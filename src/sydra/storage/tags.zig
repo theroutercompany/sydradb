@@ -3,10 +3,10 @@ const types = @import("../types.zig");
 
 pub const TagIndex = struct {
     alloc: std.mem.Allocator,
-    map: std.StringHashMap(std.ArrayList(types.SeriesId)),
+    map: std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)),
 
     pub fn loadOrInit(alloc: std.mem.Allocator, data_dir: std.fs.Dir) !TagIndex {
-        var idx = TagIndex{ .alloc = alloc, .map = std.StringHashMap(std.ArrayList(types.SeriesId)).init(alloc) };
+        var idx = TagIndex{ .alloc = alloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(alloc) };
         const f = data_dir.openFile("tags.json", .{}) catch |e| switch (e) {
             error.FileNotFound => return idx,
             else => return e,
@@ -21,7 +21,7 @@ pub const TagIndex = struct {
         while (it.next()) |entry| {
             const key = entry.key_ptr.*;
             if (entry.value_ptr.* != .array) continue;
-            var arr = try std.ArrayList(types.SeriesId).initCapacity(alloc, 0);
+            var arr = std.ArrayListUnmanaged(types.SeriesId){};
             for (entry.value_ptr.array.items) |v| if (v == .integer) try arr.append(alloc, @intCast(v.integer));
             try idx.map.put(key, arr);
         }
@@ -31,14 +31,14 @@ pub const TagIndex = struct {
     pub fn deinit(self: *TagIndex) void {
         var it = self.map.iterator();
         while (it.next()) |e| {
-            e.value_ptr.deinit();
+            e.value_ptr.deinit(self.alloc);
         }
         self.map.deinit();
     }
 
     pub fn add(self: *TagIndex, key: []const u8, series_id: types.SeriesId) !void {
         var gop = try self.map.getOrPut(key);
-        if (!gop.found_existing) gop.value_ptr.* = try std.ArrayList(types.SeriesId).initCapacity(self.alloc, 0);
+        if (!gop.found_existing) gop.value_ptr.* = .{};
         // naive dedup: check last few entries
         for (gop.value_ptr.items) |sid| if (sid == series_id) return;
         try gop.value_ptr.append(self.alloc, series_id);

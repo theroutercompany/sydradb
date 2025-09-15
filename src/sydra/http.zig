@@ -9,8 +9,7 @@ const config = @import("config.zig");
 // GET  /metrics
 
 pub fn runHttp(alloc: std.mem.Allocator, eng: *Engine, port: u16) !void {
-    const has_new_http = @hasDecl(std.http, "Server") and @hasDecl(std.http.Server, "listen");
-    comptime if (has_new_http) {
+    if (comptime (@hasDecl(std.http, "Server") and @hasDecl(std.http.Server, "listen"))) {
         var server = std.http.Server.init(.{ .reuse_address = true });
         defer server.deinit();
         try server.listen(.{ .address = try std.net.Address.parseIp4("0.0.0.0", port) });

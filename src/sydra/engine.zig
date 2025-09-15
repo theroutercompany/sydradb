@@ -7,6 +7,14 @@ const segment_mod = @import("storage/segment.zig");
 const tags_mod = @import("storage/tags.zig");
 const retention = @import("storage/retention.zig");
 
+fn sleepMs(ms: u64) void {
+    if (@hasDecl(std.time, "sleep")) {
+        std.time.sleep(ms * std.time.ns_per_ms);
+    } else {
+        std.Thread.sleep(ms * std.time.ns_per_ms);
+    }
+}
+
 pub const Engine = struct {
     alloc: std.mem.Allocator,
     config: cfg.Config,
@@ -121,13 +129,6 @@ pub const Engine = struct {
     }
 
     fn writerLoop(self: *Engine) void {
-        inline fn sleepMs(ms: u64) void {
-            comptime if (@hasDecl(std.time, "sleep")) {
-                std.time.sleep(ms * std.time.ns_per_ms);
-            } else {
-                std.Thread.sleep(ms * std.time.ns_per_ms);
-            }
-        }
         var last_flush = std.time.milliTimestamp();
         var last_sync = last_flush;
         while (!self.stop_flag) {
