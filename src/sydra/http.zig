@@ -10,21 +10,18 @@ const config = @import("config.zig");
 
 pub fn runHttp(alloc: std.mem.Allocator, eng: *Engine, port: u16) !void {
     const builtin = @import("builtin");
-    comptime if (builtin.zig_version.minor >= 15) {
+    if (builtin.zig_version.minor >= 15) {
         var server = std.http.Server.init(.{ .reuse_address = true });
         defer server.deinit();
         try server.listen(.{ .address = try std.net.Address.parseIp4("0.0.0.0", port) });
         while (true) {
             var conn = try server.accept(.{ .allocator = alloc });
             defer conn.deinit();
-            handle(alloc, eng, &conn) catch |e| {
-                _ = e;
-            };
+            handle(alloc, eng, &conn) catch {};
         }
     } else {
-        _ = alloc; _ = eng; _ = port;
         return error.Unsupported;
-    };
+    }
 }
 
 fn handle(alloc: std.mem.Allocator, eng: *Engine, res: *std.http.Server.Connection) !void {
@@ -45,10 +42,9 @@ fn handle(alloc: std.mem.Allocator, eng: *Engine, res: *std.http.Server.Connecti
     try res.sendError(.not_found, "not found");
 }
 
-fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, res: *std.http.Server.Connection, req: std.http.Server.Request) !void {
-    _ = alloc; _ = eng;
+fn handleMetrics(_: std.mem.Allocator, _: *Engine, res: *std.http.Server.Connection, _: std.http.Server.Request) !void {
+    // alloc, eng and req are currently unused; retained in signature for future use
     const body = "# HELP sydradb_up 1 if server is up\n# TYPE sydradb_up gauge\nsydradb_up 1\n";
-    _ = req;
     var response = try res.respond(.{ .status = .ok, .headers = .{ .content_type = .{ .override = true, .value = "text/plain; version=0.0.4" } } });
     try response.writer().writeAll(body);
 }

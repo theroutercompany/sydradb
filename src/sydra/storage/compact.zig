@@ -53,17 +53,17 @@ pub fn compactAll(alloc: std.mem.Allocator, data_dir: std.fs.Dir, manifest: *man
             data_dir.deleteFile(me.path) catch {};
         }
         // Rebuild manifest without old entries
-        var keep = std.ArrayList(manifest_mod.Entry).init(alloc);
-        defer keep.deinit();
+        var keep = std.ArrayListUnmanaged(manifest_mod.Entry){};
+        defer keep.deinit(alloc);
         for (manifest.entries.items) |me| {
             if (me.series_id == sid and me.hour_bucket == hour) {
                 // free removed entry path to avoid leak
                 alloc.free(me.path);
                 continue;
             }
-            try keep.append(me);
+            try keep.append(alloc, me);
         }
-        manifest.entries.deinit();
+        manifest.entries.deinit(manifest.alloc);
         manifest.entries = keep;
         // Add new consolidated entry
         const cnt: u32 = @intCast(slice.len);

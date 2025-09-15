@@ -12,10 +12,11 @@ pub const Entry = struct {
 
 pub const Manifest = struct {
     alloc: std.mem.Allocator,
-    entries: std.ArrayList(Entry),
+    // Use Unmanaged to be stable across Zig versions; pass allocator on mutation
+    entries: std.ArrayListUnmanaged(Entry),
 
     pub fn loadOrInit(alloc: std.mem.Allocator, data_dir: std.fs.Dir) !Manifest {
-        var mf = Manifest{ .alloc = alloc, .entries = std.ArrayList(Entry).init(alloc) };
+        var mf = Manifest{ .alloc = alloc, .entries = .{} };
         // create directory structure
         data_dir.makePath("segments") catch {};
         var file = data_dir.openFile("MANIFEST", .{}) catch |e| switch (e) {
@@ -27,17 +28,12 @@ pub const Manifest = struct {
             else => return e,
         };
         defer file.close();
-        // parse lines JSON
-        var br = std.io.bufferedReader(file.reader());
-        const r = br.reader();
-        var buf = std.ArrayList(u8).init(alloc);
-        defer buf.deinit();
-        while (true) {
-            buf.shrinkRetainingCapacity(0);
-            const line = try r.readUntilDelimiterOrEofAlloc(alloc, '\n', 1024 * 16);
-            if (line == null) break;
-            defer alloc.free(line.?);
-            const s = std.mem.trim(u8, line.?, " \t\r\n");
+        // Read entire file (reasonable upper bound) and split by lines
+        const body = try file.readToEndAlloc(alloc, 1024 * 1024 * 64);
+        defer alloc.free(body);
+        var it = std.mem.tokenizeScalar(u8, body, '\n');
+        while (it.next()) |raw_line| {
+            const s = std.mem.trim(u8, raw_line, " \t\r\n");
             if (s.len == 0) continue;
             var parsed = try std.json.parseFromSlice(std.json.Value, alloc, s, .{});
             defer parsed.deinit();
@@ -48,7 +44,7 @@ pub const Manifest = struct {
             const end_ts = obj.get("end_ts").?.integer;
             const count = obj.get("count").?.integer;
             const path = obj.get("path").?.string;
-            try mf.entries.append(.{
+            try mf.entries.append(alloc, .{
                 .series_id = @intCast(sid),
                 .hour_bucket = @intCast(hour),
                 .start_ts = @intCast(start_ts),
@@ -62,18 +58,22 @@ pub const Manifest = struct {
 
     pub fn deinit(self: *Manifest) void {
         for (self.entries.items) |*e| self.alloc.free(e.path);
-        self.entries.deinit();
+        self.entries.deinit(self.alloc);
     }
 
     pub fn add(self: *Manifest, data_dir: std.fs.Dir, sid: types.SeriesId, hour: i64, start_ts: i64, end_ts: i64, count: u32, path: []const u8) !void {
         // append line to MANIFEST
-        var file = try data_dir.openFile("MANIFEST", .{ .write = true, .read = true });
+        const OpenFlags = std.fs.File.OpenFlags;
+        const open_opts: OpenFlags = if (@hasField(OpenFlags, "write"))
+            OpenFlags{ .write = true, .read = true }
+        else
+            OpenFlags{ .mode = .read_write };
+        var file = try data_dir.openFile("MANIFEST", open_opts);
         defer file.close();
         try file.seekFromEnd(0);
-        var bw = std.io.bufferedWriter(file.writer());
-        const w = bw.writer();
+        var w = file.writer();
         try w.print("{{\"series_id\":{d},\"hour_bucket\":{d},\"start_ts\":{d},\"end_ts\":{d},\"count\":{d},\"path\":\"{s}\"}}\n", .{ sid, hour, start_ts, end_ts, count, path });
-        try bw.flush();
-        try self.entries.append(.{ .series_id = sid, .hour_bucket = hour, .start_ts = start_ts, .end_ts = end_ts, .count = count, .path = try self.alloc.dupe(u8, path) });
+        // no explicit flush needed with File.writer
+        try self.entries.append(self.alloc, .{ .series_id = sid, .hour_bucket = hour, .start_ts = start_ts, .end_ts = end_ts, .count = count, .path = try self.alloc.dupe(u8, path) });
     }
 };

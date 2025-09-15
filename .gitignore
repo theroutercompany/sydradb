@@ -8,3 +8,5 @@
 /.venv/
 /.direnv/
 /snapshots/
+result
+.zig-cache/

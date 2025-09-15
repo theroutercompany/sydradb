@@ -14,6 +14,18 @@ zig build -Doptimize=ReleaseSafe
 curl -XPOST localhost:8080/api/v1/ingest --data-binary $'{"series":"weather.room1","ts":1694300000,"value":24.2}\n'
 ```
 
+## Nix (reproducible toolchain)
+If you use Nix, this repo includes a flake that pins Zig and provides a dev shell:
+
+```bash
+# Start a shell with the pinned Zig
+nix develop
+
+# Build the package (installs to ./result)
+nix build
+./result/bin/sydradb serve
+```
+
 ## Status
 Pre-alpha. Expect dragons.
 

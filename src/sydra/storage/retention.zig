@@ -5,16 +5,16 @@ pub fn apply(data_dir: std.fs.Dir, manifest: *manifest_mod.Manifest, ttl_days: u
     if (ttl_days == 0) return; // keep forever
     const now_secs: i64 = @intCast(std.time.timestamp());
     const ttl_secs: i64 = @as(i64, @intCast(ttl_days)) * 24 * 3600;
-    var keep = std.ArrayList(manifest_mod.Entry).init(manifest.alloc);
-    defer keep.deinit();
+    var keep = std.ArrayListUnmanaged(manifest_mod.Entry){};
+    defer keep.deinit(manifest.alloc);
     for (manifest.entries.items) |e| {
         if ((now_secs - e.end_ts) > ttl_secs) {
             // delete segment file best-effort
             data_dir.deleteFile(e.path) catch {};
             continue;
         }
-        try keep.append(e);
+        try keep.append(manifest.alloc, e);
     }
-    manifest.entries.deinit();
+    manifest.entries.deinit(manifest.alloc);
     manifest.entries = keep;
 }

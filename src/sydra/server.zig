@@ -37,8 +37,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     if (std.mem.eql(u8, cmd, "stats")) return cmdStats(alloc, args);
 }
 
-fn cmdIngest(alloc: std.mem.Allocator, args: [][]u8) !void {
-    _ = args;
+fn cmdIngest(alloc: std.mem.Allocator, _: [][]u8) !void {
     var cfg = try config.load(alloc, "sydradb.toml");
     defer cfg.deinit(alloc);
     var eng = try engine_mod.Engine.init(alloc, cfg);
