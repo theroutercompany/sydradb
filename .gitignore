@@ -10,3 +10,5 @@
 /snapshots/
 result
 .zig-cache/
+.zig-local-cache/
+.zig-cache/

@@ -7,13 +7,14 @@ const types = @import("../types.zig");
 // Reorders by time and de-duplicates by ts (last wins), then rewrites a single segment.
 pub fn compactAll(alloc: std.mem.Allocator, data_dir: std.fs.Dir, manifest: *manifest_mod.Manifest) !void {
     // Group entries by (series_id,hour)
-    var groups = std.AutoHashMap(struct { s: u64, h: i64 }, std.ArrayList(usize)).init(alloc);
+    const Key = struct { s: u64, h: i64 };
+    var groups = std.AutoHashMap(Key, std.ArrayList(usize)).init(alloc);
     defer groups.deinit();
     for (manifest.entries.items, 0..) |e, idx| {
-        const key = .{ .s = e.series_id, .h = e.hour_bucket };
+        const key: Key = .{ .s = e.series_id, .h = e.hour_bucket };
         var gop = try groups.getOrPut(key);
         if (!gop.found_existing) gop.value_ptr.* = try std.ArrayList(usize).initCapacity(alloc, 0);
-        try gop.value_ptr.append(idx);
+        try gop.value_ptr.append(alloc, idx);
     }
     var it = groups.iterator();
     while (it.next()) |entry| {

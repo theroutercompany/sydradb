@@ -124,7 +124,7 @@ pub fn queryRange(alloc: std.mem.Allocator, data_dir: std.fs.Dir, manifest: *man
                 const u: u64 = std.mem.readInt(u64, &tmp8, .little);
                 const val: f64 = @bitCast(u);
                 const ts = ts_list[j];
-                if (ts >= start_ts and ts <= end_ts) try out.append(.{ .ts = ts, .value = val });
+                if (ts >= start_ts and ts <= end_ts) try out.append(alloc, .{ .ts = ts, .value = val });
             }
         } else {
             // v1 decode: codecs
@@ -140,7 +140,7 @@ pub fn queryRange(alloc: std.mem.Allocator, data_dir: std.fs.Dir, manifest: *man
             var k: usize = 0;
             while (k < count) : (k += 1) {
                 const ts = ts_list[k];
-                if (ts >= start_ts and ts <= end_ts) try out.append(.{ .ts = ts, .value = vals[k] });
+                if (ts >= start_ts and ts <= end_ts) try out.append(alloc, .{ .ts = ts, .value = vals[k] });
             }
         }
     }

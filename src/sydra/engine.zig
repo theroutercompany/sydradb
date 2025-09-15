@@ -42,13 +42,14 @@ pub const Engine = struct {
     };
 
     pub const Queue = struct {
+        alloc: std.mem.Allocator,
         mu: std.Thread.Mutex = .{},
         cv: std.Thread.Condition = .{},
         buf: std.ArrayList(IngestItem),
         closed: bool = false,
         pub fn init(alloc: std.mem.Allocator) !*Queue {
             const q = try alloc.create(Queue);
-            q.* = .{ .buf = try std.ArrayList(IngestItem).initCapacity(alloc, 0) };
+            q.* = .{ .alloc = alloc, .buf = try std.ArrayList(IngestItem).initCapacity(alloc, 0) };
             return q;
         }
         pub fn deinit(self: *Queue) void {
@@ -58,7 +59,7 @@ pub const Engine = struct {
             self.mu.lock();
             defer self.mu.unlock();
             if (self.closed) return error.Closed;
-            try self.buf.append(item);
+            try self.buf.append(self.alloc, item);
             self.cv.signal();
         }
         pub fn pop(self: *Queue) ?IngestItem {
@@ -120,6 +121,13 @@ pub const Engine = struct {
     }
 
     fn writerLoop(self: *Engine) void {
+        inline fn sleepMs(ms: u64) void {
+            comptime if (@hasDecl(std.time, "sleep")) {
+                std.time.sleep(ms * std.time.ns_per_ms);
+            } else {
+                std.Thread.sleep(ms * std.time.ns_per_ms);
+            }
+        }
         var last_flush = std.time.milliTimestamp();
         var last_sync = last_flush;
         while (!self.stop_flag) {
@@ -134,11 +142,9 @@ pub const Engine = struct {
                         continue;
                     };
                 }
-                _ = gop.value_ptr.append(.{ .ts = it.ts, .value = it.value }) catch {};
+                _ = gop.value_ptr.append(self.alloc, .{ .ts = it.ts, .value = it.value }) catch {};
                 self.mem.bytes += @sizeOf(types.Point);
-            } else {
-                std.time.sleep(10 * std.time.ns_per_ms);
-            }
+            } else sleepMs(10);
 
             const now = std.time.milliTimestamp();
             if (self.mem.bytes >= self.config.memtable_max_bytes or (now - last_flush) >= self.flush_timer_ms) {
@@ -209,7 +215,7 @@ pub const Engine = struct {
         var it = tree.root.object.iterator();
         while (it.next()) |e| {
             if (e.value_ptr.* == .string) {
-                var keybuf = std.ArrayList(u8).init(self.alloc);
+                var keybuf = try std.ArrayList(u8).initCapacity(self.alloc, 0);
                 defer keybuf.deinit();
                 keybuf.writer().print("{s}={s}", .{ e.key_ptr.*, e.value_ptr.string }) catch continue;
                 const key = keybuf.toOwnedSlice() catch continue;

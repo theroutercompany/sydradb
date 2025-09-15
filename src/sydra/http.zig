@@ -9,8 +9,8 @@ const config = @import("config.zig");
 // GET  /metrics
 
 pub fn runHttp(alloc: std.mem.Allocator, eng: *Engine, port: u16) !void {
-    const builtin = @import("builtin");
-    if (builtin.zig_version.minor >= 15) {
+    const has_new_http = @hasDecl(std.http, "Server") and @hasDecl(std.http.Server, "listen");
+    comptime if (has_new_http) {
         var server = std.http.Server.init(.{ .reuse_address = true });
         defer server.deinit();
         try server.listen(.{ .address = try std.net.Address.parseIp4("0.0.0.0", port) });
@@ -20,6 +20,7 @@ pub fn runHttp(alloc: std.mem.Allocator, eng: *Engine, port: u16) !void {
             handle(alloc, eng, &conn) catch {};
         }
     } else {
+        _ = alloc; _ = eng; _ = port;
         return error.Unsupported;
     }
 }
@@ -155,7 +156,7 @@ fn handleFind(alloc: std.mem.Allocator, eng: *Engine, res: *std.http.Server.Conn
                 defer keybuf.deinit();
                 keybuf.writer().print("{s}={s}", .{ e.key_ptr.*, e.value_ptr.string }) catch continue;
                 const key = keybuf.items;
-                try sets.append(eng.tags.get(key));
+                try sets.append(alloc, eng.tags.get(key));
             }
         }
     }

@@ -2,18 +2,26 @@
   description = "sydradb reproducible dev/build (Zig pinned)";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  # Optional: exact Zig versions via overlay
+  inputs.zig-overlay.url = "github:mitchellh/zig-overlay";
 
-  outputs = { self, nixpkgs }: let
+  outputs = { self, nixpkgs, zig-overlay }: let
     systems = [
       "x86_64-linux"
       "aarch64-linux"
       "x86_64-darwin"
       "aarch64-darwin"
     ];
-    forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f (import nixpkgs { inherit system; }));
+    forAllSystems = f: nixpkgs.lib.genAttrs systems (system:
+      let
+        pkgs = import nixpkgs { inherit system; overlays = [ zig-overlay.overlays.default ]; };
+        zigPkgs = zig-overlay.packages.${system} or {};
+        zigPinned = if builtins.hasAttr "zig-0.15.1" zigPkgs then zigPkgs."zig-0.15.1"
+                    else if builtins.hasAttr "0.15.1" zigPkgs then zigPkgs."0.15.1"
+                    else (pkgs.zig_0_15 or pkgs.zig);
+      in f pkgs zigPinned);
   in {
-    packages = forAllSystems (pkgs: let
-      zig = pkgs.zig_0_15 or pkgs.zig;
+    packages = forAllSystems (pkgs: zig: let
     in {
       default = pkgs.stdenvNoCC.mkDerivation {
         pname = "sydradb";
@@ -32,8 +40,7 @@
       };
     });
 
-    devShells = forAllSystems (pkgs: let
-      zig = pkgs.zig_0_15 or pkgs.zig;
+    devShells = forAllSystems (pkgs: zig: let
       nixfmt = pkgs.nixfmt-classic or pkgs.nixfmt;
     in {
       default = pkgs.mkShell {
@@ -49,4 +56,3 @@
     formatter = forAllSystems (pkgs: pkgs.nixfmt-classic or pkgs.nixfmt);
   };
 }
-

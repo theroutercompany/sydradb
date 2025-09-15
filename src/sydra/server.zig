@@ -75,7 +75,7 @@ fn cmdQuery(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     const sid = try std.fmt.parseInt(u64, args[2], 10);
     const start_ts = try std.fmt.parseInt(i64, args[3], 10);
     const end_ts = try std.fmt.parseInt(i64, args[4], 10);
-    var out = std.ArrayList(@import("types.zig").Point).init(alloc);
+    var out = try std.ArrayList(@import("types.zig").Point).initCapacity(alloc, 0);
     defer out.deinit();
     try eng.queryRange(sid, start_ts, end_ts, &out);
     for (out.items) |p| std.debug.print("{d},{d}\n", .{ p.ts, p.value });

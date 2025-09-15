@@ -26,6 +26,10 @@ nix build
 ./result/bin/sydradb serve
 ```
 
+Notes
+- The flake integrates `mitchellh/zig-overlay` and prefers Zig 0.15.1. With a flake.lock committed, Zig is fully pinned and consistent for all contributors.
+- To (re)pin: `nix flake lock --update-input nixpkgs --update-input zig-overlay` then commit the updated `flake.lock`.
+
 ## Direnv (auto-activate dev shell)
 
 This repository includes an `.envrc` that loads the pinned Nix dev shell.
