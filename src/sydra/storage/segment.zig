@@ -37,18 +37,21 @@ pub fn writeSegment(alloc: std.mem.Allocator, data_dir: std.fs.Dir, series_id: t
     try f.writeAll(tmp8[0..8]);
     std.mem.writeInt(i64, &tmp8, points[points.len - 1].ts, .little);
     try f.writeAll(tmp8[0..8]);
-    // Codec markers
-    var fw = f.writer();
-    try fw.writeByte(1); // ts codec: 1=dod-zzvar
-    try fw.writeByte(1); // val codec: 1=gorilla-xor
+    // Codec markers and payload writer
+    var writer_buffer: [4096]u8 = undefined;
+    var file_writer = f.writer(&writer_buffer);
+    try file_writer.interface.writeByte(1); // ts codec: 1=dod-zzvar
+    try file_writer.interface.writeByte(1); // val codec: 1=gorilla-xor
 
     // Encode timestamps (delta-of-delta zigzag varint)
-    try @import("../codec/gorilla.zig").encodeTsDoD(f.writer(), points[0].ts, points);
+    try @import("../codec/gorilla.zig").encodeTsDoD(&file_writer.interface, points[0].ts, points);
     // Encode values using gorilla-like XOR
     var vals = try alloc.alloc(f64, points.len);
     defer alloc.free(vals);
     for (points, 0..) |p, i| vals[i] = p.value;
-    try @import("../codec/gorilla.zig").encodeF64(f.writer(), vals);
+    try @import("../codec/gorilla.zig").encodeF64(&file_writer.interface, vals);
+
+    try file_writer.interface.flush();
 
     return try alloc.dupe(u8, file_name);
 }
@@ -56,105 +59,135 @@ pub fn writeSegment(alloc: std.mem.Allocator, data_dir: std.fs.Dir, series_id: t
 pub fn readAll(alloc: std.mem.Allocator, data_dir: std.fs.Dir, path: []const u8) ![]types.Point {
     var f = try data_dir.openFile(path, .{});
     defer f.close();
-    var hdr: [6]u8 = undefined; _ = try f.readAll(&hdr);
-    var tmp8: [8]u8 = undefined; _ = try f.readAll(tmp8[0..8]); // series
-    _ = try f.readAll(tmp8[0..8]); // hour
-    var tmp4: [4]u8 = undefined; _ = try f.readAll(tmp4[0..4]);
+
+    var reader_buffer: [4096]u8 = undefined;
+    var file_reader = f.reader(&reader_buffer);
+    var reader = &file_reader.interface;
+
+    var hdr: [6]u8 = undefined;
+    try reader.readSliceAll(&hdr);
+    var tmp8: [8]u8 = undefined;
+    try reader.readSliceAll(tmp8[0..8]); // series id (unused)
+    try reader.readSliceAll(tmp8[0..8]); // hour bucket (unused)
+    var tmp4: [4]u8 = undefined;
+    try reader.readSliceAll(tmp4[0..4]);
     const count = std.mem.readInt(u32, &tmp4, .little);
-    _ = try f.readAll(tmp8[0..8]); // start
-    _ = try f.readAll(tmp8[0..8]); // end
-    var ts_list = try alloc.alloc(i64, count);
-    var prev_ts: i64 = 0;
-    var i: usize = 0;
-    var br = std.io.bufferedReader(f.reader());
-    const r = br.reader();
-    while (i < count) : (i += 1) {
-        const delta = try decodeZigZagVarint(r);
-        const ts: i64 = if (i == 0) delta else prev_ts + delta;
-        ts_list[i] = ts;
-        prev_ts = ts;
+    try reader.readSliceAll(tmp8[0..8]);
+    const start = std.mem.readInt(i64, &tmp8, .little);
+    try reader.readSliceAll(tmp8[0..8]); // end
+
+    if (std.mem.eql(u8, hdr[0..6], "SYSEG1")) {
+        var ts_list = try alloc.alloc(i64, count);
+        defer alloc.free(ts_list);
+        var prev_ts: i64 = 0;
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            const delta = try decodeZigZagVarint(reader);
+            const ts: i64 = if (i == 0) delta else prev_ts + delta;
+            ts_list[i] = ts;
+            prev_ts = ts;
+        }
+        var points = try alloc.alloc(types.Point, count);
+        var j: usize = 0;
+        while (j < count) : (j += 1) {
+            try reader.readSliceAll(tmp8[0..8]);
+            const u: u64 = std.mem.readInt(u64, &tmp8, .little);
+            points[j] = .{ .ts = ts_list[j], .value = @bitCast(u) };
+        }
+        return points;
     }
+
+    const ts_codec = try readByte(reader);
+    const val_codec = try readByte(reader);
+    _ = ts_codec;
+    _ = val_codec;
+    const ts_list = try @import("../codec/gorilla.zig").decodeTsDoD(alloc, reader, count, start);
+    defer alloc.free(ts_list);
+    const vals = try @import("../codec/gorilla.zig").decodeF64(alloc, reader, count);
+    defer alloc.free(vals);
     var points = try alloc.alloc(types.Point, count);
-    var j: usize = 0;
-    while (j < count) : (j += 1) {
-        _ = try f.readAll(tmp8[0..8]);
-        const u: u64 = std.mem.readInt(u64, &tmp8, .little);
-        const val: f64 = @bitCast(u);
-        points[j] = .{ .ts = ts_list[j], .value = val };
+    for (ts_list, 0..) |ts, idx| {
+        points[idx] = .{ .ts = ts, .value = vals[idx] };
     }
-    alloc.free(ts_list);
     return points;
 }
 
 pub fn queryRange(alloc: std.mem.Allocator, data_dir: std.fs.Dir, manifest: *manifest_mod.Manifest, series_id: types.SeriesId, start_ts: i64, end_ts: i64, out: *std.ArrayList(types.Point)) !void {
-    // find segments overlapping by hour range from manifest
     for (manifest.entries.items) |e| {
         if (e.series_id != series_id) continue;
         if (e.end_ts < start_ts or e.start_ts > end_ts) continue;
-        // Open segment file and scan
-    var f = try data_dir.openFile(e.path, .{});
+
+        var f = try data_dir.openFile(e.path, .{});
         defer f.close();
-        // read and skip header
-        var hdr: [6]u8 = undefined; _ = try f.readAll(&hdr);
-        var tmp8: [8]u8 = undefined; _ = try f.readAll(tmp8[0..8]); // series
-        _ = try f.readAll(tmp8[0..8]); // hour
-        var tmp4: [4]u8 = undefined; _ = try f.readAll(tmp4[0..4]);
+
+        var reader_buffer: [4096]u8 = undefined;
+        var file_reader = f.reader(&reader_buffer);
+        var reader = &file_reader.interface;
+
+        var hdr: [6]u8 = undefined;
+        try reader.readSliceAll(&hdr);
+        var tmp8: [8]u8 = undefined;
+        try reader.readSliceAll(tmp8[0..8]); // series id (unused)
+        try reader.readSliceAll(tmp8[0..8]); // hour bucket (unused)
+        var tmp4: [4]u8 = undefined;
+        try reader.readSliceAll(tmp4[0..4]);
         const count = std.mem.readInt(u32, &tmp4, .little);
-        _ = try f.readAll(tmp8[0..8]); // start
+        try reader.readSliceAll(tmp8[0..8]);
         const start = std.mem.readInt(i64, &tmp8, .little);
-        _ = try f.readAll(tmp8[0..8]); // end
-        const magic = hdr;
-        if (std.mem.eql(u8, magic[0..6], "SYSEG1")) {
-            // v0 decode: delta varint for ts, raw f64
+        try reader.readSliceAll(tmp8[0..8]); // end (ignored)
+
+        if (std.mem.eql(u8, hdr[0..6], "SYSEG1")) {
             var ts_list = try alloc.alloc(i64, count);
             defer alloc.free(ts_list);
             var prev_ts: i64 = 0;
             var i: usize = 0;
-            var br = std.io.bufferedReader(f.reader());
-            const r = br.reader();
             while (i < count) : (i += 1) {
-                const delta = try decodeZigZagVarint(r);
+                const delta = try decodeZigZagVarint(reader);
                 const ts: i64 = if (i == 0) delta else prev_ts + delta;
                 ts_list[i] = ts;
                 prev_ts = ts;
             }
             var j: usize = 0;
             while (j < count) : (j += 1) {
-                _ = try f.readAll(tmp8[0..8]);
+                try reader.readSliceAll(tmp8[0..8]);
                 const u: u64 = std.mem.readInt(u64, &tmp8, .little);
                 const val: f64 = @bitCast(u);
                 const ts = ts_list[j];
                 if (ts >= start_ts and ts <= end_ts) try out.append(alloc, .{ .ts = ts, .value = val });
             }
-        } else {
-            // v1 decode: codecs
-            const ts_codec = try f.reader().readByte();
-            const val_codec = try f.reader().readByte();
-            _ = ts_codec; _ = val_codec; // reserved for future switches
-            var br = std.io.bufferedReader(f.reader());
-            const r = br.reader();
-            const ts_list = try @import("../codec/gorilla.zig").decodeTsDoD(alloc, r, count, start);
-            defer alloc.free(ts_list);
-            const vals = try @import("../codec/gorilla.zig").decodeF64(alloc, r, count);
-            defer alloc.free(vals);
-            var k: usize = 0;
-            while (k < count) : (k += 1) {
-                const ts = ts_list[k];
-                if (ts >= start_ts and ts <= end_ts) try out.append(alloc, .{ .ts = ts, .value = vals[k] });
-            }
+            continue;
+        }
+
+        const ts_codec = try readByte(reader);
+        const val_codec = try readByte(reader);
+        _ = ts_codec;
+        _ = val_codec;
+        const ts_list = try @import("../codec/gorilla.zig").decodeTsDoD(alloc, reader, count, start);
+        defer alloc.free(ts_list);
+        const vals = try @import("../codec/gorilla.zig").decodeF64(alloc, reader, count);
+        defer alloc.free(vals);
+        var k: usize = 0;
+        while (k < count) : (k += 1) {
+            const ts = ts_list[k];
+            if (ts >= start_ts and ts <= end_ts) try out.append(alloc, .{ .ts = ts, .value = vals[k] });
         }
     }
 }
 
-fn decodeZigZagVarint(r: anytype) !i64 {
+fn decodeZigZagVarint(r: *std.Io.Reader) !i64 {
     var shift: u6 = 0;
     var result: u64 = 0;
     while (true) {
-        const b = try r.readByte();
+        const b = try readByte(r);
         result |= (@as(u64, b & 0x7F)) << shift;
         if ((b & 0x80) == 0) break;
         shift += 7;
     }
     const tmp: i64 = @bitCast((result >> 1) ^ (~result & 1));
     return tmp;
+}
+
+inline fn readByte(r: *std.Io.Reader) !u8 {
+    const chunk = try r.take(1);
+    return chunk[0];
 }

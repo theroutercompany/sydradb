@@ -21,15 +21,26 @@ pub fn restore(alloc: std.mem.Allocator, data_dir: std.fs.Dir, src_path: []const
 }
 
 fn copyIfExists(from: std.fs.Dir, to: std.fs.Dir, name: []const u8) !void {
-    var f = from.openFile(name, .{}) catch |e| switch (e) { error.FileNotFound => return, else => return e };
+    var f = from.openFile(name, .{}) catch |e| switch (e) {
+        error.FileNotFound => return,
+        else => return e,
+    };
     defer f.close();
-    var g = try to.createFile(name, .{ .truncate = true });
+    var g = try to.createFile(name, .{ .truncate = true, .read = true });
     defer g.close();
-    try std.io.copyAll(f.reader(), g.writer());
+    var reader_buffer: [4096]u8 = undefined;
+    var file_reader = f.reader(&reader_buffer);
+    var writer_buffer: [4096]u8 = undefined;
+    var file_writer = g.writer(&writer_buffer);
+    _ = try file_reader.interface.streamRemaining(&file_writer.interface);
+    try file_writer.interface.flush();
 }
 
 fn copyDirRecursive(alloc: std.mem.Allocator, from: std.fs.Dir, to: std.fs.Dir, name: []const u8) !void {
-    var sub_from = from.openDir(name, .{ .iterate = true }) catch |e| switch (e) { error.FileNotFound => return, else => return e };
+    var sub_from = from.openDir(name, .{ .iterate = true }) catch |e| switch (e) {
+        error.FileNotFound => return,
+        else => return e,
+    };
     defer sub_from.close();
     to.makePath(name) catch {};
     var sub_to = try to.openDir(name, .{ .iterate = true });
@@ -39,9 +50,14 @@ fn copyDirRecursive(alloc: std.mem.Allocator, from: std.fs.Dir, to: std.fs.Dir, 
         if (ent.kind == .file) {
             var f = try sub_from.openFile(ent.name, .{});
             defer f.close();
-            var g = try sub_to.createFile(ent.name, .{ .truncate = true });
+            var g = try sub_to.createFile(ent.name, .{ .truncate = true, .read = true });
             defer g.close();
-            try std.io.copyAll(f.reader(), g.writer());
+            var reader_buffer: [4096]u8 = undefined;
+            var file_reader = f.reader(&reader_buffer);
+            var writer_buffer: [4096]u8 = undefined;
+            var file_writer = g.writer(&writer_buffer);
+            _ = try file_reader.interface.streamRemaining(&file_writer.interface);
+            try file_writer.interface.flush();
         } else if (ent.kind == .directory) {
             try copyDirRecursive(alloc, sub_from, sub_to, ent.name);
         }

@@ -43,12 +43,14 @@ fn cmdIngest(alloc: std.mem.Allocator, _: [][:0]u8) !void {
     var eng = try engine_mod.Engine.init(alloc, cfg);
     defer eng.deinit();
     // Read NDJSON from stdin
-    const stdin = std.fs.File.stdin().reader();
-    var br = std.io.bufferedReader(stdin);
-    const r = br.reader();
+    var stdin_file = std.fs.File.stdin();
+    var reader_buffer: [4096]u8 = undefined;
+    var stdin_reader = stdin_file.reader(&reader_buffer);
+    var r = &stdin_reader.interface;
+    var compat_reader = r.adaptToOldInterface();
     var count: usize = 0;
     while (true) {
-        const line_opt = try r.readUntilDelimiterOrEofAlloc(alloc, '\n', 1024 * 64);
+        const line_opt = try compat_reader.readUntilDelimiterOrEofAlloc(alloc, '\n', 1024 * 64);
         if (line_opt == null) break;
         defer alloc.free(line_opt.?);
         const line = std.mem.trim(u8, line_opt.?, " \t\r\n");
@@ -76,7 +78,7 @@ fn cmdQuery(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     const start_ts = try std.fmt.parseInt(i64, args[3], 10);
     const end_ts = try std.fmt.parseInt(i64, args[4], 10);
     var out = try std.ArrayList(@import("types.zig").Point).initCapacity(alloc, 0);
-    defer out.deinit();
+    defer out.deinit(alloc);
     try eng.queryRange(sid, start_ts, end_ts, &out);
     for (out.items) |p| std.debug.print("{d},{d}\n", .{ p.ts, p.value });
 }
@@ -94,7 +96,7 @@ fn cmdCompact(alloc: std.mem.Allocator, _: [][:0]u8) !void {
 fn cmdStats(alloc: std.mem.Allocator, _: [][:0]u8) !void {
     var cfg = try config.load(alloc, "sydradb.toml");
     defer cfg.deinit(alloc);
-    const d = try std.fs.cwd().openDir(cfg.data_dir, .{ .iterate = true });
+    var d = try std.fs.cwd().openDir(cfg.data_dir, .{ .iterate = true });
     defer d.close();
     var it = d.iterate();
     var seg_count: usize = 0;

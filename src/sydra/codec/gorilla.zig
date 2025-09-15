@@ -1,7 +1,7 @@
 const std = @import("std");
 
 // Timestamp delta-of-delta using ZigZag varint (Gorilla-inspired)
-pub fn encodeTsDoD(writer: anytype, start_ts: i64, points: []const @import("../types.zig").Point) !void {
+pub fn encodeTsDoD(writer: *std.Io.Writer, start_ts: i64, points: []const @import("../types.zig").Point) !void {
     var prev_ts: i64 = start_ts;
     var prev_delta: i64 = 0;
     for (points, 0..) |p, idx| {
@@ -15,7 +15,7 @@ pub fn encodeTsDoD(writer: anytype, start_ts: i64, points: []const @import("../t
     }
 }
 
-pub fn decodeTsDoD(alloc: std.mem.Allocator, reader: anytype, count: usize, start_ts: i64) ![]i64 {
+pub fn decodeTsDoD(alloc: std.mem.Allocator, reader: *std.Io.Reader, count: usize, start_ts: i64) ![]i64 {
     var ts_list = try alloc.alloc(i64, count);
     var prev_ts: i64 = start_ts;
     var prev_delta: i64 = 0;
@@ -35,7 +35,7 @@ pub fn decodeTsDoD(alloc: std.mem.Allocator, reader: anytype, count: usize, star
 // Encoding per value:
 // - marker: 0 = same as prev, 1 = changed (xor payload), 2 = first/raw (8 bytes)
 // - when marker=1: write [leading_zeros:u8][trailing_zeros:u8][nbytes:u8][payload:nbytes]
-pub fn encodeF64(writer: anytype, values: []const f64) !void {
+pub fn encodeF64(writer: *std.Io.Writer, values: []const f64) !void {
     var prev_bits: u64 = 0;
     for (values, 0..) |v, idx| {
         const bits: u64 = @bitCast(v);
@@ -69,16 +69,16 @@ pub fn encodeF64(writer: anytype, values: []const f64) !void {
     }
 }
 
-pub fn decodeF64(alloc: std.mem.Allocator, reader: anytype, count: usize) ![]f64 {
+pub fn decodeF64(alloc: std.mem.Allocator, reader: *std.Io.Reader, count: usize) ![]f64 {
     var out = try alloc.alloc(f64, count);
     var prev_bits: u64 = 0;
     var i: usize = 0;
     while (i < count) : (i += 1) {
-        const marker = try reader.readByte();
+        const marker = try readByte(reader);
         switch (marker) {
             2 => {
                 var b: [8]u8 = undefined;
-                _ = try reader.readAll(&b);
+                try reader.readSliceAll(&b);
                 prev_bits = std.mem.readInt(u64, &b, .little);
                 out[i] = @bitCast(prev_bits);
             },
@@ -86,11 +86,11 @@ pub fn decodeF64(alloc: std.mem.Allocator, reader: anytype, count: usize) ![]f64
                 out[i] = @bitCast(prev_bits);
             },
             1 => {
-                _ = try reader.readByte(); // lz (ignored in simplified decode)
-                const tz = try reader.readByte();
-                const nbytes = try reader.readByte();
+                _ = try readByte(reader); // lz (ignored in simplified decode)
+                const tz = try readByte(reader);
+                const nbytes = try readByte(reader);
                 var bytes: [8]u8 = .{0} ** 8;
-                _ = try reader.readAll(bytes[0..nbytes]);
+                try reader.readSliceAll(bytes[0..nbytes]);
                 const payload = std.mem.readInt(u64, &bytes, .little);
                 const tz6: u6 = @intCast(tz);
                 const x: u64 = payload << tz6;
@@ -116,15 +116,20 @@ fn encodeZigZagVarint(buf: []u8, v: i64) usize {
     return i + 1;
 }
 
-fn decodeZigZagVarint(r: anytype) !i64 {
+fn decodeZigZagVarint(r: *std.Io.Reader) !i64 {
     var shift: u6 = 0;
     var result: u64 = 0;
     while (true) {
-        const b = try r.readByte();
+        const b = try readByte(r);
         result |= (@as(u64, b & 0x7F)) << shift;
         if ((b & 0x80) == 0) break;
         shift += 7;
     }
     const tmp: i64 = @bitCast((result >> 1) ^ (~result & 1));
     return tmp;
+}
+
+inline fn readByte(r: *std.Io.Reader) !u8 {
+    const chunk = try r.take(1);
+    return chunk[0];
 }

@@ -44,7 +44,7 @@ pub const Manifest = struct {
             const end_ts = obj.get("end_ts").?.integer;
             const count = obj.get("count").?.integer;
             const path = obj.get("path").?.string;
-            try mf.entries.append(alloc, .{
+        try mf.entries.append(alloc, .{
                 .series_id = @intCast(sid),
                 .hour_bucket = @intCast(hour),
                 .start_ts = @intCast(start_ts),
@@ -71,9 +71,10 @@ pub const Manifest = struct {
         var file = try data_dir.openFile("MANIFEST", open_opts);
         defer file.close();
         try file.seekFromEnd(0);
-        var w = file.writer();
-        try w.print("{{\"series_id\":{d},\"hour_bucket\":{d},\"start_ts\":{d},\"end_ts\":{d},\"count\":{d},\"path\":\"{s}\"}}\n", .{ sid, hour, start_ts, end_ts, count, path });
-        // no explicit flush needed with File.writer
+        var writer_buffer: [512]u8 = undefined;
+        var file_writer = file.writer(&writer_buffer);
+        try file_writer.interface.print("{{\"series_id\":{d},\"hour_bucket\":{d},\"start_ts\":{d},\"end_ts\":{d},\"count\":{d},\"path\":\"{s}\"}}\n", .{ sid, hour, start_ts, end_ts, count, path });
+        try file_writer.interface.flush();
         try self.entries.append(self.alloc, .{ .series_id = sid, .hour_bucket = hour, .start_ts = start_ts, .end_ts = end_ts, .count = count, .path = try self.alloc.dupe(u8, path) });
     }
 };

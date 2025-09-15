@@ -29,14 +29,19 @@ pub const Engine = struct {
     queue: *Queue,
 
     pub const MemTable = struct {
+        alloc: std.mem.Allocator,
         series: std.AutoHashMap(types.SeriesId, std.ArrayList(types.Point)),
         bytes: usize,
         pub fn init(alloc: std.mem.Allocator) MemTable {
-            return .{ .series = std.AutoHashMap(types.SeriesId, std.ArrayList(types.Point)).init(alloc), .bytes = 0 };
+            return .{
+                .alloc = alloc,
+                .series = std.AutoHashMap(types.SeriesId, std.ArrayList(types.Point)).init(alloc),
+                .bytes = 0,
+            };
         }
         pub fn deinit(self: *MemTable) void {
             var it = self.series.valueIterator();
-            while (it.next()) |lst| lst.deinit();
+            while (it.next()) |lst| lst.deinit(self.alloc);
             self.series.deinit();
         }
     };
@@ -61,7 +66,7 @@ pub const Engine = struct {
             return q;
         }
         pub fn deinit(self: *Queue) void {
-            self.buf.deinit();
+            self.buf.deinit(self.alloc);
         }
         pub fn push(self: *Queue, item: IngestItem) !void {
             self.mu.lock();
@@ -172,7 +177,9 @@ pub const Engine = struct {
             var arr = entry.value_ptr.*;
             if (arr.items.len == 0) continue;
             std.sort.block(types.Point, arr.items, {}, struct {
-                fn lessThan(_: void, a: types.Point, b: types.Point) bool { return a.ts < b.ts; }
+                fn lessThan(_: void, a: types.Point, b: types.Point) bool {
+                    return a.ts < b.ts;
+                }
             }.lessThan);
             // Partition by hour (UTC)
             var start_idx: usize = 0;
@@ -208,18 +215,16 @@ pub const Engine = struct {
 
     pub fn noteTags(self: *Engine, series_id: types.SeriesId, tags: []const u8) void {
         // tags is expected to be a JSON object; we parse and update tag→series mapping
-        var p = std.json.Parser.init(self.alloc, false);
-        defer p.deinit();
-        var tree = p.parse(tags) catch return;
-        defer tree.deinit();
-        if (tree.root != .object) return;
-        var it = tree.root.object.iterator();
+        var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, tags, .{}) catch return;
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+        var it = parsed.value.object.iterator();
         while (it.next()) |e| {
             if (e.value_ptr.* == .string) {
-                var keybuf = try std.ArrayList(u8).initCapacity(self.alloc, 0);
-                defer keybuf.deinit();
-                keybuf.writer().print("{s}={s}", .{ e.key_ptr.*, e.value_ptr.string }) catch continue;
-                const key = keybuf.toOwnedSlice() catch continue;
+                var keybuf = std.ArrayList(u8){};
+                defer keybuf.deinit(self.alloc);
+                keybuf.print(self.alloc, "{s}={s}", .{ e.key_ptr.*, e.value_ptr.string }) catch continue;
+                const key = keybuf.toOwnedSlice(self.alloc) catch continue;
                 defer self.alloc.free(key);
                 self.tags.add(key, series_id) catch {};
             }

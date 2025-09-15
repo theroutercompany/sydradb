@@ -21,15 +21,17 @@ pub fn compactAll(alloc: std.mem.Allocator, data_dir: std.fs.Dir, manifest: *man
         const ids = entry.value_ptr.*.items;
         if (ids.len <= 1) continue;
         var all = try std.ArrayList(types.Point).initCapacity(alloc, 0);
-        defer all.deinit();
+        defer all.deinit(alloc);
         for (ids) |mi| {
             const me = manifest.entries.items[mi];
             const pts = try segment.readAll(alloc, data_dir, me.path);
             defer alloc.free(pts);
-            try all.appendSlice(pts);
+            try all.appendSlice(alloc, pts);
         }
         std.sort.block(types.Point, all.items, {}, struct {
-            fn lessThan(_: void, a: types.Point, b: types.Point) bool { return a.ts < b.ts; }
+            fn lessThan(_: void, a: types.Point, b: types.Point) bool {
+                return a.ts < b.ts;
+            }
         }.lessThan);
         // de-duplicate by ts (last wins)
         var dedup = try alloc.alloc(types.Point, all.items.len);
@@ -39,7 +41,8 @@ pub fn compactAll(alloc: std.mem.Allocator, data_dir: std.fs.Dir, manifest: *man
         while (i < all.items.len) : (i += 1) {
             const p = all.items[i];
             if (n == 0 or dedup[n - 1].ts != p.ts) {
-                dedup[n] = p; n += 1;
+                dedup[n] = p;
+                n += 1;
             } else {
                 dedup[n - 1] = p; // last wins
             }
@@ -70,5 +73,6 @@ pub fn compactAll(alloc: std.mem.Allocator, data_dir: std.fs.Dir, manifest: *man
         const cnt: u32 = @intCast(slice.len);
         try manifest.add(data_dir, sid, hour, slice[0].ts, slice[slice.len - 1].ts, cnt, new_path);
         alloc.free(new_path);
+        entry.value_ptr.deinit(alloc);
     }
 }
