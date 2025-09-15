@@ -1,0 +1,7 @@
+# sydraDB default config (MVP)
+data_dir = "./data"
+http_port = 8080
+fsync = "interval"  # one of: always, interval, none
+flush_interval_ms = 2000
+memtable_max_bytes = 8388608  # 8 MiB
+retention_days = 0  # 0 means keep forever

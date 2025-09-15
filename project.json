@@ -1,0 +1,347 @@
+{
+  "meta": {
+    "spec_version": "1.0",
+    "generated_at": "2025-09-14T19:00:00-04:00",
+    "source_context": [
+      "Project: sydraDB (time-series database in Zig)",
+      "Chats: DB formats & types, tsDB in Zig, sydraQL idea, hosting/server model, Redis/Kafka cache questions, immutability vs blockchain, TradingView API integration ideas, Solana/memecoin data pipelines, GMGN/Telegram bot ecosystem, CI badges/minimal READMEs, monorepo vs polyrepo, dev environment (macOS + Nix-Darwin), GitHub onboarding."
+    ]
+  },
+  "project": {
+    "name": "sydraDB",
+    "one_liner": "A fast, embeddable time-series database written in Zig with an LSM-like columnar engine, WAL, compaction, and a tiny query layer (sydraQL).",
+    "status": "pre-alpha",
+    "license": "Apache-2.0",
+    "repo_style": "monorepo",
+    "languages": ["Zig", "C (ffi stubs)", "Shell", "YAML", "Markdown"],
+    "principles": [
+      "Single static binary; zero external deps in core",
+      "Local-first; server mode optional",
+      "Crash-safety via WAL + checksums",
+      "Columnar TS segments w/ time-ordered SSTables",
+      "Simple wire APIs first (HTTP/REST + Arrow IPC later)",
+      "Deterministic builds; CI from day 1",
+      "Clear boundaries: storage ⟂ query ⟂ ingestion adapters"
+    ],
+    "non_goals_now": [
+      "Distributed consensus/raft",
+      "Full SQL surface",
+      "Cluster sharding",
+      "On-disk encryption (keep hooks, no impl yet)"
+    ]
+  },
+  "high_level_arch": {
+    "storage_engine": {
+      "layout": "WAL → memtable (skiplist) → flush to TS-SST (columnar, time-chunked) → leveled compaction",
+      "files": ["*.wal", "*.tsst", "MANIFEST", "CURRENT", "LOCK"],
+      "indexes": [
+        "time index per segment",
+        "series_id -> segment map",
+        "optional tags bitmap"
+      ],
+      "compression": "lz4 (pluggable, start with none + CRC32)"
+    },
+    "query_engine": {
+      "dsl": "sydraQL (minimal): SELECT fields FROM series WHERE time BETWEEN ... AND ... [GROUP BY interval] [AGG fn]",
+      "exec": "iterator over sorted segments; merge + predicate pushdown; simple agg (min/max/avg/sum/count)"
+    },
+    "ingestion": {
+      "modes": [
+        "embedded API (Zig library)",
+        "HTTP ingest endpoint (JSON line / ndjson)",
+        "CLI importer (CSV/Parquet later)"
+      ],
+      "future_adapters": ["Kafka (optional)", "Redis stream (optional)"]
+    },
+    "server": {
+      "binary_flags": [
+        "--data-dir",
+        "--http",
+        "--http-port",
+        "--max-memtable-bytes",
+        "--flush-interval-ms"
+      ],
+      "observability": ["/healthz", "/metrics (Prometheus text)"]
+    }
+  },
+  "sydraql": {
+    "grammar_min": [
+      "SELECT <agg|field[, ...]> FROM <series>",
+      "WHERE time BETWEEN <iso8601> AND <iso8601> [AND tag.<k> = '<v>']",
+      "GROUP BY TIME_BUCKET(<dur>)",
+      "AGG in {min,max,avg,sum,count}"
+    ],
+    "examples": [
+      "SELECT avg(temp_c) FROM weather.room1 WHERE time BETWEEN '2025-09-01T00:00:00Z' AND '2025-09-14T00:00:00Z' GROUP BY TIME_BUCKET(1h)"
+    ]
+  },
+  "roadmap": {
+    "phase_0_bootstrap": [
+      "Zig build scaffold (build.zig)",
+      "Filesystem layout + MANIFEST writer/reader",
+      "CRC32 + varint utils"
+    ],
+    "phase_1_wal_memtable": [
+      "Append-only WAL writer/reader with checksums",
+      "Memtable: skiplist or array+binary-search, by (series_id, ts)",
+      "Background flush trigger (size or time)"
+    ],
+    "phase_2_segment_format": [
+      "TS-SST writer: columnar pages (ts, value, tags bitmap)",
+      "Index blocks + footer; magic bytes; versioning",
+      "Reader + iterator with predicate pushdown on time"
+    ],
+    "phase_3_compaction_gc": [
+      "Size-tiered → leveled compaction",
+      "Tombstones & TTL",
+      "Space accounting and simple throttling"
+    ],
+    "phase_4_query_api": [
+      "sydraQL parser (tiny hand-rolled)",
+      "Exec pipeline (scan→filter→groupby→agg)",
+      "HTTP endpoints: /ingest, /query, /series"
+    ],
+    "phase_5_obs_ci": [
+      "Prometheus metrics",
+      "GitHub Actions (build/test, Zig matrix)",
+      "Bench harness with synthetic series"
+    ],
+    "phase_6_adapters_future": [
+      "Arrow Flight / IPC",
+      "Kafka ingest",
+      "Parquet export",
+      "Solana/GMGN pipelines as external example adapters"
+    ]
+  },
+  "repo_layout": {
+    "folders": [
+      "src/",
+      "src/sydra/",
+      "src/bin/",
+      "src/ingest/",
+      "src/query/",
+      "src/storage/",
+      "src/utils/",
+      "cmd/",
+      "docs/",
+      "examples/",
+      ".github/workflows/"
+    ]
+  },
+  "tasks_backlog": [
+    {
+      "id": "BOOT-1",
+      "title": "Initialize Zig project",
+      "labels": ["bootstrap"],
+      "body": "Create build.zig, src/main.zig; print version & help."
+    },
+    {
+      "id": "FS-1",
+      "title": "MANIFEST and CURRENT files",
+      "labels": ["storage"],
+      "body": "Define repo metadata; load on startup; write atomically."
+    },
+    {
+      "id": "WAL-1",
+      "title": "WAL writer/reader with CRC32",
+      "labels": ["storage", "reliability"],
+      "body": "Binary record format: [len][type][payload][crc]. Fsync policy toggle."
+    },
+    {
+      "id": "MT-1",
+      "title": "Memtable (skiplist) by (series_id, ts)",
+      "labels": ["storage", "perf"],
+      "body": "Insert path from ingest; iterator to flush writer."
+    },
+    {
+      "id": "FL-1",
+      "title": "Background flush daemon",
+      "labels": ["storage"],
+      "body": "Flush on size threshold or timer; rotate WAL."
+    },
+    {
+      "id": "SEG-1",
+      "title": "TS-SST writer v0",
+      "labels": ["format"],
+      "body": "Column pages, index blocks, footer; crc; magic bytes 'SYDRA0'."
+    },
+    {
+      "id": "SEG-2",
+      "title": "TS-SST reader + iterators",
+      "labels": ["format"],
+      "body": "Random access reads; time range pruning."
+    },
+    {
+      "id": "CPCT-1",
+      "title": "Compaction (size-tiered)",
+      "labels": ["storage"],
+      "body": "Merge by series; drop overwritten; write new level."
+    },
+    {
+      "id": "API-1",
+      "title": "HTTP server skeleton",
+      "labels": ["server"],
+      "body": "Routes: /healthz /metrics /ingest /query; JSON bodies."
+    },
+    {
+      "id": "QL-1",
+      "title": "sydraQL MVP parser",
+      "labels": ["query"],
+      "body": "Hand-rolled tokenizer & parser for MVP grammar."
+    },
+    {
+      "id": "QL-2",
+      "title": "Query execution pipeline",
+      "labels": ["query"],
+      "body": "Scan→filter(time/tags)→groupby(bucket)→agg."
+    },
+    {
+      "id": "OBS-1",
+      "title": "Prometheus metrics",
+      "labels": ["ops"],
+      "body": "Process, ingest, wal_bytes, compaction_durations."
+    },
+    {
+      "id": "CI-1",
+      "title": "GitHub Actions (build & test)",
+      "labels": ["ci"],
+      "body": "Zig stable + nightly matrix; cache ~/.zigmod."
+    },
+    {
+      "id": "DOC-1",
+      "title": "Write docs/FORMAT.md",
+      "labels": ["docs"],
+      "body": "WAL & TS-SST on-disk spec v0 with diagrams."
+    },
+    {
+      "id": "EX-1",
+      "title": "Example: CSV ingest CLI",
+      "labels": ["example"],
+      "body": "cmd/sydra-csv: pipe CSV with ts,value into /ingest."
+    }
+  ],
+  "ci": {
+    "badges": [
+      { "label": "CI", "type": "github_actions", "workflow": "ci.yml" },
+      { "label": "License", "type": "shields", "value": "Apache-2.0" },
+      { "label": "Code Style", "type": "static", "value": "zig fmt" }
+    ],
+    "workflows": [
+      {
+        "path": ".github/workflows/ci.yml",
+        "description": "Build + test on push/PR",
+        "content": "name: CI\non:\n  push:\n    branches: [ main ]\n  pull_request:\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - name: Install Zig\n        uses: goto-bus-stop/setup-zig@v2\n        with:\n          version: stable\n      - name: Build\n        run: zig build -Doptimize=ReleaseSafe\n      - name: Test\n        run: zig build test\n"
+      }
+    ]
+  },
+  "files": [
+    {
+      "path": "README.md",
+      "content": "# sydraDB\n\nA fast, embeddable time-series database in Zig.\n\n## Why\n- Local-first, single binary\n- Crash-safe WAL → columnar TS segments\n- Simple query layer (sydraQL)\n\n## Quick start\n```bash\nzig build -Doptimize=ReleaseSafe\n./zig-out/bin/sydradb --data-dir ./data --http :8080\ncurl -XPOST localhost:8080/ingest -d '{\"series\":\"weather.room1\",\"ts\":1694300000,\"temp_c\":24.2}'\n```\n\n## Status\nPre-alpha. Expect dragons.\n\n## License\nApache-2.0\n"
+    },
+    {
+      "path": "LICENSE",
+      "content": "Apache License 2.0\n\nCopyright (c) 2025 sydraDB contributors\n\nLicensed under the Apache License, Version 2.0 (the \"License\");\nYou may not use this file except in compliance with the License.\nYou may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0\n\nUnless required by applicable law or agreed to in writing, software\nDistributed under the License is distributed on an \"AS IS\" BASIS,\nWITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\nSee the License for the specific language governing permissions and\nlimitations under the License.\n"
+    },
+    {
+      "path": "build.zig",
+      "content": "const std = @import(\"std\");\npub fn build(b: *std.Build) void {\n    const target = b.standardTargetOptions(.{});\n    const optimize = b.standardOptimizeOption(.{});\n    const exe = b.addExecutable(.{\n        .name = \"sydradb\",\n        .root_source_file = .{ .path = \"src/main.zig\" },\n        .target = target,\n        .optimize = optimize,\n    });\n    exe.install();\n    const run_cmd = exe.run();\n    if (b.args) |args| run_cmd.addArgs(args);\n    b.step(\"run\", \"Run sydraDB\").dependOn(&run_cmd.step);\n    const unit_tests = b.addTest(.{ .root_source_file = .{ .path = \"src/main.zig\" }, .target = target, .optimize = optimize });\n    const test_run = b.addRunArtifact(unit_tests);\n    b.step(\"test\", \"Run tests\").dependOn(&test_run.step);\n}\n"
+    },
+    {
+      "path": "src/main.zig",
+      "content": "const std = @import(\"std\");\nconst server = @import(\"sydra/server.zig\");\npub fn main() !void {\n    var gpa = std.heap.GeneralPurposeAllocator(.{}){};\n    defer _ = gpa.deinit();\n    const alloc = gpa.allocator();\n    var stdout = std.io.getStdOut().writer();\n    try stdout.print(\"sydraDB pre-alpha\\n\", .{});\n    try server.run(alloc);\n}\n"
+    },
+    {
+      "path": "src/sydra/server.zig",
+      "content": "const std = @import(\"std\");\npub fn run(alloc: std.mem.Allocator) !void {\n    _ = alloc; // TODO: wire HTTP later\n    // Placeholder: event loop / signal handling\n    // Future: /healthz, /ingest, /query\n}\n"
+    },
+    {
+      "path": "src/sydra/storage/wal.zig",
+      "content": "// WAL v0 placeholder; record: [u32 len][u8 type][bytes payload][u32 crc]\n"
+    },
+    {
+      "path": "src/sydra/storage/memtable.zig",
+      "content": "// Memtable: skiplist by (series_id, ts) → iterator for flush\n"
+    },
+    {
+      "path": "src/sydra/storage/segment.zig",
+      "content": "// TS-SST writer/reader v0 placeholder\n"
+    },
+    {
+      "path": "src/sydra/query/parser.zig",
+      "content": "// sydraQL tokenizer + parser prototype\n"
+    },
+    {
+      "path": "src/sydra/query/exec.zig",
+      "content": "// scan→filter→groupby→agg pipeline prototype\n"
+    },
+    {
+      "path": "cmd/sydra-csv/main.zig",
+      "content": "// CLI to stream CSV into /ingest (future)\n"
+    },
+    {
+      "path": "docs/FORMAT.md",
+      "content": "# On-Disk Format v0 (Draft)\n\n## WAL\n- Record: [len:u32][type:u8][payload][crc:u32]\n- Types: PUT, DELETE, META\n\n## TS-SST\n- Column pages: ts[], value[], tags_bitmap\n- Index blocks per series; footer with offsets; magic 'SYDRA0'\n"
+    },
+    {
+      "path": ".gitignore",
+      "content": "/zig-cache/\n/zig-out/\n/.idea/\n/.vscode/\n/data/\n"
+    },
+    {
+      "path": ".github/ISSUE_TEMPLATE/feature.yml",
+      "content": "name: Feature request\nlabels: [feature]\nbody:\n  - type: textarea\n    id: desc\n    attributes:\n      label: Description\n"
+    }
+  ],
+  "http_api": {
+    "paths": [
+      {
+        "method": "POST",
+        "path": "/ingest",
+        "body_example": "{\"series\":\"<name>\",\"ts\":<unix_sec>,\"fields\":{\"temp_c\":24.2},\"tags\":{\"room\":\"1\"}}",
+        "notes": "Batch accept array of points too; upsert semantics; reject future>now+skew"
+      },
+      {
+        "method": "POST",
+        "path": "/query",
+        "body_example": "{\"q\":\"SELECT avg(temp_c) FROM weather.room1 WHERE time BETWEEN '2025-09-01T00:00:00Z' AND '2025-09-14T00:00:00Z' GROUP BY TIME_BUCKET(1h)\"}"
+      },
+      { "method": "GET", "path": "/healthz" },
+      { "method": "GET", "path": "/metrics" }
+    ]
+  },
+  "coding_conventions": {
+    "zig": [
+      "zig fmt enforced in CI",
+      "Prefer explicit error sets; no hidden panics",
+      "No global allocators; pass allocator explicitly"
+    ],
+    "testing": [
+      "Unit tests beside modules",
+      "End-to-end smoke: ingest→flush→query"
+    ]
+  },
+  "dev_env": {
+    "nix_darwin": {
+      "notes": [
+        "Keep dev shell minimal; pin Zig stable",
+        "Provide 'zig' and 'just' in shell"
+      ]
+    }
+  },
+  "scaffold_instructions_for_tool": {
+    "actions": [
+      { "type": "create_files_from_array", "source": "files" },
+      { "type": "create_workflows_from_array", "source": "ci.workflows" },
+      { "type": "create_issues_from_array", "source": "tasks_backlog" },
+      {
+        "type": "set_repo_topics",
+        "topics": ["timeseries", "zig", "database", "tsdb", "storage-engine"]
+      },
+      { "type": "set_license", "value": "Apache-2.0" }
+    ]
+  },
+  "future_integration_notes": {
+    "tradingview": "Out of core scope; provide example adapter in examples/ when query layer is stable.",
+    "solana_memecoin_pipeline": "Treat as external data pipeline project using sydraDB as sink. Use Helius/Solana APIs or third-party, write adapter to /ingest."
+  }
+}

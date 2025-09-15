@@ -1,0 +1,10 @@
+/zig-cache/
+/zig-out/
+/.idea/
+/.vscode/
+/data/
+/.DS_Store
+/.env
+/.venv/
+/.direnv/
+/snapshots/

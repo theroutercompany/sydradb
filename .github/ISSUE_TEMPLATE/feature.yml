@@ -1,0 +1,7 @@
+name: Feature request
+labels: [feature]
+body:
+  - type: textarea
+    id: desc
+    attributes:
+      label: Description

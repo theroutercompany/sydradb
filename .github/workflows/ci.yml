@@ -1,0 +1,26 @@
+name: CI
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Install pre-commit
+        run: pip install pre-commit
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: stable
+      - name: Pre-commit
+        run: pre-commit run --all-files --show-diff-on-failure
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe
+      - name: Test
+        run: zig build test

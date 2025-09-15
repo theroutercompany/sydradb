@@ -1,0 +1,26 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-merge-conflict
+      - id: check-yaml
+
+  - repo: local
+    hooks:
+      - id: zig-fmt
+        name: zig fmt (check)
+        entry: zig fmt --check .
+        language: system
+        pass_filenames: false
+      - id: zig-build
+        name: zig build
+        entry: zig build -Doptimize=Debug
+        language: system
+        pass_filenames: false
+      - id: zig-test
+        name: zig test
+        entry: zig build test
+        language: system
+        pass_filenames: false

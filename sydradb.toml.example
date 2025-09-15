@@ -1,0 +1,14 @@
+# Example config for sydraDB
+data_dir = "./data"
+http_port = 8080
+fsync = "interval"  # always|interval|none
+flush_interval_ms = 2000
+memtable_max_bytes = 8388608
+mem_limit_bytes = 268435456
+auth_token = ""  # set to enable auth on /api/*
+enable_influx = false
+enable_prom = true
+
+# Per-namespace TTL (days)
+retention.default = 0
+retention.weather = 30
