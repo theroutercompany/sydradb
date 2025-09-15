@@ -119,7 +119,7 @@ fn handleQuery(alloc: std.mem.Allocator, eng: *Engine, res: *std.http.Server.Con
     else if (obj.get("series")) |v| series_id = types.hash64(v.string);
     const start_ts: i64 = @intCast(obj.get("start").?.integer);
     const end_ts: i64 = @intCast(obj.get("end").?.integer);
-    var points = std.ArrayList(types.Point).init(alloc);
+    var points = try std.ArrayList(types.Point).initCapacity(alloc, 0);
     defer points.deinit();
     try eng.queryRange(series_id, start_ts, end_ts, &points);
     var response = try res.respond(.{ .status = .ok });
@@ -145,13 +145,13 @@ fn handleFind(alloc: std.mem.Allocator, eng: *Engine, res: *std.http.Server.Conn
     if (obj.get("op")) |v| {
         if (v == .string and std.ascii.eqlIgnoreCase(v.string, "or")) op_and = false;
     }
-    var sets = std.ArrayList([]const u64).init(alloc);
+    var sets = try std.ArrayList([]const u64).initCapacity(alloc, 0);
     defer sets.deinit();
     if (obj.get("tags")) |t| {
         if (t == .object) {
             var it = t.object.iterator();
             while (it.next()) |e| {
-                var keybuf = std.ArrayList(u8).init(alloc);
+                var keybuf = try std.ArrayList(u8).initCapacity(alloc, 0);
                 defer keybuf.deinit();
                 keybuf.writer().print("{s}={s}", .{ e.key_ptr.*, e.value_ptr.string }) catch continue;
                 const key = keybuf.items;

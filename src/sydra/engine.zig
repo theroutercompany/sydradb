@@ -48,7 +48,7 @@ pub const Engine = struct {
         closed: bool = false,
         pub fn init(alloc: std.mem.Allocator) !*Queue {
             const q = try alloc.create(Queue);
-            q.* = .{ .buf = std.ArrayList(IngestItem).init(alloc) };
+            q.* = .{ .buf = try std.ArrayList(IngestItem).initCapacity(alloc, 0) };
             return q;
         }
         pub fn deinit(self: *Queue) void {
@@ -128,7 +128,12 @@ pub const Engine = struct {
                 self.wal.append(it.series_id, it.ts, it.value) catch {};
                 // Memtable insert
                 var gop = self.mem.series.getOrPut(it.series_id) catch continue;
-                if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(types.Point).init(self.alloc);
+                if (!gop.found_existing) {
+                    gop.value_ptr.* = std.ArrayList(types.Point).initCapacity(self.alloc, 0) catch {
+                        // drop this point if we can't allocate
+                        continue;
+                    };
+                }
                 _ = gop.value_ptr.append(.{ .ts = it.ts, .value = it.value }) catch {};
                 self.mem.bytes += @sizeOf(types.Point);
             } else {

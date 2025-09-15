@@ -26,6 +26,20 @@ nix build
 ./result/bin/sydradb serve
 ```
 
+## Direnv (auto-activate dev shell)
+
+This repository includes an `.envrc` that loads the pinned Nix dev shell.
+
+1) Install direnv and nix-direnv
+   - Nix: `nix profile install nixpkgs#direnv nixpkgs#nix-direnv`
+   - Homebrew: `brew install direnv`
+2) Hook direnv in your shell (e.g., zsh): add `eval "$(direnv hook zsh)"` to your shell rc.
+3) Ensure nix-direnv is sourced by direnv (recommended):
+   - Create `~/.config/direnv/direnvrc` with: `source "$HOME/.nix-profile/share/nix-direnv/direnvrc"` (or equivalent for your profile).
+4) In this repo run: `direnv allow`.
+
+From now on, entering the directory will auto‑activate the correct toolchain.
+
 ## Status
 Pre-alpha. Expect dragons.
 

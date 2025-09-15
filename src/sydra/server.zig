@@ -37,7 +37,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     if (std.mem.eql(u8, cmd, "stats")) return cmdStats(alloc, args);
 }
 
-fn cmdIngest(alloc: std.mem.Allocator, _: [][]u8) !void {
+fn cmdIngest(alloc: std.mem.Allocator, _: [][:0]u8) !void {
     var cfg = try config.load(alloc, "sydradb.toml");
     defer cfg.deinit(alloc);
     var eng = try engine_mod.Engine.init(alloc, cfg);
@@ -66,7 +66,7 @@ fn cmdIngest(alloc: std.mem.Allocator, _: [][]u8) !void {
     std.debug.print("ingested {d} points\n", .{count});
 }
 
-fn cmdQuery(alloc: std.mem.Allocator, args: [][]u8) !void {
+fn cmdQuery(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     if (args.len < 5) return error.Invalid;
     var cfg = try config.load(alloc, "sydradb.toml");
     defer cfg.deinit(alloc);
@@ -81,7 +81,7 @@ fn cmdQuery(alloc: std.mem.Allocator, args: [][]u8) !void {
     for (out.items) |p| std.debug.print("{d},{d}\n", .{ p.ts, p.value });
 }
 
-fn cmdCompact(alloc: std.mem.Allocator, _: [][]u8) !void {
+fn cmdCompact(alloc: std.mem.Allocator, _: [][:0]u8) !void {
     var cfg = try config.load(alloc, "sydradb.toml");
     defer cfg.deinit(alloc);
     var data_dir = try std.fs.cwd().openDir(cfg.data_dir, .{ .iterate = true });
@@ -91,7 +91,7 @@ fn cmdCompact(alloc: std.mem.Allocator, _: [][]u8) !void {
     try @import("storage/compact.zig").compactAll(alloc, data_dir, &manifest);
 }
 
-fn cmdStats(alloc: std.mem.Allocator, _: [][]u8) !void {
+fn cmdStats(alloc: std.mem.Allocator, _: [][:0]u8) !void {
     var cfg = try config.load(alloc, "sydradb.toml");
     defer cfg.deinit(alloc);
     const d = try std.fs.cwd().openDir(cfg.data_dir, .{ .iterate = true });
@@ -118,7 +118,7 @@ fn cmdStats(alloc: std.mem.Allocator, _: [][]u8) !void {
     std.debug.print("segments_total {d}\n", .{seg_count});
 }
 
-fn cmdSnapshot(alloc: std.mem.Allocator, args: [][]u8) !void {
+fn cmdSnapshot(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     if (args.len < 3) return error.Invalid;
     var cfg = try config.load(alloc, "sydradb.toml");
     defer cfg.deinit(alloc);
@@ -127,7 +127,7 @@ fn cmdSnapshot(alloc: std.mem.Allocator, args: [][]u8) !void {
     try @import("snapshot.zig").snapshot(alloc, data_dir, args[2]);
 }
 
-fn cmdRestore(alloc: std.mem.Allocator, args: [][]u8) !void {
+fn cmdRestore(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     if (args.len < 3) return error.Invalid;
     var cfg = try config.load(alloc, "sydradb.toml");
     defer cfg.deinit(alloc);

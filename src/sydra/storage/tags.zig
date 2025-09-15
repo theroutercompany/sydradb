@@ -21,7 +21,7 @@ pub const TagIndex = struct {
         while (it.next()) |entry| {
             const key = entry.key_ptr.*;
             if (entry.value_ptr.* != .array) continue;
-            var arr = std.ArrayList(types.SeriesId).init(alloc);
+            var arr = try std.ArrayList(types.SeriesId).initCapacity(alloc, 0);
             for (entry.value_ptr.array.items) |v| if (v == .integer) try arr.append(@intCast(v.integer));
             try idx.map.put(key, arr);
         }
@@ -38,7 +38,7 @@ pub const TagIndex = struct {
 
     pub fn add(self: *TagIndex, key: []const u8, series_id: types.SeriesId) !void {
         var gop = try self.map.getOrPut(key);
-        if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(types.SeriesId).init(self.alloc);
+        if (!gop.found_existing) gop.value_ptr.* = try std.ArrayList(types.SeriesId).initCapacity(self.alloc, 0);
         // naive dedup: check last few entries
         for (gop.value_ptr.items) |sid| if (sid == series_id) return;
         try gop.value_ptr.append(series_id);

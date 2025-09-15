@@ -12,14 +12,14 @@ pub fn compactAll(alloc: std.mem.Allocator, data_dir: std.fs.Dir, manifest: *man
     for (manifest.entries.items, 0..) |e, idx| {
         const key = .{ .s = e.series_id, .h = e.hour_bucket };
         var gop = try groups.getOrPut(key);
-        if (!gop.found_existing) gop.value_ptr.* = std.ArrayList(usize).init(alloc);
+        if (!gop.found_existing) gop.value_ptr.* = try std.ArrayList(usize).initCapacity(alloc, 0);
         try gop.value_ptr.append(idx);
     }
     var it = groups.iterator();
     while (it.next()) |entry| {
         const ids = entry.value_ptr.*.items;
         if (ids.len <= 1) continue;
-        var all = std.ArrayList(types.Point).init(alloc);
+        var all = try std.ArrayList(types.Point).initCapacity(alloc, 0);
         defer all.deinit();
         for (ids) |mi| {
             const me = manifest.entries.items[mi];
