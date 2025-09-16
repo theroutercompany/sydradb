@@ -1,0 +1,1 @@
+{"name":"select-constant","sql":"SELECT 1","expect":{"kind":"success","sydraql":"select const 1"},"notes":"Placeholder translation case"}
