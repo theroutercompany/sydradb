@@ -35,6 +35,30 @@ pub const RelationSpec = struct {
     toast_relation_oid: ?u32 = null,
 };
 
+pub const TypeKind = enum {
+    base,
+    enum_type,
+    domain,
+    pseudo,
+};
+
+pub const TypeSpec = struct {
+    name: []const u8,
+    namespace: []const u8,
+    oid: u32,
+    length: i16,
+    by_value: bool,
+    kind: TypeKind = .base,
+    category: u8 = 'U',
+    delimiter: u8 = ',',
+    element_type_oid: u32 = 0,
+    array_type_oid: u32 = 0,
+    base_type_oid: u32 = 0,
+    collation_oid: u32 = 0,
+    input_regproc: u32 = 0,
+    output_regproc: u32 = 0,
+};
+
 pub const IdentityKind = enum {
     none,
     always,
@@ -97,10 +121,30 @@ pub const AttributeRow = struct {
 
 const empty_attribute_rows = [_]AttributeRow{};
 
+pub const TypeRow = struct {
+    oid: u32,
+    typname: []const u8,
+    typnamespace: u32,
+    typlen: i16,
+    typbyval: bool,
+    typtype: u8,
+    typcategory: u8,
+    typdelim: u8,
+    typelem: u32,
+    typarray: u32,
+    typbasetype: u32,
+    typcollation: u32,
+    typinput: u32,
+    typoutput: u32,
+};
+
+const empty_type_rows = [_]TypeRow{};
+
 pub const Snapshot = struct {
     namespaces: []NamespaceRow = &empty_namespace_rows,
     classes: []ClassRow = &empty_class_rows,
     attributes: []AttributeRow = &empty_attribute_rows,
+    types: []TypeRow = &empty_type_rows,
 
     pub fn deinit(self: *Snapshot, alloc: std.mem.Allocator) void {
         for (self.namespaces) |ns| {
@@ -118,6 +162,11 @@ pub const Snapshot = struct {
         }
         alloc.free(self.attributes);
 
+        for (self.types) |ty| {
+            alloc.free(ty.typname);
+        }
+        alloc.free(self.types);
+
         self.* = Snapshot{};
     }
 };
@@ -126,6 +175,7 @@ pub fn buildSnapshot(
     alloc: std.mem.Allocator,
     namespace_specs: []const NamespaceSpec,
     relation_specs: []const RelationSpec,
+    type_specs: []const TypeSpec,
     column_specs: []const ColumnSpec,
 ) !Snapshot {
     var ns_map = std.StringArrayHashMap(NamespaceSpec).init(alloc);
@@ -228,6 +278,46 @@ pub fn buildSnapshot(
         });
     }
 
+    var type_entries = std.ArrayList(TypeRow).init(alloc);
+    defer type_entries.deinit();
+
+    const type_buffer = try alloc.alloc(TypeSpec, type_specs.len);
+    defer alloc.free(type_buffer);
+    std.mem.copy(TypeSpec, type_buffer, type_specs);
+
+    std.sort.sort(TypeSpec, type_buffer, {}, struct {
+        pub fn lessThan(_: void, lhs: TypeSpec, rhs: TypeSpec) bool {
+            if (!std.mem.eql(u8, lhs.namespace, rhs.namespace)) {
+                return std.mem.lessThan(u8, lhs.namespace, rhs.namespace);
+            }
+            return std.mem.lessThan(u8, lhs.name, rhs.name);
+        }
+    }.lessThan);
+
+    try type_entries.ensureTotalCapacity(type_buffer.len);
+
+    for (type_buffer) |spec| {
+        const ns_oid = ns_lookup.get(spec.namespace) orelse return error.MissingNamespace;
+        const name_copy = try alloc.dupe(u8, spec.name);
+        errdefer alloc.free(name_copy);
+        try type_entries.append(.{
+            .oid = spec.oid,
+            .typname = name_copy,
+            .typnamespace = ns_oid,
+            .typlen = spec.length,
+            .typbyval = spec.by_value,
+            .typtype = typeKindChar(spec.kind),
+            .typcategory = spec.category,
+            .typdelim = spec.delimiter,
+            .typelem = spec.element_type_oid,
+            .typarray = spec.array_type_oid,
+            .typbasetype = spec.base_type_oid,
+            .typcollation = spec.collation_oid,
+            .typinput = spec.input_regproc,
+            .typoutput = spec.output_regproc,
+        });
+    }
+
     var attribute_entries = std.ArrayList(AttributeRow).init(alloc);
     defer attribute_entries.deinit();
 
@@ -287,6 +377,7 @@ pub fn buildSnapshot(
         .namespaces = try namespace_entries.toOwnedSlice(),
         .classes = try class_entries.toOwnedSlice(),
         .attributes = try attribute_entries.toOwnedSlice(),
+        .types = try type_entries.toOwnedSlice(),
     };
 }
 
@@ -319,6 +410,15 @@ fn generatedChar(kind: GeneratedKind) u8 {
     return switch (kind) {
         .none => ' ',
         .stored => 's',
+    };
+}
+
+fn typeKindChar(kind: TypeKind) u8 {
+    return switch (kind) {
+        .base => 'b',
+        .enum_type => 'e',
+        .domain => 'd',
+        .pseudo => 'p',
     };
 }
 
@@ -361,9 +461,10 @@ pub const Store = struct {
         alloc: std.mem.Allocator,
         namespace_specs: []const NamespaceSpec,
         relation_specs: []const RelationSpec,
+        type_specs: []const TypeSpec,
         column_specs: []const ColumnSpec,
     ) !void {
-        const new_snapshot = try buildSnapshot(alloc, namespace_specs, relation_specs, column_specs);
+        const new_snapshot = try buildSnapshot(alloc, namespace_specs, relation_specs, type_specs, column_specs);
         self.deinit(alloc);
         self.snapshot = new_snapshot;
     }
@@ -379,6 +480,10 @@ pub const Store = struct {
     pub fn attributes(self: *Store) []const AttributeRow {
         return self.snapshot.attributes;
     }
+
+    pub fn types(self: *Store) []const TypeRow {
+        return self.snapshot.types;
+    }
 };
 
 var global_store: Store = .{};
@@ -390,6 +495,7 @@ pub fn global() *Store {
 test "build catalog snapshot" {
     const alloc = std.testing.allocator;
     const namespace_specs = [_]NamespaceSpec{
+        .{ .name = "pg_catalog", .owner = 10 },
         .{ .name = "public", .owner = 10 },
     };
     const relation_specs = [_]RelationSpec{
@@ -399,20 +505,28 @@ test "build catalog snapshot" {
         .{ .namespace = "public", .name = "users_id_seq", .kind = .sequence },
     };
 
+    const type_specs = [_]TypeSpec{
+        .{ .name = "int4", .namespace = "pg_catalog", .oid = 23, .length = 4, .by_value = true, .category = 'N' },
+        .{ .name = "text", .namespace = "pg_catalog", .oid = 25, .length = -1, .by_value = false, .category = 'S' },
+        .{ .name = "_int4", .namespace = "pg_catalog", .oid = 1007, .length = -1, .by_value = false, .category = 'A', .element_type_oid = 23 },
+    };
+
     const column_specs = [_]ColumnSpec{
         .{ .namespace = "public", .relation = "users", .name = "id", .type_oid = 23, .not_null = true, .has_default = true, .identity = .always },
         .{ .namespace = "public", .relation = "users", .name = "name", .type_oid = 25 },
         .{ .namespace = "auth", .relation = "refresh_tokens", .name = "token", .type_oid = 25 },
     };
 
-    var snapshot = try buildSnapshot(alloc, &namespace_specs, &relation_specs, &column_specs);
+    var snapshot = try buildSnapshot(alloc, &namespace_specs, &relation_specs, &type_specs, &column_specs);
     defer snapshot.deinit(alloc);
 
-    try std.testing.expectEqual(@as(usize, 2), snapshot.namespaces.len);
+    try std.testing.expectEqual(@as(usize, 3), snapshot.namespaces.len);
     try std.testing.expectEqual(namespace_oid_base, snapshot.namespaces[0].oid);
     try std.testing.expectEqualStrings("auth", snapshot.namespaces[0].nspname);
     try std.testing.expectEqual(namespace_oid_base + 1, snapshot.namespaces[1].oid);
-    try std.testing.expectEqualStrings("public", snapshot.namespaces[1].nspname);
+    try std.testing.expectEqualStrings("pg_catalog", snapshot.namespaces[1].nspname);
+    try std.testing.expectEqual(namespace_oid_base + 2, snapshot.namespaces[2].oid);
+    try std.testing.expectEqualStrings("public", snapshot.namespaces[2].nspname);
 
     try std.testing.expectEqual(@as(usize, 4), snapshot.classes.len);
     try std.testing.expectEqual(relation_oid_base, snapshot.classes[0].oid);
@@ -438,6 +552,17 @@ test "build catalog snapshot" {
     try std.testing.expectEqual(@as(i16, 2), snapshot.attributes[1].attnum);
     try std.testing.expectEqualStrings("token", snapshot.attributes[2].attname);
     try std.testing.expectEqual(snapshot.classes[0].oid, snapshot.attributes[2].attrelid);
+    try std.testing.expectEqual(@as(usize, 3), snapshot.types.len);
+    try std.testing.expectEqual(@as(u32, 23), snapshot.types[0].oid);
+    try std.testing.expectEqualStrings("int4", snapshot.types[0].typname);
+    try std.testing.expect(snapshot.types[0].typbyval);
+    try std.testing.expectEqual(@as(u8, 'N'), snapshot.types[0].typcategory);
+    try std.testing.expectEqual(@as(u32, 25), snapshot.types[1].oid);
+    try std.testing.expectEqualStrings("text", snapshot.types[1].typname);
+    try std.testing.expectEqual(@as(i16, -1), snapshot.types[1].typlen);
+    try std.testing.expect(!snapshot.types[1].typbyval);
+    try std.testing.expectEqual(@as(u32, 1007), snapshot.types[2].oid);
+    try std.testing.expectEqual(@as(u32, 23), snapshot.types[2].typelem);
 }
 
 test "store load lifecycle" {
@@ -445,14 +570,18 @@ test "store load lifecycle" {
     var store = Store{};
     defer store.deinit(alloc);
 
-    const namespaces = [_]NamespaceSpec{.{ .name = "public" }};
     const relations = [_]RelationSpec{.{ .namespace = "public", .name = "users", .kind = .table }};
+    const types = [_]TypeSpec{.{ .name = "int4", .namespace = "pg_catalog", .oid = 23, .length = 4, .by_value = true, .category = 'N' }};
     const columns = [_]ColumnSpec{.{ .namespace = "public", .relation = "users", .name = "id", .type_oid = 23 }};
 
-    try store.load(alloc, &namespaces, &relations, &columns);
-    try std.testing.expectEqual(@as(usize, 1), store.namespaces().len);
+    const ns_full = [_]NamespaceSpec{.{ .name = "pg_catalog" }, .{ .name = "public" }};
+
+    try store.load(alloc, &ns_full, &relations, &types, &columns);
+    try std.testing.expectEqual(@as(usize, 2), store.namespaces().len);
     try std.testing.expectEqual(@as(usize, 1), store.classes().len);
-    try std.testing.expectEqualStrings("public", store.namespaces()[0].nspname);
+    try std.testing.expectEqualStrings("pg_catalog", store.namespaces()[0].nspname);
+    try std.testing.expectEqualStrings("public", store.namespaces()[1].nspname);
     try std.testing.expectEqualStrings("users", store.classes()[0].relname);
     try std.testing.expectEqual(@as(usize, 1), store.attributes().len);
+    try std.testing.expectEqual(@as(usize, 1), store.types().len);
 }

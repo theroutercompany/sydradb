@@ -30,6 +30,7 @@ This memo captures the minimum viable definitions for the PostgreSQL catalog vie
 - Columns: `oid`, `typname`, `typnamespace`, `typlen`, `typbyval`, `typtype`, `typcategory`, `typdelim`, `typelem`, `typarray`, `typbasetype`, `typcollation`, `typinput`, `typoutput`.
 - Mirror PostgreSQL OIDs for common scalars (`16` bool, `23` int4, `25` text, `2950` uuid) to keep drivers happy.
 - Allocate a sydra-owned range (`900000`+) for composite/array/JSONB types we synthesise.
+- Builder coverage: `compat/catalog.zig` now emits deterministic rows from `TypeSpec` records; supply namespace + OID pairs so array/base mappings line up with the translator.
 
 ### pg_index
 - Columns: `indexrelid`, `indrelid`, `indnatts`, `indnkeyatts`, `indisunique`, `indisprimary`, `indisexclusion`, `indimmediate`, `indisvalid`, `indkey`, `indcollation`, `indclass`, `indoption`.
