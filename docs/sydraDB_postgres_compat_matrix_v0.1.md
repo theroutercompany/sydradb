@@ -10,6 +10,8 @@ I’m assuming a typical modern engine baseline; where I don’t know sydraDB’
 - **Partial** — works for common cases; edge cases documented.  
 - **Plan** — planned; treat as unsupported until implemented.
 
+> **Progress note (2025-09-15):** Translator scaffolding, structured compat logging, and stats counters are in-tree (`src/sydra/query/translator.zig`, `compat/log.zig`, `/debug/compat/stats`). Unit fixtures live in `tests/translator/` and assert translation/fallback counts per run.
+
 ---
 
 ## A. Compatibility matrix (v0.1 proposal)
