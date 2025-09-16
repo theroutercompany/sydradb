@@ -55,8 +55,8 @@ This memo captures the minimum viable definitions for the PostgreSQL catalog vie
 - Document differences (e.g., sequence cache semantics) in `docs/compatibility.md` when deviations exist.
 
 ## Implementation Sketch
-- `src/sydra/compat/catalog.zig` now provides a builder and in-memory store for `pg_namespace`/`pg_class` slices with deterministic OID assignment.
-- Wire an engine-facing adapter (`src/sydra/catalog.zig`) that feeds real metadata into the compat builder (future work).
+- `src/sydra/compat/catalog.zig` now provides a builder and in-memory store for `pg_namespace`/`pg_class`/`pg_attribute`/`pg_type` slices with deterministic OID assignment.
+- `src/sydra/catalog.zig` exposes an adapter layer that translates engine metadata (currently stubbed) into the compat builder input; swap the stub for real engine iterators when available.
 - Define view renderers that synthesise row structs consumed by the protocol front-end.
 - Cache results per schema change epoch; invalidate on DDL events.
 
