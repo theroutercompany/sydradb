@@ -231,3 +231,60 @@ pub const Engine = struct {
         }
     }
 };
+
+const waitError = error{Timeout};
+
+fn waitForFlush(engine: *Engine, expected_entries: usize, timeout_ms: u64) waitError!void {
+    const deadline: i64 = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (std.time.milliTimestamp() < deadline) {
+        if (engine.manifest.entries.items.len >= expected_entries and engine.mem.bytes == 0)
+            return;
+        sleepMs(10);
+    }
+    return waitError.Timeout;
+}
+
+test "engine ingests, flushes, and queries range" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/data", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const sid = types.hash64("cpu.total");
+    try engine.ingest(.{ .series_id = sid, .ts = 1_000, .value = 1.5, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 1_500, .value = 2.25, .tags_json = "{}" });
+    engine.noteTags(sid, "{\"host\":\"a\"}");
+
+    try waitForFlush(engine, 1, 1_000);
+
+    var results = std.ArrayList(types.Point).init(talloc);
+    defer results.deinit();
+    try engine.queryRange(sid, 0, 10_000, &results);
+    try std.testing.expectEqual(@as(usize, 2), results.items.len);
+    try std.testing.expectEqual(@as(i64, 1_000), results.items[0].ts);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), results.items[0].value, 1e-9);
+    try std.testing.expectEqual(@as(i64, 1_500), results.items[1].ts);
+
+    const matches = engine.tags.get("host=a");
+    try std.testing.expectEqual(@as(usize, 1), matches.len);
+    try std.testing.expectEqual(sid, matches[0]);
+}

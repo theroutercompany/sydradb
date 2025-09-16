@@ -2,6 +2,7 @@ const std = @import("std");
 const Engine = @import("engine.zig").Engine;
 const types = @import("types.zig");
 const config = @import("config.zig");
+const compat = @import("compat.zig");
 
 pub fn runHttp(alloc: std.mem.Allocator, eng: *Engine, port: u16) !void {
     var address = try std.net.Address.parseIp4("0.0.0.0", port);
@@ -64,6 +65,9 @@ fn handleRequest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     if (std.mem.eql(u8, path, "/metrics") and method == .GET) {
         return try handleMetrics(req);
     }
+    if (std.mem.eql(u8, path, "/debug/compat/stats") and method == .GET) {
+        return try handleCompatStats(req);
+    }
     if (std.mem.eql(u8, path, "/api/v1/ingest") and method == .POST) {
         return try handleIngest(alloc, eng, req);
     }
@@ -91,18 +95,38 @@ fn handleMetrics(req: *std.http.Server.Request) !void {
     try req.respond(body, .{ .extra_headers = &headers });
 }
 
+fn handleCompatStats(req: *std.http.Server.Request) !void {
+    const snap = compat.stats.global().snapshot();
+    var buf: [128]u8 = undefined;
+    const body = try std.fmt.bufPrint(
+        &buf,
+        "{{\"translations\":{d},\"fallbacks\":{d},\"cache_hits\":{d}}}",
+        .{ snap.translations, snap.fallbacks, snap.cache_hits },
+    );
+    const headers = [_]std.http.Header{.{ .name = "Content-Type", .value = "application/json" }};
+    try req.respond(body, .{ .extra_headers = &headers });
+}
+
 fn handleIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
     var body_buffer: [4096]u8 = undefined;
     var body_reader = try req.readerExpectContinue(&body_buffer);
-    var compat_body_reader = body_reader.adaptToOldInterface();
     var count: usize = 0;
 
     while (true) {
-        const line_opt = try compat_body_reader.readUntilDelimiterOrEofAlloc(alloc, '\n', 1024 * 64);
-        if (line_opt == null) break;
-        defer alloc.free(line_opt.?);
-        const line = std.mem.trim(u8, line_opt.?, " \t\r\n");
+        const slice = body_reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.StreamTooLong => {
+                _ = req.respond("line too long", .{ .status = .payload_too_large, .keep_alive = false }) catch {};
+                return;
+            },
+            else => return err,
+        };
+        const trimmed = std.mem.trim(u8, slice, " \t\r\n");
+        if (trimmed.len == 0) continue;
+
+        const line = try alloc.dupe(u8, trimmed);
         if (line.len == 0) continue;
+        defer alloc.free(line);
 
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch continue;
         defer parsed.deinit();
@@ -155,9 +179,18 @@ fn handleIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Re
 fn handleQuery(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
     var body_buffer: [4096]u8 = undefined;
     var reader = try req.readerExpectContinue(&body_buffer);
-    var compat_reader = reader.adaptToOldInterface();
-    const body = try compat_reader.readAllAlloc(alloc, 1024 * 64);
+    const content_len = req.head.content_length orelse {
+        try req.respond("length required", .{ .status = .length_required, .keep_alive = false });
+        return;
+    };
+    if (content_len > 1024 * 64) {
+        try req.respond("payload too large", .{ .status = .payload_too_large, .keep_alive = false });
+        return;
+    }
+    const alloc_len: usize = @intCast(content_len);
+    const body = try alloc.alloc(u8, alloc_len);
     defer alloc.free(body);
+    try reader.readSliceAll(body);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
@@ -193,9 +226,18 @@ fn handleQuery(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Req
 fn handleFind(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
     var body_buffer: [4096]u8 = undefined;
     var reader = try req.readerExpectContinue(&body_buffer);
-    var compat_reader = reader.adaptToOldInterface();
-    const body = try compat_reader.readAllAlloc(alloc, 64 * 1024);
+    const content_len = req.head.content_length orelse {
+        try req.respond("length required", .{ .status = .length_required, .keep_alive = false });
+        return;
+    };
+    if (content_len > 64 * 1024) {
+        try req.respond("payload too large", .{ .status = .payload_too_large, .keep_alive = false });
+        return;
+    }
+    const alloc_len: usize = @intCast(content_len);
+    const body = try alloc.alloc(u8, alloc_len);
     defer alloc.free(body);
+    try reader.readSliceAll(body);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();

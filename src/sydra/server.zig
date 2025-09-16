@@ -46,15 +46,18 @@ fn cmdIngest(alloc: std.mem.Allocator, _: [][:0]u8) !void {
     var stdin_file = std.fs.File.stdin();
     var reader_buffer: [4096]u8 = undefined;
     var stdin_reader = stdin_file.reader(&reader_buffer);
-    var r = &stdin_reader.interface;
-    var compat_reader = r.adaptToOldInterface();
+    var reader = &stdin_reader.interface;
     var count: usize = 0;
     while (true) {
-        const line_opt = try compat_reader.readUntilDelimiterOrEofAlloc(alloc, '\n', 1024 * 64);
-        if (line_opt == null) break;
-        defer alloc.free(line_opt.?);
-        const line = std.mem.trim(u8, line_opt.?, " \t\r\n");
-        if (line.len == 0) continue;
+        const slice = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
+            error.EndOfStream => break,
+            error.StreamTooLong => return error.StreamTooLong,
+            else => return err,
+        };
+        const trimmed = std.mem.trim(u8, slice, " \t\r\n");
+        if (trimmed.len == 0) continue;
+        const line = try alloc.dupe(u8, trimmed);
+        defer alloc.free(line);
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch continue;
         defer parsed.deinit();
         const obj = parsed.value.object;
