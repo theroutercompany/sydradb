@@ -132,8 +132,10 @@ test "load translator fixtures" {
     const alloc = std.testing.allocator;
     const list = try loadCases(alloc, "tests/translator/cases.jsonl");
     defer list.deinit();
-    try std.testing.expect(list.cases.len > 0);
+    try std.testing.expect(list.cases.len >= 2);
     const case0 = list.cases[0];
     try std.testing.expectEqualStrings("select-constant", case0.name);
     try std.testing.expect(case0.expect == .success);
+    const case1 = list.cases[1];
+    try std.testing.expect(case1.expect == .failure);
 }
