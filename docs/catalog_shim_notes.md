@@ -56,7 +56,7 @@ This memo captures the minimum viable definitions for the PostgreSQL catalog vie
 
 ## Implementation Sketch
 - `src/sydra/compat/catalog.zig` now provides a builder and in-memory store for `pg_namespace`/`pg_class`/`pg_attribute`/`pg_type` slices with deterministic OID assignment.
-- `src/sydra/catalog.zig` exposes an adapter layer that translates engine metadata (currently stubbed) into the compat builder input; swap the stub for real engine iterators when available.
+- `src/sydra/catalog.zig` exposes an adapter layer that translates engine metadata (currently stubbed) into the compat builder input; defaults seed common scalar/array types (bool/int2/int4/int8/numeric/float4/float8/text/uuid/timestamp*/date/time/jsonb) so the shim answers baseline introspection immediately. Swap the stub for real engine iterators when available.
 - Define view renderers that synthesise row structs consumed by the protocol front-end.
 - Cache results per schema change epoch; invalidate on DDL events.
 - `GET /debug/compat/catalog` renders the live snapshot (namespaces/classes/attributes/types) for quick inspection while iterating on the shim.

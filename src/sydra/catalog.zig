@@ -69,12 +69,32 @@ const default_relations = [_]RelationInfo{
 const default_types = [_]TypeInfo{
     .{ .name = "bool", .namespace = "pg_catalog", .oid = 16, .length = 1, .by_value = true, .category = 'B', .array_type_oid = 1000 },
     .{ .name = "int2", .namespace = "pg_catalog", .oid = 21, .length = 2, .by_value = true, .category = 'N', .array_type_oid = 1005 },
+    .{ .name = "int8", .namespace = "pg_catalog", .oid = 20, .length = 8, .by_value = true, .category = 'N', .array_type_oid = 1016 },
     .{ .name = "int4", .namespace = "pg_catalog", .oid = 23, .length = 4, .by_value = true, .category = 'N', .array_type_oid = 1007 },
+    .{ .name = "float4", .namespace = "pg_catalog", .oid = 700, .length = 4, .by_value = true, .category = 'N', .array_type_oid = 1021 },
+    .{ .name = "float8", .namespace = "pg_catalog", .oid = 701, .length = 8, .by_value = true, .category = 'N', .array_type_oid = 1022 },
+    .{ .name = "numeric", .namespace = "pg_catalog", .oid = 1700, .length = -1, .by_value = false, .category = 'N', .array_type_oid = 1231 },
     .{ .name = "text", .namespace = "pg_catalog", .oid = 25, .length = -1, .by_value = false, .category = 'S', .array_type_oid = 1009 },
+    .{ .name = "uuid", .namespace = "pg_catalog", .oid = 2950, .length = 16, .by_value = true, .category = 'U', .array_type_oid = 2951 },
+    .{ .name = "timestamp", .namespace = "pg_catalog", .oid = 1114, .length = 8, .by_value = true, .category = 'D', .array_type_oid = 1115 },
+    .{ .name = "timestamptz", .namespace = "pg_catalog", .oid = 1184, .length = 8, .by_value = true, .category = 'D', .array_type_oid = 1185 },
+    .{ .name = "date", .namespace = "pg_catalog", .oid = 1082, .length = 4, .by_value = true, .category = 'D', .array_type_oid = 1182 },
+    .{ .name = "time", .namespace = "pg_catalog", .oid = 1083, .length = 8, .by_value = true, .category = 'D', .array_type_oid = 1183 },
+    .{ .name = "jsonb", .namespace = "pg_catalog", .oid = 3802, .length = -1, .by_value = false, .category = 'U', .array_type_oid = 3807 },
     .{ .name = "_bool", .namespace = "pg_catalog", .oid = 1000, .length = -1, .by_value = false, .category = 'A', .element_type_oid = 16 },
     .{ .name = "_int2", .namespace = "pg_catalog", .oid = 1005, .length = -1, .by_value = false, .category = 'A', .element_type_oid = 21 },
+    .{ .name = "_int8", .namespace = "pg_catalog", .oid = 1016, .length = -1, .by_value = false, .category = 'A', .element_type_oid = 20 },
     .{ .name = "_int4", .namespace = "pg_catalog", .oid = 1007, .length = -1, .by_value = false, .category = 'A', .element_type_oid = 23 },
+    .{ .name = "_float4", .namespace = "pg_catalog", .oid = 1021, .length = -1, .by_value = false, .category = 'A', .element_type_oid = 700 },
+    .{ .name = "_float8", .namespace = "pg_catalog", .oid = 1022, .length = -1, .by_value = false, .category = 'A', .element_type_oid = 701 },
+    .{ .name = "_numeric", .namespace = "pg_catalog", .oid = 1231, .length = -1, .by_value = false, .category = 'A', .element_type_oid = 1700 },
     .{ .name = "_text", .namespace = "pg_catalog", .oid = 1009, .length = -1, .by_value = false, .category = 'A', .element_type_oid = 25 },
+    .{ .name = "_uuid", .namespace = "pg_catalog", .oid = 2951, .length = -1, .by_value = false, .category = 'A', .element_type_oid = 2950 },
+    .{ .name = "_timestamp", .namespace = "pg_catalog", .oid = 1115, .length = -1, .by_value = false, .category = 'A', .element_type_oid = 1114 },
+    .{ .name = "_timestamptz", .namespace = "pg_catalog", .oid = 1185, .length = -1, .by_value = false, .category = 'A', .element_type_oid = 1184 },
+    .{ .name = "_date", .namespace = "pg_catalog", .oid = 1182, .length = -1, .by_value = false, .category = 'A', .element_type_oid = 1082 },
+    .{ .name = "_time", .namespace = "pg_catalog", .oid = 1183, .length = -1, .by_value = false, .category = 'A', .element_type_oid = 1083 },
+    .{ .name = "_jsonb", .namespace = "pg_catalog", .oid = 3807, .length = -1, .by_value = false, .category = 'A', .element_type_oid = 3802 },
 };
 
 const default_columns = [_]ColumnInfo{
@@ -248,6 +268,8 @@ test "bootstrap seeds global defaults" {
     const types = store.types();
     var found_int4 = false;
     var found_text_array = false;
+    var found_timestamptz = false;
+    var found_jsonb = false;
     for (types) |ty| {
         if (std.mem.eql(u8, ty.typname, "int4")) {
             try std.testing.expectEqual(@as(u32, 1007), ty.typarray);
@@ -255,8 +277,16 @@ test "bootstrap seeds global defaults" {
         } else if (std.mem.eql(u8, ty.typname, "_text")) {
             try std.testing.expectEqual(@as(u32, 25), ty.typelem);
             found_text_array = true;
+        } else if (std.mem.eql(u8, ty.typname, "timestamptz")) {
+            try std.testing.expectEqual(@as(u32, 1185), ty.typarray);
+            found_timestamptz = true;
+        } else if (std.mem.eql(u8, ty.typname, "jsonb")) {
+            try std.testing.expectEqual(@as(u32, 3807), ty.typarray);
+            found_jsonb = true;
         }
     }
     try std.testing.expect(found_int4);
     try std.testing.expect(found_text_array);
+    try std.testing.expect(found_timestamptz);
+    try std.testing.expect(found_jsonb);
 }
