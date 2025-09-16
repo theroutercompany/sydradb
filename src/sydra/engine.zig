@@ -93,10 +93,10 @@ pub const Engine = struct {
     };
 
     pub fn init(alloc: std.mem.Allocator, config: cfg.Config) !*Engine {
-        var dir = try std.fs.cwd().openDir(config.data_dir, .{ .iterate = true });
-        // Create if missing
-        dir.close();
-        try std.fs.cwd().makePath(config.data_dir);
+        std.fs.cwd().makePath(config.data_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
         const data_dir = try std.fs.cwd().openDir(config.data_dir, .{ .iterate = true });
         const wal = try wal_mod.WAL.open(alloc, data_dir, config.fsync);
         var engine = try alloc.create(Engine);
