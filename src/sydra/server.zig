@@ -2,6 +2,7 @@ const std = @import("std");
 const config = @import("config.zig");
 const engine_mod = @import("engine.zig");
 const http = @import("http.zig");
+const catalog = @import("catalog.zig");
 
 pub fn run(alloc: std.mem.Allocator) !void {
     const args = try std.process.argsAlloc(alloc);
@@ -23,6 +24,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
         defer cfg.deinit(alloc);
         var eng = try engine_mod.Engine.init(alloc, cfg);
         defer eng.deinit();
+        try catalog.bootstrap(alloc);
         std.debug.print("sydradb serve :{d}\n", .{cfg.http_port});
         try http.runHttp(alloc, eng, cfg.http_port);
         return;

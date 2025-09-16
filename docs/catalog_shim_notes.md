@@ -59,6 +59,7 @@ This memo captures the minimum viable definitions for the PostgreSQL catalog vie
 - `src/sydra/catalog.zig` exposes an adapter layer that translates engine metadata (currently stubbed) into the compat builder input; swap the stub for real engine iterators when available.
 - Define view renderers that synthesise row structs consumed by the protocol front-end.
 - Cache results per schema change epoch; invalidate on DDL events.
+- `GET /debug/compat/catalog` renders the live snapshot (namespaces/classes/attributes/types) for quick inspection while iterating on the shim.
 
 ## Testing
 - Add golden-result fixtures under `tests/catalog/` comparing our synthetic views against captured PostgreSQL outputs for reference schemas.

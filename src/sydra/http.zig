@@ -68,6 +68,9 @@ fn handleRequest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     if (std.mem.eql(u8, path, "/debug/compat/stats") and method == .GET) {
         return try handleCompatStats(req);
     }
+    if (std.mem.eql(u8, path, "/debug/compat/catalog") and method == .GET) {
+        return try handleCompatCatalog(alloc, req);
+    }
     if (std.mem.eql(u8, path, "/api/v1/ingest") and method == .POST) {
         return try handleIngest(alloc, eng, req);
     }
@@ -105,6 +108,134 @@ fn handleCompatStats(req: *std.http.Server.Request) !void {
     );
     const headers = [_]std.http.Header{.{ .name = "Content-Type", .value = "application/json" }};
     try req.respond(body, .{ .extra_headers = &headers });
+}
+
+fn handleCompatCatalog(alloc: std.mem.Allocator, req: *std.http.Server.Request) !void {
+    var buf = std.ArrayList(u8).init(alloc);
+    defer buf.deinit();
+
+    var jw = std.json.Writer.init(buf.writer(), .{});
+    try jw.beginObject();
+
+    const store = compat.catalog.global();
+
+    try jw.objectField("namespaces");
+    try jw.beginArray();
+    for (store.namespaces()) |ns| {
+        try jw.beginObject();
+        try jw.objectField("oid");
+        try jw.write(ns.oid);
+        try jw.objectField("name");
+        try jw.write(ns.nspname);
+        try jw.endObject();
+    }
+    try jw.endArray();
+
+    try jw.objectField("classes");
+    try jw.beginArray();
+    for (store.classes()) |cls| {
+        try jw.beginObject();
+        try jw.objectField("oid");
+        try jw.write(cls.oid);
+        try jw.objectField("name");
+        try jw.write(cls.relname);
+        try jw.objectField("namespace");
+        try jw.write(cls.relnamespace);
+        const kind_buf = [_]u8{cls.relkind};
+        try jw.objectField("kind");
+        try jw.write(kind_buf[0..]);
+        const pers_buf = [_]u8{cls.relpersistence};
+        try jw.objectField("persistence");
+        try jw.write(pers_buf[0..]);
+        try jw.objectField("tuples");
+        try jw.write(cls.reltuples);
+        try jw.objectField("has_pkey");
+        try jw.write(cls.relhaspkey);
+        try jw.objectField("is_partition");
+        try jw.write(cls.relispartition);
+        try jw.objectField("toast_oid");
+        try jw.write(cls.reltoastrelid);
+        try jw.endObject();
+    }
+    try jw.endArray();
+
+    try jw.objectField("attributes");
+    try jw.beginArray();
+    for (store.attributes()) |attr| {
+        try jw.beginObject();
+        try jw.objectField("rel_oid");
+        try jw.write(attr.attrelid);
+        try jw.objectField("name");
+        try jw.write(attr.attname);
+        try jw.objectField("type_oid");
+        try jw.write(attr.atttypid);
+        try jw.objectField("attnum");
+        try jw.write(attr.attnum);
+        try jw.objectField("not_null");
+        try jw.write(attr.attnotnull);
+        try jw.objectField("has_default");
+        try jw.write(attr.atthasdef);
+        try jw.objectField("is_dropped");
+        try jw.write(attr.attisdropped);
+        try jw.objectField("len");
+        try jw.write(attr.attlen);
+        try jw.objectField("typmod");
+        try jw.write(attr.atttypmod);
+        const identity_buf = [_]u8{attr.attidentity};
+        try jw.objectField("identity");
+        try jw.write(identity_buf[0..]);
+        const generated_buf = [_]u8{attr.attgenerated};
+        try jw.objectField("generated");
+        try jw.write(generated_buf[0..]);
+        try jw.objectField("dims");
+        try jw.write(attr.attndims);
+        try jw.endObject();
+    }
+    try jw.endArray();
+
+    try jw.objectField("types");
+    try jw.beginArray();
+    for (store.types()) |ty| {
+        try jw.beginObject();
+        try jw.objectField("oid");
+        try jw.write(ty.oid);
+        try jw.objectField("name");
+        try jw.write(ty.typname);
+        try jw.objectField("namespace");
+        try jw.write(ty.typnamespace);
+        try jw.objectField("len");
+        try jw.write(ty.typlen);
+        try jw.objectField("byval");
+        try jw.write(ty.typbyval);
+        const type_buf = [_]u8{ty.typtype};
+        try jw.objectField("type");
+        try jw.write(type_buf[0..]);
+        try jw.objectField("category");
+        const cat_buf = [_]u8{ty.typcategory};
+        try jw.write(cat_buf[0..]);
+        try jw.objectField("delim");
+        const delim_buf = [_]u8{ty.typdelim};
+        try jw.write(delim_buf[0..]);
+        try jw.objectField("elem");
+        try jw.write(ty.typelem);
+        try jw.objectField("array");
+        try jw.write(ty.typarray);
+        try jw.objectField("basetype");
+        try jw.write(ty.typbasetype);
+        try jw.objectField("collation");
+        try jw.write(ty.typcollation);
+        try jw.objectField("input");
+        try jw.write(ty.typinput);
+        try jw.objectField("output");
+        try jw.write(ty.typoutput);
+        try jw.endObject();
+    }
+    try jw.endArray();
+
+    try jw.endObject();
+
+    const headers = [_]std.http.Header{.{ .name = "Content-Type", .value = "application/json" }};
+    try req.respond(buf.items, .{ .extra_headers = &headers });
 }
 
 fn handleIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {

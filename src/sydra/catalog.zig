@@ -57,6 +57,38 @@ pub const Adapter = struct {
     columns: []const ColumnInfo,
 };
 
+const default_namespaces = [_]NamespaceInfo{
+    .{ .name = "pg_catalog" },
+    .{ .name = "public" },
+};
+
+const default_relations = [_]RelationInfo{
+    .{ .namespace = "pg_catalog", .name = "pg_type", .kind = .table },
+};
+
+const default_types = [_]TypeInfo{
+    .{ .name = "bool", .namespace = "pg_catalog", .oid = 16, .length = 1, .by_value = true, .category = 'B' },
+    .{ .name = "int2", .namespace = "pg_catalog", .oid = 21, .length = 2, .by_value = true, .category = 'N' },
+    .{ .name = "int4", .namespace = "pg_catalog", .oid = 23, .length = 4, .by_value = true, .category = 'N' },
+    .{ .name = "text", .namespace = "pg_catalog", .oid = 25, .length = -1, .by_value = false, .category = 'S' },
+    .{ .name = "_int4", .namespace = "pg_catalog", .oid = 1007, .length = -1, .by_value = false, .category = 'A', .element_type_oid = 23 },
+};
+
+const default_columns = [_]ColumnInfo{
+    .{ .namespace = "pg_catalog", .relation = "pg_type", .name = "oid", .type_oid = 23, .not_null = true },
+    .{ .namespace = "pg_catalog", .relation = "pg_type", .name = "typname", .type_oid = 25, .not_null = true },
+    .{ .namespace = "pg_catalog", .relation = "pg_type", .name = "typlen", .type_oid = 21, .not_null = true },
+};
+
+pub fn defaultAdapter() Adapter {
+    return Adapter{
+        .namespaces = &default_namespaces,
+        .relations = &default_relations,
+        .types = &default_types,
+        .columns = &default_columns,
+    };
+}
+
 fn toNamespaceSpecs(alloc: std.mem.Allocator, infos: []const NamespaceInfo) ![]compat.catalog.NamespaceSpec {
     if (infos.len == 0) return &[_]compat.catalog.NamespaceSpec{};
     const specs = try alloc.alloc(compat.catalog.NamespaceSpec, infos.len);
@@ -149,6 +181,10 @@ pub fn loadIntoStore(store: *compat.catalog.Store, alloc: std.mem.Allocator, ada
 
 pub fn refreshGlobal(alloc: std.mem.Allocator, adapter: Adapter) !void {
     try loadIntoStore(compat.catalog.global(), alloc, adapter);
+}
+
+pub fn bootstrap(alloc: std.mem.Allocator) !void {
+    try refreshGlobal(alloc, defaultAdapter());
 }
 
 test "adapter loads into store" {
