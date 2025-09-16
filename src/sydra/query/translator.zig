@@ -108,6 +108,9 @@ test "translator fixtures" {
     var cases = try compat.fixtures.translator.loadCases(alloc, "tests/translator/cases.jsonl");
     defer cases.deinit();
 
+    var expected_translations: u64 = 0;
+    var expected_fallbacks: u64 = 0;
+
     for (cases.cases) |case| {
         const result = try translate(alloc, case.sql);
         defer switch (result) {
@@ -118,6 +121,7 @@ test "translator fixtures" {
             .success => |expected| {
                 try std.testing.expect(result == .success);
                 try std.testing.expectEqualStrings(expected.sydraql, result.success.sydraql);
+                expected_translations += 1;
             },
             .failure => |expected| {
                 try std.testing.expect(result == .failure);
@@ -125,7 +129,13 @@ test "translator fixtures" {
                 if (expected.message.len != 0) {
                     try std.testing.expectEqualStrings(expected.message, result.failure.message);
                 }
+                expected_fallbacks += 1;
             },
         }
     }
+
+    const snap = compat.stats.global().snapshot();
+    try std.testing.expectEqual(expected_translations, snap.translations);
+    try std.testing.expectEqual(expected_fallbacks, snap.fallbacks);
+    compat.stats.global().reset();
 }

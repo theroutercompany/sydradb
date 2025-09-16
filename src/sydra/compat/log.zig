@@ -13,6 +13,9 @@ pub const Recorder = struct {
     }
 
     pub fn record(self: *Recorder, sql: []const u8, translated: []const u8, used_cache: bool, fell_back: bool, duration_ns: u64) void {
+        if (fell_back) stats.global().noteFallback() else stats.global().noteTranslation();
+        if (used_cache) stats.global().noteCacheHit();
+
         if (!self.shouldRecord()) return;
         const stderr = std.io.getStdErr().writer();
         var jw = std.json.Writer.init(stderr, .{});
@@ -34,8 +37,7 @@ pub const Recorder = struct {
         jw.endObject() catch return;
         stderr.writeAll("\n") catch {};
 
-        if (fell_back) stats.global().noteFallback() else stats.global().noteTranslation();
-        if (used_cache) stats.global().noteCacheHit();
+        // stats already recorded above even when sampling skips emission
     }
 };
 

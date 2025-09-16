@@ -6,7 +6,7 @@ This document sketches the guard-rails we need while the PostgreSQL compatibilit
 
 1. **Confidence through layers** – run fast unit suites on every change, replay realistic SQL traces in CI, and bootstrap heavy regression runs nightly.
 2. **Golden results** – anything we emulate from PostgreSQL must be exercised against a real Postgres reference and compared for both results and SQLSTATE/diagnostics.
-3. **Observability baked in** – every suite should emit per-query metadata (stats, translation logs) so we can debug mismatches quickly.
+3. **Observability baked in** – every suite should emit per-query metadata. Tests must assert that `compat/stats` counters change as expected and capture `compat/log` output (or archived JSONL) for post-mortem analysis.
 
 ## Test Layers
 
@@ -14,7 +14,7 @@ This document sketches the guard-rails we need while the PostgreSQL compatibilit
 
 - Cover SQL→sydraQL transformation rules directly.
 - One fixture per SQL construct (DDL, DML, aggregates, JSONB ops, arrays, etc.).
-- Assert both the generated sydraQL AST and the SQLSTATE metadata when a rule falls back.
+- Assert the generated sydraQL AST, SQLSTATE metadata when a rule falls back, **and** the stats/logging side effects (`translations`, `fallbacks`, cache hits when fixtures opt in).
 - **Status**: scaffolding landed (`compat/fixtures/translator.zig`, `tests/translator/cases.jsonl`, and `query/translator.zig` driving the fixtures).
 - Runs automatically via `zig build test`.
 
@@ -22,7 +22,7 @@ This document sketches the guard-rails we need while the PostgreSQL compatibilit
 
 - Stand up the PG wire front-end inside a test harness.
 - Use synthetic libpq/psql scripts to exercise startup, auth, simple + extended queries, COPY, transactions.
-- Assert network-level behaviour (messages, SQLSTATE, parameter status).
+- Assert network-level behaviour (messages, SQLSTATE, parameter status) **and** verify structured logs capture handshake + query events.
 - Execute inside CI using a dedicated `zig build compat-wire-test` step.
 
 ### 3. Trace Replay Harness
@@ -30,12 +30,13 @@ This document sketches the guard-rails we need while the PostgreSQL compatibilit
 - Capture real SQL traffic by proxying a Postgres database during sample application runs (Django, Rails, Prisma, etc.).
 - Store anonymised traces in `tests/traces/<app>/trace.jsonl` with metadata (session, parameters, expected results).
 - Provide a replay tool (`zig build compat-replay --trace tests/traces/...`) that feeds the translator and compares results against a local Postgres instance.
-- Failures should emit diff files with SQLSTATE, payload, execution stats.
+- Failures should emit diff files with SQLSTATE, payload, execution stats, and include the relevant JSONL log excerpt for debugging.
 
 ### 4. ORM Smoke Suites
 
 - Provision containerised sample apps (Django polls, Rails blog, Prisma todo, SQLAlchemy models).
 - Each suite starts the sydra PG endpoint, runs the ORM migrations/tests, and records metrics.
+- Capture translator logs + stats snapshots at suite start/end to quantify coverage.
 - Managed via Nix flake outputs for reproducibility; triggered nightly and on release branches.
 
 ### 5. Postgres Regression Subset
