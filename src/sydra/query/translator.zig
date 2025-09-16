@@ -26,6 +26,23 @@ fn findCaseInsensitive(haystack: []const u8, needle: []const u8) ?usize {
     return null;
 }
 
+fn findLastCaseInsensitive(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0 or haystack.len < needle.len) return null;
+    var idx = haystack.len - needle.len + 1;
+    while (idx > 0) {
+        idx -= 1;
+        var match = true;
+        for (needle, 0..) |ch, j| {
+            if (std.ascii.toLower(haystack[idx + j]) != std.ascii.toLower(ch)) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return idx;
+    }
+    return null;
+}
+
 fn findMatchingParen(text: []const u8, open_index: usize) ?usize {
     if (open_index >= text.len or text[open_index] != '(') return null;
     var depth: i32 = 0;
@@ -190,37 +207,113 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
             if (findCaseInsensitive(after_update, " SET ")) |set_idx| {
                 const table_raw = std.mem.trim(u8, after_update[0..set_idx], " \t\r\n");
                 if (table_raw.len != 0) {
-                    var remainder = std.mem.trim(u8, after_update[set_idx + " SET ".len ..], " \t\r\n;");
+                    var remainder = std.mem.trim(u8, after_update[set_idx + " SET ".len ..], " \t\r\n");
                     if (remainder.len != 0) {
-                        var set_clause = remainder;
-                        var where_clause: ?[]const u8 = null;
-                        if (findCaseInsensitive(remainder, " WHERE ")) |where_idx| {
-                            set_clause = std.mem.trim(u8, remainder[0..where_idx], " \t\r\n");
-                            const after_where = std.mem.trim(u8, remainder[where_idx + " WHERE ".len ..], " \t\r\n");
-                            if (after_where.len != 0) {
-                                where_clause = after_where;
-                            } else {
-                                set_clause = remainder;
-                                where_clause = null;
+                        var returning_clause: ?[]const u8 = null;
+                        if (findLastCaseInsensitive(remainder, "RETURNING")) |ret_idx| {
+                            const before_ok = ret_idx == 0 or std.ascii.isWhitespace(remainder[ret_idx - 1]);
+                            const after_idx = ret_idx + "RETURNING".len;
+                            const after_ok = after_idx >= remainder.len or std.ascii.isWhitespace(remainder[after_idx]);
+                            if (before_ok and after_idx <= remainder.len and after_ok) {
+                                const clause_raw = std.mem.trim(u8, remainder[after_idx ..], " \t\r\n;");
+                                if (clause_raw.len != 0) {
+                                    returning_clause = clause_raw;
+                                    remainder = std.mem.trimRight(u8, remainder[0..ret_idx], " \t\r\n;");
+                                }
                             }
                         }
-                        if (set_clause.len != 0) {
-                            var builder = std.ArrayList(u8).init(alloc);
-                            defer builder.deinit();
-                            try builder.appendSlice("update ");
-                            try builder.appendSlice(table_raw);
-                            try builder.appendSlice(" set ");
-                            try builder.appendSlice(set_clause);
-                            if (where_clause) |wc| {
-                                try builder.appendSlice(" where ");
-                                try builder.appendSlice(wc);
+                        remainder = std.mem.trimRight(u8, remainder, " \t\r\n;");
+                        if (remainder.len != 0) {
+                            var set_clause = remainder;
+                            var where_clause: ?[]const u8 = null;
+                            if (findCaseInsensitive(remainder, " WHERE ")) |where_idx| {
+                                const before_where = std.mem.trimRight(u8, remainder[0..where_idx], " \t\r\n;");
+                                const after_where = std.mem.trim(u8, remainder[where_idx + " WHERE ".len ..], " \t\r\n;");
+                                if (after_where.len != 0 and before_where.len != 0) {
+                                    set_clause = before_where;
+                                    where_clause = after_where;
+                                } else {
+                                    where_clause = null;
+                                    set_clause = remainder;
+                                }
                             }
-                            const sydra_str = try builder.toOwnedSlice();
-                            const duration = std.time.nanoTimestamp() - start;
-                            compat.clog.global().record(trimmed, sydra_str, false, false, duration);
-                            return Result{ .success = .{ .sydraql = sydra_str } };
+                            set_clause = std.mem.trimRight(u8, set_clause, " \t\r\n;");
+                            if (set_clause.len != 0) {
+                                var builder = std.ArrayList(u8).init(alloc);
+                                defer builder.deinit();
+                                try builder.appendSlice("update ");
+                                try builder.appendSlice(table_raw);
+                                try builder.appendSlice(" set ");
+                                try builder.appendSlice(set_clause);
+                                if (where_clause) |wc| {
+                                    try builder.appendSlice(" where ");
+                                    try builder.appendSlice(wc);
+                                }
+                                if (returning_clause) |rc| {
+                                    try builder.appendSlice(" returning ");
+                                    try builder.appendSlice(rc);
+                                }
+                                const sydra_str = try builder.toOwnedSlice();
+                                const duration = std.time.nanoTimestamp() - start;
+                                compat.clog.global().record(trimmed, sydra_str, false, false, duration);
+                                return Result{ .success = .{ .sydraql = sydra_str } };
+                            }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    if (startsWithCaseInsensitive(trimmed, "DELETE FROM ")) {
+        var remainder = std.mem.trim(u8, trimmed["DELETE FROM ".len ..], " \t\r\n");
+        if (remainder.len != 0) {
+            var returning_clause: ?[]const u8 = null;
+            if (findLastCaseInsensitive(remainder, "RETURNING")) |ret_idx| {
+                const before_ok = ret_idx == 0 or std.ascii.isWhitespace(remainder[ret_idx - 1]);
+                const after_idx = ret_idx + "RETURNING".len;
+                const after_ok = after_idx >= remainder.len or std.ascii.isWhitespace(remainder[after_idx]);
+                if (before_ok and after_idx <= remainder.len and after_ok) {
+                    const clause_raw = std.mem.trim(u8, remainder[after_idx ..], " \t\r\n;");
+                    if (clause_raw.len != 0) {
+                        returning_clause = clause_raw;
+                        remainder = std.mem.trimRight(u8, remainder[0..ret_idx], " \t\r\n;");
+                    }
+                }
+            }
+            remainder = std.mem.trimRight(u8, remainder, " \t\r\n;");
+            if (remainder.len != 0) {
+                var table_slice = remainder;
+                var where_clause: ?[]const u8 = null;
+                if (findCaseInsensitive(remainder, " WHERE ")) |where_idx| {
+                    const before_where = std.mem.trimRight(u8, remainder[0..where_idx], " \t\r\n;");
+                    const after_where = std.mem.trim(u8, remainder[where_idx + " WHERE ".len ..], " \t\r\n;");
+                    if (after_where.len != 0 and before_where.len != 0) {
+                        table_slice = before_where;
+                        where_clause = after_where;
+                    } else {
+                        table_slice = remainder;
+                        where_clause = null;
+                    }
+                }
+                table_slice = std.mem.trimRight(u8, table_slice, " \t\r\n;");
+                if (table_slice.len != 0) {
+                    var builder = std.ArrayList(u8).init(alloc);
+                    defer builder.deinit();
+                    try builder.appendSlice("delete from ");
+                    try builder.appendSlice(table_slice);
+                    if (where_clause) |wc| {
+                        try builder.appendSlice(" where ");
+                        try builder.appendSlice(wc);
+                    }
+                    if (returning_clause) |rc| {
+                        try builder.appendSlice(" returning ");
+                        try builder.appendSlice(rc);
+                    }
+                    const sydra_str = try builder.toOwnedSlice();
+                    const duration = std.time.nanoTimestamp() - start;
+                    compat.clog.global().record(trimmed, sydra_str, false, false, duration);
+                    return Result{ .success = .{ .sydraql = sydra_str } };
                 }
             }
         }
