@@ -52,28 +52,41 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
 
     if (startsWithCaseInsensitive(trimmed, "SELECT ")) {
         if (findCaseInsensitive(trimmed, " FROM ")) |from_idx| {
-            const cols_raw = std.mem.trim(u8, trimmed["SELECT ".len..from_idx], " \t\r\n");
-            const table_raw = std.mem.trim(u8, trimmed[from_idx + " FROM ".len ..], " \t\r\n;");
-            if (cols_raw.len != 0 and table_raw.len != 0) {
-                var builder = std.ArrayList(u8).init(alloc);
-                defer builder.deinit();
-                try builder.appendSlice("from ");
-                try builder.appendSlice(table_raw);
-                try builder.appendSlice(" select ");
-                var col_iter = std.mem.splitScalar(u8, cols_raw, ',');
-                var first = true;
-                while (col_iter.next()) |raw| {
-                    const trimmed_col = std.mem.trim(u8, raw, " \t\r\n");
-                    if (trimmed_col.len == 0) continue;
-                    if (!first) try builder.appendSlice(",");
-                    first = false;
-                    try builder.appendSlice(trimmed_col);
+            const cols_raw = std.mem.trim(u8, trimmed["SELECT ".len .. from_idx], " \t\r\n");
+            const remainder = std.mem.trim(u8, trimmed[from_idx + " FROM ".len ..], " \t\r\n;");
+            if (cols_raw.len != 0 and remainder.len != 0) {
+                var table_part = remainder;
+                var where_part: ?[]const u8 = null;
+                if (findCaseInsensitive(remainder, " WHERE ")) |where_idx| {
+                    table_part = std.mem.trim(u8, remainder[0..where_idx], " \t\r\n");
+                    const cond_slice = std.mem.trim(u8, remainder[where_idx + " WHERE ".len ..], " \t\r\n;");
+                    if (cond_slice.len != 0) where_part = cond_slice;
                 }
-                if (!first) {
-                    const sydra_str = try builder.toOwnedSlice();
-                    const duration = std.time.nanoTimestamp() - start;
-                    compat.clog.global().record(trimmed, sydra_str, false, false, duration);
-                    return Result{ .success = .{ .sydraql = sydra_str } };
+                if (table_part.len != 0) {
+                    var builder = std.ArrayList(u8).init(alloc);
+                    defer builder.deinit();
+                    try builder.appendSlice("from ");
+                    try builder.appendSlice(table_part);
+                    if (where_part) |cond| {
+                        try builder.appendSlice(" where ");
+                        try builder.appendSlice(cond);
+                    }
+                    try builder.appendSlice(" select ");
+                    var col_iter = std.mem.splitScalar(u8, cols_raw, ',');
+                    var first = true;
+                    while (col_iter.next()) |raw| {
+                        const trimmed_col = std.mem.trim(u8, raw, " \t\r\n");
+                        if (trimmed_col.len == 0) continue;
+                        if (!first) try builder.appendSlice(",");
+                        first = false;
+                        try builder.appendSlice(trimmed_col);
+                    }
+                    if (!first) {
+                        const sydra_str = try builder.toOwnedSlice();
+                        const duration = std.time.nanoTimestamp() - start;
+                        compat.clog.global().record(trimmed, sydra_str, false, false, duration);
+                        return Result{ .success = .{ .sydraql = sydra_str } };
+                    }
                 }
             }
         }
