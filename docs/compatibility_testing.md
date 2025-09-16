@@ -15,7 +15,8 @@ This document sketches the guard-rails we need while the PostgreSQL compatibilit
 - Cover SQL→sydraQL transformation rules directly.
 - One fixture per SQL construct (DDL, DML, aggregates, JSONB ops, arrays, etc.).
 - Assert both the generated sydraQL AST and the SQLSTATE metadata when a rule falls back.
-- Lives under `src/sydra/translator/tests.zig` (to be added) and runs via `zig build test`.
+- **Status**: scaffolding landed (`compat/fixtures/translator.zig`, `tests/translator/cases.jsonl`, and `query/translator.zig` driving the fixtures).
+- Runs automatically via `zig build test`.
 
 ### 2. Protocol Wire Tests
 

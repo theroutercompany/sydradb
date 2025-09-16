@@ -39,6 +39,12 @@ pub const Recorder = struct {
     }
 };
 
+var default_recorder: Recorder = .{};
+
+pub fn global() *Recorder {
+    return &default_recorder;
+}
+
 test "recorder sampling" {
     var recorder = Recorder{ .sample_every = 2 };
     try std.testing.expect(recorder.shouldRecord());
