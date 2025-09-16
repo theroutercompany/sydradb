@@ -67,17 +67,28 @@ const default_relations = [_]RelationInfo{
 };
 
 const default_types = [_]TypeInfo{
-    .{ .name = "bool", .namespace = "pg_catalog", .oid = 16, .length = 1, .by_value = true, .category = 'B' },
-    .{ .name = "int2", .namespace = "pg_catalog", .oid = 21, .length = 2, .by_value = true, .category = 'N' },
-    .{ .name = "int4", .namespace = "pg_catalog", .oid = 23, .length = 4, .by_value = true, .category = 'N' },
-    .{ .name = "text", .namespace = "pg_catalog", .oid = 25, .length = -1, .by_value = false, .category = 'S' },
+    .{ .name = "bool", .namespace = "pg_catalog", .oid = 16, .length = 1, .by_value = true, .category = 'B', .array_type_oid = 1000 },
+    .{ .name = "int2", .namespace = "pg_catalog", .oid = 21, .length = 2, .by_value = true, .category = 'N', .array_type_oid = 1005 },
+    .{ .name = "int4", .namespace = "pg_catalog", .oid = 23, .length = 4, .by_value = true, .category = 'N', .array_type_oid = 1007 },
+    .{ .name = "text", .namespace = "pg_catalog", .oid = 25, .length = -1, .by_value = false, .category = 'S', .array_type_oid = 1009 },
+    .{ .name = "_bool", .namespace = "pg_catalog", .oid = 1000, .length = -1, .by_value = false, .category = 'A', .element_type_oid = 16 },
+    .{ .name = "_int2", .namespace = "pg_catalog", .oid = 1005, .length = -1, .by_value = false, .category = 'A', .element_type_oid = 21 },
     .{ .name = "_int4", .namespace = "pg_catalog", .oid = 1007, .length = -1, .by_value = false, .category = 'A', .element_type_oid = 23 },
+    .{ .name = "_text", .namespace = "pg_catalog", .oid = 1009, .length = -1, .by_value = false, .category = 'A', .element_type_oid = 25 },
 };
 
 const default_columns = [_]ColumnInfo{
     .{ .namespace = "pg_catalog", .relation = "pg_type", .name = "oid", .type_oid = 23, .not_null = true },
     .{ .namespace = "pg_catalog", .relation = "pg_type", .name = "typname", .type_oid = 25, .not_null = true },
     .{ .namespace = "pg_catalog", .relation = "pg_type", .name = "typlen", .type_oid = 21, .not_null = true },
+    .{ .namespace = "pg_catalog", .relation = "pg_type", .name = "typbyval", .type_oid = 16, .not_null = true },
+    .{ .namespace = "pg_catalog", .relation = "pg_type", .name = "typtype", .type_oid = 25 },
+    .{ .namespace = "pg_catalog", .relation = "pg_type", .name = "typcategory", .type_oid = 25 },
+    .{ .namespace = "pg_catalog", .relation = "pg_type", .name = "typdelim", .type_oid = 25 },
+    .{ .namespace = "pg_catalog", .relation = "pg_type", .name = "typelem", .type_oid = 23 },
+    .{ .namespace = "pg_catalog", .relation = "pg_type", .name = "typarray", .type_oid = 23 },
+    .{ .namespace = "pg_catalog", .relation = "pg_type", .name = "typbasetype", .type_oid = 23 },
+    .{ .namespace = "pg_catalog", .relation = "pg_type", .name = "typcollation", .type_oid = 23 },
 };
 
 pub fn defaultAdapter() Adapter {
@@ -226,4 +237,26 @@ test "adapter loads into store" {
     try std.testing.expectEqual(@as(i16, 1), store.attributes()[0].attnum);
 
     try std.testing.expectEqual(@as(usize, 2), store.types().len);
+}
+
+test "bootstrap seeds global defaults" {
+    const alloc = std.testing.allocator;
+    try bootstrap(alloc);
+    const store = compat.catalog.global();
+    try std.testing.expect(store.namespaces().len >= 2);
+    try std.testing.expect(store.types().len >= 4);
+    const types = store.types();
+    var found_int4 = false;
+    var found_text_array = false;
+    for (types) |ty| {
+        if (std.mem.eql(u8, ty.typname, "int4")) {
+            try std.testing.expectEqual(@as(u32, 1007), ty.typarray);
+            found_int4 = true;
+        } else if (std.mem.eql(u8, ty.typname, "_text")) {
+            try std.testing.expectEqual(@as(u32, 25), ty.typelem);
+            found_text_array = true;
+        }
+    }
+    try std.testing.expect(found_int4);
+    try std.testing.expect(found_text_array);
 }
