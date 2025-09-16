@@ -24,6 +24,7 @@ This memo captures the minimum viable definitions for the PostgreSQL catalog vie
 - Columns: `attrelid`, `attname`, `atttypid`, `attnum`, `attnotnull`, `atthasdef`, `attisdropped`, `attlen`, `atttypmod`, `attidentity`, `attgenerated`, `attndims`.
 - `atttypid` links into `pg_type`. For arrays use dedicated array type OIDs.
 - `attidentity` → `'a'` for identity columns, `'d'` for generated defaults we emulate, else `''`.
+- Builder in `compat/catalog.zig` assigns deterministic OIDs/attnums by sorting namespace + relation + optional position; override positions map 1‑based attnums just like PostgreSQL.
 
 ### pg_type
 - Columns: `oid`, `typname`, `typnamespace`, `typlen`, `typbyval`, `typtype`, `typcategory`, `typdelim`, `typelem`, `typarray`, `typbasetype`, `typcollation`, `typinput`, `typoutput`.
@@ -53,7 +54,8 @@ This memo captures the minimum viable definitions for the PostgreSQL catalog vie
 - Document differences (e.g., sequence cache semantics) in `docs/compatibility.md` when deviations exist.
 
 ## Implementation Sketch
-- Introduce `src/sydra/catalog.zig` exposing iterators for namespaces, relations, attributes, and constraints.
+- `src/sydra/compat/catalog.zig` now provides a builder and in-memory store for `pg_namespace`/`pg_class` slices with deterministic OID assignment.
+- Wire an engine-facing adapter (`src/sydra/catalog.zig`) that feeds real metadata into the compat builder (future work).
 - Define view renderers that synthesise row structs consumed by the protocol front-end.
 - Cache results per schema change epoch; invalidate on DDL events.
 

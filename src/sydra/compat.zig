@@ -4,3 +4,4 @@ pub const clog = @import("compat/log.zig");
 pub const fixtures = struct {
     pub const translator = @import("compat/fixtures/translator.zig");
 };
+pub const catalog = @import("compat/catalog.zig");
