@@ -1,2 +1,3 @@
 {"name":"select-constant","sql":"SELECT 1","expect":{"kind":"success","sydraql":"select const 1"},"notes":"Placeholder translation case"}
 {"name":"insert-duplicate","sql":"INSERT INTO users(id) VALUES (1)","expect":{"kind":"error","sqlstate":"0A000","message":"feature not supported"},"notes":"Current stub returns feature_not_supported; update when translator handles inserts."}
+{"name":"select-columns","sql":"SELECT id, name FROM users","expect":{"kind":"success","sydraql":"from users select id,name"},"notes":"Basic projection rewrite"}
