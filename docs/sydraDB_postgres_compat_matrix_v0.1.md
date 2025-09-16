@@ -56,7 +56,8 @@ I’m assuming a typical modern engine baseline; where I don’t know sydraDB’
 |---|---|---|---|
 | Basic `SELECT` projection + `WHERE` | **Scaffold** | **Native** | Translator rewrites `SELECT <cols> FROM <table> [WHERE ...]` into sydraQL (`src/sydra/query/translator.zig`); fixtures in `tests/translator/cases.jsonl`. |
 | `INSERT` (single `VALUES`, optional `RETURNING`) | **Scaffold** | **Shim** | Translator rewrites to `insert into <table> (...) values (...) [returning ...]`; see `tests/translator/cases.jsonl`. |
-| `UPDATE/DELETE ... RETURNING` | **Plan** | **Shim** | RETURNING must reflect final values. |
+| `UPDATE` (`SET` assignments, optional `WHERE`) | **Scaffold** | **Shim** | Translator emits `update <table> set <assignments> [where ...]`; fixtures cover WHERE/non-WHERE cases. |
+| `DELETE` / UPDATE with `RETURNING` | **Plan** | **Shim** | RETURNING must reflect final values. |
 | Upsert (`ON CONFLICT`) | **Plan** | **Shim / Partial** | Matches arbiter semantics; composite keys. |
 | CTEs (WITH) | **Plan** | **Shim / Partial** | Recursive optional (Plan if costly). |
 | Window functions | **Plan** | **Partial** | Add subset later if not native. |
@@ -310,7 +311,7 @@ Replicate the idea for `pg_attribute`, `pg_type`, `pg_index`, `pg_constraint`, `
 
 - **Protocol front-end** – Build listener skeleton with Startup + SSL + Authentication negotiation; add `compat/stats` counters for handshake stages; unit harness pending under `zig build compat-wire-test`.
 - **Catalog shim** – Extend `src/sydra/catalog.zig` adapter to ingest real namespace/relation lists from the engine and expose deterministic OIDs; backfill `/debug/compat/catalog` with row counts and checksum stats.
-- **Translator** – Extend coverage beyond current SELECT + INSERT (VALUES/RETURNING) path to handle UPDATE/DELETE, bulk inserts, and SELECT locking clauses; expose cache-hit stats via `compat/log` sampling knobs.
+- **Translator** – Extend coverage beyond current SELECT + INSERT (VALUES/RETURNING) + UPDATE (SET/WHERE) path to handle DELETE, UPDATE/DELETE with `RETURNING`, bulk inserts, and SELECT locking clauses; expose cache-hit stats via `compat/log` sampling knobs.
 - **SQLSTATE mapper** – Wire `compat/sqlstate.zig` into engine error surfaces so `/debug/compat/stats` fallbacks reflect actual failures; add tests that assert round-tripping of common codes.
 - **Testing harness** – Draft protocol replay CLI (see `docs/compatibility_testing.md`) and add CI job skeleton invoking `zig build test` + placeholder `compat-wire-test`.
 

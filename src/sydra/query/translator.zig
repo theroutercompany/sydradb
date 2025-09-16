@@ -184,6 +184,48 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
         }
     }
 
+    if (startsWithCaseInsensitive(trimmed, "UPDATE ")) {
+        const after_update = std.mem.trim(u8, trimmed["UPDATE ".len ..], " \t\r\n");
+        if (after_update.len != 0) {
+            if (findCaseInsensitive(after_update, " SET ")) |set_idx| {
+                const table_raw = std.mem.trim(u8, after_update[0..set_idx], " \t\r\n");
+                if (table_raw.len != 0) {
+                    var remainder = std.mem.trim(u8, after_update[set_idx + " SET ".len ..], " \t\r\n;");
+                    if (remainder.len != 0) {
+                        var set_clause = remainder;
+                        var where_clause: ?[]const u8 = null;
+                        if (findCaseInsensitive(remainder, " WHERE ")) |where_idx| {
+                            set_clause = std.mem.trim(u8, remainder[0..where_idx], " \t\r\n");
+                            const after_where = std.mem.trim(u8, remainder[where_idx + " WHERE ".len ..], " \t\r\n");
+                            if (after_where.len != 0) {
+                                where_clause = after_where;
+                            } else {
+                                set_clause = remainder;
+                                where_clause = null;
+                            }
+                        }
+                        if (set_clause.len != 0) {
+                            var builder = std.ArrayList(u8).init(alloc);
+                            defer builder.deinit();
+                            try builder.appendSlice("update ");
+                            try builder.appendSlice(table_raw);
+                            try builder.appendSlice(" set ");
+                            try builder.appendSlice(set_clause);
+                            if (where_clause) |wc| {
+                                try builder.appendSlice(" where ");
+                                try builder.appendSlice(wc);
+                            }
+                            const sydra_str = try builder.toOwnedSlice();
+                            const duration = std.time.nanoTimestamp() - start;
+                            compat.clog.global().record(trimmed, sydra_str, false, false, duration);
+                            return Result{ .success = .{ .sydraql = sydra_str } };
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     const payload = compat.sqlstate.buildPayload(.feature_not_supported, null, null, null);
     const duration = std.time.nanoTimestamp() - start;
     compat.clog.global().record(trimmed, "", false, true, duration);
