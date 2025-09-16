@@ -26,6 +26,22 @@ fn findCaseInsensitive(haystack: []const u8, needle: []const u8) ?usize {
     return null;
 }
 
+fn findMatchingParen(text: []const u8, open_index: usize) ?usize {
+    if (open_index >= text.len or text[open_index] != '(') return null;
+    var depth: i32 = 0;
+    var idx = open_index;
+    while (idx < text.len) : (idx += 1) {
+        const ch = text[idx];
+        if (ch == '(') {
+            depth += 1;
+        } else if (ch == ')') {
+            depth -= 1;
+            if (depth == 0) return idx;
+        }
+    }
+    return null;
+}
+
 pub const Result = union(enum) {
     success: Success,
     failure: Failure,
@@ -86,6 +102,82 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
                         const duration = std.time.nanoTimestamp() - start;
                         compat.clog.global().record(trimmed, sydra_str, false, false, duration);
                         return Result{ .success = .{ .sydraql = sydra_str } };
+                    }
+                }
+            }
+        }
+    }
+
+    if (startsWithCaseInsensitive(trimmed, "INSERT INTO ")) {
+        const inserted = std.mem.trim(u8, trimmed["INSERT INTO ".len ..], " \t\r\n");
+        if (inserted.len != 0) {
+            var idx: usize = 0;
+            while (idx < inserted.len and inserted[idx] == ' ') : (idx += 1) {}
+            const table_start = idx;
+            while (idx < inserted.len) : (idx += 1) {
+                const ch = inserted[idx];
+                if (ch == ' ' or ch == '(') break;
+            }
+            if (idx > table_start) {
+                const table_name = std.mem.trimRight(u8, inserted[table_start..idx], " \t\r\n");
+                var cursor = idx;
+                while (cursor < inserted.len and std.ascii.isWhitespace(inserted[cursor])) : (cursor += 1) {}
+
+                var columns_slice: ?[]const u8 = null;
+                if (cursor < inserted.len and inserted[cursor] == '(') {
+                    if (findMatchingParen(inserted, cursor)) |close_idx| {
+                        const inner = inserted[cursor + 1 .. close_idx];
+                        columns_slice = std.mem.trim(u8, inner, " \t\r\n");
+                        cursor = close_idx + 1;
+                        while (cursor < inserted.len and std.ascii.isWhitespace(inserted[cursor])) : (cursor += 1) {}
+                    } else {
+                        cursor = inserted.len;
+                    }
+                }
+
+                const values_kw = "VALUES";
+                if (cursor < inserted.len and startsWithCaseInsensitive(inserted[cursor..], values_kw)) {
+                    cursor += values_kw.len;
+                    while (cursor < inserted.len and std.ascii.isWhitespace(inserted[cursor])) : (cursor += 1) {}
+                    if (cursor < inserted.len and inserted[cursor] == '(') {
+                        if (findMatchingParen(inserted, cursor)) |values_close| {
+                            const values_inner = std.mem.trim(u8, inserted[cursor + 1 .. values_close], " \t\r\n");
+                            var remainder = inserted[values_close + 1 ..];
+                            remainder = std.mem.trim(u8, remainder, " \t\r\n;");
+                            if (remainder.len == 0 or startsWithCaseInsensitive(remainder, "RETURNING")) {
+                                const returning_clause = if (remainder.len == 0)
+                                    null
+                                else blk: {
+                                    const clause = std.mem.trim(u8, remainder["RETURNING".len ..], " \t\r\n");
+                                    if (clause.len == 0) break :blk null;
+                                    break :blk clause;
+                                };
+                                if (remainder.len != 0 and returning_clause == null) {
+                                    // Malformed RETURNING clause; allow fallback below.
+                                } else {
+                                    var builder = std.ArrayList(u8).init(alloc);
+                                    defer builder.deinit();
+                                    try builder.appendSlice("insert into ");
+                                    try builder.appendSlice(table_name);
+                                    if (columns_slice) |cols| {
+                                        try builder.appendSlice(" (");
+                                        try builder.appendSlice(cols);
+                                        try builder.appendSlice(")");
+                                    }
+                                    try builder.appendSlice(" values (");
+                                    try builder.appendSlice(values_inner);
+                                    try builder.appendSlice(")");
+                                    if (returning_clause) |clause| {
+                                        try builder.appendSlice(" returning ");
+                                        try builder.appendSlice(clause);
+                                    }
+                                    const sydra_str = try builder.toOwnedSlice();
+                                    const duration = std.time.nanoTimestamp() - start;
+                                    compat.clog.global().record(trimmed, sydra_str, false, false, duration);
+                                    return Result{ .success = .{ .sydraql = sydra_str } };
+                                }
+                            }
+                        }
                     }
                 }
             }

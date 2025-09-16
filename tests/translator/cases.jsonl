@@ -1,6 +1,8 @@
 {"name":"select-constant","sql":"SELECT 1","expect":{"kind":"success","sydraql":"select const 1"},"notes":"Placeholder translation case"}
-{"name":"insert-duplicate","sql":"INSERT INTO users(id) VALUES (1)","expect":{"kind":"error","sqlstate":"0A000","message":"feature not supported"},"notes":"Current stub returns feature_not_supported; update when translator handles inserts."}
+{"name":"insert-basic","sql":"INSERT INTO users(id) VALUES (1)","expect":{"kind":"success","sydraql":"insert into users (id) values (1)"},"notes":"Basic INSERT rewrite without RETURNING"}
 {"name":"select-columns","sql":"SELECT id, name FROM users","expect":{"kind":"success","sydraql":"from users select id,name"},"notes":"Basic projection rewrite"}
 {"name":"select-where","sql":"SELECT name FROM users WHERE id = 42","expect":{"kind":"success","sydraql":"from users where id = 42 select name"},"notes":"Ensures WHERE clause is preserved"}
 {"name":"select-star","sql":"select * from accounts","expect":{"kind":"success","sydraql":"from accounts select *"},"notes":"Case-insensitive keyword handling"}
 {"name":"update-fallback","sql":"UPDATE users SET name = 'rex' WHERE id = 1","expect":{"kind":"error","sqlstate":"0A000","message":"feature not supported"},"notes":"Unsupported verb should hit fallback"}
+{"name":"insert-returning","sql":"INSERT INTO users (id) VALUES (2) RETURNING id","expect":{"kind":"success","sydraql":"insert into users (id) values (2) returning id"},"notes":"RETURNING clause translated"}
+{"name":"insert-returning-invalid","sql":"INSERT INTO users (id) VALUES (3) RETURNING","expect":{"kind":"error","sqlstate":"0A000","message":"feature not supported"},"notes":"Empty RETURNING should fallback"}
