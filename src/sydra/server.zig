@@ -3,24 +3,13 @@ const config = @import("config.zig");
 const engine_mod = @import("engine.zig");
 const http = @import("http.zig");
 const catalog = @import("catalog.zig");
+const compat = @import("compat.zig");
 
 pub fn run(alloc: std.mem.Allocator) !void {
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
     if (args.len <= 1 or std.mem.eql(u8, args[1], "serve")) {
-        var cfg = config.load(alloc, "sydradb.toml") catch config.Config{
-            .data_dir = try alloc.dupe(u8, "./data"),
-            .http_port = 8080,
-            .fsync = .interval,
-            .flush_interval_ms = 2000,
-            .memtable_max_bytes = 8 * 1024 * 1024,
-            .retention_days = 0,
-            .auth_token = try alloc.dupe(u8, ""),
-            .enable_influx = false,
-            .enable_prom = true,
-            .mem_limit_bytes = 256 * 1024 * 1024,
-            .retention_ns = std.StringHashMap(u32).init(alloc),
-        };
+        var cfg = try loadConfigOrDefault(alloc);
         defer cfg.deinit(alloc);
         var eng = try engine_mod.Engine.init(alloc, cfg);
         defer eng.deinit();
@@ -31,6 +20,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     }
 
     const cmd = args[1];
+    if (std.mem.eql(u8, cmd, "pgwire")) return cmdPgWire(alloc, args);
     if (std.mem.eql(u8, cmd, "ingest")) return cmdIngest(alloc, args);
     if (std.mem.eql(u8, cmd, "query")) return cmdQuery(alloc, args);
     if (std.mem.eql(u8, cmd, "compact")) return cmdCompact(alloc, args);
@@ -39,8 +29,55 @@ pub fn run(alloc: std.mem.Allocator) !void {
     if (std.mem.eql(u8, cmd, "stats")) return cmdStats(alloc, args);
 }
 
+fn loadConfigOrDefault(alloc: std.mem.Allocator) !config.Config {
+    return config.load(alloc, "sydradb.toml") catch config.Config{
+        .data_dir = try alloc.dupe(u8, "./data"),
+        .http_port = 8080,
+        .fsync = .interval,
+        .flush_interval_ms = 2000,
+        .memtable_max_bytes = 8 * 1024 * 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = true,
+        .mem_limit_bytes = 256 * 1024 * 1024,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+}
+
+fn cmdPgWire(alloc: std.mem.Allocator, args: [][:0]u8) !void {
+    var cfg = try loadConfigOrDefault(alloc);
+    defer cfg.deinit(alloc);
+
+    var eng = try engine_mod.Engine.init(alloc, cfg);
+    defer eng.deinit();
+
+    try catalog.bootstrap(alloc);
+
+    const default_address = "127.0.0.1";
+    const address = if (args.len >= 3)
+        std.mem.span(args[2])
+    else
+        default_address;
+
+    var port: u16 = 6432;
+    if (args.len >= 4) {
+        port = std.fmt.parseInt(u16, std.mem.span(args[3]), 10) catch return error.Invalid;
+    }
+
+    const session_cfg = compat.wire.session.SessionConfig{};
+    const server_cfg = compat.wire.server.ServerConfig{
+        .address = address,
+        .port = port,
+        .session = session_cfg,
+    };
+
+    std.debug.print("sydradb pgwire {s}:{d}\n", .{ server_cfg.address, server_cfg.port });
+    try compat.wire.server.run(alloc, server_cfg);
+}
+
 fn cmdIngest(alloc: std.mem.Allocator, _: [][:0]u8) !void {
-    var cfg = try config.load(alloc, "sydradb.toml");
+    var cfg = try loadConfigOrDefault(alloc);
     defer cfg.deinit(alloc);
     var eng = try engine_mod.Engine.init(alloc, cfg);
     defer eng.deinit();
@@ -75,7 +112,7 @@ fn cmdIngest(alloc: std.mem.Allocator, _: [][:0]u8) !void {
 
 fn cmdQuery(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     if (args.len < 5) return error.Invalid;
-    var cfg = try config.load(alloc, "sydradb.toml");
+    var cfg = try loadConfigOrDefault(alloc);
     defer cfg.deinit(alloc);
     var eng = try engine_mod.Engine.init(alloc, cfg);
     defer eng.deinit();
@@ -89,7 +126,7 @@ fn cmdQuery(alloc: std.mem.Allocator, args: [][:0]u8) !void {
 }
 
 fn cmdCompact(alloc: std.mem.Allocator, _: [][:0]u8) !void {
-    var cfg = try config.load(alloc, "sydradb.toml");
+    var cfg = try loadConfigOrDefault(alloc);
     defer cfg.deinit(alloc);
     var data_dir = try std.fs.cwd().openDir(cfg.data_dir, .{ .iterate = true });
     defer data_dir.close();
@@ -99,7 +136,7 @@ fn cmdCompact(alloc: std.mem.Allocator, _: [][:0]u8) !void {
 }
 
 fn cmdStats(alloc: std.mem.Allocator, _: [][:0]u8) !void {
-    var cfg = try config.load(alloc, "sydradb.toml");
+    var cfg = try loadConfigOrDefault(alloc);
     defer cfg.deinit(alloc);
     var d = try std.fs.cwd().openDir(cfg.data_dir, .{ .iterate = true });
     defer d.close();
@@ -127,7 +164,7 @@ fn cmdStats(alloc: std.mem.Allocator, _: [][:0]u8) !void {
 
 fn cmdSnapshot(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     if (args.len < 3) return error.Invalid;
-    var cfg = try config.load(alloc, "sydradb.toml");
+    var cfg = try loadConfigOrDefault(alloc);
     defer cfg.deinit(alloc);
     var data_dir = try std.fs.cwd().openDir(cfg.data_dir, .{ .iterate = true });
     defer data_dir.close();
@@ -136,7 +173,7 @@ fn cmdSnapshot(alloc: std.mem.Allocator, args: [][:0]u8) !void {
 
 fn cmdRestore(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     if (args.len < 3) return error.Invalid;
-    var cfg = try config.load(alloc, "sydradb.toml");
+    var cfg = try loadConfigOrDefault(alloc);
     defer cfg.deinit(alloc);
     var data_dir = try std.fs.cwd().openDir(cfg.data_dir, .{ .iterate = true });
     defer data_dir.close();

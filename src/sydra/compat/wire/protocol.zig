@@ -164,6 +164,23 @@ pub fn writeReadyForQuery(writer: anytype, status: u8) !void {
     try writer.writeAll(buf[0..6]);
 }
 
+pub fn writeCommandComplete(writer: anytype, tag: []const u8) !void {
+    try writer.writeByte('C');
+    var length_buf: [4]u8 = undefined;
+    const length: u32 = 4 + @as(u32, @intCast(tag.len + 1));
+    std.mem.writeInt(u32, length_buf[0..4], length, .big);
+    try writer.writeAll(length_buf[0..4]);
+    try writer.writeAll(tag);
+    try writer.writeByte(0);
+}
+
+pub fn writeEmptyQueryResponse(writer: anytype) !void {
+    try writer.writeByte('I');
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], 4, .big);
+    try writer.writeAll(buf[0..4]);
+}
+
 pub fn writeErrorResponse(writer: anytype, severity: []const u8, code: []const u8, message: []const u8) !void {
     try writer.writeByte('E');
     var length: u32 = 4 + 1; // length field + terminating zero
