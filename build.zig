@@ -28,4 +28,14 @@ pub fn build(b: *std.Build) void {
 
     const test_run = b.addRunArtifact(unit_tests);
     b.step("test", "Run tests").dependOn(&test_run.step);
+
+    const pgwire_tests = if (is015) blk3: {
+        const mod = b.createModule(.{ .root_source_file = b.path("src/sydra/compat/wire/server.zig"), .target = target, .optimize = optimize });
+        break :blk3 b.addTest(.{ .root_module = mod });
+    } else blk3: {
+        break :blk3 b.addTest(.{ .root_source_file = b.path("src/sydra/compat/wire/server.zig"), .target = target, .optimize = optimize });
+    };
+
+    const pgwire_run = b.addRunArtifact(pgwire_tests);
+    b.step("compat-wire-test", "Run PostgreSQL wire compatibility tests").dependOn(&pgwire_run.step);
 }
