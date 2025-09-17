@@ -5,3 +5,4 @@ pub const fixtures = struct {
     pub const translator = @import("compat/fixtures/translator.zig");
 };
 pub const catalog = @import("compat/catalog.zig");
+pub const wire = @import("compat/wire.zig");
