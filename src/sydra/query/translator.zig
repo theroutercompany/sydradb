@@ -85,7 +85,7 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
 
     if (startsWithCaseInsensitive(trimmed, "SELECT ")) {
         if (findCaseInsensitive(trimmed, " FROM ")) |from_idx| {
-            const cols_raw = std.mem.trim(u8, trimmed["SELECT ".len .. from_idx], " \t\r\n");
+            const cols_raw = std.mem.trim(u8, trimmed["SELECT ".len..from_idx], " \t\r\n");
             const remainder = std.mem.trim(u8, trimmed[from_idx + " FROM ".len ..], " \t\r\n;");
             if (cols_raw.len != 0 and remainder.len != 0) {
                 var table_part = remainder;
@@ -126,7 +126,7 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
     }
 
     if (startsWithCaseInsensitive(trimmed, "INSERT INTO ")) {
-        const inserted = std.mem.trim(u8, trimmed["INSERT INTO ".len ..], " \t\r\n");
+        const inserted = std.mem.trim(u8, trimmed["INSERT INTO ".len..], " \t\r\n");
         if (inserted.len != 0) {
             var idx: usize = 0;
             while (idx < inserted.len and inserted[idx] == ' ') : (idx += 1) {}
@@ -165,7 +165,7 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
                                 const returning_clause = if (remainder.len == 0)
                                     null
                                 else blk: {
-                                    const clause = std.mem.trim(u8, remainder["RETURNING".len ..], " \t\r\n");
+                                    const clause = std.mem.trim(u8, remainder["RETURNING".len..], " \t\r\n");
                                     if (clause.len == 0) break :blk null;
                                     break :blk clause;
                                 };
@@ -202,7 +202,7 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
     }
 
     if (startsWithCaseInsensitive(trimmed, "UPDATE ")) {
-        const after_update = std.mem.trim(u8, trimmed["UPDATE ".len ..], " \t\r\n");
+        const after_update = std.mem.trim(u8, trimmed["UPDATE ".len..], " \t\r\n");
         if (after_update.len != 0) {
             if (findCaseInsensitive(after_update, " SET ")) |set_idx| {
                 const table_raw = std.mem.trim(u8, after_update[0..set_idx], " \t\r\n");
@@ -215,7 +215,7 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
                             const after_idx = ret_idx + "RETURNING".len;
                             const after_ok = after_idx >= remainder.len or std.ascii.isWhitespace(remainder[after_idx]);
                             if (before_ok and after_idx <= remainder.len and after_ok) {
-                                const clause_raw = std.mem.trim(u8, remainder[after_idx ..], " \t\r\n;");
+                                const clause_raw = std.mem.trim(u8, remainder[after_idx..], " \t\r\n;");
                                 if (clause_raw.len != 0) {
                                     returning_clause = clause_raw;
                                     remainder = std.mem.trimRight(u8, remainder[0..ret_idx], " \t\r\n;");
@@ -266,7 +266,7 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
     }
 
     if (startsWithCaseInsensitive(trimmed, "DELETE FROM ")) {
-        var remainder = std.mem.trim(u8, trimmed["DELETE FROM ".len ..], " \t\r\n");
+        var remainder = std.mem.trim(u8, trimmed["DELETE FROM ".len..], " \t\r\n");
         if (remainder.len != 0) {
             var returning_clause: ?[]const u8 = null;
             if (findLastCaseInsensitive(remainder, "RETURNING")) |ret_idx| {
@@ -274,7 +274,7 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
                 const after_idx = ret_idx + "RETURNING".len;
                 const after_ok = after_idx >= remainder.len or std.ascii.isWhitespace(remainder[after_idx]);
                 if (before_ok and after_idx <= remainder.len and after_ok) {
-                    const clause_raw = std.mem.trim(u8, remainder[after_idx ..], " \t\r\n;");
+                    const clause_raw = std.mem.trim(u8, remainder[after_idx..], " \t\r\n;");
                     if (clause_raw.len != 0) {
                         returning_clause = clause_raw;
                         remainder = std.mem.trimRight(u8, remainder[0..ret_idx], " \t\r\n;");
