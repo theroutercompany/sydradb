@@ -141,14 +141,14 @@ pub const Engine = struct {
                 // WAL append
                 self.wal.append(it.series_id, it.ts, it.value) catch {};
                 // Memtable insert
-                var gop = self.mem.series.getOrPut(it.series_id) catch continue;
+                const gop = self.mem.series.getOrPut(it.series_id) catch continue;
                 if (!gop.found_existing) {
                     gop.value_ptr.* = std.ArrayList(types.Point).initCapacity(self.alloc, 0) catch {
                         // drop this point if we can't allocate
                         continue;
                     };
                 }
-                _ = gop.value_ptr.append(self.alloc, .{ .ts = it.ts, .value = it.value }) catch {};
+                gop.value_ptr.*.append(.{ .ts = it.ts, .value = it.value }) catch {};
                 self.mem.bytes += @sizeOf(types.Point);
             } else sleepMs(10);
 

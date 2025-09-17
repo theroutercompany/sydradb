@@ -26,7 +26,11 @@ pub const StartupRequest = struct {
             alloc.free(param.value);
         }
         alloc.free(self.parameters);
-        self.* = StartupRequest{};
+        self.* = .{
+            .protocol_version = 0,
+            .parameters = &[_]Parameter{},
+            .ssl_request_seen = false,
+        };
     }
 
     pub fn find(self: StartupRequest, key: []const u8) ?[]const u8 {

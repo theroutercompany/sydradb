@@ -212,10 +212,10 @@ pub fn buildSnapshot(
     var idx: usize = 0;
     var it = ns_map.iterator();
     while (it.next()) |entry| : (idx += 1) {
-        entry_buffer[idx] = entry.*;
+        entry_buffer[idx] = entry;
     }
 
-    std.sort.sort(MapEntry, entry_buffer, {}, struct {
+    std.sort.heap(MapEntry, entry_buffer, {}, struct {
         pub fn lessThan(_: void, lhs: MapEntry, rhs: MapEntry) bool {
             return std.mem.lessThan(u8, lhs.key_ptr.*, rhs.key_ptr.*);
         }
@@ -574,7 +574,7 @@ test "store load lifecycle" {
     const types = [_]TypeSpec{.{ .name = "int4", .namespace = "pg_catalog", .oid = 23, .length = 4, .by_value = true, .category = 'N' }};
     const columns = [_]ColumnSpec{.{ .namespace = "public", .relation = "users", .name = "id", .type_oid = 23 }};
 
-    const ns_full = [_]NamespaceSpec{.{ .name = "pg_catalog" }, .{ .name = "public" }};
+    const ns_full = [_]NamespaceSpec{ .{ .name = "pg_catalog" }, .{ .name = "public" } };
 
     try store.load(alloc, &ns_full, &relations, &types, &columns);
     try std.testing.expectEqual(@as(usize, 2), store.namespaces().len);

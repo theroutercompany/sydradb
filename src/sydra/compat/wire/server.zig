@@ -38,15 +38,10 @@ pub fn handleConnection(
 ) !void {
     defer connection.stream.close();
 
-    var recv_buffer: [4096]u8 = undefined;
-    var send_buffer: [4096]u8 = undefined;
-    var reader_state = connection.stream.reader(&recv_buffer);
-    var writer_state = connection.stream.writer(&send_buffer);
+    const handshake_reader = connection.stream.reader();
+    const handshake_writer = connection.stream.writer();
 
-    var reader_any = reader_state.interface();
-    var writer_any = writer_state.interface();
-
-    var session = session_mod.performHandshake(alloc, reader_any, writer_any, session_config) catch |err| {
+    var session = session_mod.performHandshake(alloc, handshake_reader, handshake_writer, session_config) catch |err| {
         switch (err) {
             session_mod.HandshakeError.MissingUser,
             session_mod.HandshakeError.InvalidStartup,
@@ -65,16 +60,16 @@ pub fn handleConnection(
         .{ session.borrowedUser(), session.borrowedDatabase(), session.borrowedApplicationName() },
     );
 
-    reader_any = reader_state.interface();
-    writer_any = writer_state.interface();
+    const reader = connection.stream.reader();
+    const writer = connection.stream.writer();
 
-    try messageLoop(alloc, &reader_any, &writer_any);
+    try messageLoop(alloc, reader, writer);
 }
 
 fn messageLoop(
     alloc: std.mem.Allocator,
-    reader: *std.io.AnyReader,
-    writer: *std.io.AnyWriter,
+    reader: std.net.Stream.Reader,
+    writer: std.net.Stream.Writer,
 ) !void {
     while (true) {
         const type_byte = reader.readByte() catch |err| switch (err) {
@@ -96,13 +91,13 @@ fn messageLoop(
             'Q' => {
                 const query = trimNullTerminator(payload_storage);
                 log.debug("simple query received: {s}", .{query});
-                try protocol.writeErrorResponse(writer.*, "ERROR", "0A000", "simple query not implemented");
-                try protocol.writeReadyForQuery(writer.*, 'I');
+                try protocol.writeErrorResponse(writer, "ERROR", "0A000", "simple query not implemented");
+                try protocol.writeReadyForQuery(writer, 'I');
             },
             else => {
                 log.debug("frontend message {c} unsupported", .{type_byte});
-                try protocol.writeErrorResponse(writer.*, "ERROR", "0A000", "message type not implemented");
-                try protocol.writeReadyForQuery(writer.*, 'I');
+                try protocol.writeErrorResponse(writer, "ERROR", "0A000", "message type not implemented");
+                try protocol.writeReadyForQuery(writer, 'I');
             },
         }
     }
@@ -116,7 +111,7 @@ fn trimNullTerminator(buffer: []u8) []const u8 {
     return buffer;
 }
 
-fn readU32(reader: *std.io.AnyReader) !u32 {
+fn readU32(reader: std.net.Stream.Reader) !u32 {
     var buf: [4]u8 = undefined;
     try reader.readNoEof(&buf);
     return std.mem.readInt(u32, &buf, .big);

@@ -49,6 +49,7 @@ pub const HandshakeError = error{
     InvalidStartup,
     UnsupportedProtocol,
     CancelRequestUnsupported,
+    OutOfMemory,
 };
 
 fn duplicateParameters(alloc: std.mem.Allocator, params: []protocol.Parameter) ![]protocol.Parameter {
@@ -85,7 +86,7 @@ pub fn performHandshake(
     errdefer startup.deinit(alloc);
 
     const user_param = startup.find("user") orelse {
-        try protocol.writeErrorResponse(writer, "FATAL", "28000", "user parameter required");
+        protocol.writeErrorResponse(writer, "FATAL", "28000", "user parameter required") catch return HandshakeError.InvalidStartup;
         return HandshakeError.MissingUser;
     };
 
@@ -108,7 +109,7 @@ pub fn performHandshake(
         alloc.free(param_copies);
     }
 
-    try protocol.writeAuthenticationOk(writer);
+    protocol.writeAuthenticationOk(writer) catch return HandshakeError.InvalidStartup;
 
     const status_pairs = [_]struct { key: []const u8, value: []const u8 }{
         .{ .key = "server_version", .value = config.server_version },
@@ -122,10 +123,10 @@ pub fn performHandshake(
     };
 
     for (status_pairs) |pair| {
-        try protocol.writeParameterStatus(writer, pair.key, pair.value);
+        protocol.writeParameterStatus(writer, pair.key, pair.value) catch return HandshakeError.InvalidStartup;
     }
 
-    try protocol.writeReadyForQuery(writer, 'I');
+    protocol.writeReadyForQuery(writer, 'I') catch return HandshakeError.InvalidStartup;
 
     startup.deinit(alloc);
 
