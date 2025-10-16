@@ -70,9 +70,7 @@ fn parseToml(alloc: std.mem.Allocator, text: []const u8) !Config {
         } else if (std.mem.eql(u8, key_raw, "fsync")) {
             var val = val_raw;
             if (val.len >= 2 and val[0] == '"' and val[val.len - 1] == '"') val = val[1 .. val.len - 1];
-            if (std.mem.eql(u8, val, "always")) cfg.fsync = .always
-            else if (std.mem.eql(u8, val, "interval")) cfg.fsync = .interval
-            else if (std.mem.eql(u8, val, "none")) cfg.fsync = .none;
+            if (std.mem.eql(u8, val, "always")) cfg.fsync = .always else if (std.mem.eql(u8, val, "interval")) cfg.fsync = .interval else if (std.mem.eql(u8, val, "none")) cfg.fsync = .none;
         } else if (std.mem.eql(u8, key_raw, "mem_limit_bytes")) {
             cfg.mem_limit_bytes = @intCast(try std.fmt.parseInt(usize, val_raw, 10));
         } else if (std.mem.eql(u8, key_raw, "auth_token")) {
