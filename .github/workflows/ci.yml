@@ -1,28 +1,92 @@
 name: CI
+
 permissions:
   contents: read
+
 on:
   push:
     branches: [ main ]
+    tags: [ 'v*' ]
   pull_request:
+
 jobs:
-  build:
-    runs-on: ubuntu-latest
+  checks:
+    name: Checks (${{ matrix.os }})
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+    runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
+
       - name: Install pre-commit
         run: pip install pre-commit
+
       - name: Install Zig
         uses: goto-bus-stop/setup-zig@v2
         with:
           version: stable
-      - name: Pre-commit
+
+      - name: Cache pre-commit
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: ${{ runner.os }}-precommit-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      - name: Run pre-commit (fmt, build, test)
         run: pre-commit run --all-files --show-diff-on-failure
-      - name: Build
-        run: zig build -Doptimize=ReleaseSafe
-      - name: Test
-        run: zig build test
+
+  release-artifacts:
+    if: github.event_name != 'pull_request'
+    needs: checks
+    name: Release Artifacts (${{ matrix.name }})
+    strategy:
+      matrix:
+        include:
+          - name: linux-amd64
+            target: x86_64-linux
+            os: ubuntu-latest
+          - name: linux-arm64
+            target: aarch64-linux
+            os: ubuntu-latest
+          - name: macos-amd64
+            target: x86_64-macos
+            os: macos-latest
+          - name: macos-arm64
+            target: aarch64-macos
+            os: macos-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: stable
+
+      - name: Build release binary
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+
+      - name: Package artifact
+        run: |
+          set -e
+          ART_DIR="artifacts"
+          ART_NAME="sydradb-${{ matrix.name }}"
+          mkdir -p "${ART_DIR}"
+          cp "zig-out/bin/sydradb" "${ART_DIR}/${ART_NAME}"
+          chmod +x "${ART_DIR}/${ART_NAME}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sydradb-${{ matrix.name }}
+          path: artifacts/sydradb-${{ matrix.name }}
