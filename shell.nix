@@ -1,7 +1,7 @@
 { pkgs ? import <nixpkgs> {} }:
 
 let
-  zig = if pkgs ? zig_0_15 then pkgs.zig_0_15 else pkgs.zig;
+  zig = if pkgs ? zig_0_14 then pkgs.zig_0_14 else pkgs.zig;
   nixfmt = if pkgs ? nixfmt-classic then pkgs.nixfmt-classic else pkgs.nixfmt;
 in pkgs.mkShell {
   packages = [ zig pkgs.zls pkgs.ripgrep pkgs.git nixfmt ];
@@ -13,4 +13,3 @@ in pkgs.mkShell {
     echo "sydradb dev shell with Zig $(zig version)" >&2
   '';
 }
-
