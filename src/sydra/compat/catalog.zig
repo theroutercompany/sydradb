@@ -200,7 +200,7 @@ pub fn buildSnapshot(
         try ns_map.put(name_copy, NamespaceSpec{ .name = name_copy });
     }
 
-    var namespace_entries = std.ArrayList(NamespaceRow).init(alloc);
+    var namespace_entries = std.array_list.Managed(NamespaceRow).init(alloc);
     defer namespace_entries.deinit();
 
     var ns_lookup = std.StringArrayHashMap(u32).init(alloc);
@@ -239,7 +239,7 @@ pub fn buildSnapshot(
         try ns_lookup.put(name_ptr, oid);
     }
 
-    var class_entries = std.ArrayList(ClassRow).init(alloc);
+    var class_entries = std.array_list.Managed(ClassRow).init(alloc);
     defer class_entries.deinit();
 
     const rel_entries = try alloc.alloc(RelationSpec, relation_specs.len);
@@ -280,7 +280,7 @@ pub fn buildSnapshot(
         });
     }
 
-    var type_entries = std.ArrayList(TypeRow).init(alloc);
+    var type_entries = std.array_list.Managed(TypeRow).init(alloc);
     defer type_entries.deinit();
 
     const type_buffer = try alloc.alloc(TypeSpec, type_specs.len);
@@ -320,7 +320,7 @@ pub fn buildSnapshot(
         });
     }
 
-    var attribute_entries = std.ArrayList(AttributeRow).init(alloc);
+    var attribute_entries = std.array_list.Managed(AttributeRow).init(alloc);
     defer attribute_entries.deinit();
 
     const ColEntry = ColumnSpec;

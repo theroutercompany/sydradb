@@ -17,9 +17,13 @@ pub const Recorder = struct {
         if (used_cache) stats.global().noteCacheHit();
 
         if (!self.shouldRecord()) return;
-        const stderr = std.io.getStdErr().writer();
-        var jw = std.json.writeStream(stderr, .{});
-        defer jw.deinit();
+        var stderr_file = std.fs.File.stderr();
+        var stderr_buf: [512]u8 = undefined;
+        var stderr_state = stderr_file.writer(&stderr_buf);
+        var jw = std.json.Stringify{
+            .writer = &stderr_state.interface,
+            .options = .{},
+        };
         jw.beginObject() catch return;
         jw.objectField("ts") catch return;
         jw.write(std.time.milliTimestamp()) catch return;
@@ -36,7 +40,8 @@ pub const Recorder = struct {
         jw.objectField("duration_ns") catch return;
         jw.write(duration_ns) catch return;
         jw.endObject() catch return;
-        stderr.writeAll("\n") catch {};
+        stderr_state.interface.writeAll("\n") catch {};
+        stderr_state.end() catch {};
 
         // stats already recorded above even when sampling skips emission
     }

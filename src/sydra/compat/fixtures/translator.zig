@@ -55,7 +55,7 @@ pub fn loadCases(alloc: std.mem.Allocator, path: []const u8) !CaseList {
     const contents = try file.readToEndAlloc(alloc, 1024 * 1024);
     defer alloc.free(contents);
 
-    var cases = std.ArrayList(Case).init(alloc);
+    var cases = std.array_list.Managed(Case).init(alloc);
     errdefer {
         for (cases.items) |case| {
             alloc.free(case.name);

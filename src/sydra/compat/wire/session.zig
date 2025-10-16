@@ -74,8 +74,8 @@ fn duplicateParameters(alloc: std.mem.Allocator, params: []protocol.Parameter) !
 
 pub fn performHandshake(
     alloc: std.mem.Allocator,
-    reader: anytype,
-    writer: anytype,
+    reader: std.Io.AnyReader,
+    writer: std.Io.AnyWriter,
     config: SessionConfig,
 ) HandshakeError!Session {
     var startup = protocol.readStartup(alloc, reader, writer, .{}) catch |err| switch (err) {
@@ -140,7 +140,7 @@ pub fn performHandshake(
 }
 
 fn buildStartupBuffer(allocator: std.mem.Allocator, params: []const protocol.Parameter) ![]u8 {
-    var body = std.ArrayList(u8).init(allocator);
+    var body = std.array_list.Managed(u8).init(allocator);
     defer body.deinit();
 
     var buf: [4]u8 = undefined;
@@ -162,7 +162,7 @@ fn buildStartupBuffer(allocator: std.mem.Allocator, params: []const protocol.Par
     return out;
 }
 
-fn appendSslRequest(buffer: *std.ArrayList(u8)) !void {
+fn appendSslRequest(buffer: *std.array_list.Managed(u8)) !void {
     var len_buf: [4]u8 = undefined;
     std.mem.writeInt(u32, len_buf[0..4], 8, .big);
     try buffer.appendSlice(len_buf);
@@ -182,16 +182,20 @@ test "performHandshake returns session metadata and writes responses" {
     const startup = try buildStartupBuffer(alloc, &params);
     defer alloc.free(startup);
 
-    var inbound = std.ArrayList(u8).init(alloc);
+    var inbound = std.array_list.Managed(u8).init(alloc);
     defer inbound.deinit();
     try appendSslRequest(&inbound);
     try inbound.appendSlice(startup);
 
     var reader_stream = std.io.fixedBufferStream(inbound.items);
+    var reader_state = reader_stream.reader();
+    const reader = reader_state.any();
     var write_storage: [512]u8 = undefined;
     var writer_stream = std.io.fixedBufferStream(write_storage[0..]);
+    var writer_state = writer_stream.writer();
+    const writer = writer_state.any();
 
-    var session = performHandshake(alloc, reader_stream.reader(), writer_stream.writer(), .{}) catch unreachable;
+    var session = performHandshake(alloc, reader, writer, .{}) catch unreachable;
     defer session.deinit();
 
     try std.testing.expectEqualStrings("alice", session.borrowedUser());

@@ -49,7 +49,7 @@ fn readU32(reader: anytype) !u32 {
 
 fn appendParameter(
     alloc: std.mem.Allocator,
-    list: *std.ArrayList(Parameter),
+    list: *std.array_list.Managed(Parameter),
     key_slice: []const u8,
     value_slice: []const u8,
 ) !void {
@@ -73,7 +73,7 @@ pub fn readStartup(
     };
     errdefer request.deinit(alloc);
 
-    var params = std.ArrayList(Parameter).init(alloc);
+    var params = std.array_list.Managed(Parameter).init(alloc);
     defer params.deinit();
 
     var ssl_seen = false;
@@ -210,7 +210,7 @@ pub fn formatParameters(params: []Parameter, writer: anytype) !void {
 }
 
 fn buildStartupMessage(allocator: std.mem.Allocator, pairs: []const Parameter) ![]u8 {
-    var body = std.ArrayList(u8).init(allocator);
+    var body = std.array_list.Managed(u8).init(allocator);
     defer body.deinit();
 
     var buf: [4]u8 = undefined;
@@ -244,7 +244,7 @@ test "read startup parses parameters and emits basic responses" {
     const startup = try buildStartupMessage(alloc, &pairs);
     defer alloc.free(startup);
 
-    var input = std.ArrayList(u8).init(alloc);
+    var input = std.array_list.Managed(u8).init(alloc);
     defer input.deinit();
 
     // SSLRequest
@@ -259,10 +259,14 @@ test "read startup parses parameters and emits basic responses" {
     try input.appendSlice(startup);
 
     var read_stream = std.io.fixedBufferStream(input.items);
+    var read_state = read_stream.reader();
+    const reader = read_state.any();
     var write_buffer: [256]u8 = undefined;
     var write_stream = std.io.fixedBufferStream(write_buffer[0..]);
+    var write_state = write_stream.writer();
+    const writer = write_state.any();
 
-    var req = try readStartup(alloc, read_stream.reader(), write_stream.writer(), .{});
+    var req = try readStartup(alloc, reader, writer, .{});
     defer req.deinit(alloc);
 
     try std.testing.expect(req.ssl_request_seen);
@@ -275,9 +279,9 @@ test "read startup parses parameters and emits basic responses" {
     try std.testing.expectEqual(@as(usize, 1), write_stream.pos);
     try std.testing.expectEqual(@as(u8, 'N'), write_buffer[0]);
 
-    try writeAuthenticationOk(write_stream.writer());
-    try writeParameterStatus(write_stream.writer(), "server_version", "15.2");
-    try writeReadyForQuery(write_stream.writer(), 'I');
+    try writeAuthenticationOk(writer);
+    try writeParameterStatus(writer, "server_version", "15.2");
+    try writeReadyForQuery(writer, 'I');
 
     const written = write_stream.buffer[0..write_stream.pos];
     const expected_prefix = [_]u8{
