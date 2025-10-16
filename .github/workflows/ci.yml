@@ -33,7 +33,7 @@ jobs:
       - name: Install Zig
         uses: goto-bus-stop/setup-zig@v2
         with:
-          version: stable
+          version: 0.15.1
 
       - name: Cache pre-commit
         uses: actions/cache@v4
@@ -52,10 +52,10 @@ jobs:
       matrix:
         include:
           - name: linux-amd64
-            target: x86_64-linux
+            target: x86_64-linux-gnu
             os: ubuntu-latest
           - name: linux-arm64
-            target: aarch64-linux
+            target: aarch64-linux-gnu
             os: ubuntu-latest
           - name: macos-amd64
             target: x86_64-macos
@@ -71,7 +71,7 @@ jobs:
       - name: Install Zig
         uses: goto-bus-stop/setup-zig@v2
         with:
-          version: stable
+          version: 0.15.1
 
       - name: Build release binary
         run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
