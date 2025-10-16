@@ -249,7 +249,7 @@
     },
     {
       "path": "src/main.zig",
-      "content": "const std = @import(\"std\");\nconst server = @import(\"sydra/server.zig\");\npub fn main() !void {\n    var gpa = std.heap.GeneralPurposeAllocator(.{}){};\n    defer _ = gpa.deinit();\n    const alloc = gpa.allocator();\n    var stdout = std.io.getStdOut().writer();\n    try stdout.print(\"sydraDB pre-alpha\\n\", .{});\n    try server.run(alloc);\n}\n"
+      "content": "const std = @import(\"std\");\nconst server = @import(\"sydra/server.zig\");\npub fn main() !void {\n    var gpa = std.heap.GeneralPurposeAllocator(.{}){};\n    defer _ = gpa.deinit();\n    const alloc = gpa.allocator();\n    var stdout_file = std.fs.File.stdout();\n    var stdout_buf: [512]u8 = undefined;\n    var stdout_state = stdout_file.writer(&stdout_buf);\n    var stdout = stdout_state.interface();\n    try stdout.print(\"sydraDB pre-alpha\\n\", .{});\n    try server.run(alloc);\n}\n"
     },
     {
       "path": "src/sydra/server.zig",

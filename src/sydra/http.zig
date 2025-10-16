@@ -35,8 +35,11 @@ fn connectionWorker(eng: *Engine, connection: std.net.Server.Connection) void {
 fn handleConnection(alloc: std.mem.Allocator, eng: *Engine, connection: std.net.Server.Connection) !void {
     defer connection.stream.close();
 
-    var recv_buffer: [4096]u8 = undefined;
-    var http_server: std.http.Server = std.http.Server.init(connection, &recv_buffer);
+    var in_buf: [4096]u8 = undefined;
+    var out_buf: [4096]u8 = undefined;
+    var reader_state = connection.stream.reader(&in_buf);
+    var writer_state = connection.stream.writer(&out_buf);
+    var http_server = std.http.Server.init(reader_state.interface(), &writer_state.interface);
 
     while (true) {
         var req = http_server.receiveHead() catch |err| switch (err) {
@@ -122,14 +125,14 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     const memtable_bytes = eng.mem.bytes.load(.monotonic);
     const flush_seconds_total = @as(f64, @floatFromInt(flush_ns_total)) / 1_000_000_000.0;
 
-    var buf = std.ArrayList(u8).init(alloc);
+    var buf = std.array_list.Managed(u8).init(alloc);
     defer buf.deinit();
     var writer = buf.writer();
 
     try writer.writeAll("# HELP sydradb_up 1 if server is up\n# TYPE sydradb_up gauge\nsydradb_up 1\n");
     try writer.print("# HELP sydradb_ingest_total Total ingested points since start\n# TYPE sydradb_ingest_total counter\nsydradb_ingest_total {d}\n", .{ingest_total});
     try writer.print("# HELP sydradb_flush_total Total flush operations\n# TYPE sydradb_flush_total counter\nsydradb_flush_total {d}\n", .{flush_total});
-    try writer.print("# HELP sydradb_flush_seconds_total Aggregate flush duration in seconds\n# TYPE sydradb_flush_seconds_total counter\nsydradb_flush_seconds_total {s}\n", .{std.fmt.fmtFloatDecimal(flush_seconds_total, .{ .precision = 6 })});
+    try writer.print("# HELP sydradb_flush_seconds_total Aggregate flush duration in seconds\n# TYPE sydradb_flush_seconds_total counter\nsydradb_flush_seconds_total {d:.6}\n", .{flush_seconds_total});
     try writer.print("# HELP sydradb_flush_points_total Total points flushed to disk\n# TYPE sydradb_flush_points_total counter\nsydradb_flush_points_total {d}\n", .{flush_points_total});
     try writer.print("# HELP sydradb_wal_bytes_total Total bytes written to WAL\n# TYPE sydradb_wal_bytes_total counter\nsydradb_wal_bytes_total {d}\n", .{wal_bytes_total});
     try writer.print("# HELP sydradb_queue_depth Current ingest queue depth\n# TYPE sydradb_queue_depth gauge\nsydradb_queue_depth {d}\n", .{queue_depth});
@@ -152,11 +155,14 @@ fn handleCompatStats(req: *std.http.Server.Request) !void {
 }
 
 fn handleCompatCatalog(alloc: std.mem.Allocator, req: *std.http.Server.Request) !void {
-    var buf = std.ArrayList(u8).init(alloc);
+    var buf = std.array_list.Managed(u8).init(alloc);
     defer buf.deinit();
 
-    var jw = std.json.writeStream(buf.writer(), .{});
-    defer jw.deinit();
+    var jw_writer = buf.writer();
+    var jw_buffer: [512]u8 = undefined;
+    var jw_adapter = jw_writer.adaptToNewApi(&jw_buffer);
+    var jw_iface = &jw_adapter.new_interface;
+    var jw = std.json.Stringify{ .writer = jw_iface };
     try jw.beginObject();
 
     const store = compat.catalog.global();
@@ -275,6 +281,8 @@ fn handleCompatCatalog(alloc: std.mem.Allocator, req: *std.http.Server.Request) 
     try jw.endArray();
 
     try jw.endObject();
+    try jw_iface.flush();
+    if (jw_adapter.err) |write_err| return write_err;
 
     const headers = [_]std.http.Header{.{ .name = "Content-Type", .value = "application/json" }};
     try req.respond(buf.items, .{ .extra_headers = &headers });
@@ -286,13 +294,14 @@ fn handleStatus(req: *std.http.Server.Request) !void {
 }
 
 fn handleIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
-    var body_reader = try req.reader();
+    var body_buf: [4096]u8 = undefined;
+    const body_reader_ptr = req.readerExpectNone(&body_buf);
+    const body_reader = std.Io.Reader.adaptToOldInterface(body_reader_ptr);
     var line_buf: [4096]u8 = undefined;
     var count: usize = 0;
 
     while (true) {
         const maybe_slice = body_reader.readUntilDelimiterOrEof(&line_buf, '\n') catch |err| switch (err) {
-            error.EndOfStream => break,
             error.StreamTooLong => {
                 _ = req.respond("line too long", .{ .status = .payload_too_large, .keep_alive = false }) catch {};
                 return;
@@ -334,11 +343,16 @@ fn handleIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Re
         var tags_owned: ?[]u8 = null;
         if (obj.get("tags")) |v| {
             if (v == .object) {
-                var tags_buf = std.ArrayList(u8).init(alloc);
+                var tags_buf = std.array_list.Managed(u8).init(alloc);
                 defer tags_buf.deinit();
-                var stream = std.json.writeStream(tags_buf.writer(), .{});
-                defer stream.deinit();
+                var tags_writer = tags_buf.writer();
+                var tags_tmp: [128]u8 = undefined;
+                var tags_adapter = tags_writer.adaptToNewApi(&tags_tmp);
+                var tags_iface = &tags_adapter.new_interface;
+                var stream = std.json.Stringify{ .writer = tags_iface };
                 try stream.write(v);
+                try tags_iface.flush();
+                if (tags_adapter.err) |write_err| return write_err;
                 tags_owned = try tags_buf.toOwnedSlice();
                 tags_json = tags_owned.?;
             }
@@ -357,7 +371,9 @@ fn handleIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Re
 }
 
 fn handleQuery(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
-    var reader = try req.reader();
+    var body_buf: [1024]u8 = undefined;
+    const reader_ptr = req.readerExpectNone(&body_buf);
+    const reader = std.Io.Reader.adaptToOldInterface(reader_ptr);
     const content_len = req.head.content_length orelse {
         try req.respond("length required", .{ .status = .length_required, .keep_alive = false });
         return;
@@ -437,7 +453,7 @@ fn handleQueryGet(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.
 }
 
 fn queryAndRespond(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request, sid: types.SeriesId, start_ts: i64, end_ts: i64) !void {
-    var points = try std.ArrayList(types.Point).initCapacity(alloc, 0);
+    var points = try std.array_list.Managed(types.Point).initCapacity(alloc, 0);
     defer points.deinit();
     try eng.queryRange(sid, start_ts, end_ts, &points);
     try respondPoints(req, points.items);
@@ -445,15 +461,14 @@ fn queryAndRespond(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server
 
 fn respondPoints(req: *std.http.Server.Request, points: []const types.Point) !void {
     var send_buffer: [1024]u8 = undefined;
-    var response = req.respondStreaming(.{
-        .send_buffer = &send_buffer,
+    var response = try req.respondStreaming(&send_buffer, .{
         .respond_options = .{
             .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
         },
     });
     errdefer response.end() catch {};
 
-    var resp_writer = response.writer();
+    const resp_writer = &response.writer;
     try resp_writer.writeAll("[");
     var first = true;
     for (points) |pnt| {
@@ -466,7 +481,9 @@ fn respondPoints(req: *std.http.Server.Request, points: []const types.Point) !vo
 }
 
 fn handleFind(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
-    var reader = try req.reader();
+    var body_buf: [1024]u8 = undefined;
+    const reader_ptr = req.readerExpectNone(&body_buf);
+    const reader = std.Io.Reader.adaptToOldInterface(reader_ptr);
     const content_len = req.head.content_length orelse {
         try req.respond("length required", .{ .status = .length_required, .keep_alive = false });
         return;
@@ -487,7 +504,7 @@ fn handleFind(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Requ
     if (obj.get("op")) |v| {
         if (v == .string and std.ascii.eqlIgnoreCase(v.string, "or")) op_and = false;
     }
-    var sets = try std.ArrayList([]const u64).initCapacity(alloc, 0);
+    var sets = try std.array_list.Managed([]const u64).initCapacity(alloc, 0);
     defer sets.deinit();
     if (obj.get("tags")) |t| {
         if (t == .object) {
@@ -526,15 +543,14 @@ fn handleFind(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Requ
     }
 
     var send_buffer: [512]u8 = undefined;
-    var response = req.respondStreaming(.{
-        .send_buffer = &send_buffer,
+    var response = try req.respondStreaming(&send_buffer, .{
         .respond_options = .{
             .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
         },
     });
     errdefer response.end() catch {};
 
-    var resp_writer = response.writer();
+    const resp_writer = &response.writer;
     try resp_writer.writeAll("[");
     var it2 = result.keyIterator();
     var first2 = true;

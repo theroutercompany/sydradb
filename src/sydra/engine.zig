@@ -31,12 +31,12 @@ pub const Engine = struct {
 
     pub const MemTable = struct {
         alloc: std.mem.Allocator,
-        series: std.AutoHashMap(types.SeriesId, std.ArrayList(types.Point)),
+        series: std.AutoHashMap(types.SeriesId, std.array_list.Managed(types.Point)),
         bytes: std.atomic.Value(usize),
         pub fn init(alloc: std.mem.Allocator) MemTable {
             return .{
                 .alloc = alloc,
-                .series = std.AutoHashMap(types.SeriesId, std.ArrayList(types.Point)).init(alloc),
+                .series = std.AutoHashMap(types.SeriesId, std.array_list.Managed(types.Point)).init(alloc),
                 .bytes = std.atomic.Value(usize).init(0),
             };
         }
@@ -59,11 +59,11 @@ pub const Engine = struct {
         alloc: std.mem.Allocator,
         mu: std.Thread.Mutex = .{},
         cv: std.Thread.Condition = .{},
-        buf: std.ArrayList(IngestItem),
+        buf: std.array_list.Managed(IngestItem),
         closed: bool = false,
         pub fn init(alloc: std.mem.Allocator) !*Queue {
             const q = try alloc.create(Queue);
-            q.* = .{ .alloc = alloc, .buf = try std.ArrayList(IngestItem).initCapacity(alloc, 0) };
+            q.* = .{ .alloc = alloc, .buf = try std.array_list.Managed(IngestItem).initCapacity(alloc, 0) };
             return q;
         }
         pub fn deinit(self: *Queue) void {
@@ -189,7 +189,7 @@ pub const Engine = struct {
                 if (self.appendMemtablePoint(it.series_id, it.ts, it.value)) |_| {
                     _ = self.metrics.ingest_total.fetchAdd(1, .monotonic);
                 } else |err| {
-                    _ = err;
+                    std.log.warn("failed to append to memtable: {s}", .{@errorName(err)});
                     continue;
                 }
             } else sleepMs(10);
@@ -267,7 +267,7 @@ pub const Engine = struct {
         return (@divTrunc(ts, secs_per_hour)) * secs_per_hour;
     }
 
-    pub fn queryRange(self: *Engine, series_id: types.SeriesId, start_ts: i64, end_ts: i64, out: *std.ArrayList(types.Point)) !void {
+    pub fn queryRange(self: *Engine, series_id: types.SeriesId, start_ts: i64, end_ts: i64, out: *std.array_list.Managed(types.Point)) !void {
         try segment_mod.queryRange(self.alloc, self.data_dir, &self.manifest, series_id, start_ts, end_ts, out);
     }
 
@@ -289,7 +289,7 @@ pub const Engine = struct {
     fn appendMemtablePoint(self: *Engine, sid: types.SeriesId, ts: i64, value: f64) !void {
         const gop = try self.mem.series.getOrPut(sid);
         if (!gop.found_existing) {
-            gop.value_ptr.* = std.ArrayList(types.Point).init(self.alloc);
+            gop.value_ptr.* = std.array_list.Managed(types.Point).init(self.alloc);
         }
         try gop.value_ptr.*.append(.{ .ts = ts, .value = value });
         _ = self.mem.bytes.fetchAdd(@sizeOf(types.Point), .monotonic);
@@ -306,7 +306,7 @@ pub const Engine = struct {
             }
         }
 
-        const ctx = struct {
+        var ctx = struct {
             engine: *Engine,
             highwater: *std.AutoHashMap(types.SeriesId, i64),
             pub fn onRecord(self_ctx: *@This(), series_id: types.SeriesId, ts: i64, value: f64) !void {
@@ -322,7 +322,7 @@ pub const Engine = struct {
             }
         }{ .engine = self, .highwater = &highwater };
 
-        try self.wal.replay(self.alloc, ctx);
+        try self.wal.replay(self.alloc, &ctx);
         if (self.mem.bytes.load(.monotonic) > 0) {
             try flushMemtable(self);
         }
@@ -373,7 +373,7 @@ test "engine ingests, flushes, and queries range" {
 
     try waitForFlush(engine, 1, 1_000);
 
-    var results = std.ArrayList(types.Point).init(talloc);
+    var results = std.array_list.Managed(types.Point).init(talloc);
     defer results.deinit();
     try engine.queryRange(sid, 0, 10_000, &results);
     try std.testing.expectEqual(@as(usize, 2), results.items.len);
@@ -423,7 +423,7 @@ test "engine replays wal on startup" {
     var engine = try Engine.init(talloc, config);
     defer engine.deinit();
 
-    var results = std.ArrayList(types.Point).init(talloc);
+    var results = std.array_list.Managed(types.Point).init(talloc);
     defer results.deinit();
     try engine.queryRange(sid, 0, 10_000, &results);
     try std.testing.expectEqual(@as(usize, 2), results.items.len);

@@ -83,7 +83,7 @@ test "lookup and payload formatting" {
     const payload = buildPayload(.unique_violation, null, "duplicate key value violates unique constraint \"users_pkey\"", "Check the ON CONFLICT clause");
     try std.testing.expectEqualStrings("23505", payload.sqlstate);
     try std.testing.expectEqualStrings("duplicate key value violates unique constraint", payload.message);
-    var buf = std.ArrayList(u8).init(std.testing.allocator);
+    var buf = std.array_list.Managed(u8).init(std.testing.allocator);
     defer buf.deinit();
     try writeHumanReadable(payload, buf.writer());
     try std.testing.expectStringStartsWith(buf.items, "[23505] ERROR: duplicate key value violates unique constraint");

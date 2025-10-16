@@ -39,10 +39,14 @@ pub fn handleConnection(
 ) !void {
     defer connection.stream.close();
 
-    const handshake_reader = connection.stream.reader();
-    const handshake_writer = connection.stream.writer();
+    var in_buf: [4096]u8 = undefined;
+    var out_buf: [4096]u8 = undefined;
+    var reader_state = connection.stream.reader(&in_buf);
+    var writer_state = connection.stream.writer(&out_buf);
+    const reader = std.Io.Reader.adaptToOldInterface(reader_state.interface());
+    const writer = anyWriter(&writer_state.interface);
 
-    var session = session_mod.performHandshake(alloc, handshake_reader, handshake_writer, session_config) catch |err| {
+    var session = session_mod.performHandshake(alloc, reader, writer, session_config) catch |err| {
         switch (err) {
             session_mod.HandshakeError.MissingUser,
             session_mod.HandshakeError.InvalidStartup,
@@ -62,19 +66,16 @@ pub fn handleConnection(
         .{ session.borrowedUser(), session.borrowedDatabase(), session.borrowedApplicationName() },
     );
 
-    var reader = connection.stream.reader();
-    var writer = connection.stream.writer();
-
-    try messageLoop(alloc, &reader, &writer);
+    try messageLoop(alloc, reader, writer);
 }
 
 fn messageLoop(
     alloc: std.mem.Allocator,
-    reader: *std.net.Stream.Reader,
-    writer: *std.net.Stream.Writer,
+    reader: std.Io.AnyReader,
+    writer: std.Io.AnyWriter,
 ) !void {
     while (true) {
-        const type_byte = reader.*.readByte() catch |err| switch (err) {
+        const type_byte = reader.readByte() catch |err| switch (err) {
             error.EndOfStream => return,
             else => return err,
         };
@@ -86,7 +87,7 @@ fn messageLoop(
 
         const payload_storage = try alloc.alloc(u8, payload_len);
         defer alloc.free(payload_storage);
-        try reader.*.readNoEof(payload_storage);
+        try reader.readNoEof(payload_storage);
 
         switch (type_byte) {
             'X' => return,
@@ -97,12 +98,12 @@ fn messageLoop(
                 try handleParseMessage(alloc, writer, payload_storage);
             },
             'S' => {
-                try protocol.writeReadyForQuery(writer.*, 'I');
+                try protocol.writeReadyForQuery(writer, 'I');
             },
             else => {
                 log.debug("frontend message {c} unsupported", .{type_byte});
-                try protocol.writeErrorResponse(writer.*, "ERROR", "0A000", "message type not implemented");
-                try protocol.writeReadyForQuery(writer.*, 'I');
+                try protocol.writeErrorResponse(writer, "ERROR", "0A000", "message type not implemented");
+                try protocol.writeReadyForQuery(writer, 'I');
             },
         }
     }
@@ -116,22 +117,22 @@ fn trimNullTerminator(buffer: []u8) []const u8 {
     return buffer;
 }
 
-fn readU32(reader: *std.net.Stream.Reader) !u32 {
+fn readU32(reader: std.Io.AnyReader) !u32 {
     var buf: [4]u8 = undefined;
-    try reader.*.readNoEof(&buf);
+    try reader.readNoEof(&buf);
     return std.mem.readInt(u32, &buf, .big);
 }
 
 fn handleSimpleQuery(
     alloc: std.mem.Allocator,
-    writer: *std.net.Stream.Writer,
+    writer: std.Io.AnyWriter,
     payload: []u8,
 ) !void {
     const raw_sql = trimNullTerminator(payload);
     const trimmed = std.mem.trim(u8, raw_sql, " \t\r\n");
     if (trimmed.len == 0) {
-        try protocol.writeEmptyQueryResponse(writer.*);
-        try protocol.writeReadyForQuery(writer.*, 'I');
+        try protocol.writeEmptyQueryResponse(writer);
+        try protocol.writeReadyForQuery(writer, 'I');
         return;
     }
 
@@ -139,8 +140,8 @@ fn handleSimpleQuery(
 
     const translation = translator.translate(alloc, trimmed) catch |err| switch (err) {
         error.OutOfMemory => {
-            try protocol.writeErrorResponse(writer.*, "FATAL", "53100", "out of memory during translation");
-            try protocol.writeReadyForQuery(writer.*, 'I');
+            try protocol.writeErrorResponse(writer, "FATAL", "53100", "out of memory during translation");
+            try protocol.writeReadyForQuery(writer, 'I');
             return;
         },
     };
@@ -148,41 +149,41 @@ fn handleSimpleQuery(
     switch (translation) {
         .success => |success| {
             defer alloc.free(success.sydraql);
-            try protocol.writeErrorResponse(writer.*, "ERROR", "0A000", "execution bridge not implemented yet");
+            try protocol.writeErrorResponse(writer, "ERROR", "0A000", "execution bridge not implemented yet");
         },
         .failure => |failure| {
             const msg = if (failure.message.len == 0)
                 "translation failed"
             else
                 failure.message;
-            try protocol.writeErrorResponse(writer.*, "ERROR", failure.sqlstate, msg);
+            try protocol.writeErrorResponse(writer, "ERROR", failure.sqlstate, msg);
         },
     }
 
-    try protocol.writeReadyForQuery(writer.*, 'I');
+    try protocol.writeReadyForQuery(writer, 'I');
 }
 
 fn handleParseMessage(
     alloc: std.mem.Allocator,
-    writer: *std.net.Stream.Writer,
+    writer: std.Io.AnyWriter,
     payload: []u8,
 ) !void {
     var cursor: usize = 0;
     const statement_name = readCString(payload, &cursor) catch {
-        try protocol.writeErrorResponse(writer.*, "ERROR", "08P01", "malformed parse message");
-        try protocol.writeReadyForQuery(writer.*, 'I');
+        try protocol.writeErrorResponse(writer, "ERROR", "08P01", "malformed parse message");
+        try protocol.writeReadyForQuery(writer, 'I');
         return;
     };
 
     const query_bytes = readCString(payload, &cursor) catch {
-        try protocol.writeErrorResponse(writer.*, "ERROR", "08P01", "malformed parse message");
-        try protocol.writeReadyForQuery(writer.*, 'I');
+        try protocol.writeErrorResponse(writer, "ERROR", "08P01", "malformed parse message");
+        try protocol.writeReadyForQuery(writer, 'I');
         return;
     };
 
     if (payload.len < cursor + 2) {
-        try protocol.writeErrorResponse(writer.*, "ERROR", "08P01", "parse message truncated");
-        try protocol.writeReadyForQuery(writer.*, 'I');
+        try protocol.writeErrorResponse(writer, "ERROR", "08P01", "parse message truncated");
+        try protocol.writeReadyForQuery(writer, 'I');
         return;
     }
 
@@ -191,8 +192,8 @@ fn handleParseMessage(
     cursor += 2;
     const expected_bytes = @as(usize, parameter_count) * 4;
     if (payload.len < cursor + expected_bytes) {
-        try protocol.writeErrorResponse(writer.*, "ERROR", "08P01", "parse message truncated");
-        try protocol.writeReadyForQuery(writer.*, 'I');
+        try protocol.writeErrorResponse(writer, "ERROR", "08P01", "parse message truncated");
+        try protocol.writeReadyForQuery(writer, 'I');
         return;
     }
 
@@ -204,8 +205,8 @@ fn handleParseMessage(
 
     const translation = translator.translate(alloc, trimmed) catch |err| switch (err) {
         error.OutOfMemory => {
-            try protocol.writeErrorResponse(writer.*, "FATAL", "53100", "out of memory during translation");
-            try protocol.writeReadyForQuery(writer.*, 'I');
+            try protocol.writeErrorResponse(writer, "FATAL", "53100", "out of memory during translation");
+            try protocol.writeReadyForQuery(writer, 'I');
             return;
         },
     };
@@ -213,18 +214,18 @@ fn handleParseMessage(
     switch (translation) {
         .success => |success| {
             defer alloc.free(success.sydraql);
-            try protocol.writeErrorResponse(writer.*, "ERROR", "0A000", "extended protocol not implemented yet");
+            try protocol.writeErrorResponse(writer, "ERROR", "0A000", "extended protocol not implemented yet");
         },
         .failure => |failure| {
             const msg = if (failure.message.len == 0)
                 "translation failed"
             else
                 failure.message;
-            try protocol.writeErrorResponse(writer.*, "ERROR", failure.sqlstate, msg);
+            try protocol.writeErrorResponse(writer, "ERROR", failure.sqlstate, msg);
         },
     }
 
-    try protocol.writeReadyForQuery(writer.*, 'I');
+    try protocol.writeReadyForQuery(writer, 'I');
 }
 
 fn readCString(buffer: []const u8, cursor: *usize) ![]const u8 {
@@ -239,5 +240,17 @@ fn parseAddress(host: []const u8, port: u16) !std.net.Address {
         return std.net.Address.parseIp6(host, port) catch {
             return error.InvalidAddress;
         };
+    };
+}
+
+fn anyWriter(writer: *std.Io.Writer) std.Io.AnyWriter {
+    return .{
+        .context = writer,
+        .writeFn = struct {
+            fn call(ctx: *const anyopaque, bytes: []const u8) anyerror!usize {
+                const w: *std.Io.Writer = @ptrCast(@alignCast(@constCast(ctx)));
+                return w.write(bytes);
+            }
+        }.call,
     };
 }

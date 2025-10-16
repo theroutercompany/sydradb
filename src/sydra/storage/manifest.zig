@@ -84,10 +84,23 @@ pub const Manifest = struct {
         var file = try data_dir.openFile("MANIFEST", open_opts);
         defer file.close();
         try file.seekFromEnd(0);
-        var buffered_writer = std.io.bufferedWriter(file.writer());
-        var writer = buffered_writer.writer();
+        var write_buf: [4096]u8 = undefined;
+        var writer_state = file.writer(&write_buf);
+        var writer = anyWriter(&writer_state.interface);
         try writer.print("{{\"series_id\":{d},\"hour_bucket\":{d},\"start_ts\":{d},\"end_ts\":{d},\"count\":{d},\"path\":\"{s}\"}}\n", .{ sid, hour, start_ts, end_ts, count, path });
-        try buffered_writer.flush();
+        try writer_state.end();
         try self.entries.append(self.alloc, .{ .series_id = sid, .hour_bucket = hour, .start_ts = start_ts, .end_ts = end_ts, .count = count, .path = try self.alloc.dupe(u8, path) });
     }
 };
+
+fn anyWriter(writer: *std.Io.Writer) std.Io.AnyWriter {
+    return .{
+        .context = writer,
+        .writeFn = struct {
+            fn call(ctx: *const anyopaque, bytes: []const u8) anyerror!usize {
+                const w: *std.Io.Writer = @ptrCast(@alignCast(@constCast(ctx)));
+                return w.write(bytes);
+            }
+        }.call,
+    };
+}
