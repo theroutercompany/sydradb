@@ -97,7 +97,7 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
                     if (cond_slice.len != 0) where_part = cond_slice;
                 }
                 if (table_part.len != 0) {
-                    var builder = std.ArrayList(u8).init(alloc);
+                    var builder = std.array_list.Managed(u8).init(alloc);
                     defer builder.deinit();
                     try builder.appendSlice("from ");
                     try builder.appendSlice(table_part);
@@ -174,7 +174,7 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
                                 if (remainder.len != 0 and returning_clause == null) {
                                     // Malformed RETURNING clause; allow fallback below.
                                 } else {
-                                    var builder = std.ArrayList(u8).init(alloc);
+                                    var builder = std.array_list.Managed(u8).init(alloc);
                                     defer builder.deinit();
                                     try builder.appendSlice("insert into ");
                                     try builder.appendSlice(table_name);
@@ -242,7 +242,7 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
                             }
                             set_clause = std.mem.trimRight(u8, set_clause, " \t\r\n;");
                             if (set_clause.len != 0) {
-                                var builder = std.ArrayList(u8).init(alloc);
+                                var builder = std.array_list.Managed(u8).init(alloc);
                                 defer builder.deinit();
                                 try builder.appendSlice("update ");
                                 try builder.appendSlice(table_raw);
@@ -302,7 +302,7 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
                 }
                 table_slice = std.mem.trimRight(u8, table_slice, " \t\r\n;");
                 if (table_slice.len != 0) {
-                    var builder = std.ArrayList(u8).init(alloc);
+                    var builder = std.array_list.Managed(u8).init(alloc);
                     defer builder.deinit();
                     try builder.appendSlice("delete from ");
                     try builder.appendSlice(table_slice);

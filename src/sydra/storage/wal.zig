@@ -76,7 +76,7 @@ pub const WAL = struct {
         };
         defer wal_dir.close();
 
-        var files = std.ArrayList([]u8).init(alloc);
+        var files = try std.array_list.Managed([]u8).initCapacity(alloc, 0);
         defer {
             for (files.items) |name| alloc.free(name);
             files.deinit();
@@ -100,8 +100,9 @@ pub const WAL = struct {
             }
         }.lessThan);
 
+        const ctx_ptr = @constCast(ctx);
         for (files.items) |name| {
-            try replayFile(alloc, wal_dir, name, ctx);
+            try replayFile(alloc, wal_dir, name, ctx_ptr);
         }
     }
 };
@@ -110,15 +111,13 @@ fn replayFile(alloc: std.mem.Allocator, wal_dir: std.fs.Dir, file_name: []const 
     var file = try wal_dir.openFile(file_name, .{});
     defer file.close();
 
-    var buffered = std.io.bufferedReader(file.reader());
-    const reader = buffered.reader();
+    var read_buf: [4096]u8 = undefined;
+    var reader_state = file.reader(&read_buf);
+    const reader = std.Io.Reader.adaptToOldInterface(&reader_state.interface);
 
     while (true) {
         var len_buf: [4]u8 = undefined;
-        const len_read = reader.read(&len_buf) catch |err| switch (err) {
-            error.EndOfStream => break,
-            else => return err,
-        };
+        const len_read = try reader.read(&len_buf);
         if (len_read == 0) break;
         if (len_read != 4) return error.CorruptWal;
 
@@ -127,10 +126,10 @@ fn replayFile(alloc: std.mem.Allocator, wal_dir: std.fs.Dir, file_name: []const 
 
         const payload = try alloc.alloc(u8, payload_len);
         defer alloc.free(payload);
-        try reader.readNoEof(payload);
+        try readExact(reader, payload);
 
         var crc_buf: [4]u8 = undefined;
-        try reader.readNoEof(crc_buf[0..4]);
+        try readExact(reader, crc_buf[0..4]);
         const expected_crc = std.mem.readInt(u32, &crc_buf, .little);
         var crc = std.hash.Crc32.init();
         crc.update(payload);
@@ -143,5 +142,14 @@ fn replayFile(alloc: std.mem.Allocator, wal_dir: std.fs.Dir, file_name: []const 
         const val_bits = std.mem.readInt(u64, payload[17 .. 17 + 8], .little);
         const value: f64 = @bitCast(val_bits);
         try ctx.onRecord(sid, ts, value);
+    }
+}
+
+fn readExact(reader: std.Io.AnyReader, buf: []u8) !void {
+    var offset: usize = 0;
+    while (offset < buf.len) {
+        const n = try reader.read(buf[offset..]);
+        if (n == 0) return error.CorruptWal;
+        offset += n;
     }
 }

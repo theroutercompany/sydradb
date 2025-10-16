@@ -82,9 +82,10 @@ fn cmdIngest(alloc: std.mem.Allocator, _: [][:0]u8) !void {
     var eng = try engine_mod.Engine.init(alloc, cfg);
     defer eng.deinit();
     // Read NDJSON from stdin
-    var stdin_stream = std.io.getStdIn();
-    var buffered_stdin = std.io.bufferedReader(stdin_stream.reader());
-    var reader = buffered_stdin.reader();
+    var stdin_file = std.fs.File.stdin();
+    var stdin_buf: [4096]u8 = undefined;
+    var reader_state = stdin_file.reader(&stdin_buf);
+    var reader = std.Io.Reader.adaptToOldInterface(&reader_state.interface);
     var line_buf: [4096]u8 = undefined;
     var count: usize = 0;
     while (true) {
@@ -119,7 +120,7 @@ fn cmdQuery(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     const sid = try std.fmt.parseInt(u64, args[2], 10);
     const start_ts = try std.fmt.parseInt(i64, args[3], 10);
     const end_ts = try std.fmt.parseInt(i64, args[4], 10);
-    var out = try std.ArrayList(@import("types.zig").Point).initCapacity(alloc, 0);
+    var out = try std.array_list.Managed(@import("types.zig").Point).initCapacity(alloc, 0);
     defer out.deinit();
     try eng.queryRange(sid, start_ts, end_ts, &out);
     for (out.items) |p| std.debug.print("{d},{d}\n", .{ p.ts, p.value });

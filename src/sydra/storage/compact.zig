@@ -8,19 +8,19 @@ const types = @import("../types.zig");
 pub fn compactAll(alloc: std.mem.Allocator, data_dir: std.fs.Dir, manifest: *manifest_mod.Manifest) !void {
     // Group entries by (series_id,hour)
     const Key = struct { s: u64, h: i64 };
-    var groups = std.AutoHashMap(Key, std.ArrayList(usize)).init(alloc);
+    var groups = std.AutoHashMap(Key, std.array_list.Managed(usize)).init(alloc);
     defer groups.deinit();
     for (manifest.entries.items, 0..) |e, idx| {
         const key: Key = .{ .s = e.series_id, .h = e.hour_bucket };
         var gop = try groups.getOrPut(key);
-        if (!gop.found_existing) gop.value_ptr.* = try std.ArrayList(usize).initCapacity(alloc, 0);
+        if (!gop.found_existing) gop.value_ptr.* = try std.array_list.Managed(usize).initCapacity(alloc, 0);
         try gop.value_ptr.append(idx);
     }
     var it = groups.iterator();
     while (it.next()) |entry| {
         const ids = entry.value_ptr.*.items;
         if (ids.len <= 1) continue;
-        var all = try std.ArrayList(types.Point).initCapacity(alloc, 0);
+        var all = try std.array_list.Managed(types.Point).initCapacity(alloc, 0);
         defer all.deinit();
         for (ids) |mi| {
             const me = manifest.entries.items[mi];

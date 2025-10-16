@@ -22,8 +22,9 @@ pub fn writeSegment(alloc: std.mem.Allocator, data_dir: std.fs.Dir, series_id: t
     var f = try data_dir.createFile(file_name, .{ .read = true });
     defer f.close();
 
-    var buffered_writer = std.io.bufferedWriter(f.writer());
-    var writer = buffered_writer.writer();
+    var write_buf: [4096]u8 = undefined;
+    var writer_state = f.writer(&write_buf);
+    var writer = anyWriter(&writer_state.interface);
 
     try writer.writeAll("SYSEG2");
     var tmp8: [8]u8 = undefined;
@@ -50,7 +51,7 @@ pub fn writeSegment(alloc: std.mem.Allocator, data_dir: std.fs.Dir, series_id: t
     for (points, 0..) |p, i| vals[i] = p.value;
     try @import("../codec/gorilla.zig").encodeF64(writer, vals);
 
-    try buffered_writer.flush();
+    try writer_state.end();
 
     return try alloc.dupe(u8, file_name);
 }
@@ -59,8 +60,9 @@ pub fn readAll(alloc: std.mem.Allocator, data_dir: std.fs.Dir, path: []const u8)
     var f = try data_dir.openFile(path, .{});
     defer f.close();
 
-    var buffered_reader = std.io.bufferedReader(f.reader());
-    const reader = buffered_reader.reader();
+    var read_buf: [4096]u8 = undefined;
+    var reader_state = f.reader(&read_buf);
+    var reader = std.Io.Reader.adaptToOldInterface(&reader_state.interface);
 
     var hdr: [6]u8 = undefined;
     try reader.readNoEof(&hdr);
@@ -110,7 +112,7 @@ pub fn readAll(alloc: std.mem.Allocator, data_dir: std.fs.Dir, path: []const u8)
     return points;
 }
 
-pub fn queryRange(alloc: std.mem.Allocator, data_dir: std.fs.Dir, manifest: *manifest_mod.Manifest, series_id: types.SeriesId, start_ts: i64, end_ts: i64, out: *std.ArrayList(types.Point)) !void {
+pub fn queryRange(alloc: std.mem.Allocator, data_dir: std.fs.Dir, manifest: *manifest_mod.Manifest, series_id: types.SeriesId, start_ts: i64, end_ts: i64, out: *std.array_list.Managed(types.Point)) !void {
     for (manifest.entries.items) |e| {
         if (e.series_id != series_id) continue;
         if (e.end_ts < start_ts or e.start_ts > end_ts) continue;
@@ -118,8 +120,9 @@ pub fn queryRange(alloc: std.mem.Allocator, data_dir: std.fs.Dir, manifest: *man
         var f = try data_dir.openFile(e.path, .{});
         defer f.close();
 
-        var buffered_reader = std.io.bufferedReader(f.reader());
-        const reader = buffered_reader.reader();
+        var read_buf: [4096]u8 = undefined;
+        var reader_state = f.reader(&read_buf);
+        var reader = std.Io.Reader.adaptToOldInterface(&reader_state.interface);
 
         var hdr: [6]u8 = undefined;
         try reader.readNoEof(&hdr);
@@ -186,4 +189,16 @@ fn decodeZigZagVarint(reader: anytype) !i64 {
 
 inline fn readByte(reader: anytype) !u8 {
     return try reader.readByte();
+}
+
+fn anyWriter(writer: *std.Io.Writer) std.Io.AnyWriter {
+    return .{
+        .context = writer,
+        .writeFn = struct {
+            fn call(ctx: *const anyopaque, bytes: []const u8) anyerror!usize {
+                const w: *std.Io.Writer = @ptrCast(@alignCast(@constCast(ctx)));
+                return w.write(bytes);
+            }
+        }.call,
+    };
 }

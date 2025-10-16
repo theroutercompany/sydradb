@@ -2,9 +2,8 @@ const std = @import("std");
 
 pub const Level = enum { debug, info, warn, err };
 
-pub fn logJson(level: Level, msg: []const u8, fields: ?[]const std.json.Value, writer: anytype) !void {
-    var jw = std.json.writeStream(writer, .{});
-    defer jw.deinit();
+pub fn logJson(level: Level, msg: []const u8, fields: ?[]const std.json.Value, writer: *std.io.Writer) !void {
+    var jw = std.json.Stringify{ .writer = writer };
     try jw.beginObject();
     try jw.objectField("ts");
     try jw.write(std.time.milliTimestamp());
