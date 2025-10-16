@@ -79,7 +79,8 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
     if (std.ascii.eqlIgnoreCase(trimmed, "SELECT 1")) {
         const out = try alloc.dupe(u8, "select const 1");
         const duration = std.time.nanoTimestamp() - start;
-        compat.clog.global().record(trimmed, out, false, false, duration);
+        const duration_ns: u64 = @intCast(@max(duration, @as(i128, 0)));
+        compat.clog.global().record(trimmed, out, false, false, duration_ns);
         return Result{ .success = .{ .sydraql = out } };
     }
 
@@ -117,7 +118,8 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
                     if (!first) {
                         const sydra_str = try builder.toOwnedSlice();
                         const duration = std.time.nanoTimestamp() - start;
-                        compat.clog.global().record(trimmed, sydra_str, false, false, duration);
+                        const duration_ns: u64 = @intCast(@max(duration, @as(i128, 0)));
+                        compat.clog.global().record(trimmed, sydra_str, false, false, duration_ns);
                         return Result{ .success = .{ .sydraql = sydra_str } };
                     }
                 }
@@ -190,7 +192,8 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
                                     }
                                     const sydra_str = try builder.toOwnedSlice();
                                     const duration = std.time.nanoTimestamp() - start;
-                                    compat.clog.global().record(trimmed, sydra_str, false, false, duration);
+                                    const duration_ns: u64 = @intCast(@max(duration, @as(i128, 0)));
+                                    compat.clog.global().record(trimmed, sydra_str, false, false, duration_ns);
                                     return Result{ .success = .{ .sydraql = sydra_str } };
                                 }
                             }
@@ -255,7 +258,8 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
                                 }
                                 const sydra_str = try builder.toOwnedSlice();
                                 const duration = std.time.nanoTimestamp() - start;
-                                compat.clog.global().record(trimmed, sydra_str, false, false, duration);
+                                const duration_ns: u64 = @intCast(@max(duration, @as(i128, 0)));
+                                compat.clog.global().record(trimmed, sydra_str, false, false, duration_ns);
                                 return Result{ .success = .{ .sydraql = sydra_str } };
                             }
                         }
@@ -312,7 +316,8 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
                     }
                     const sydra_str = try builder.toOwnedSlice();
                     const duration = std.time.nanoTimestamp() - start;
-                    compat.clog.global().record(trimmed, sydra_str, false, false, duration);
+                    const duration_ns: u64 = @intCast(@max(duration, @as(i128, 0)));
+                    compat.clog.global().record(trimmed, sydra_str, false, false, duration_ns);
                     return Result{ .success = .{ .sydraql = sydra_str } };
                 }
             }
@@ -321,7 +326,8 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
 
     const payload = compat.sqlstate.buildPayload(.feature_not_supported, null, null, null);
     const duration = std.time.nanoTimestamp() - start;
-    compat.clog.global().record(trimmed, "", false, true, duration);
+    const duration_ns: u64 = @intCast(@max(duration, @as(i128, 0)));
+    compat.clog.global().record(trimmed, "", false, true, duration_ns);
     return Result{ .failure = .{ .sqlstate = payload.sqlstate, .message = payload.message } };
 }
 

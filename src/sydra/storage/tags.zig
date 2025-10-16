@@ -52,9 +52,8 @@ pub const TagIndex = struct {
     pub fn save(self: *TagIndex, data_dir: std.fs.Dir) !void {
         var f = try data_dir.createFile("tags.json", .{ .truncate = true, .read = true });
         defer f.close();
-        var writer_buffer: [4096]u8 = undefined;
-        var file_writer = f.writer(&writer_buffer);
-        var w = &file_writer.interface;
+        var buffered_writer = std.io.bufferedWriter(f.writer());
+        var w = buffered_writer.writer();
         try w.writeAll("{");
         var it = self.map.iterator();
         var first = true;
@@ -71,6 +70,6 @@ pub const TagIndex = struct {
             try w.writeAll("]");
         }
         try w.writeAll("}");
-        try w.flush();
+        try buffered_writer.flush();
     }
 };

@@ -86,7 +86,7 @@ pub fn readStartup(
         defer alloc.free(body);
         try reader.readNoEof(body);
 
-        const protocol = std.mem.readInt(u32, body[0..4], .big);
+        const protocol = std.mem.readInt(u32, @as(*const [4]u8, @ptrCast(body[0..4].ptr)), .big);
 
         if (protocol == ssl_request_code) {
             if (options.allow_ssl) {
@@ -228,7 +228,7 @@ fn buildStartupMessage(allocator: std.mem.Allocator, pairs: []const Parameter) !
     const total_len: u32 = @intCast(body.items.len + 4);
     var message = try allocator.alloc(u8, body.items.len + 4);
     std.mem.writeInt(u32, message[0..4], total_len, .big);
-    std.mem.copy(u8, message[4..], body.items);
+    @memcpy(message[4..], body.items);
     return message;
 }
 

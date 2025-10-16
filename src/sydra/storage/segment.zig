@@ -22,36 +22,35 @@ pub fn writeSegment(alloc: std.mem.Allocator, data_dir: std.fs.Dir, series_id: t
     var f = try data_dir.createFile(file_name, .{ .read = true });
     defer f.close();
 
-    // Header
-    try f.writeAll("SYSEG2");
+    var buffered_writer = std.io.bufferedWriter(f.writer());
+    var writer = buffered_writer.writer();
+
+    try writer.writeAll("SYSEG2");
     var tmp8: [8]u8 = undefined;
     std.mem.writeInt(u64, &tmp8, series_id, .little);
-    try f.writeAll(tmp8[0..8]);
+    try writer.writeAll(tmp8[0..8]);
     std.mem.writeInt(i64, &tmp8, hour, .little);
-    try f.writeAll(tmp8[0..8]);
+    try writer.writeAll(tmp8[0..8]);
     var tmp4: [4]u8 = undefined;
     const cnt_u32: u32 = @intCast(points.len);
     std.mem.writeInt(u32, &tmp4, cnt_u32, .little);
-    try f.writeAll(tmp4[0..4]);
+    try writer.writeAll(tmp4[0..4]);
     std.mem.writeInt(i64, &tmp8, points[0].ts, .little);
-    try f.writeAll(tmp8[0..8]);
+    try writer.writeAll(tmp8[0..8]);
     std.mem.writeInt(i64, &tmp8, points[points.len - 1].ts, .little);
-    try f.writeAll(tmp8[0..8]);
-    // Codec markers and payload writer
-    var writer_buffer: [4096]u8 = undefined;
-    var file_writer = f.writer(&writer_buffer);
-    try file_writer.interface.writeByte(1); // ts codec: 1=dod-zzvar
-    try file_writer.interface.writeByte(1); // val codec: 1=gorilla-xor
+    try writer.writeAll(tmp8[0..8]);
+    try writer.writeByte(1); // ts codec: 1=dod-zzvar
+    try writer.writeByte(1); // val codec: 1=gorilla-xor
 
     // Encode timestamps (delta-of-delta zigzag varint)
-    try @import("../codec/gorilla.zig").encodeTsDoD(&file_writer.interface, points[0].ts, points);
+    try @import("../codec/gorilla.zig").encodeTsDoD(writer, points[0].ts, points);
     // Encode values using gorilla-like XOR
     var vals = try alloc.alloc(f64, points.len);
     defer alloc.free(vals);
     for (points, 0..) |p, i| vals[i] = p.value;
-    try @import("../codec/gorilla.zig").encodeF64(&file_writer.interface, vals);
+    try @import("../codec/gorilla.zig").encodeF64(writer, vals);
 
-    try file_writer.interface.flush();
+    try buffered_writer.flush();
 
     return try alloc.dupe(u8, file_name);
 }
@@ -60,21 +59,20 @@ pub fn readAll(alloc: std.mem.Allocator, data_dir: std.fs.Dir, path: []const u8)
     var f = try data_dir.openFile(path, .{});
     defer f.close();
 
-    var reader_buffer: [4096]u8 = undefined;
-    var file_reader = f.reader(&reader_buffer);
-    var reader = &file_reader.interface;
+    var buffered_reader = std.io.bufferedReader(f.reader());
+    const reader = buffered_reader.reader();
 
     var hdr: [6]u8 = undefined;
-    try reader.readSliceAll(&hdr);
+    try reader.readNoEof(&hdr);
     var tmp8: [8]u8 = undefined;
-    try reader.readSliceAll(tmp8[0..8]); // series id (unused)
-    try reader.readSliceAll(tmp8[0..8]); // hour bucket (unused)
+    try reader.readNoEof(tmp8[0..8]); // series id (unused)
+    try reader.readNoEof(tmp8[0..8]); // hour bucket (unused)
     var tmp4: [4]u8 = undefined;
-    try reader.readSliceAll(tmp4[0..4]);
+    try reader.readNoEof(tmp4[0..4]);
     const count = std.mem.readInt(u32, &tmp4, .little);
-    try reader.readSliceAll(tmp8[0..8]);
+    try reader.readNoEof(tmp8[0..8]);
     const start = std.mem.readInt(i64, &tmp8, .little);
-    try reader.readSliceAll(tmp8[0..8]); // end
+    try reader.readNoEof(tmp8[0..8]); // end
 
     if (std.mem.eql(u8, hdr[0..6], "SYSEG1")) {
         var ts_list = try alloc.alloc(i64, count);
@@ -90,7 +88,7 @@ pub fn readAll(alloc: std.mem.Allocator, data_dir: std.fs.Dir, path: []const u8)
         var points = try alloc.alloc(types.Point, count);
         var j: usize = 0;
         while (j < count) : (j += 1) {
-            try reader.readSliceAll(tmp8[0..8]);
+            try reader.readNoEof(tmp8[0..8]);
             const u: u64 = std.mem.readInt(u64, &tmp8, .little);
             points[j] = .{ .ts = ts_list[j], .value = @bitCast(u) };
         }
@@ -120,21 +118,20 @@ pub fn queryRange(alloc: std.mem.Allocator, data_dir: std.fs.Dir, manifest: *man
         var f = try data_dir.openFile(e.path, .{});
         defer f.close();
 
-        var reader_buffer: [4096]u8 = undefined;
-        var file_reader = f.reader(&reader_buffer);
-        var reader = &file_reader.interface;
+        var buffered_reader = std.io.bufferedReader(f.reader());
+        const reader = buffered_reader.reader();
 
         var hdr: [6]u8 = undefined;
-        try reader.readSliceAll(&hdr);
+        try reader.readNoEof(&hdr);
         var tmp8: [8]u8 = undefined;
-        try reader.readSliceAll(tmp8[0..8]); // series id (unused)
-        try reader.readSliceAll(tmp8[0..8]); // hour bucket (unused)
+        try reader.readNoEof(tmp8[0..8]); // series id (unused)
+        try reader.readNoEof(tmp8[0..8]); // hour bucket (unused)
         var tmp4: [4]u8 = undefined;
-        try reader.readSliceAll(tmp4[0..4]);
+        try reader.readNoEof(tmp4[0..4]);
         const count = std.mem.readInt(u32, &tmp4, .little);
-        try reader.readSliceAll(tmp8[0..8]);
+        try reader.readNoEof(tmp8[0..8]);
         const start = std.mem.readInt(i64, &tmp8, .little);
-        try reader.readSliceAll(tmp8[0..8]); // end (ignored)
+        try reader.readNoEof(tmp8[0..8]); // end (ignored)
 
         if (std.mem.eql(u8, hdr[0..6], "SYSEG1")) {
             var ts_list = try alloc.alloc(i64, count);
@@ -149,11 +146,11 @@ pub fn queryRange(alloc: std.mem.Allocator, data_dir: std.fs.Dir, manifest: *man
             }
             var j: usize = 0;
             while (j < count) : (j += 1) {
-                try reader.readSliceAll(tmp8[0..8]);
+                try reader.readNoEof(tmp8[0..8]);
                 const u: u64 = std.mem.readInt(u64, &tmp8, .little);
                 const val: f64 = @bitCast(u);
                 const ts = ts_list[j];
-                if (ts >= start_ts and ts <= end_ts) try out.append(alloc, .{ .ts = ts, .value = val });
+                if (ts >= start_ts and ts <= end_ts) try out.append(.{ .ts = ts, .value = val });
             }
             continue;
         }
@@ -169,16 +166,16 @@ pub fn queryRange(alloc: std.mem.Allocator, data_dir: std.fs.Dir, manifest: *man
         var k: usize = 0;
         while (k < count) : (k += 1) {
             const ts = ts_list[k];
-            if (ts >= start_ts and ts <= end_ts) try out.append(alloc, .{ .ts = ts, .value = vals[k] });
+            if (ts >= start_ts and ts <= end_ts) try out.append(.{ .ts = ts, .value = vals[k] });
         }
     }
 }
 
-fn decodeZigZagVarint(r: *std.Io.Reader) !i64 {
+fn decodeZigZagVarint(reader: anytype) !i64 {
     var shift: u6 = 0;
     var result: u64 = 0;
     while (true) {
-        const b = try readByte(r);
+        const b = try readByte(reader);
         result |= (@as(u64, b & 0x7F)) << shift;
         if ((b & 0x80) == 0) break;
         shift += 7;
@@ -187,7 +184,6 @@ fn decodeZigZagVarint(r: *std.Io.Reader) !i64 {
     return tmp;
 }
 
-inline fn readByte(r: *std.Io.Reader) !u8 {
-    const chunk = try r.take(1);
-    return chunk[0];
+inline fn readByte(reader: anytype) !u8 {
+    return try reader.readByte();
 }

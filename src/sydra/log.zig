@@ -1,9 +1,10 @@
 const std = @import("std");
 
-pub const Level = enum { debug, info, warn, error };
+pub const Level = enum { debug, info, warn, err };
 
 pub fn logJson(level: Level, msg: []const u8, fields: ?[]const std.json.Value, writer: anytype) !void {
-    var jw = std.json.Writer.init(writer, .{});
+    var jw = std.json.writeStream(writer, .{});
+    defer jw.deinit();
     try jw.beginObject();
     try jw.objectField("ts");
     try jw.write(std.time.milliTimestamp());
@@ -12,8 +13,7 @@ pub fn logJson(level: Level, msg: []const u8, fields: ?[]const std.json.Value, w
     try jw.objectField("msg");
     try jw.write(msg);
     if (fields) |arr| {
-        for (arr) |v, i| {
-            _ = i;
+        for (arr) |v| {
             // Best-effort merge of flat objects passed in.
             if (v == .object) {
                 var it = v.object.iterator();

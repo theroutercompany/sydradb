@@ -145,8 +145,10 @@ pub const Snapshot = struct {
     classes: []ClassRow = &empty_class_rows,
     attributes: []AttributeRow = &empty_attribute_rows,
     types: []TypeRow = &empty_type_rows,
+    owns_memory: bool = false,
 
     pub fn deinit(self: *Snapshot, alloc: std.mem.Allocator) void {
+        if (!self.owns_memory) return;
         for (self.namespaces) |ns| {
             alloc.free(ns.nspname);
         }
@@ -242,9 +244,9 @@ pub fn buildSnapshot(
 
     const rel_entries = try alloc.alloc(RelationSpec, relation_specs.len);
     defer alloc.free(rel_entries);
-    std.mem.copy(RelationSpec, rel_entries, relation_specs);
+    @memcpy(rel_entries, relation_specs);
 
-    std.sort.sort(RelationSpec, rel_entries, {}, struct {
+    std.sort.heap(RelationSpec, rel_entries, {}, struct {
         pub fn lessThan(_: void, lhs: RelationSpec, rhs: RelationSpec) bool {
             if (std.mem.eql(u8, lhs.namespace, rhs.namespace)) {
                 return std.mem.lessThan(u8, lhs.name, rhs.name);
@@ -283,9 +285,9 @@ pub fn buildSnapshot(
 
     const type_buffer = try alloc.alloc(TypeSpec, type_specs.len);
     defer alloc.free(type_buffer);
-    std.mem.copy(TypeSpec, type_buffer, type_specs);
+    @memcpy(type_buffer, type_specs);
 
-    std.sort.sort(TypeSpec, type_buffer, {}, struct {
+    std.sort.heap(TypeSpec, type_buffer, {}, struct {
         pub fn lessThan(_: void, lhs: TypeSpec, rhs: TypeSpec) bool {
             if (!std.mem.eql(u8, lhs.namespace, rhs.namespace)) {
                 return std.mem.lessThan(u8, lhs.namespace, rhs.namespace);
@@ -324,9 +326,9 @@ pub fn buildSnapshot(
     const ColEntry = ColumnSpec;
     const col_entries = try alloc.alloc(ColEntry, column_specs.len);
     defer alloc.free(col_entries);
-    std.mem.copy(ColEntry, col_entries, column_specs);
+    @memcpy(col_entries, column_specs);
 
-    std.sort.sort(ColEntry, col_entries, {}, struct {
+    std.sort.heap(ColEntry, col_entries, {}, struct {
         pub fn lessThan(_: void, lhs: ColEntry, rhs: ColEntry) bool {
             if (!std.mem.eql(u8, lhs.namespace, rhs.namespace)) {
                 return std.mem.lessThan(u8, lhs.namespace, rhs.namespace);
@@ -378,6 +380,7 @@ pub fn buildSnapshot(
         .classes = try class_entries.toOwnedSlice(),
         .attributes = try attribute_entries.toOwnedSlice(),
         .types = try type_entries.toOwnedSlice(),
+        .owns_memory = true,
     };
 }
 
@@ -450,9 +453,7 @@ pub const Store = struct {
     snapshot: Snapshot = .{},
 
     pub fn deinit(self: *Store, alloc: std.mem.Allocator) void {
-        if (self.snapshot.namespaces.ptr != empty_namespace_rows.ptr or self.snapshot.namespaces.len != 0) {
-            self.snapshot.deinit(alloc);
-        }
+        self.snapshot.deinit(alloc);
         self.snapshot = Snapshot{};
     }
 

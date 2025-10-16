@@ -158,7 +158,7 @@ fn buildStartupBuffer(allocator: std.mem.Allocator, params: []const protocol.Par
     const total_len = @as(u32, @intCast(body.items.len + 4));
     var out = try allocator.alloc(u8, body.items.len + 4);
     std.mem.writeInt(u32, out[0..4], total_len, .big);
-    std.mem.copy(u8, out[4..], body.items);
+    @memcpy(out[4..], body.items);
     return out;
 }
 

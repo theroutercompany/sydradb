@@ -48,6 +48,7 @@ pub fn handleConnection(
             session_mod.HandshakeError.InvalidStartup,
             session_mod.HandshakeError.UnsupportedProtocol,
             session_mod.HandshakeError.CancelRequestUnsupported,
+            session_mod.HandshakeError.OutOfMemory,
             => {
                 log.debug("handshake terminated early: {s}", .{@errorName(err)});
                 return;
@@ -185,7 +186,8 @@ fn handleParseMessage(
         return;
     }
 
-    const parameter_count = std.mem.readInt(u16, payload[cursor .. cursor + 2], .big);
+    const parameter_bytes = payload[cursor .. cursor + 2];
+    const parameter_count = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(parameter_bytes.ptr)), .big);
     cursor += 2;
     const expected_bytes = @as(usize, parameter_count) * 4;
     if (payload.len < cursor + expected_bytes) {

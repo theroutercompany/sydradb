@@ -18,7 +18,8 @@ pub const Recorder = struct {
 
         if (!self.shouldRecord()) return;
         const stderr = std.io.getStdErr().writer();
-        var jw = std.json.Writer.init(stderr, .{});
+        var jw = std.json.writeStream(stderr, .{});
+        defer jw.deinit();
         jw.beginObject() catch return;
         jw.objectField("ts") catch return;
         jw.write(std.time.milliTimestamp()) catch return;

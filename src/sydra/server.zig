@@ -56,13 +56,13 @@ fn cmdPgWire(alloc: std.mem.Allocator, args: [][:0]u8) !void {
 
     const default_address = "127.0.0.1";
     const address = if (args.len >= 3)
-        std.mem.span(args[2])
+        std.mem.sliceTo(args[2], 0)
     else
         default_address;
 
     var port: u16 = 6432;
     if (args.len >= 4) {
-        port = std.fmt.parseInt(u16, std.mem.span(args[3]), 10) catch return error.Invalid;
+        port = std.fmt.parseInt(u16, std.mem.sliceTo(args[3], 0), 10) catch return error.Invalid;
     }
 
     const session_cfg = compat.wire.session.SessionConfig{};
@@ -82,17 +82,17 @@ fn cmdIngest(alloc: std.mem.Allocator, _: [][:0]u8) !void {
     var eng = try engine_mod.Engine.init(alloc, cfg);
     defer eng.deinit();
     // Read NDJSON from stdin
-    var stdin_file = std.fs.File.stdin();
-    var reader_buffer: [4096]u8 = undefined;
-    var stdin_reader = stdin_file.reader(&reader_buffer);
-    var reader = &stdin_reader.interface;
+    var stdin_stream = std.io.getStdIn();
+    var buffered_stdin = std.io.bufferedReader(stdin_stream.reader());
+    var reader = buffered_stdin.reader();
+    var line_buf: [4096]u8 = undefined;
     var count: usize = 0;
     while (true) {
-        const slice = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
-            error.EndOfStream => break,
+        const maybe_slice = reader.readUntilDelimiterOrEof(&line_buf, '\n') catch |err| switch (err) {
             error.StreamTooLong => return error.StreamTooLong,
             else => return err,
         };
+        const slice = maybe_slice orelse break;
         const trimmed = std.mem.trim(u8, slice, " \t\r\n");
         if (trimmed.len == 0) continue;
         const line = try alloc.dupe(u8, trimmed);
@@ -120,7 +120,7 @@ fn cmdQuery(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     const start_ts = try std.fmt.parseInt(i64, args[3], 10);
     const end_ts = try std.fmt.parseInt(i64, args[4], 10);
     var out = try std.ArrayList(@import("types.zig").Point).initCapacity(alloc, 0);
-    defer out.deinit(alloc);
+    defer out.deinit();
     try eng.queryRange(sid, start_ts, end_ts, &out);
     for (out.items) |p| std.debug.print("{d},{d}\n", .{ p.ts, p.value });
 }

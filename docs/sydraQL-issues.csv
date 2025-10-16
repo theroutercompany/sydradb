@@ -1,0 +1,24 @@
+title,body,labels,milestone
+sydraQL: language goals & scope,"Define sydraQL goals: simple TS-first query language with time windows, tag filters, rollups, math, joins on time, and alert expressions. Non-goals: arbitrary cross-series joins, complex UDFs v1.","sydraQL,docs,design,M2",M2 Core
+sydraQL: lexical syntax & tokens,"Durations (1s,5m,1h,1d), timestamps (ISO8601/epoch), identifiers, string/number literals, comments, keywords.","sydraQL,parser,design,M2",M2 Core
+sydraQL: EBNF grammar v0,"Write EBNF for SELECT, FROM series, WHERE (time & tag filters), GROUP BY time(), FILL, ORDER/LIMIT/OFFSET, functions.","sydraQL,parser,design,M2",M2 Core
+sydraQL: doc with examples,"Examples for range scans, downsampling, tag filters, math, joins-on-time, alert predicates.","sydraQL,docs,M2",M2 Core
+sydraQL: lexer in Zig,Implement zero-copy lexer with slice-based tokens; error spans and messages.,"sydraQL,parser,zig,M2",M2 Core
+sydraQL: parser + AST,Recursive-descent parser building typed AST structs; recover from minor errors for better UX.,"sydraQL,parser,zig,M2",M2 Core
+sydraQL: duration/timezone parsing,Support s/m/h/d/w durations; ISO8601 with timezone; default tz; NOW() builtin.,"sydraQL,time,M2",M2 Core
+Planner: logical plan,"Translate AST to logical ops: Scan, Filter, Project, Agg(window), Sort, Limit, JoinTime.","sydraQL,planner,M2",M2 Core
+Planner: rule-based rewrites,"Predicate pushdown (time/tag), rollup selection, projection pruning, filter simplification.","sydraQL,planner,perf,M2",M2 Core
+Execution: operators,Implement vectorized operators for Scan/Filter/Project/Aggregate/Sort/Limit; streaming iterators.,"sydraQL,engine,perf,M2",M2 Core
+Execution: group-by time windows,"time_bucket(step, ts[, origin]) and tumbling windows; partial agg combine for parallelism.","sydraQL,engine,agg,M2",M2 Core
+Execution: downsample selection,Planner chooses rollup series (1m/5m/1h) when query step >= rollup; fall back to raw.,"sydraQL,planner,downsampling,M2",M2 Core
+Execution: join on time,ALIGN JOIN: align two series by time bucket (nearest/forward-fill); constraints: same step/zone.,"sydraQL,engine,join,M2",M2 Core
+Nulls & fill policy,FILL (prev|linear|null|number) semantics; per-series and per-select-item control.,"sydraQL,engine,semantics,M2",M2 Core
+Limits & quotas,"MAX_POINTS, MAX_SERIES per query; timeout; memory budgeting; error codes.","sydraQL,engine,reliability,M2",M2 Core
+Function registry & type system,"Register scalar funcs (abs, ln, pow), aggs (min,max,avg,sum,count,last,rate,irate,delta), and time funcs.","sydraQL,functions,M2",M2 Core
+Window/derivative functions,"moving_avg, exponential_moving_avg, rate/irate, delta/integral with step-aware logic.","sydraQL,functions,agg,M2",M2 Core
+Tag filter syntax,"AND/OR/NOT, =, !=, =~, !~ operators on tags; exact vs regex; case sensitivity doc.","sydraQL,design,parser,M2",M2 Core
+HTTP endpoint: /api/v1/sydraql,POST text/plain sydraQL → JSON result; stream chunks; include query_stats.,"sydraQL,api,http,M2",M2 Core
+CLI: sydradb query,`sydradb query -f query.sq` or stdin; table/CSV/JSON output; --pretty and --raw flags.,"sydraQL,cli,tooling,M2",M2 Core
+Docs: compatibility notes,Compare sydraQL to InfluxQL/PromQL; mapping guide; what’s intentionally different.,"sydraQL,docs,M2",M2 Core
+Conformance tests,Golden tests: query → result; fuzzing parser; randomized window/agg tests.,"sydraQL,testing,M2",M2 Core
+Benchmarks,"Microbenchmarks for parser, planner, and operator throughput; end-to-end query p50/p95.","sydraQL,perf,benchmarks,M2",M2 Core
