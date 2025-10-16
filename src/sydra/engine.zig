@@ -24,6 +24,7 @@ pub const Engine = struct {
     manifest: manifest_mod.Manifest,
     tags: tags_mod.TagIndex,
     flush_timer_ms: u32,
+    metrics: Metrics,
     writer_thread: ?std.Thread = null,
     stop_flag: bool = false,
     queue: *Queue,
@@ -31,17 +32,17 @@ pub const Engine = struct {
     pub const MemTable = struct {
         alloc: std.mem.Allocator,
         series: std.AutoHashMap(types.SeriesId, std.ArrayList(types.Point)),
-        bytes: usize,
+        bytes: std.atomic.Value(usize),
         pub fn init(alloc: std.mem.Allocator) MemTable {
             return .{
                 .alloc = alloc,
                 .series = std.AutoHashMap(types.SeriesId, std.ArrayList(types.Point)).init(alloc),
-                .bytes = 0,
+                .bytes = std.atomic.Value(usize).init(0),
             };
         }
         pub fn deinit(self: *MemTable) void {
             var it = self.series.valueIterator();
-            while (it.next()) |lst| lst.deinit(self.alloc);
+            while (it.next()) |lst| lst.deinit();
             self.series.deinit();
         }
     };
@@ -66,13 +67,13 @@ pub const Engine = struct {
             return q;
         }
         pub fn deinit(self: *Queue) void {
-            self.buf.deinit(self.alloc);
+            self.buf.deinit();
         }
         pub fn push(self: *Queue, item: IngestItem) !void {
             self.mu.lock();
             defer self.mu.unlock();
             if (self.closed) return error.Closed;
-            try self.buf.append(self.alloc, item);
+            try self.buf.append(item);
             self.cv.signal();
         }
         pub fn pop(self: *Queue) ?IngestItem {
@@ -90,6 +91,29 @@ pub const Engine = struct {
             self.mu.unlock();
             self.cv.broadcast();
         }
+        pub fn len(self: *Queue) usize {
+            self.mu.lock();
+            defer self.mu.unlock();
+            return self.buf.items.len;
+        }
+    };
+
+    pub const Metrics = struct {
+        ingest_total: std.atomic.Value(u64),
+        flush_total: std.atomic.Value(u64),
+        flush_ns_total: std.atomic.Value(u64),
+        flush_points_total: std.atomic.Value(u64),
+        wal_bytes_total: std.atomic.Value(u64),
+
+        pub fn init() Metrics {
+            return .{
+                .ingest_total = std.atomic.Value(u64).init(0),
+                .flush_total = std.atomic.Value(u64).init(0),
+                .flush_ns_total = std.atomic.Value(u64).init(0),
+                .flush_points_total = std.atomic.Value(u64).init(0),
+                .wal_bytes_total = std.atomic.Value(u64).init(0),
+            };
+        }
     };
 
     pub fn init(alloc: std.mem.Allocator, config: cfg.Config) !*Engine {
@@ -100,6 +124,7 @@ pub const Engine = struct {
         const data_dir = try std.fs.cwd().openDir(config.data_dir, .{ .iterate = true });
         const wal = try wal_mod.WAL.open(alloc, data_dir, config.fsync);
         var engine = try alloc.create(Engine);
+        errdefer alloc.destroy(engine);
         engine.* = .{
             .alloc = alloc,
             .config = config,
@@ -109,8 +134,23 @@ pub const Engine = struct {
             .manifest = try manifest_mod.Manifest.loadOrInit(alloc, data_dir),
             .tags = try tags_mod.TagIndex.loadOrInit(alloc, data_dir),
             .flush_timer_ms = config.flush_interval_ms,
-            .queue = try Queue.init(alloc),
+            .metrics = Metrics.init(),
+            .queue = undefined,
         };
+        errdefer {
+            engine.mem.deinit();
+            engine.manifest.deinit();
+            engine.tags.deinit();
+            engine.wal.close();
+            engine.data_dir.close();
+            engine.config.deinit(engine.alloc);
+        }
+        engine.queue = try Queue.init(alloc);
+        errdefer {
+            engine.queue.deinit();
+            engine.alloc.destroy(engine.queue);
+        }
+        try engine.recover();
         engine.writer_thread = try std.Thread.spawn(.{}, writerLoop, .{engine});
         return engine;
     }
@@ -124,6 +164,7 @@ pub const Engine = struct {
         self.tags.deinit();
         self.wal.close();
         self.data_dir.close();
+        self.queue.deinit();
         self.alloc.destroy(self.queue);
         self.config.deinit(self.alloc);
         self.alloc.destroy(self);
@@ -139,21 +180,23 @@ pub const Engine = struct {
         while (!self.stop_flag) {
             if (self.queue.pop()) |it| {
                 // WAL append
-                self.wal.append(it.series_id, it.ts, it.value) catch {};
-                // Memtable insert
-                const gop = self.mem.series.getOrPut(it.series_id) catch continue;
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = std.ArrayList(types.Point).initCapacity(self.alloc, 0) catch {
-                        // drop this point if we can't allocate
-                        continue;
-                    };
+                const wal_bytes = self.wal.append(it.series_id, it.ts, it.value) catch 0;
+                if (wal_bytes != 0) {
+                    const wal_bytes_u64: u64 = @intCast(wal_bytes);
+                    _ = self.metrics.wal_bytes_total.fetchAdd(wal_bytes_u64, .monotonic);
                 }
-                gop.value_ptr.*.append(.{ .ts = it.ts, .value = it.value }) catch {};
-                self.mem.bytes += @sizeOf(types.Point);
+                // Memtable insert
+                if (self.appendMemtablePoint(it.series_id, it.ts, it.value)) |_| {
+                    _ = self.metrics.ingest_total.fetchAdd(1, .monotonic);
+                } else |err| {
+                    _ = err;
+                    continue;
+                }
             } else sleepMs(10);
 
             const now = std.time.milliTimestamp();
-            if (self.mem.bytes >= self.config.memtable_max_bytes or (now - last_flush) >= self.flush_timer_ms) {
+            const mem_usage = self.mem.bytes.load(.monotonic);
+            if (mem_usage >= self.config.memtable_max_bytes or (now - last_flush) >= self.flush_timer_ms) {
                 flushMemtable(self) catch {};
                 last_flush = now;
                 // apply retention best-effort after flush
@@ -170,6 +213,9 @@ pub const Engine = struct {
     }
 
     fn flushMemtable(self: *Engine) !void {
+        const start_ns = std.time.nanoTimestamp();
+        var points_written: usize = 0;
+        var segments_written: usize = 0;
         // write per-series per-hour segments, update manifest, then clear memtable
         var it = self.mem.series.iterator();
         while (it.next()) |entry| {
@@ -193,11 +239,23 @@ pub const Engine = struct {
                 const c: u32 = @intCast(slice.len);
                 try self.manifest.add(self.data_dir, sid, hour, slice[0].ts, slice[slice.len - 1].ts, c, seg_path);
                 self.alloc.free(seg_path);
+                points_written += slice.len;
+                segments_written += 1;
                 start_idx = end_idx;
             }
             arr.clearRetainingCapacity();
         }
-        self.mem.bytes = 0;
+        self.mem.bytes.store(0, .monotonic);
+        if (segments_written > 0) {
+            const duration_ns_i128 = std.time.nanoTimestamp() - start_ns;
+            const duration_ns: u64 = @intCast(duration_ns_i128);
+            const points_u64: u64 = @intCast(points_written);
+            _ = self.metrics.flush_total.fetchAdd(1, .monotonic);
+            _ = self.metrics.flush_ns_total.fetchAdd(duration_ns, .monotonic);
+            _ = self.metrics.flush_points_total.fetchAdd(points_u64, .monotonic);
+            const duration_ms = if (std.time.ns_per_ms == 0) 0 else duration_ns / std.time.ns_per_ms;
+            std.log.info("flush completed: segments={d} points={d} duration_ms={d}", .{ segments_written, points_written, duration_ms });
+        }
         // rotate WAL optionally
         self.wal.rotateIfNeeded() catch {};
         // persist tag index snapshot (best-effort)
@@ -221,13 +279,52 @@ pub const Engine = struct {
         var it = parsed.value.object.iterator();
         while (it.next()) |e| {
             if (e.value_ptr.* == .string) {
-                var keybuf = std.ArrayList(u8){};
-                defer keybuf.deinit(self.alloc);
-                keybuf.print(self.alloc, "{s}={s}", .{ e.key_ptr.*, e.value_ptr.string }) catch continue;
-                const key = keybuf.toOwnedSlice(self.alloc) catch continue;
+                const key = std.fmt.allocPrint(self.alloc, "{s}={s}", .{ e.key_ptr.*, e.value_ptr.string }) catch continue;
                 defer self.alloc.free(key);
                 self.tags.add(key, series_id) catch {};
             }
+        }
+    }
+
+    fn appendMemtablePoint(self: *Engine, sid: types.SeriesId, ts: i64, value: f64) !void {
+        const gop = try self.mem.series.getOrPut(sid);
+        if (!gop.found_existing) {
+            gop.value_ptr.* = std.ArrayList(types.Point).init(self.alloc);
+        }
+        try gop.value_ptr.*.append(.{ .ts = ts, .value = value });
+        _ = self.mem.bytes.fetchAdd(@sizeOf(types.Point), .monotonic);
+    }
+
+    fn recover(self: *Engine) !void {
+        var highwater = std.AutoHashMap(types.SeriesId, i64).init(self.alloc);
+        defer highwater.deinit();
+
+        for (self.manifest.entries.items) |entry| {
+            const gop = try highwater.getOrPut(entry.series_id);
+            if (!gop.found_existing or entry.end_ts > gop.value_ptr.*) {
+                gop.value_ptr.* = entry.end_ts;
+            }
+        }
+
+        const ctx = struct {
+            engine: *Engine,
+            highwater: *std.AutoHashMap(types.SeriesId, i64),
+            pub fn onRecord(self_ctx: *@This(), series_id: types.SeriesId, ts: i64, value: f64) !void {
+                if (self_ctx.highwater.getPtr(series_id)) |ptr| {
+                    if (ts <= ptr.*) return;
+                }
+                try self_ctx.engine.appendMemtablePoint(series_id, ts, value);
+                if (self_ctx.highwater.getPtr(series_id)) |ptr| {
+                    if (ts > ptr.*) ptr.* = ts;
+                } else {
+                    try self_ctx.highwater.put(series_id, ts);
+                }
+            }
+        }{ .engine = self, .highwater = &highwater };
+
+        try self.wal.replay(self.alloc, ctx);
+        if (self.mem.bytes.load(.monotonic) > 0) {
+            try flushMemtable(self);
         }
     }
 };
@@ -237,7 +334,7 @@ const waitError = error{Timeout};
 fn waitForFlush(engine: *Engine, expected_entries: usize, timeout_ms: u64) waitError!void {
     const deadline: i64 = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
     while (std.time.milliTimestamp() < deadline) {
-        if (engine.manifest.entries.items.len >= expected_entries and engine.mem.bytes == 0)
+        if (engine.manifest.entries.items.len >= expected_entries and engine.mem.bytes.load(.monotonic) == 0)
             return;
         sleepMs(10);
     }
@@ -287,4 +384,94 @@ test "engine ingests, flushes, and queries range" {
     const matches = engine.tags.get("host=a");
     try std.testing.expectEqual(@as(usize, 1), matches.len);
     try std.testing.expectEqual(sid, matches[0]);
+}
+
+test "engine replays wal on startup" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/data", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const sid = types.hash64("sensor.temp");
+
+    {
+        try std.fs.cwd().makePath(data_path);
+        var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+        defer data_dir.close();
+        var wal = try wal_mod.WAL.open(talloc, data_dir, .none);
+        _ = try wal.append(sid, 1_000, 42.0);
+        _ = try wal.append(sid, 1_050, 43.5);
+        wal.close();
+    }
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 100,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    var results = std.ArrayList(types.Point).init(talloc);
+    defer results.deinit();
+    try engine.queryRange(sid, 0, 10_000, &results);
+    try std.testing.expectEqual(@as(usize, 2), results.items.len);
+    try std.testing.expectEqual(@as(i64, 1_000), results.items[0].ts);
+    try std.testing.expectApproxEqAbs(@as(f64, 42.0), results.items[0].value, 1e-9);
+    try std.testing.expectEqual(@as(i64, 1_050), results.items[1].ts);
+}
+
+test "engine metrics track ingest and flush" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/data", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const sid = types.hash64("metrics.series");
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.0, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 20, .value = 2.0, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 30, .value = 3.0, .tags_json = "{}" });
+
+    try waitForFlush(engine, 1, 1_000);
+
+    const ingest_total = engine.metrics.ingest_total.load(.monotonic);
+    try std.testing.expectEqual(@as(u64, 3), ingest_total);
+    const flush_total = engine.metrics.flush_total.load(.monotonic);
+    try std.testing.expectEqual(@as(u64, 1), flush_total);
+    const flush_points = engine.metrics.flush_points_total.load(.monotonic);
+    try std.testing.expectEqual(@as(u64, 3), flush_points);
+    const wal_bytes = engine.metrics.wal_bytes_total.load(.monotonic);
+    try std.testing.expect(wal_bytes > 0);
+    const flush_ns = engine.metrics.flush_ns_total.load(.monotonic);
+    try std.testing.expect(flush_ns > 0);
 }

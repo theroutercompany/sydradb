@@ -44,7 +44,7 @@ pub const Manifest = struct {
             const end_ts = obj.get("end_ts").?.integer;
             const count = obj.get("count").?.integer;
             const path = obj.get("path").?.string;
-        try mf.entries.append(alloc, .{
+            try mf.entries.append(alloc, .{
                 .series_id = @intCast(sid),
                 .hour_bucket = @intCast(hour),
                 .start_ts = @intCast(start_ts),
@@ -61,6 +61,19 @@ pub const Manifest = struct {
         self.entries.deinit(self.alloc);
     }
 
+    pub fn maxEndTs(self: *const Manifest, sid: types.SeriesId) ?i64 {
+        var result: ?i64 = null;
+        for (self.entries.items) |e| {
+            if (e.series_id != sid) continue;
+            if (result) |existing| {
+                if (e.end_ts > existing) result = e.end_ts;
+            } else {
+                result = e.end_ts;
+            }
+        }
+        return result;
+    }
+
     pub fn add(self: *Manifest, data_dir: std.fs.Dir, sid: types.SeriesId, hour: i64, start_ts: i64, end_ts: i64, count: u32, path: []const u8) !void {
         // append line to MANIFEST
         const OpenFlags = std.fs.File.OpenFlags;
@@ -71,10 +84,10 @@ pub const Manifest = struct {
         var file = try data_dir.openFile("MANIFEST", open_opts);
         defer file.close();
         try file.seekFromEnd(0);
-        var writer_buffer: [512]u8 = undefined;
-        var file_writer = file.writer(&writer_buffer);
-        try file_writer.interface.print("{{\"series_id\":{d},\"hour_bucket\":{d},\"start_ts\":{d},\"end_ts\":{d},\"count\":{d},\"path\":\"{s}\"}}\n", .{ sid, hour, start_ts, end_ts, count, path });
-        try file_writer.interface.flush();
+        var buffered_writer = std.io.bufferedWriter(file.writer());
+        var writer = buffered_writer.writer();
+        try writer.print("{{\"series_id\":{d},\"hour_bucket\":{d},\"start_ts\":{d},\"end_ts\":{d},\"count\":{d},\"path\":\"{s}\"}}\n", .{ sid, hour, start_ts, end_ts, count, path });
+        try buffered_writer.flush();
         try self.entries.append(self.alloc, .{ .series_id = sid, .hour_bucket = hour, .start_ts = start_ts, .end_ts = end_ts, .count = count, .path = try self.alloc.dupe(u8, path) });
     }
 };
