@@ -70,6 +70,7 @@ fn cmdPgWire(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         .address = address,
         .port = port,
         .session = session_cfg,
+        .engine = eng,
     };
 
     std.debug.print("sydradb pgwire {s}:{d}\n", .{ server_cfg.address, server_cfg.port });

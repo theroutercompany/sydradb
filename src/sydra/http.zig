@@ -3,6 +3,8 @@ const Engine = @import("engine.zig").Engine;
 const types = @import("types.zig");
 const config = @import("config.zig");
 const compat = @import("compat.zig");
+const query_exec = @import("query/exec.zig");
+const query_value = @import("query/value.zig");
 
 pub fn runHttp(alloc: std.mem.Allocator, eng: *Engine, port: u16) !void {
     var address = try std.net.Address.parseIp4("0.0.0.0", port);
@@ -103,8 +105,147 @@ fn handleRequest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     if (std.mem.eql(u8, path, "/api/v1/query/find") and method == .POST) {
         return try handleFind(alloc, eng, req);
     }
+    if (std.mem.eql(u8, path, "/api/v1/sydraql") and method == .POST) {
+        return try handleSydraql(alloc, eng, req);
+    }
 
     try req.respond("not found", .{ .status = .not_found });
+}
+
+fn handleSydraql(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    var body_buf: [1024]u8 = undefined;
+    const reader_ptr = req.readerExpectNone(&body_buf);
+    const reader = std.Io.Reader.adaptToOldInterface(reader_ptr);
+    const content_len = req.head.content_length orelse {
+        return respondJsonError(alloc, req, .length_required, "length required");
+    };
+    if (content_len > 256 * 1024) {
+        return respondJsonError(alloc, req, .payload_too_large, "payload too large");
+    }
+
+    const len: usize = @intCast(content_len);
+    const body = try alloc.alloc(u8, len);
+    defer alloc.free(body);
+    try reader.readNoEof(body);
+
+    const sydraql = std.mem.trim(u8, body, " \t\r\n");
+    if (sydraql.len == 0) {
+        return respondJsonError(alloc, req, .bad_request, "query required");
+    }
+
+    const start_time = std.time.microTimestamp();
+    var cursor = query_exec.execute(alloc, eng, sydraql) catch |err| {
+        return respondExecutionError(alloc, req, err);
+    };
+    defer cursor.deinit();
+
+    var send_buf: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&send_buf, .{
+        .respond_options = .{
+            .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        },
+    });
+    errdefer response.end() catch {};
+
+    var writer = response.writer;
+    var adapter_buf: [256]u8 = undefined;
+    var adapter = writer.adaptToNewApi(&adapter_buf);
+    var jw = std.json.Stringify{ .writer = &adapter.new_interface };
+
+    try jw.beginObject();
+    try jw.objectField("columns");
+    try jw.beginArray();
+    for (cursor.columns) |col| {
+        try jw.write(col.name);
+    }
+    try jw.endArray();
+    try jw.objectField("rows");
+    try jw.beginArray();
+    var row_count: usize = 0;
+    while (try cursor.next()) |row| {
+        try jw.beginArray();
+        for (row.values) |cell| {
+            try writeJsonValue(&jw, cell);
+        }
+        try jw.endArray();
+        row_count += 1;
+    }
+    try jw.endArray();
+    try jw.objectField("stats");
+    try jw.beginObject();
+    const elapsed_us = std.time.microTimestamp() - start_time;
+    try jw.objectField("stream_rows");
+    try jw.write(row_count);
+    try jw.objectField("stream_ms");
+    try jw.write(@as(f64, @floatFromInt(elapsed_us)) / 1000.0);
+    try jw.objectField("parse_ms");
+    try jw.write(usToMs(cursor.stats.parse_us));
+    try jw.objectField("validate_ms");
+    try jw.write(usToMs(cursor.stats.validate_us));
+    try jw.objectField("optimize_ms");
+    try jw.write(usToMs(cursor.stats.optimize_us));
+    try jw.objectField("physical_ms");
+    try jw.write(usToMs(cursor.stats.physical_us));
+    try jw.objectField("pipeline_ms");
+    try jw.write(usToMs(cursor.stats.pipeline_us));
+    if (cursor.stats.trace_id.len != 0) {
+        try jw.objectField("trace_id");
+        try jw.write(cursor.stats.trace_id);
+    }
+    try jw.endObject();
+    try jw.endObject();
+
+    try response.end();
+}
+
+fn respondExecutionError(alloc: std.mem.Allocator, req: *std.http.Server.Request, err: query_exec.ExecuteError) !void {
+    const status: std.http.Status = switch (err) {
+        error.OutOfMemory => .internal_server_error,
+        error.UnsupportedPlan,
+        error.UnsupportedExpression,
+        error.UnsupportedAggregate,
+        error.Unimplemented,
+        error.UnsupportedSelector,
+        => .bad_request,
+        else => .bad_request,
+    };
+    return respondJsonError(alloc, req, status, @errorName(err));
+}
+
+fn respondJsonError(
+    alloc: std.mem.Allocator,
+    req: *std.http.Server.Request,
+    status: std.http.Status,
+    message: []const u8,
+) !void {
+    var buf = std.ArrayList(u8).init(alloc);
+    defer buf.deinit();
+
+    var writer = buf.writer();
+    var adapter_buf: [128]u8 = undefined;
+    var adapter = writer.adaptToNewApi(&adapter_buf);
+    var jw = std.json.Stringify{ .writer = &adapter.new_interface };
+    try jw.beginObject();
+    try jw.objectField("error");
+    try jw.write(message);
+    try jw.endObject();
+
+    const headers = [_]std.http.Header{.{ .name = "Content-Type", .value = "application/json" }};
+    try req.respond(buf.items, .{ .status = status, .keep_alive = false, .extra_headers = &headers });
+}
+
+fn writeJsonValue(jw: *std.json.Stringify, value: query_value.Value) !void {
+    switch (value) {
+        .null => try jw.write(null),
+        .boolean => |b| try jw.write(b),
+        .integer => |i| try jw.write(i),
+        .float => |f| try jw.write(f),
+        .string => |s| try jw.write(s),
+    }
+}
+
+fn usToMs(value: u64) f64 {
+    return @as(f64, @floatFromInt(value)) / 1000.0;
 }
 
 fn findHeader(req: *std.http.Server.Request, name: []const u8) ?[]const u8 {

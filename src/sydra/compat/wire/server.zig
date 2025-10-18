@@ -2,6 +2,10 @@ const std = @import("std");
 const protocol = @import("protocol.zig");
 const session_mod = @import("session.zig");
 const translator = @import("../../query/translator.zig");
+const query_exec = @import("../../query/exec.zig");
+const plan = @import("../../query/plan.zig");
+const value_mod = @import("../../query/value.zig");
+const engine_mod = @import("../../engine.zig");
 
 const log = std.log.scoped(.pgwire);
 
@@ -11,6 +15,7 @@ pub const ServerConfig = struct {
     address: []const u8 = "127.0.0.1",
     port: u16 = 6432,
     session: session_mod.SessionConfig = .{},
+    engine: *engine_mod.Engine,
 };
 
 pub fn run(alloc: std.mem.Allocator, config: ServerConfig) !void {
@@ -25,7 +30,7 @@ pub fn run(alloc: std.mem.Allocator, config: ServerConfig) !void {
             error.ConnectionResetByPeer, error.ConnectionAborted => continue,
             else => return err,
         };
-        handleConnection(alloc, connection, config.session) catch |err| switch (err) {
+        handleConnection(alloc, connection, config.session, config.engine) catch |err| switch (err) {
             error.EndOfStream => {},
             else => log.warn("pgwire connection ended with {s}", .{@errorName(err)}),
         };
@@ -36,6 +41,7 @@ pub fn handleConnection(
     alloc: std.mem.Allocator,
     connection: std.net.Server.Connection,
     session_config: session_mod.SessionConfig,
+    engine: *engine_mod.Engine,
 ) !void {
     defer connection.stream.close();
 
@@ -66,13 +72,14 @@ pub fn handleConnection(
         .{ session.borrowedUser(), session.borrowedDatabase(), session.borrowedApplicationName() },
     );
 
-    try messageLoop(alloc, reader, writer);
+    try messageLoop(alloc, reader, writer, engine);
 }
 
 fn messageLoop(
     alloc: std.mem.Allocator,
     reader: std.Io.AnyReader,
     writer: std.Io.AnyWriter,
+    engine: *engine_mod.Engine,
 ) !void {
     while (true) {
         const type_byte = reader.readByte() catch |err| switch (err) {
@@ -92,7 +99,7 @@ fn messageLoop(
         switch (type_byte) {
             'X' => return,
             'Q' => {
-                try handleSimpleQuery(alloc, writer, payload_storage);
+                try handleSimpleQuery(alloc, writer, payload_storage, engine);
             },
             'P' => {
                 try handleParseMessage(alloc, writer, payload_storage);
@@ -127,6 +134,7 @@ fn handleSimpleQuery(
     alloc: std.mem.Allocator,
     writer: std.Io.AnyWriter,
     payload: []u8,
+    engine: *engine_mod.Engine,
 ) !void {
     const raw_sql = trimNullTerminator(payload);
     const trimmed = std.mem.trim(u8, raw_sql, " \t\r\n");
@@ -149,7 +157,12 @@ fn handleSimpleQuery(
     switch (translation) {
         .success => |success| {
             defer alloc.free(success.sydraql);
-            try protocol.writeErrorResponse(writer, "ERROR", "0A000", "execution bridge not implemented yet");
+            handleSydraqlQuery(alloc, writer, engine, success.sydraql) catch |err| {
+                log.debug("sydraql execution failed: {s}", .{@errorName(err)});
+                try protocol.writeErrorResponse(writer, "ERROR", "XX000", @errorName(err));
+                try protocol.writeReadyForQuery(writer, 'I');
+                return;
+            };
         },
         .failure => |failure| {
             const msg = if (failure.message.len == 0)
@@ -157,10 +170,9 @@ fn handleSimpleQuery(
             else
                 failure.message;
             try protocol.writeErrorResponse(writer, "ERROR", failure.sqlstate, msg);
+            try protocol.writeReadyForQuery(writer, 'I');
         },
     }
-
-    try protocol.writeReadyForQuery(writer, 'I');
 }
 
 fn handleParseMessage(
@@ -226,6 +238,143 @@ fn handleParseMessage(
     }
 
     try protocol.writeReadyForQuery(writer, 'I');
+}
+
+fn handleSydraqlQuery(
+    alloc: std.mem.Allocator,
+    writer: std.Io.AnyWriter,
+    engine: *engine_mod.Engine,
+    sydraql: []const u8,
+) !void {
+    const start_time = std.time.microTimestamp();
+    var cursor = query_exec.execute(alloc, engine, sydraql) catch |err| {
+        try protocol.writeErrorResponse(writer, "ERROR", "0A000", @errorName(err));
+        try protocol.writeReadyForQuery(writer, 'I');
+        return;
+    };
+    defer cursor.deinit();
+
+    try writeRowDescription(writer, cursor.columns);
+
+    var row_buffer = std.array_list.Managed(u8).init(alloc);
+    defer row_buffer.deinit();
+    var value_buffer = std.ArrayList(u8).init(alloc);
+    defer value_buffer.deinit();
+
+    var row_count: usize = 0;
+    while (try cursor.next()) |row| {
+        writeDataRow(writer, row.values, &row_buffer, &value_buffer) catch |err| {
+            try protocol.writeErrorResponse(writer, "ERROR", "XX000", @errorName(err));
+            try protocol.writeReadyForQuery(writer, 'I');
+            return;
+        };
+        row_count += 1;
+    }
+
+    const elapsed_us = std.time.microTimestamp() - start_time;
+    const plan_us = cursor.stats.parse_us + cursor.stats.validate_us + cursor.stats.optimize_us + cursor.stats.physical_us + cursor.stats.pipeline_us;
+    const tag = if (cursor.stats.trace_id.len != 0)
+        try std.fmt.allocPrint(
+            alloc,
+            "SELECT rows={d} stream_ms={d} plan_ms={d} trace_id={s}",
+            .{ row_count, elapsed_us / 1000, plan_us / 1000, cursor.stats.trace_id },
+        )
+    else
+        try std.fmt.allocPrint(
+            alloc,
+            "SELECT rows={d} stream_ms={d} plan_ms={d}",
+            .{ row_count, elapsed_us / 1000, plan_us / 1000 },
+        );
+    defer alloc.free(tag);
+    try protocol.writeCommandComplete(writer, tag);
+    try protocol.writeReadyForQuery(writer, 'I');
+}
+
+fn writeRowDescription(writer: std.Io.AnyWriter, columns: []const plan.ColumnInfo) !void {
+    try writer.writeByte('T');
+    var len: u32 = 4 + 2;
+    for (columns) |col| {
+        len += @as(u32, @intCast(col.name.len + 19));
+    }
+    var buf4: [4]u8 = undefined;
+    std.mem.writeInt(u32, buf4[0..4], len, .big);
+    try writer.writeAll(buf4[0..4]);
+
+    var buf2: [2]u8 = undefined;
+    std.mem.writeInt(u16, buf2[0..2], @as(u16, @intCast(columns.len)), .big);
+    try writer.writeAll(buf2[0..2]);
+
+    for (columns) |col| {
+        try writer.writeAll(col.name);
+        try writer.writeByte(0);
+
+        std.mem.writeInt(u32, buf4[0..4], 0, .big);
+        try writer.writeAll(buf4[0..4]);
+        std.mem.writeInt(u16, buf2[0..2], 0, .big);
+        try writer.writeAll(buf2[0..2]);
+        std.mem.writeInt(u32, buf4[0..4], 25, .big); // text OID
+        try writer.writeAll(buf4[0..4]);
+        std.mem.writeInt(i16, buf2[0..2], -1, .big);
+        try writer.writeAll(buf2[0..2]);
+        std.mem.writeInt(i32, buf4[0..4], -1, .big);
+        try writer.writeAll(buf4[0..4]);
+        std.mem.writeInt(u16, buf2[0..2], 0, .big); // text format
+        try writer.writeAll(buf2[0..2]);
+    }
+}
+
+fn writeDataRow(
+    writer: std.Io.AnyWriter,
+    values: []const value_mod.Value,
+    row_buffer: *std.array_list.Managed(u8),
+    value_buffer: *std.ArrayList(u8),
+) !void {
+    row_buffer.items.len = 0;
+    try row_buffer.append('D');
+    const len_index = row_buffer.items.len;
+    try row_buffer.appendSlice(&[_]u8{ 0, 0, 0, 0 });
+
+    var buf2: [2]u8 = undefined;
+    std.mem.writeInt(u16, buf2[0..2], @as(u16, @intCast(values.len)), .big);
+    try row_buffer.appendSlice(buf2[0..2]);
+
+    var len_buf: [4]u8 = undefined;
+    for (values) |value| {
+        const maybe_text = try formatValue(value, value_buffer);
+        if (maybe_text) |text| {
+            std.mem.writeInt(i32, len_buf[0..4], @as(i32, @intCast(text.len)), .big);
+            try row_buffer.appendSlice(len_buf[0..4]);
+            try row_buffer.appendSlice(text);
+        } else {
+            std.mem.writeInt(i32, len_buf[0..4], -1, .big);
+            try row_buffer.appendSlice(len_buf[0..4]);
+        }
+    }
+
+    std.mem.writeInt(u32, row_buffer.items[len_index .. len_index + 4], @as(u32, @intCast(row_buffer.items.len - 1)), .big);
+    try writer.writeAll(row_buffer.items);
+}
+
+fn formatValue(value: value_mod.Value, buf: *std.ArrayList(u8)) !?[]const u8 {
+    switch (value) {
+        .null => return null,
+        .boolean => |b| {
+            buf.items.len = 0;
+            try buf.writer().writeAll(if (b) "t" else "f");
+            return buf.items;
+        },
+        .integer => |i| {
+            buf.items.len = 0;
+            try buf.writer().print("{d}", .{i});
+            return buf.items;
+        },
+        .float => |f| {
+            buf.items.len = 0;
+            try buf.writer().print("{d}", .{f});
+            return buf.items;
+        },
+        .string => |s| return s,
+    }
 }
 
 fn readCString(buffer: []const u8, cursor: *usize) ![]const u8 {
