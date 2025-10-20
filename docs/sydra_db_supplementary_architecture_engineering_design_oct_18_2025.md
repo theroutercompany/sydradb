@@ -72,3 +72,42 @@ query planning and execution components.
    keeping the streamed row contract intact.
 3. Introduce operator fusion opportunities (e.g., scan+filter pushdown) once
    correctness is locked in.
+
+## Allocator Strategy Roadmap
+
+SydraDB's ingest path continues to bias toward *many tiny writes* across
+concurrent writers. The general-purpose Gpa allocator remains serviceable, but
+tail-latency spikes surface whenever bursts contend for the global heap. We are
+standardising on a layered allocator strategy purpose-built for this workload:
+
+1. **mimalloc baseline**
+   - Link mimalloc as the global allocator behind `-Dallocator-mode=mimalloc` so
+     per-thread caches and tight small-object classes become the default fast
+     path.
+   - Keep mimalloc's chunk recycling enabled for steady RSS and expose knobs to
+     tune its release-to-OS behaviour in perf profiles.
+2. **Sharded memory pools (SMP)**
+   - Introduce shard-local fixed-size slabs for the common shapes on the write
+     path (ingest headers, skip-list nodes, tombstones, metadata records).
+   - Target initial bins at 16/24/32/48/64/96/128/192/256 bytes; trim once
+     telemetry lands. Each shard owns its slab freelists to avoid cross-core
+     locking.
+3. **Append-only arenas**
+   - WAL and memtable segments allocate via per-segment bump allocators;
+     compaction or sealing drops the whole arena in one operation.
+4. **Epoch/QSBR reclamation**
+   - Writers recycle objects into a shard-local quarantine; a lightweight epoch
+     counter ensures readers have advanced before slabs are returned to service.
+   - Embed shard identifiers in headers to guarantee objects are freed on the
+     owning shard.
+5. **Instrumentation and guard rails**
+   - Record allocation histograms, slab occupancy, and lock hold durations; emit
+     metrics through the allocator benchmark and runtime telemetry.
+   - In debug builds, poison freed slabs and assert shard ownership to catch
+     violations early.
+
+Success criteria: ≥30% improvement in p99 allocation latency and ≥20%
+improvement in p999 ingest latency under the mixed read/write microbench, RSS
+stability within ±10% over a 30‑minute churn test, and zero cross-shard free
+violations in stress tests. Benchmarks must cover 2k/20k/200k op loads with the
+new diagnostics to document regressions and wins.
