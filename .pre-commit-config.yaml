@@ -11,7 +11,7 @@ repos:
     hooks:
       - id: zig-fmt
         name: zig fmt (check)
-        entry: zig fmt --check .
+        entry: zig fmt --check build.zig src cmd examples docs
         language: system
         pass_filenames: false
       - id: zig-build

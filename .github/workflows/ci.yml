@@ -34,6 +34,7 @@ jobs:
         uses: goto-bus-stop/setup-zig@v2
         with:
           version: 0.15.1
+          cache: false
 
       - name: Cache pre-commit
         uses: actions/cache@v4
@@ -72,6 +73,7 @@ jobs:
         uses: goto-bus-stop/setup-zig@v2
         with:
           version: 0.15.1
+          cache: false
 
       - name: Build release binary
         run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
