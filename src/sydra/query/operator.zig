@@ -9,6 +9,8 @@ const engine_mod = @import("../engine.zig");
 const expression = @import("expression.zig");
 const value_mod = @import("value.zig");
 
+const ManagedArrayList = std.array_list.Managed;
+
 pub const Value = value_mod.Value;
 
 pub const ExecuteError = std.mem.Allocator.Error || expression.EvalError || error{
@@ -77,15 +79,15 @@ pub const Operator = struct {
         group_exprs: []const ast.GroupExpr,
         aggregates: []AggregateExpr,
         column_meta: []ColumnMeta,
-        groups: std.ArrayList(GroupState),
-        key_buffer: std.ArrayList(Value),
+        groups: ManagedArrayList(GroupState),
+        key_buffer: ManagedArrayList(Value),
         output_buffer: []Value,
         initialized: bool,
         index: usize,
     };
 
     const Sort = struct {
-        rows: std.ArrayList(OwnedRow),
+        rows: ManagedArrayList(OwnedRow),
         index: usize,
     };
 
@@ -304,8 +306,8 @@ fn createAggregateOperator(allocator: std.mem.Allocator, child: *Operator, node:
         .group_exprs = node.groupings,
         .aggregates = aggregates.exprs,
         .column_meta = column_meta,
-        .groups = std.ArrayList(Operator.GroupState).init(allocator),
-        .key_buffer = std.ArrayList(Value).init(allocator),
+        .groups = ManagedArrayList(Operator.GroupState).init(allocator),
+        .key_buffer = ManagedArrayList(Value).init(allocator),
         .output_buffer = try allocator.alloc(Value, schema.len),
         .initialized = false,
         .index = 0,
@@ -323,7 +325,7 @@ const AggregateAnalysis = struct {
 
 fn analyseAggregates(allocator: std.mem.Allocator, columns: []const plan.ColumnInfo, groupings: []const ast.GroupExpr) ExecuteError!AggregateAnalysis {
     _ = groupings;
-    var exprs = std.ArrayList(Operator.AggregateExpr).init(allocator);
+    var exprs = ManagedArrayList(Operator.AggregateExpr).init(allocator);
     errdefer exprs.deinit();
 
     var map = std.AutoHashMap(*const ast.Expr, usize).init(allocator);
@@ -460,7 +462,7 @@ fn createSortOperator(
     ordering: []const ast.OrderExpr,
     limit_hint: ?LimitHint,
 ) ExecuteError!*Operator {
-    var rows = std.ArrayList(Operator.OwnedRow).init(allocator);
+    var rows = ManagedArrayList(Operator.OwnedRow).init(allocator);
     errdefer {
         for (rows.items) |owned| freeOwnedRow(allocator, owned);
         rows.deinit();

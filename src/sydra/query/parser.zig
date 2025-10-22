@@ -3,6 +3,8 @@ const lexer = @import("lexer.zig");
 const ast = @import("ast.zig");
 const common = @import("common.zig");
 
+const ManagedArrayList = std.array_list.Managed;
+
 pub const ParseError = lexer.LexError || std.mem.Allocator.Error || error{
     UnexpectedToken,
     UnexpectedStatement,
@@ -635,7 +637,7 @@ pub const Parser = struct {
 
     fn decodeStringLiteral(self: *Parser, text: []const u8) ParseError![]const u8 {
         std.debug.assert(text.len >= 2);
-        var buf = std.ArrayList(u8).init(self.allocator);
+        var buf = ManagedArrayList(u8).init(self.allocator);
         errdefer buf.deinit();
         var i: usize = 1;
         while (i < text.len - 1) {

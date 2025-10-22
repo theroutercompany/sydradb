@@ -4,6 +4,8 @@ const ast = @import("ast.zig");
 const common = @import("common.zig");
 const meta = std.meta;
 
+const ManagedArrayList = std.array_list.Managed;
+
 pub const OptimizeError = plan.BuildError || std.mem.Allocator.Error;
 
 pub fn optimize(allocator: std.mem.Allocator, root: *plan.Node) OptimizeError!*plan.Node {
@@ -169,9 +171,9 @@ fn pushFilterBelowAggregate(node_ptr: *plan.Node, allocator: std.mem.Allocator) 
     var aggregate_data = aggregate_node_ptr.aggregate;
     if (aggregate_data.groupings.len == 0) return;
 
-    var push_list = std.ArrayList(*const ast.Expr).init(allocator);
+    var push_list = ManagedArrayList(*const ast.Expr).init(allocator);
     defer push_list.deinit();
-    var keep_list = std.ArrayList(*const ast.Expr).init(allocator);
+    var keep_list = ManagedArrayList(*const ast.Expr).init(allocator);
     defer keep_list.deinit();
 
     for (node_ptr.filter.conjunctive_predicates) |expr| {

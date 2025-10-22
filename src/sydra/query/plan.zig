@@ -4,6 +4,8 @@ const ast = @import("ast.zig");
 const functions = @import("functions.zig");
 const common = @import("common.zig");
 
+const ManagedArrayList = std.array_list.Managed;
+
 pub const BuildError = error{
     UnsupportedStatement,
 };
@@ -106,7 +108,7 @@ pub const Builder = struct {
                 .output = scan_columns,
             },
         });
-        var filter_list = std.ArrayList(*const ast.Expr).init(self.allocator);
+        var filter_list = ManagedArrayList(*const ast.Expr).init(self.allocator);
         try self.collectPredicates(select.predicate, &filter_list);
         var filter_conditions: []const *const ast.Expr = &.{};
         if (filter_list.items.len != 0) {
@@ -177,7 +179,7 @@ pub const Builder = struct {
         return cols;
     }
 
-    fn collectPredicates(self: *Builder, predicate: ?*const ast.Expr, list: *std.ArrayList(*const ast.Expr)) !void {
+    fn collectPredicates(self: *Builder, predicate: ?*const ast.Expr, list: *ManagedArrayList(*const ast.Expr)) !void {
         if (predicate) |expr| {
             switch (expr.*) {
                 .binary => |binary| {

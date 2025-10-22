@@ -4,7 +4,7 @@ const errors = @import("errors.zig");
 const functions = @import("functions.zig");
 const common = @import("common.zig");
 
-pub const AnalyzeError = errors.DiagnosticList.AppendError || std.mem.Allocator.Error;
+pub const AnalyzeError = std.mem.Allocator.Error;
 
 pub const AnalyzeResult = struct {
     diagnostics: errors.DiagnosticList = .{},

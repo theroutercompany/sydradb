@@ -218,20 +218,10 @@ fn respondJsonError(
     status: std.http.Status,
     message: []const u8,
 ) !void {
-    var buf = std.ArrayList(u8).init(alloc);
-    defer buf.deinit();
-
-    var writer = buf.writer();
-    var adapter_buf: [128]u8 = undefined;
-    var adapter = writer.adaptToNewApi(&adapter_buf);
-    var jw = std.json.Stringify{ .writer = &adapter.new_interface };
-    try jw.beginObject();
-    try jw.objectField("error");
-    try jw.write(message);
-    try jw.endObject();
-
+    const payload = try std.fmt.allocPrint(alloc, "{{\"error\":\"{s}\"}}", .{message});
+    defer alloc.free(payload);
     const headers = [_]std.http.Header{.{ .name = "Content-Type", .value = "application/json" }};
-    try req.respond(buf.items, .{ .status = status, .keep_alive = false, .extra_headers = &headers });
+    try req.respond(payload, .{ .status = status, .keep_alive = false, .extra_headers = &headers });
 }
 
 fn writeJsonValue(jw: *std.json.Stringify, value: query_value.Value) !void {

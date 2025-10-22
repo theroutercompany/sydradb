@@ -7,6 +7,8 @@ const plan = @import("../../query/plan.zig");
 const value_mod = @import("../../query/value.zig");
 const engine_mod = @import("../../engine.zig");
 
+const ManagedArrayList = std.array_list.Managed;
+
 const log = std.log.scoped(.pgwire);
 
 const max_message_size: usize = 16 * 1024 * 1024;
@@ -258,7 +260,7 @@ fn handleSydraqlQuery(
 
     var row_buffer = std.array_list.Managed(u8).init(alloc);
     defer row_buffer.deinit();
-    var value_buffer = std.ArrayList(u8).init(alloc);
+    var value_buffer = ManagedArrayList(u8).init(alloc);
     defer value_buffer.deinit();
 
     var row_count: usize = 0;
@@ -327,7 +329,7 @@ fn writeDataRow(
     writer: std.Io.AnyWriter,
     values: []const value_mod.Value,
     row_buffer: *std.array_list.Managed(u8),
-    value_buffer: *std.ArrayList(u8),
+    value_buffer: *ManagedArrayList(u8),
 ) !void {
     row_buffer.items.len = 0;
     try row_buffer.append('D');
@@ -355,7 +357,7 @@ fn writeDataRow(
     try writer.writeAll(row_buffer.items);
 }
 
-fn formatValue(value: value_mod.Value, buf: *std.ArrayList(u8)) !?[]const u8 {
+fn formatValue(value: value_mod.Value, buf: *ManagedArrayList(u8)) !?[]const u8 {
     switch (value) {
         .null => return null,
         .boolean => |b| {
