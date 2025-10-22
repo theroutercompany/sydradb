@@ -8,7 +8,7 @@ const physical = @import("physical.zig");
 const executor = @import("executor.zig");
 const engine_mod = @import("../engine.zig");
 
-pub const ExecuteError = parser.ParseError || validator.AnalyzeError || plan_builder.BuildError || optimizer.OptimizeError || physical.BuildError || executor.ExecuteError || std.mem.Allocator.Error;
+pub const ExecuteError = parser.ParseError || validator.AnalyzeError || plan_builder.BuildError || optimizer.OptimizeError || physical.BuildError || executor.ExecuteError || std.mem.Allocator.Error || error{ValidationFailed};
 
 pub fn execute(allocator: std.mem.Allocator, engine: *engine_mod.Engine, query: []const u8) ExecuteError!executor.ExecutionCursor {
     var arena_ptr = try allocator.create(std.heap.ArenaAllocator);
@@ -29,7 +29,7 @@ pub fn execute(allocator: std.mem.Allocator, engine: *engine_mod.Engine, query: 
     var analyzer = validator.Analyzer.init(arena_ptr.allocator());
     var analysis = try analyzer.analyze(&statement);
     defer analyzer.deinit(&analysis);
-    if (!analysis.is_valid) return error.Unimplemented;
+    if (!analysis.is_valid) return error.ValidationFailed;
     const t_validate = std.time.microTimestamp();
 
     var builder = plan_builder.Builder.init(arena_ptr.allocator());

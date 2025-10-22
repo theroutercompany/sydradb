@@ -204,8 +204,8 @@ fn respondExecutionError(alloc: std.mem.Allocator, req: *std.http.Server.Request
         error.UnsupportedPlan,
         error.UnsupportedExpression,
         error.UnsupportedAggregate,
-        error.Unimplemented,
         error.UnsupportedSelector,
+        error.ValidationFailed,
         => .bad_request,
         else => .bad_request,
     };

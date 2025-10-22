@@ -37,10 +37,15 @@ pub fn build(b: *std.Build) void {
         }
         break :blk exe_inner;
     };
+    const os_tag = target.result.os.tag;
+
     if (use_mimalloc) {
         exe.addCSourceFile(.{ .file = mimalloc_c_file, .flags = mimalloc_flags });
         exe.linkLibC();
         exe.linkSystemLibrary("pthread");
+    } else {
+        exe.linkLibC();
+        if (os_tag == .linux) exe.linkSystemLibrary("pthread");
     }
 
     b.installArtifact(exe);
@@ -72,6 +77,9 @@ pub fn build(b: *std.Build) void {
         unit_tests.addCSourceFile(.{ .file = mimalloc_c_file, .flags = mimalloc_flags });
         unit_tests.linkLibC();
         unit_tests.linkSystemLibrary("pthread");
+    } else if (!use_mimalloc) {
+        unit_tests.linkLibC();
+        if (os_tag == .linux) unit_tests.linkSystemLibrary("pthread");
     }
 
     const test_run = b.addRunArtifact(unit_tests);
@@ -101,6 +109,9 @@ pub fn build(b: *std.Build) void {
         pgwire_tests.addCSourceFile(.{ .file = mimalloc_c_file, .flags = mimalloc_flags });
         pgwire_tests.linkLibC();
         pgwire_tests.linkSystemLibrary("pthread");
+    } else if (!use_mimalloc) {
+        pgwire_tests.linkLibC();
+        if (os_tag == .linux) pgwire_tests.linkSystemLibrary("pthread");
     }
 
     const pgwire_run = b.addRunArtifact(pgwire_tests);
@@ -143,6 +154,9 @@ pub fn build(b: *std.Build) void {
         bench_exe.addCSourceFile(.{ .file = mimalloc_c_file, .flags = mimalloc_flags });
         bench_exe.linkLibC();
         bench_exe.linkSystemLibrary("pthread");
+    } else if (!use_mimalloc) {
+        bench_exe.linkLibC();
+        if (os_tag == .linux) bench_exe.linkSystemLibrary("pthread");
     }
 
     const bench_run = b.addRunArtifact(bench_exe);

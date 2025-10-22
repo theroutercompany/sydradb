@@ -22,13 +22,6 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Warm Zig cache
-        run: |
-          curl -L "https://ziglang.org/download/0.15.1/zig-aarch64-macos-0.15.1.tar.xz" -o /tmp/zig.tar.xz
-          mkdir -p $HOME/.zig-cache-aarch64-macos-0.15.1
-          tar -xf /tmp/zig.tar.xz -C $HOME/.zig-cache-aarch64-macos-0.15.1 --strip-components=1
-        if: runner.os == 'macOS'
-
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -42,7 +35,6 @@ jobs:
         with:
           version: 0.15.1
           cache: false
-          install-dir: ${{ runner.os == 'macOS' && '$HOME/.zig-cache-aarch64-macos-0.15.1' || '' }}
 
       - name: Cache pre-commit
         uses: actions/cache@v4

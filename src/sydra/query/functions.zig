@@ -21,6 +21,7 @@ pub const ReturnType = enum {
     integer,
     float,
     boolean,
+    timestamp,
     value,
     void,
 };

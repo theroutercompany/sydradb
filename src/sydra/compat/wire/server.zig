@@ -353,7 +353,8 @@ fn writeDataRow(
         }
     }
 
-    std.mem.writeInt(u32, row_buffer.items[len_index .. len_index + 4], @as(u32, @intCast(row_buffer.items.len - 1)), .big);
+    const len_ptr = @as(*[4]u8, @ptrCast(row_buffer.items.ptr + len_index));
+    std.mem.writeInt(u32, len_ptr, @as(u32, @intCast(row_buffer.items.len - 1)), .big);
     try writer.writeAll(row_buffer.items);
 }
 

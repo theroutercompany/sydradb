@@ -33,7 +33,7 @@ pub const Analyzer = struct {
         return result;
     }
 
-    fn validateStatement(self: *Analyzer, statement: *ast.Statement, result: *AnalyzeResult) AnalyzeError!void {
+    fn validateStatement(self: *Analyzer, statement: *const ast.Statement, result: *AnalyzeResult) AnalyzeError!void {
         switch (statement.*) {
             .invalid => |invalid| {
                 try self.addDiagnostic(result, .invalid_syntax, "invalid statement", invalid.span);
@@ -129,8 +129,8 @@ pub const Analyzer = struct {
                 }
 
                 if (functions.lookup(call.callee.value) == null) {
-                    var buf: [128]u8 = undefined;
-                    const msg = try std.fmt.bufPrint(&buf, "unknown function '{s}'", .{call.callee.value});
+                    const msg = try std.fmt.allocPrint(self.allocator, "unknown function '{s}'", .{call.callee.value});
+                    defer self.allocator.free(msg);
                     try self.addDiagnostic(result, .invalid_syntax, msg, call.span);
                 }
 

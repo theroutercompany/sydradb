@@ -5,6 +5,15 @@ const common = @import("common.zig");
 
 const ManagedArrayList = std.array_list.Managed;
 
+inline fn tokenHasKeyword(token: lexer.Token, keyword: lexer.Keyword) bool {
+    return token.kind == .keyword and token.keyword != null and token.keyword.? == keyword;
+}
+
+inline fn tokenKeyword(token: lexer.Token) ?lexer.Keyword {
+    if (token.kind != .keyword) return null;
+    return token.keyword;
+}
+
 pub const ParseError = lexer.LexError || std.mem.Allocator.Error || error{
     UnexpectedToken,
     UnexpectedStatement,
@@ -237,14 +246,15 @@ pub const Parser = struct {
             _ = try self.advance();
             return .{ .value = token.lexeme, .quoted = false, .span = token.span };
         }
-        if (token.kind == .keyword and token.keyword) |kw| {
-            // allow keywords not reserved if used as alias?
-            switch (kw) {
-                .time, .tag => {
-                    _ = try self.advance();
-                    return .{ .value = token.lexeme, .quoted = false, .span = token.span };
-                },
-                else => {},
+        if (token.kind == .keyword) {
+            if (token.keyword) |kw| {
+                switch (kw) {
+                    .time, .tag => {
+                        _ = try self.advance();
+                        return .{ .value = token.lexeme, .quoted = false, .span = token.span };
+                    },
+                    else => {},
+                }
             }
         }
         return ParseError.UnexpectedToken;
@@ -274,24 +284,29 @@ pub const Parser = struct {
         var strategy: ast.FillStrategy = undefined;
 
         const token = try self.peek();
-        if (token.kind == .keyword and token.keyword) |kw| {
-            switch (kw) {
-                .previous => {
-                    _ = try self.advance();
-                    strategy = .previous;
-                },
-                .linear => {
-                    _ = try self.advance();
-                    strategy = .linear;
-                },
-                .null_literal => {
-                    _ = try self.advance();
-                    strategy = .null_value;
-                },
-                else => {
-                    const expr = try self.parseExpression();
-                    strategy = ast.FillStrategy{ .constant = expr };
-                },
+        if (token.kind == .keyword) {
+            if (token.keyword) |kw| {
+                switch (kw) {
+                    .previous => {
+                        _ = try self.advance();
+                        strategy = .previous;
+                    },
+                    .linear => {
+                        _ = try self.advance();
+                        strategy = .linear;
+                    },
+                    .null_literal => {
+                        _ = try self.advance();
+                        strategy = .null_value;
+                    },
+                    else => {
+                        const expr = try self.parseExpression();
+                        strategy = ast.FillStrategy{ .constant = expr };
+                    },
+                }
+            } else {
+                const expr = try self.parseExpression();
+                strategy = ast.FillStrategy{ .constant = expr };
             }
         } else {
             const expr = try self.parseExpression();
@@ -621,7 +636,7 @@ pub const Parser = struct {
 
     fn matchLogicalOr(self: *Parser) ParseError!?lexer.Token {
         const token = try self.peek();
-        if (token.kind == .or_or or (token.kind == .keyword and token.keyword == .logical_or)) {
+        if (token.kind == .or_or or tokenHasKeyword(token, .logical_or)) {
             return try self.advance();
         }
         return null;
@@ -629,7 +644,7 @@ pub const Parser = struct {
 
     fn matchLogicalAnd(self: *Parser) ParseError!?lexer.Token {
         const token = try self.peek();
-        if (token.kind == .and_and or (token.kind == .keyword and token.keyword == .logical_and)) {
+        if (token.kind == .and_and or tokenHasKeyword(token, .logical_and)) {
             return try self.advance();
         }
         return null;
