@@ -104,6 +104,11 @@ pub const Engine = struct {
         flush_ns_total: std.atomic.Value(u64),
         flush_points_total: std.atomic.Value(u64),
         wal_bytes_total: std.atomic.Value(u64),
+        queue_pop_total: std.atomic.Value(u64),
+        queue_wait_ns_total: std.atomic.Value(u64),
+        queue_max_len: std.atomic.Value(usize),
+        queue_len_sum: std.atomic.Value(u128),
+        queue_len_samples: std.atomic.Value(u64),
 
         pub fn init() Metrics {
             return .{
@@ -112,6 +117,11 @@ pub const Engine = struct {
                 .flush_ns_total = std.atomic.Value(u64).init(0),
                 .flush_points_total = std.atomic.Value(u64).init(0),
                 .wal_bytes_total = std.atomic.Value(u64).init(0),
+                .queue_pop_total = std.atomic.Value(u64).init(0),
+                .queue_wait_ns_total = std.atomic.Value(u64).init(0),
+                .queue_max_len = std.atomic.Value(usize).init(0),
+                .queue_len_sum = std.atomic.Value(u128).init(0),
+                .queue_len_samples = std.atomic.Value(u64).init(0),
             };
         }
     };
@@ -172,13 +182,31 @@ pub const Engine = struct {
 
     pub fn ingest(self: *Engine, item: IngestItem) !void {
         try self.queue.push(item);
+        const len_now = self.queue.len();
+        _ = self.metrics.queue_len_sum.fetchAdd(len_now, .monotonic);
+        _ = self.metrics.queue_len_samples.fetchAdd(1, .monotonic);
+        var current_max = self.metrics.queue_max_len.load(.monotonic);
+        while (len_now > current_max) {
+            if (self.metrics.queue_max_len.cmpxchgWeak(current_max, len_now, .monotonic, .monotonic)) |prev|
+                current_max = prev
+            else
+                break;
+        }
     }
 
     fn writerLoop(self: *Engine) void {
         var last_flush = std.time.milliTimestamp();
         var last_sync = last_flush;
+        var last_pop_ns = std.time.nanoTimestamp();
         while (!self.stop_flag) {
             if (self.queue.pop()) |it| {
+                const now_ns = std.time.nanoTimestamp();
+                const wait_delta = now_ns - last_pop_ns;
+                _ = self.metrics.queue_pop_total.fetchAdd(1, .monotonic);
+                if (wait_delta > 0) {
+                    _ = self.metrics.queue_wait_ns_total.fetchAdd(@as(u64, @intCast(wait_delta)), .monotonic);
+                }
+                last_pop_ns = now_ns;
                 // WAL append
                 const wal_bytes = self.wal.append(it.series_id, it.ts, it.value) catch 0;
                 if (wal_bytes != 0) {

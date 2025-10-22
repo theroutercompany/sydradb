@@ -69,6 +69,10 @@ fn parseArgs(alloc: std.mem.Allocator) !struct {
     ops: usize,
     concurrency: usize,
     series: usize,
+    drain_timeout_ms: usize,
+    poll_ms: u32,
+    flush_interval_ms: u32,
+    memtable_max_bytes: usize,
 } {
     var args = try std.process.argsWithAllocator(alloc);
     defer args.deinit();
@@ -77,6 +81,10 @@ fn parseArgs(alloc: std.mem.Allocator) !struct {
     var total_ops: usize = 200_000;
     var concurrency: usize = 4;
     var series: usize = 128;
+    var drain_timeout_ms: usize = 0;
+    var poll_ms: u32 = 5;
+    var flush_interval_ms: u32 = 200;
+    var memtable_mb: usize = 32;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--ops")) {
@@ -91,9 +99,25 @@ fn parseArgs(alloc: std.mem.Allocator) !struct {
             if (args.next()) |val| {
                 series = try std.fmt.parseInt(usize, val, 10);
             } else return error.InvalidArgs;
+        } else if (std.mem.eql(u8, arg, "--drain-timeout-ms")) {
+            if (args.next()) |val| {
+                drain_timeout_ms = try std.fmt.parseInt(usize, val, 10);
+            } else return error.InvalidArgs;
+        } else if (std.mem.eql(u8, arg, "--poll-ms")) {
+            if (args.next()) |val| {
+                poll_ms = try std.fmt.parseInt(u32, val, 10);
+            } else return error.InvalidArgs;
+        } else if (std.mem.eql(u8, arg, "--flush-ms")) {
+            if (args.next()) |val| {
+                flush_interval_ms = try std.fmt.parseInt(u32, val, 10);
+            } else return error.InvalidArgs;
+        } else if (std.mem.eql(u8, arg, "--memtable-mb")) {
+            if (args.next()) |val| {
+                memtable_mb = try std.fmt.parseInt(usize, val, 10);
+            } else return error.InvalidArgs;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             std.debug.print(
-                "Usage: bench_alloc [--ops N] [--concurrency N] [--series N]\n",
+                "Usage: bench_alloc [--ops N] [--concurrency N] [--series N] [--drain-timeout-ms N] [--poll-ms N] [--flush-ms N] [--memtable-mb N]\n",
                 .{},
             );
             std.process.exit(0);
@@ -101,7 +125,16 @@ fn parseArgs(alloc: std.mem.Allocator) !struct {
     }
 
     if (concurrency == 0 or series == 0 or total_ops == 0) return error.InvalidArgs;
-    return .{ .ops = total_ops, .concurrency = concurrency, .series = series };
+    const memtable_max_bytes = memtable_mb * 1024 * 1024;
+    return .{
+        .ops = total_ops,
+        .concurrency = concurrency,
+        .series = series,
+        .drain_timeout_ms = drain_timeout_ms,
+        .poll_ms = poll_ms,
+        .flush_interval_ms = flush_interval_ms,
+        .memtable_max_bytes = memtable_max_bytes,
+    };
 }
 
 pub fn main() !void {
@@ -119,7 +152,7 @@ pub fn main() !void {
     const dir_name = try std.fmt.bufPrint(&path_buf, "bench-data-{d}", .{timestamp});
     try std.fs.cwd().makePath(dir_name);
 
-    var config = try makeConfig(alloc, dir_name, 50, 4 * 1024 * 1024);
+    var config = try makeConfig(alloc, dir_name, arg_state.flush_interval_ms, arg_state.memtable_max_bytes);
     var config_guard = true;
     defer if (config_guard) config.deinit(alloc);
 
@@ -179,20 +212,29 @@ pub fn main() !void {
 
     // Wait for writer thread to drain queue and update metrics
     const target_total: u64 = @intCast(ops_total);
-    const timeout_ns: i128 = 30 * std.time.ns_per_s;
+    const timeout_ns: ?i128 = if (arg_state.drain_timeout_ms == 0)
+        null
+    else
+        @as(i128, @intCast(arg_state.drain_timeout_ms)) * std.time.ns_per_ms;
     const wait_start = std.time.nanoTimestamp();
+    var samples: usize = 0;
+    var max_pending: usize = 0;
+    var pending_sum: u128 = 0;
+    var timed_out = false;
     while (true) {
         const ingested = eng.metrics.ingest_total.load(.monotonic);
         const pending = eng.queue.len();
+        samples += 1;
+        pending_sum += pending;
+        if (pending > max_pending) max_pending = pending;
         if (ingested >= target_total and pending == 0) break;
-        if (@as(i128, std.time.nanoTimestamp()) - wait_start > timeout_ns) {
-            std.debug.print(
-                "warning: timeout waiting for writer thread (ingested={d}, pending={d})\n",
-                .{ ingested, pending },
-            );
-            break;
+        if (timeout_ns) |limit_ns| {
+            if (@as(i128, std.time.nanoTimestamp()) - wait_start > limit_ns) {
+                timed_out = true;
+                break;
+            }
         }
-        sleepMs(1);
+        sleepMs(arg_state.poll_ms);
     }
     const end_ns = std.time.nanoTimestamp();
 
@@ -208,8 +250,36 @@ pub fn main() !void {
     const final_ingested = eng.metrics.ingest_total.load(.monotonic);
     const final_flushes = eng.metrics.flush_total.load(.monotonic);
 
+    const queue_avg = if (samples > 0) @as(f64, @floatFromInt(pending_sum)) / @as(f64, @floatFromInt(samples)) else 0.0;
+    const pending_end = eng.queue.len();
+
+    const flush_total = final_flushes;
+    const flush_ns_total = eng.metrics.flush_ns_total.load(.monotonic);
+    const flush_points_total = eng.metrics.flush_points_total.load(.monotonic);
+    const avg_flush_ms = if (flush_total > 0)
+        (@as(f64, @floatFromInt(flush_ns_total)) / @as(f64, std.time.ns_per_ms)) / @as(f64, @floatFromInt(flush_total))
+    else
+        0.0;
+    const avg_flush_points = if (flush_total > 0)
+        @as(f64, @floatFromInt(flush_points_total)) / @as(f64, @floatFromInt(flush_total))
+    else
+        0.0;
+    const queue_pop_total = eng.metrics.queue_pop_total.load(.monotonic);
+    const queue_wait_ns_total = eng.metrics.queue_wait_ns_total.load(.monotonic);
+    const queue_len_sum = eng.metrics.queue_len_sum.load(.monotonic);
+    const queue_len_samples = eng.metrics.queue_len_samples.load(.monotonic);
+    const queue_max_len = eng.metrics.queue_max_len.load(.monotonic);
+    const avg_queue_wait_ms = if (queue_pop_total > 0)
+        (@as(f64, @floatFromInt(queue_wait_ns_total)) / @as(f64, std.time.ns_per_ms)) / @as(f64, @floatFromInt(queue_pop_total))
+    else
+        0.0;
+    const avg_queue_len = if (queue_len_samples > 0)
+        @as(f64, @floatFromInt(queue_len_sum)) / @as(f64, @floatFromInt(queue_len_samples))
+    else
+        0.0;
+
     std.debug.print(
-        "allocator_mode={s} ops={d} concurrency={d} series={d} produce_ms={d:.3} wait_ms={d:.3} total_ms={d:.3} throughput={d:.2} ops/s ingested={d} flushes={d}\n",
+        "allocator_mode={s} ops={d} concurrency={d} series={d} produce_ms={d:.3} wait_ms={d:.3} total_ms={d:.3} throughput={d:.2} ops/s ingested={d} flushes={d} avg_flush_ms={d:.3} avg_flush_points={d:.1}\n",
         .{
             build_options.allocator_mode,
             ops_total,
@@ -221,6 +291,44 @@ pub fn main() !void {
             throughput,
             final_ingested,
             final_flushes,
+            avg_flush_ms,
+            avg_flush_points,
         },
     );
+    std.debug.print(
+        "queue_stats max_pending={d} avg_pending={d:.1} samples={d} pending_end={d} timed_out={s}\n",
+        .{ max_pending, queue_avg, samples, pending_end, if (timed_out) "true" else "false" },
+    );
+    std.debug.print(
+        "queue_metrics pops={d} avg_wait_ms={d:.3} avg_len={d:.1} max_len={d}\n",
+        .{ queue_pop_total, avg_queue_wait_ms, avg_queue_len, queue_max_len },
+    );
+
+    if (comptime std.mem.eql(u8, alloc_mod.mode, "small_pool")) {
+        const pool_stats = allocator_handle.snapshotSmallPoolStats();
+        std.debug.print(
+            "small_pool fallback_allocs={d} fallback_frees={d} fallback_resizes={d} fallback_remaps={d}\n",
+            .{ pool_stats.fallback_allocs, pool_stats.fallback_frees, pool_stats.fallback_resizes, pool_stats.fallback_remaps },
+        );
+        std.debug.print("  fallback_size_buckets:\n", .{});
+        inline for (pool_stats.fallback_size_buckets, 0..) |count, bucket_i| {
+            const upper = pool_stats.fallback_size_bounds[bucket_i];
+            if (upper) |bound| {
+                std.debug.print("    <= {d:>5}B : {d}\n", .{ bound, count });
+            } else {
+                const last = pool_stats.fallback_size_bounds[pool_stats.fallback_size_bounds.len - 2].?;
+                std.debug.print("    >  {d:>5}B : {d}\n", .{ last, count });
+            }
+        }
+        for (pool_stats.buckets) |bucket| {
+            std.debug.print(
+                "  bucket size={d} alloc_size={d} allocations={d} in_use={d} high_water={d} refills={d} slabs={d} free={d}\n",
+                .{ bucket.size, bucket.alloc_size, bucket.allocations, bucket.in_use, bucket.high_water, bucket.refills, bucket.slabs, bucket.free_nodes },
+            );
+        }
+    }
+
+    if (timed_out) {
+        std.debug.print("warning: writer drain timed out after {d} ms\n", .{arg_state.drain_timeout_ms});
+    }
 }
