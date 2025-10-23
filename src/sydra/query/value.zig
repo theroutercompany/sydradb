@@ -78,7 +78,7 @@ pub const Value = union(enum) {
 
     pub fn copySlice(allocator: std.mem.Allocator, values: []const Value) ![]Value {
         const out = try allocator.alloc(Value, values.len);
-        std.mem.copy(Value, out, values);
+        std.mem.copyForwards(Value, out, values);
         return out;
     }
 };

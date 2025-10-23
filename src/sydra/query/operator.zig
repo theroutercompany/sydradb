@@ -13,7 +13,9 @@ const ManagedArrayList = std.array_list.Managed;
 
 pub const Value = value_mod.Value;
 
-pub const ExecuteError = std.mem.Allocator.Error || expression.EvalError || error{
+const QueryRangeError = @typeInfo(@typeInfo(@TypeOf(engine_mod.Engine.queryRange)).@"fn".return_type.?).error_union.error_set;
+
+pub const ExecuteError = std.mem.Allocator.Error || expression.EvalError || QueryRangeError || error{
     UnsupportedPlan,
     UnsupportedAggregate,
 };
@@ -95,16 +97,6 @@ pub const Operator = struct {
         child: *Operator,
         offset: usize,
         remaining: usize,
-
-        pub fn init(child: *Operator, offset: usize, take: usize) Operator {
-            return Operator{
-                .allocator = child.allocator,
-                .schema = child.schema,
-                .payload = .{ .limit = .{ .child = child, .offset = offset, .remaining = take } },
-                .next_fn = limitNext,
-                .destroy_fn = limitDestroy,
-            };
-        }
     };
 
     const AggregateKind = enum { avg, sum, count };
@@ -165,7 +157,7 @@ pub fn buildPipeline(allocator: std.mem.Allocator, engine: *engine_mod.Engine, n
                 return try createSortLimitOperator(allocator, engine, limit.child, limit, physical.nodeOutput(node));
             }
             const child = try buildPipeline(allocator, engine, limit.child);
-            return Operator.Limit.init(child, limit.offset, limit.limit.limit);
+            return try createLimitOperator(allocator, child, physical.nodeOutput(node), limit.offset, limit.limit.limit);
         },
     };
 }
@@ -296,7 +288,7 @@ fn projectDestroy(op: *Operator) void {
 }
 
 fn createAggregateOperator(allocator: std.mem.Allocator, child: *Operator, node: physical.Aggregate, schema: []const plan.ColumnInfo) ExecuteError!*Operator {
-    const aggregates = try analyseAggregates(allocator, node.output, node.groupings);
+    var aggregates = try analyseAggregates(allocator, node.output, node.groupings);
     defer aggregates.map.deinit();
     const column_meta = try buildColumnMeta(allocator, node.output, node.groupings, aggregates.exprs);
     errdefer allocator.free(column_meta);
@@ -495,15 +487,15 @@ fn createSortOperator(
     }
 
     const sort_ctx = SortContext{ .ordering = ordering };
-    std.sort.sort(Operator.OwnedRow, rows.items, sort_ctx, SortContext.lessThan);
+    std.sort.pdq(Operator.OwnedRow, rows.items, sort_ctx, SortContext.lessThan);
 
     if (limit_hint) |hint| {
-        const start = std.math.min(hint.offset, rows.items.len);
+        const start = @min(hint.offset, rows.items.len);
         for (rows.items[0..start]) |owned| {
             freeOwnedRow(allocator, owned);
         }
         const remaining = rows.items[start..];
-        std.mem.copy(Operator.OwnedRow, rows.items[0..remaining.len], remaining);
+        std.mem.copyForwards(Operator.OwnedRow, rows.items[0..remaining.len], remaining);
         rows.items.len = remaining.len;
 
         if (rows.items.len > hint.take) {
@@ -515,6 +507,17 @@ fn createSortOperator(
     }
 
     return try createOperator(allocator, schema, sortNext, sortDestroy, .{ .sort = .{ .rows = rows, .index = 0 } });
+}
+
+fn createLimitOperator(
+    allocator: std.mem.Allocator,
+    child: *Operator,
+    schema: []const plan.ColumnInfo,
+    offset: usize,
+    take: usize,
+) ExecuteError!*Operator {
+    const payload = Operator.Limit{ .child = child, .offset = offset, .remaining = take };
+    return try createOperator(allocator, schema, limitNext, limitDestroy, .{ .limit = payload });
 }
 
 fn createSortLimitOperator(

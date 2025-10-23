@@ -63,7 +63,7 @@ fn randomTraceId(allocator: std.mem.Allocator) ![]const u8 {
     const buf = try allocator.alloc(u8, 16);
     errdefer allocator.free(buf);
 
-    try std.crypto.random.bytes(buf);
+    std.crypto.random.bytes(buf);
 
     const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
     for (buf) |*byte| {

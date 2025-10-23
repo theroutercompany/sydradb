@@ -62,7 +62,7 @@ pub fn rowResolver(ctx: *const RowContext) Resolver {
 }
 
 fn rowGetIdentifier(ctx_ptr: *const anyopaque, ident: ast.Identifier) EvalError!Value {
-    const ctx = @as(*const RowContext, @ptrCast(ctx_ptr));
+    const ctx = @as(*const RowContext, @ptrCast(@alignCast(ctx_ptr)));
     const name = ident.value;
     const unqualified = trailingSegment(name);
     for (ctx.schema, 0..) |column, idx| {
@@ -139,7 +139,7 @@ fn evaluateScalarCall(call: ast.Call, resolver: *const Resolver) EvalError!Value
     if (std.ascii.eqlIgnoreCase(call.callee.value, "abs")) {
         if (call.args.len != 1) return EvalError.UnsupportedExpression;
         const arg = try evaluate(call.args[0], resolver);
-        return Value{ .float = std.math.fabs(try arg.asFloat()) };
+        return Value{ .float = @abs(try arg.asFloat()) };
     }
     return EvalError.UnsupportedExpression;
 }

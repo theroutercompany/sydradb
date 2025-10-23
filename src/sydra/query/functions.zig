@@ -65,10 +65,9 @@ pub fn registry() []const FunctionSignature {
 }
 
 pub fn lookup(name: []const u8) ?*const FunctionSignature {
-    for (builtin_registry) |*entry| {
-        if (std.ascii.eqlIgnoreCase(entry.name, name)) {
-            return entry;
-        }
+    for (builtin_registry, 0..) |_, idx| {
+        const entry = &builtin_registry[idx];
+        if (std.ascii.eqlIgnoreCase(entry.name, name)) return entry;
     }
     return null;
 }

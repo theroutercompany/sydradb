@@ -196,7 +196,7 @@ pub const Builder = struct {
     }
 
     fn combinePredicates(self: *Builder, predicates: []const *const ast.Expr) !*const ast.Expr {
-        if (predicates.len == 0) return null;
+        std.debug.assert(predicates.len != 0);
         var result = predicates[0];
         for (predicates[1..]) |expr| {
             const span = spanUnion(exprSpan(result), exprSpan(expr));

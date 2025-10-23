@@ -49,10 +49,10 @@ This plan captures every known change required to move the codebase and tooling 
 - Run `zig fmt` after all code edits; the formatter will catch lingering layout issues (e.g., `src/sydra/codec/zstd.zig`, `src/sydra/config.zig` were cited by pre-commit).
 
 ## 7. Verification Checklist
-- `zig fmt` (root)  
-- `zig build`  
-- `zig build test`  
-- `pre-commit run --all-files --show-diff-on-failure`  
+- `zig fmt` (root)<br>
+- `zig build`<br>
+- `zig build test`<br>
+- `pre-commit run --all-files --show-diff-on-failure`
 - Manual smoke tests:
   - Start HTTP server, hit `/metrics`, POST `/api/v1/ingest`, and query `/api/v1/query/range`.
   - Run `sydradb pgwire` and confirm a `psql` startup handshake succeeds (see `logs/logs_47733482709/2_Checks (ubuntu-latest).txt` for prior failures).

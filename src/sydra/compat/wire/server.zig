@@ -275,17 +275,19 @@ fn handleSydraqlQuery(
 
     const elapsed_us = std.time.microTimestamp() - start_time;
     const plan_us = cursor.stats.parse_us + cursor.stats.validate_us + cursor.stats.optimize_us + cursor.stats.physical_us + cursor.stats.pipeline_us;
+    const stream_ms = @divTrunc(elapsed_us, 1000);
+    const plan_ms = @divTrunc(plan_us, 1000);
     const tag = if (cursor.stats.trace_id.len != 0)
         try std.fmt.allocPrint(
             alloc,
             "SELECT rows={d} stream_ms={d} plan_ms={d} trace_id={s}",
-            .{ row_count, elapsed_us / 1000, plan_us / 1000, cursor.stats.trace_id },
+            .{ row_count, stream_ms, plan_ms, cursor.stats.trace_id },
         )
     else
         try std.fmt.allocPrint(
             alloc,
             "SELECT rows={d} stream_ms={d} plan_ms={d}",
-            .{ row_count, elapsed_us / 1000, plan_us / 1000 },
+            .{ row_count, stream_ms, plan_ms },
         );
     defer alloc.free(tag);
     try protocol.writeCommandComplete(writer, tag);

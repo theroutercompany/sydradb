@@ -3,10 +3,11 @@ repos:
     rev: v4.6.0
     hooks:
       - id: trailing-whitespace
+        exclude: ^vendor/
       - id: end-of-file-fixer
+        exclude: ^vendor/
       - id: check-merge-conflict
       - id: check-yaml
-    exclude: ^vendor/
 
   - repo: local
     hooks:

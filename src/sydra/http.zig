@@ -148,9 +148,7 @@ fn handleSydraql(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     errdefer response.end() catch {};
 
     var writer = response.writer;
-    var adapter_buf: [256]u8 = undefined;
-    var adapter = writer.adaptToNewApi(&adapter_buf);
-    var jw = std.json.Stringify{ .writer = &adapter.new_interface };
+    var jw = std.json.Stringify{ .writer = &writer };
 
     try jw.beginObject();
     try jw.objectField("columns");
@@ -204,7 +202,6 @@ fn respondExecutionError(alloc: std.mem.Allocator, req: *std.http.Server.Request
         error.UnsupportedPlan,
         error.UnsupportedExpression,
         error.UnsupportedAggregate,
-        error.UnsupportedSelector,
         error.ValidationFailed,
         => .bad_request,
         else => .bad_request,

@@ -16,13 +16,13 @@ pub fn optimize(allocator: std.mem.Allocator, root: *plan.Node) OptimizeError!*p
 
 fn pruneProjects(allocator: std.mem.Allocator, node: *plan.Node) !void {
     switch (node.*) {
-        .project => |project| {
+        .project => |*project| {
             switch (project.input.*) {
-                .project => |child| {
+                .project => |*child| {
                     child.output = try mergeColumns(allocator, project.projections, child.output);
                     project.input = child.input;
                 },
-                .aggregate => |child| {
+                .aggregate => |*child| {
                     child.output = try mergeColumns(allocator, project.projections, child.output);
                 },
                 else => {},
@@ -153,8 +153,8 @@ fn mergeFilters(parent: *plan.Filter, child_node: *plan.Node, allocator: std.mem
     const child = child_node.filter;
     const new_len = parent.conjunctive_predicates.len + child.conjunctive_predicates.len;
     const merged = try allocator.alloc(*const ast.Expr, new_len);
-    std.mem.copy(*const ast.Expr, merged[0..parent.conjunctive_predicates.len], parent.conjunctive_predicates);
-    std.mem.copy(*const ast.Expr, merged[parent.conjunctive_predicates.len..], child.conjunctive_predicates);
+    std.mem.copyForwards(*const ast.Expr, merged[0..parent.conjunctive_predicates.len], parent.conjunctive_predicates);
+    std.mem.copyForwards(*const ast.Expr, merged[parent.conjunctive_predicates.len..], child.conjunctive_predicates);
 
     parent.conjunctive_predicates = merged;
     parent.input = child.input;
@@ -338,7 +338,7 @@ fn callEqual(a: ast.Call, b: ast.Call) bool {
 }
 
 fn buildPredicateExpr(allocator: std.mem.Allocator, predicates: []const *const ast.Expr) !*const ast.Expr {
-    if (predicates.len == 0) return null;
+    std.debug.assert(predicates.len != 0);
     var result = predicates[0];
     for (predicates[1..]) |expr| {
         const span = spanUnion(exprSpan(result), exprSpan(expr));
