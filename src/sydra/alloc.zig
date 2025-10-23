@@ -85,7 +85,7 @@ const SmallPoolAllocator = if (use_small_pool) struct {
     const fallback_bucket_count = fallback_bucket_bounds.len + 1;
     const lock_wait_threshold_ns: i64 = 1_000;
     const shard_classes_table = buildSlabClasses();
-    const max_shard_size = shard_classes_table[shard_classes_table.len - 1].size;
+    pub const max_shard_size = shard_classes_table[shard_classes_table.len - 1].size;
 
     const ThreadShardState = struct {
         manager: ?*ShardManager = null,
@@ -247,7 +247,7 @@ const SmallPoolAllocator = if (use_small_pool) struct {
         return classes;
     }
 
-    fn shardConfig() slab_shard.ShardConfig {
+    pub fn shardConfig() slab_shard.ShardConfig {
         return .{
             .classes = shard_classes_table[0..],
             .slab_bytes = slab_bytes,
@@ -741,6 +741,47 @@ pub const AllocatorHandle = if (use_small_pool) struct {
         _ = self.gpa.deinit();
     }
 };
+
+test "small_pool oversize allocation falls back" {
+    if (!use_small_pool) return;
+
+    var handle = AllocatorHandle.init();
+    defer handle.deinit();
+
+    const before = handle.snapshotSmallPoolStats();
+    const alloc = handle.allocator();
+
+    const big_len = SmallPoolAllocator.max_shard_size + 16;
+    const buf = alloc.alloc(u8, big_len) catch return error.TestUnexpectedResult;
+    const mid = handle.snapshotSmallPoolStats();
+    try std.testing.expectEqual(before.fallback_allocs + 1, mid.fallback_allocs);
+
+    alloc.free(buf);
+    const after = handle.snapshotSmallPoolStats();
+    try std.testing.expectEqual(before.fallback_frees + 1, after.fallback_frees);
+}
+
+test "small_pool shard stats capture allocation hits" {
+    if (!use_small_pool) return;
+
+    var pool = SmallPoolAllocator.init();
+    defer pool.deinit();
+
+    if (pool.shard_manager == null) {
+        const config = SmallPoolAllocator.shardConfig();
+        const manager = SmallPoolAllocator.ShardManager.init(pool.gpa.allocator(), config, 2) catch return error.TestUnexpectedResult;
+        pool.shard_manager = manager;
+    }
+
+    const alloc = pool.allocator();
+    const buf = alloc.alloc(u8, 32) catch return error.TestUnexpectedResult;
+    alloc.free(buf);
+
+    const stats = pool.snapshotStats();
+    try std.testing.expect(stats.shard_enabled);
+    try std.testing.expect(stats.shard_count >= 1);
+    try std.testing.expect(stats.shard_alloc_hits >= 1);
+}
 
 test "shard manager assigns per-thread shards" {
     if (!use_small_pool) return;

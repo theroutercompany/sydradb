@@ -109,7 +109,10 @@ pub const Shard = struct {
         const base = ptr - header_size;
         const node = @as(*FreeNode, @ptrCast(@alignCast(base)));
         const state = node.class_state;
-        if (!self.ownsState(state)) return false;
+        const owned = self.ownsState(state);
+        std.debug.assert(owned);
+        if (!owned) return false;
+        std.debug.assert(state.owner == self);
         node.next = state.free_list;
         state.free_list = node;
         if (state.in_use > 0) state.in_use -= 1;
@@ -120,7 +123,10 @@ pub const Shard = struct {
         const base = ptr - header_size;
         const node = @as(*FreeNode, @ptrCast(@alignCast(base)));
         const state = node.class_state;
-        if (!self.ownsState(state)) return false;
+        const owned = self.ownsState(state);
+        std.debug.assert(owned);
+        if (!owned) return false;
+        std.debug.assert(state.owner == self);
         const epoch = self.global_epoch.load(.monotonic);
         node.epoch = epoch;
         var expected = state.deferred.load(.monotonic);
@@ -278,4 +284,39 @@ test "owningShard returns correct shard" {
     const owner = Shard.owningShard(ptr) orelse return error.TestUnexpectedResult;
     try std.testing.expect(owner == &shard);
     try std.testing.expect(shard.free(ptr));
+}
+
+test "shard snapshot reports deferred queues and epochs" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    const classes = [_]SlabClass{
+        .{ .size = 32, .alloc_size = 32 + header_size, .objects_per_slab = 4 },
+    };
+    var shard = try Shard.init(arena.allocator(), .{
+        .classes = &classes,
+        .slab_bytes = 64 * 1024,
+    });
+    defer shard.deinit();
+    shard.assignOwner();
+
+    const ptr = shard.allocate(16, default_alignment, @returnAddress()) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(shard.freeDeferred(ptr));
+
+    const summary = shard.summary();
+    try std.testing.expectEqual(@as(usize, 1), summary.deferred_total);
+
+    const stats = try shard.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(stats);
+    try std.testing.expectEqual(@as(usize, 1), stats[0].deferred);
+    try std.testing.expectEqual(summary.current_epoch, stats[0].current_epoch);
+    try std.testing.expectEqual(summary.min_observed_epoch, stats[0].min_observed_epoch);
+
+    const epoch = shard.advanceEpoch();
+    shard.observeEpoch(epoch);
+    shard.collectGarbage();
+
+    const stats_after = try shard.snapshot(std.testing.allocator);
+    defer std.testing.allocator.free(stats_after);
+    try std.testing.expectEqual(@as(usize, 0), stats_after[0].deferred);
 }
