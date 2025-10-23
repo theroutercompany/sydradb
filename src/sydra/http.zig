@@ -4,8 +4,10 @@ const types = @import("types.zig");
 const config = @import("config.zig");
 const compat = @import("compat.zig");
 const query_exec = @import("query/exec.zig");
+const plan = @import("query/plan.zig");
 const query_executor = @import("query/executor.zig");
 const query_value = @import("query/value.zig");
+const query_functions = @import("query/functions.zig");
 
 pub fn runHttp(alloc: std.mem.Allocator, eng: *Engine, port: u16) !void {
     var address = try std.net.Address.parseIp4("0.0.0.0", port);
@@ -155,7 +157,14 @@ fn handleSydraql(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     try jw.objectField("columns");
     try jw.beginArray();
     for (cursor.columns) |col| {
+        try jw.beginObject();
+        try jw.objectField("name");
         try jw.write(col.name);
+        try jw.objectField("type");
+        try jw.write(query_functions.displayName(col.ty));
+        try jw.objectField("nullable");
+        try jw.write(col.ty.nullable);
+        try jw.endObject();
     }
     try jw.endArray();
     try jw.objectField("rows");
@@ -182,7 +191,7 @@ fn handleSydraql(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     cursor.stats.rows_scanned = rows_scanned;
     const elapsed_us_signed = std.time.microTimestamp() - start_time;
     const elapsed_us = @as(u64, @intCast(elapsed_us_signed));
-    try writeStatsObject(&jw, row_count, elapsed_us, &cursor.stats, op_stats);
+    try writeStatsObject(&jw, row_count, elapsed_us, &cursor.stats, op_stats, cursor.columns);
     try jw.endObject();
 
     try response.end();
@@ -229,6 +238,7 @@ fn writeStatsObject(
     stream_us: u64,
     stats: *const query_executor.ExecutionStats,
     operators: []const query_executor.OperatorStats,
+    columns: []const plan.ColumnInfo,
 ) !void {
     try jw.objectField("stats");
     try jw.beginObject();
@@ -254,6 +264,19 @@ fn writeStatsObject(
         try jw.objectField("trace_id");
         try jw.write(stats.trace_id);
     }
+    try jw.objectField("schema");
+    try jw.beginArray();
+    for (columns) |col| {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(col.name);
+        try jw.objectField("type");
+        try jw.write(query_functions.displayName(col.ty));
+        try jw.objectField("nullable");
+        try jw.write(col.ty.nullable);
+        try jw.endObject();
+    }
+    try jw.endArray();
     try jw.objectField("operators");
     try jw.beginArray();
     for (operators) |op| {
@@ -303,13 +326,26 @@ test "writeStatsObject emits operator metrics" {
     const ops = [_]query_executor.OperatorStats{
         .{ .name = "scan", .elapsed_us = 2000, .rows_out = 5 },
     };
-    try writeStatsObject(&jw, 5, 5000, &stats, &ops);
+    const ast = @import("query/ast.zig");
+    const common = @import("query/common.zig");
+    const expr = try alloc.create(ast.Expr);
+    defer alloc.destroy(expr);
+    expr.* = .{ .literal = .{
+        .value = .null,
+        .span = common.Span.init(0, 0),
+    } };
+    const columns = [_]plan.ColumnInfo{
+        .{ .name = "value", .expr = expr, .ty = query_functions.Type.init(.value, true) },
+    };
+    try writeStatsObject(&jw, 5, 5000, &stats, &ops, columns[0..]);
     try jw.endObject();
 
     const json = buffer.items;
     try std.testing.expect(std.mem.indexOf(u8, json, "\"operators\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"rows_out\":5") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"scan\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"schema\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"nullable\":true") != null);
 }
 
 fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {

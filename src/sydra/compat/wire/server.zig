@@ -6,6 +6,7 @@ const query_exec = @import("../../query/exec.zig");
 const plan = @import("../../query/plan.zig");
 const value_mod = @import("../../query/value.zig");
 const engine_mod = @import("../../engine.zig");
+const query_functions = @import("../../query/functions.zig");
 
 const ManagedArrayList = std.array_list.Managed;
 
@@ -287,6 +288,16 @@ fn handleSydraqlQuery(
     const plan_us = cursor.stats.parse_us + cursor.stats.validate_us + cursor.stats.optimize_us + cursor.stats.physical_us + cursor.stats.pipeline_us;
     const stream_ms = @divTrunc(elapsed_us, 1000);
     const plan_ms = @divTrunc(@as(i64, @intCast(plan_us)), 1000);
+    if (cursor.columns.len != 0) {
+        const schema_notice = try formatSchemaNotice(alloc, cursor.columns);
+        defer alloc.free(schema_notice);
+        try protocol.writeNoticeResponse(writer, schema_notice);
+    }
+    if (cursor.stats.trace_id.len != 0) {
+        const trace_notice = try formatTraceNotice(alloc, cursor.stats.trace_id);
+        defer alloc.free(trace_notice);
+        try protocol.writeNoticeResponse(writer, trace_notice);
+    }
     for (op_stats) |stat| {
         const elapsed_ms = @divTrunc(@as(i64, @intCast(stat.elapsed_us)), 1000);
         const notice = try std.fmt.allocPrint(alloc, "operator={s} rows_out={d} elapsed_ms={d}", .{ stat.name, stat.rows_out, elapsed_ms });
@@ -321,15 +332,44 @@ fn writeRowDescription(writer: std.Io.AnyWriter, columns: []const plan.ColumnInf
         try writer.writeAll(buf4[0..4]);
         std.mem.writeInt(u16, buf2[0..2], 0, .big);
         try writer.writeAll(buf2[0..2]);
-        std.mem.writeInt(u32, buf4[0..4], 25, .big); // text OID
+        const type_info = query_functions.pgTypeInfo(col.ty);
+        std.mem.writeInt(u32, buf4[0..4], type_info.oid, .big);
         try writer.writeAll(buf4[0..4]);
-        std.mem.writeInt(i16, buf2[0..2], -1, .big);
+        std.mem.writeInt(i16, buf2[0..2], type_info.len, .big);
         try writer.writeAll(buf2[0..2]);
-        std.mem.writeInt(i32, buf4[0..4], -1, .big);
+        std.mem.writeInt(i32, buf4[0..4], type_info.modifier, .big);
         try writer.writeAll(buf4[0..4]);
-        std.mem.writeInt(u16, buf2[0..2], 0, .big); // text format
+        std.mem.writeInt(u16, buf2[0..2], type_info.format, .big);
         try writer.writeAll(buf2[0..2]);
     }
+}
+
+fn formatSchemaNotice(alloc: std.mem.Allocator, columns: []const plan.ColumnInfo) ![]u8 {
+    var buf = std.ArrayListUnmanaged(u8){};
+    errdefer buf.deinit(alloc);
+    var w = buf.writer(alloc);
+    try w.writeAll("schema=[");
+    for (columns, 0..) |col, idx| {
+        if (idx != 0) try w.writeAll(", ");
+        const type_name = query_functions.displayName(col.ty);
+        try w.writeAll("{name:\"");
+        try w.writeAll(col.name);
+        try w.writeAll("\",type:\"");
+        try w.writeAll(type_name);
+        try w.writeAll("\",nullable:");
+        if (col.ty.nullable) {
+            try w.writeAll("true");
+        } else {
+            try w.writeAll("false");
+        }
+        try w.writeByte('}');
+    }
+    try w.writeByte(']');
+    return buf.toOwnedSlice(alloc);
+}
+
+fn formatTraceNotice(alloc: std.mem.Allocator, trace_id: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "trace_id={s}", .{trace_id});
 }
 
 fn writeDataRow(
@@ -448,4 +488,11 @@ test "formatSelectTag includes trace id when present" {
     const tag = try formatSelectTag(alloc, 2, 4, 15, 9, "ABC123");
     defer alloc.free(tag);
     try std.testing.expectEqualStrings("SELECT rows=2 scanned=4 stream_ms=15 plan_ms=9 trace_id=ABC123", tag);
+}
+
+test "formatTraceNotice renders id" {
+    const alloc = std.testing.allocator;
+    const notice = try formatTraceNotice(alloc, "xyz");
+    defer alloc.free(notice);
+    try std.testing.expectEqualStrings("trace_id=xyz", notice);
 }
