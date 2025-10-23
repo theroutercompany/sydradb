@@ -737,3 +737,30 @@ pub const AllocatorHandle = if (use_small_pool) struct {
         _ = self.gpa.deinit();
     }
 };
+
+test "shard manager assigns per-thread shards" {
+    if (!use_small_pool) return;
+
+    var manager = try SmallPoolAllocator.ShardManager.init(std.testing.allocator, SmallPoolAllocator.shardConfig(), 2);
+    defer manager.deinit();
+
+    const main_shard = manager.currentShard();
+    try std.testing.expect(main_shard == manager.currentShard());
+
+    const Context = struct {
+        manager: *SmallPoolAllocator.ShardManager,
+        shard: ?*slab_shard.Shard = null,
+    };
+
+    var ctx = Context{ .manager = &manager, .shard = null };
+    const thread_fn = struct {
+        fn run(arg: *Context) void {
+            arg.shard = arg.manager.currentShard();
+        }
+    }.run;
+
+    var worker = try std.Thread.spawn(.{}, thread_fn, .{&ctx});
+    worker.join();
+    try std.testing.expect(ctx.shard != null);
+    try std.testing.expect(ctx.shard.? != main_shard);
+}
