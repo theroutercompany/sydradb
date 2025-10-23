@@ -155,11 +155,14 @@ const SmallPoolAllocator = if (use_small_pool) struct {
             return &self.shards[state.shard_index];
         }
 
-        pub fn freeLocal(_: *ShardManager, ptr: [*]u8) bool {
-            if (slab_shard.Shard.owningShard(ptr)) |owner| {
+        pub fn freeLocal(self: *ShardManager, ptr: [*]u8) bool {
+            const owner = slab_shard.Shard.owningShard(ptr) orelse return false;
+            const local = self.currentShard();
+            if (owner == local) {
                 return owner.free(ptr);
+            } else {
+                return owner.freeDeferred(ptr);
             }
-            return false;
         }
 
         pub fn freeDeferred(_: *ShardManager, ptr: [*]u8) bool {
@@ -479,8 +482,7 @@ const SmallPoolAllocator = if (use_small_pool) struct {
         if (memory.len == 0) return;
         if (self.shard_manager) |*manager| {
             const ptr = @as([*]u8, memory.ptr);
-            if (manager.freeLocal(ptr)) return;
-            if (manager.freeDeferred(ptr)) {
+            if (manager.freeLocal(ptr)) {
                 manager.collectGarbage();
                 return;
             }
@@ -765,4 +767,50 @@ test "shard manager assigns per-thread shards" {
     worker.join();
     try std.testing.expect(ctx.shard != null);
     try std.testing.expect(ctx.shard.? != main_shard);
+}
+
+test "shard manager defers cross-thread free" {
+    if (!use_small_pool) return;
+
+    var manager = try SmallPoolAllocator.ShardManager.init(std.testing.allocator, SmallPoolAllocator.shardConfig(), 2);
+    defer manager.deinit();
+
+    const shard_a = manager.currentShard();
+    const block = shard_a.allocate(16, SmallPoolAllocator.default_alignment, @returnAddress()) orelse return error.TestUnexpectedResult;
+
+    const Context = struct {
+        manager: *SmallPoolAllocator.ShardManager,
+        ptr: [*]u8,
+        success: bool = false,
+    };
+
+    var ctx = Context{ .manager = &manager, .ptr = block };
+
+    const thread_fn = struct {
+        fn run(arg: *Context) void {
+            const mgr = arg.manager;
+            _ = mgr.currentShard();
+            const epoch = mgr.enterEpoch();
+            arg.success = mgr.freeLocal(arg.ptr);
+            mgr.leaveEpoch(epoch);
+        }
+    }.run;
+
+    var worker = try std.Thread.spawn(.{}, thread_fn, .{&ctx});
+    worker.join();
+    try std.testing.expect(ctx.success);
+
+    const summary_before = shard_a.summary();
+    try std.testing.expect(summary_before.deferred_total == 1);
+
+    const new_epoch = manager.advanceEpoch();
+    manager.leaveEpoch(new_epoch);
+    manager.collectGarbage();
+
+    const summary_after = shard_a.summary();
+    try std.testing.expect(summary_after.deferred_total == 0);
+
+    const reclaimed = shard_a.allocate(16, SmallPoolAllocator.default_alignment, @returnAddress()) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(reclaimed == block);
+    try std.testing.expect(shard_a.free(reclaimed));
 }

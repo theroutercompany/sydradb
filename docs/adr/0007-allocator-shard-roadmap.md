@@ -109,6 +109,9 @@ We need a custom allocator that meets the performance and telemetry expectations
 - Compare metrics against acceptance criteria.
 - Ensure regression checks fail loudly if deferred queue spikes or contention climbs.
 
+**Status**
+- `bench_alloc` prints shard-level stats (hits/misses, deferred count, epoch bounds); profiling percentiles and stress harness remain TODO.
+
 ### Phase 6 – Documentation & Cleanup
 - Update README and design doc with new allocator options, metrics, expected behavior.
 - Add diagrams or tables summarizing shard architecture.
