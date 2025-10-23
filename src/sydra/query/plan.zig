@@ -3,6 +3,7 @@ const meta = std.meta;
 const ast = @import("ast.zig");
 const functions = @import("functions.zig");
 const common = @import("common.zig");
+const infer = @import("type_inference.zig");
 
 const ManagedArrayList = std.array_list.Managed;
 

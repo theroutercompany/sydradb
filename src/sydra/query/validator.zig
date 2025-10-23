@@ -3,6 +3,7 @@ const ast = @import("ast.zig");
 const errors = @import("errors.zig");
 const functions = @import("functions.zig");
 const common = @import("common.zig");
+const infer = @import("type_inference.zig");
 
 pub const AnalyzeError = std.mem.Allocator.Error;
 
