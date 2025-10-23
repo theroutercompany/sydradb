@@ -341,7 +341,28 @@ pub fn main() !void {
     );
 
     if (comptime std.mem.eql(u8, alloc_mod.mode, "small_pool")) {
+        if (allocator_handle.advanceEpoch()) |epoch| {
+            allocator_handle.leaveEpoch(epoch);
+        }
         const pool_stats = allocator_handle.snapshotSmallPoolStats();
+        if (pool_stats.shard_enabled) {
+            std.debug.print(
+                "  shards enabled count={d} hits={d} misses={d} deferred={d} epoch_current={d} epoch_min={d}\n",
+                .{
+                    pool_stats.shard_count,
+                    pool_stats.shard_alloc_hits,
+                    pool_stats.shard_alloc_misses,
+                    pool_stats.shard_deferred_total,
+                    pool_stats.shard_current_epoch,
+                    pool_stats.shard_min_epoch,
+                },
+            );
+        } else {
+            std.debug.print(
+                "  shards disabled hits={d} misses={d}\n",
+                .{ pool_stats.shard_alloc_hits, pool_stats.shard_alloc_misses },
+            );
+        }
         std.debug.print(
             "small_pool fallback_allocs={d} fallback_frees={d} fallback_resizes={d} fallback_remaps={d}\n",
             .{ pool_stats.fallback_allocs, pool_stats.fallback_frees, pool_stats.fallback_resizes, pool_stats.fallback_remaps },

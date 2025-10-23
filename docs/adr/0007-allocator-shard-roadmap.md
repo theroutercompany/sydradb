@@ -80,6 +80,9 @@ We need a custom allocator that meets the performance and telemetry expectations
 - `snapshotSmallPoolStats` merges legacy buckets + shard stats.
 - Expose new stats via `AllocatorHandle`.
 
+**Status**
+- Stats struct now aggregates shard hits/misses, deferred totals, and epoch bounds; bench driver emits the new metrics.
+
 **Tasks**
 1. Add atomic counters in `shard_shard`.
 2. Update `alloc.zig` stats structs & HTTP/CLI telemetry surfaces.
