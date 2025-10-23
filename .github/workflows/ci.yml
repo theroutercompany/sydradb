@@ -6,9 +6,14 @@ on:
     tags: [ 'v*' ]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   checks:
     name: Checks (${{ matrix.os }})
+    permissions:
+      contents: read
     strategy:
       matrix:
         os:
@@ -46,6 +51,8 @@ jobs:
     if: github.event_name != 'pull_request'
     needs: checks
     name: Release Artifacts (${{ matrix.name }})
+    permissions:
+      contents: read
     strategy:
       matrix:
         include:
