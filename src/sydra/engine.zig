@@ -107,7 +107,7 @@ pub const Engine = struct {
         queue_pop_total: std.atomic.Value(u64),
         queue_wait_ns_total: std.atomic.Value(u64),
         queue_max_len: std.atomic.Value(usize),
-        queue_len_sum: std.atomic.Value(u128),
+        queue_len_sum: std.atomic.Value(u64),
         queue_len_samples: std.atomic.Value(u64),
 
         pub fn init() Metrics {
@@ -120,7 +120,7 @@ pub const Engine = struct {
                 .queue_pop_total = std.atomic.Value(u64).init(0),
                 .queue_wait_ns_total = std.atomic.Value(u64).init(0),
                 .queue_max_len = std.atomic.Value(usize).init(0),
-                .queue_len_sum = std.atomic.Value(u128).init(0),
+                .queue_len_sum = std.atomic.Value(u64).init(0),
                 .queue_len_samples = std.atomic.Value(u64).init(0),
             };
         }
@@ -183,7 +183,8 @@ pub const Engine = struct {
     pub fn ingest(self: *Engine, item: IngestItem) !void {
         try self.queue.push(item);
         const len_now = self.queue.len();
-        _ = self.metrics.queue_len_sum.fetchAdd(len_now, .monotonic);
+        const len_now_u64: u64 = @intCast(len_now);
+        _ = self.metrics.queue_len_sum.fetchAdd(len_now_u64, .monotonic);
         _ = self.metrics.queue_len_samples.fetchAdd(1, .monotonic);
         var current_max = self.metrics.queue_max_len.load(.monotonic);
         while (len_now > current_max) {
