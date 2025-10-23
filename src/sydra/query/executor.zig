@@ -5,6 +5,7 @@ const engine_mod = @import("../engine.zig");
 const plan = @import("plan.zig");
 const operator = @import("operator.zig");
 const value_mod = @import("value.zig");
+const ManagedArrayList = std.array_list.Managed;
 
 pub const Value = value_mod.Value;
 
@@ -17,7 +18,11 @@ pub const ExecutionStats = struct {
     physical_us: u64 = 0,
     pipeline_us: u64 = 0,
     trace_id: []const u8 = "",
+    rows_emitted: u64 = 0,
+    rows_scanned: u64 = 0,
 };
+
+pub const OperatorStats = operator.Operator.StatsSnapshot;
 
 pub const ExecutionCursor = struct {
     allocator: std.mem.Allocator,
@@ -37,6 +42,13 @@ pub const ExecutionCursor = struct {
             self.allocator.destroy(arena_ptr);
             self.arena = null;
         }
+    }
+
+    pub fn collectOperatorStats(self: *ExecutionCursor, allocator: std.mem.Allocator) ![]OperatorStats {
+        var list = ManagedArrayList(OperatorStats).init(allocator);
+        errdefer list.deinit();
+        try self.operator.collectStats(&list);
+        return try list.toOwnedSlice();
     }
 };
 

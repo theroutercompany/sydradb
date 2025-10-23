@@ -81,7 +81,7 @@ fn parseArgs(alloc: std.mem.Allocator) !struct {
     var total_ops: usize = 200_000;
     var concurrency: usize = 4;
     var series: usize = 128;
-    var drain_timeout_ms: usize = 0;
+    var drain_timeout_ms: usize = 60_000;
     var poll_ms: u32 = 5;
     var flush_interval_ms: u32 = 200;
     var memtable_mb: usize = 32;
@@ -269,6 +269,14 @@ pub fn main() !void {
     const queue_len_sum = eng.metrics.queue_len_sum.load(.monotonic);
     const queue_len_samples = eng.metrics.queue_len_samples.load(.monotonic);
     const queue_max_len = eng.metrics.queue_max_len.load(.monotonic);
+    const queue_push_lock_wait_ns_total = eng.metrics.queue_push_lock_wait_ns_total.load(.monotonic);
+    const queue_push_lock_hold_ns_total = eng.metrics.queue_push_lock_hold_ns_total.load(.monotonic);
+    const queue_push_lock_acquisitions = eng.metrics.queue_push_lock_acquisitions.load(.monotonic);
+    const queue_push_lock_contention = eng.metrics.queue_push_lock_contention.load(.monotonic);
+    const queue_pop_lock_wait_ns_total = eng.metrics.queue_pop_lock_wait_ns_total.load(.monotonic);
+    const queue_pop_lock_hold_ns_total = eng.metrics.queue_pop_lock_hold_ns_total.load(.monotonic);
+    const queue_pop_lock_acquisitions = eng.metrics.queue_pop_lock_acquisitions.load(.monotonic);
+    const queue_pop_lock_contention = eng.metrics.queue_pop_lock_contention.load(.monotonic);
     const avg_queue_wait_ms = if (queue_pop_total > 0)
         (@as(f64, @floatFromInt(queue_wait_ns_total)) / @as(f64, std.time.ns_per_ms)) / @as(f64, @floatFromInt(queue_pop_total))
     else
@@ -304,6 +312,34 @@ pub fn main() !void {
         .{ queue_pop_total, avg_queue_wait_ms, avg_queue_len, queue_max_len },
     );
 
+    const avg_push_wait_us = if (queue_push_lock_acquisitions > 0)
+        (@as(f64, @floatFromInt(queue_push_lock_wait_ns_total)) / 1000.0) / @as(f64, @floatFromInt(queue_push_lock_acquisitions))
+    else
+        0.0;
+    const avg_push_hold_us = if (queue_push_lock_acquisitions > 0)
+        (@as(f64, @floatFromInt(queue_push_lock_hold_ns_total)) / 1000.0) / @as(f64, @floatFromInt(queue_push_lock_acquisitions))
+    else
+        0.0;
+    const avg_pop_wait_us = if (queue_pop_lock_acquisitions > 0)
+        (@as(f64, @floatFromInt(queue_pop_lock_wait_ns_total)) / 1000.0) / @as(f64, @floatFromInt(queue_pop_lock_acquisitions))
+    else
+        0.0;
+    const avg_pop_hold_us = if (queue_pop_lock_acquisitions > 0)
+        (@as(f64, @floatFromInt(queue_pop_lock_hold_ns_total)) / 1000.0) / @as(f64, @floatFromInt(queue_pop_lock_acquisitions))
+    else
+        0.0;
+    std.debug.print(
+        "queue_locks push_avg_wait_us={d:.3} push_avg_hold_us={d:.3} push_contention={d} pop_avg_wait_us={d:.3} pop_avg_hold_us={d:.3} pop_contention={d}\n",
+        .{
+            avg_push_wait_us,
+            avg_push_hold_us,
+            queue_push_lock_contention,
+            avg_pop_wait_us,
+            avg_pop_hold_us,
+            queue_pop_lock_contention,
+        },
+    );
+
     if (comptime std.mem.eql(u8, alloc_mod.mode, "small_pool")) {
         const pool_stats = allocator_handle.snapshotSmallPoolStats();
         std.debug.print(
@@ -321,9 +357,30 @@ pub fn main() !void {
             }
         }
         for (pool_stats.buckets) |bucket| {
+            const lock_acq = bucket.lock_acquisitions;
+            const avg_wait_us_bucket = if (lock_acq > 0)
+                (@as(f64, @floatFromInt(bucket.lock_wait_ns_total)) / 1000.0) / @as(f64, @floatFromInt(lock_acq))
+            else
+                0.0;
+            const avg_hold_us_bucket = if (lock_acq > 0)
+                (@as(f64, @floatFromInt(bucket.lock_hold_ns_total)) / 1000.0) / @as(f64, @floatFromInt(lock_acq))
+            else
+                0.0;
             std.debug.print(
-                "  bucket size={d} alloc_size={d} allocations={d} in_use={d} high_water={d} refills={d} slabs={d} free={d}\n",
-                .{ bucket.size, bucket.alloc_size, bucket.allocations, bucket.in_use, bucket.high_water, bucket.refills, bucket.slabs, bucket.free_nodes },
+                "  bucket size={d} alloc_size={d} allocations={d} in_use={d} high_water={d} refills={d} slabs={d} free={d} avg_wait_us={d:.3} avg_hold_us={d:.3} contention={d}\n",
+                .{
+                    bucket.size,
+                    bucket.alloc_size,
+                    bucket.allocations,
+                    bucket.in_use,
+                    bucket.high_water,
+                    bucket.refills,
+                    bucket.slabs,
+                    bucket.free_nodes,
+                    avg_wait_us_bucket,
+                    avg_hold_us_bucket,
+                    bucket.lock_contention,
+                },
             );
         }
     }

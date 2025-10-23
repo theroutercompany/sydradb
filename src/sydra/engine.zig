@@ -61,29 +61,78 @@ pub const Engine = struct {
         cv: std.Thread.Condition = .{},
         buf: std.array_list.Managed(IngestItem),
         closed: bool = false,
-        pub fn init(alloc: std.mem.Allocator) !*Queue {
+        metrics: *Metrics,
+        const lock_wait_threshold_ns: i64 = 1_000;
+
+        pub fn init(alloc: std.mem.Allocator, metrics: *Metrics) !*Queue {
             const q = try alloc.create(Queue);
-            q.* = .{ .alloc = alloc, .buf = try std.array_list.Managed(IngestItem).initCapacity(alloc, 0) };
+            q.* = .{
+                .alloc = alloc,
+                .buf = try std.array_list.Managed(IngestItem).initCapacity(alloc, 0),
+                .metrics = metrics,
+            };
             return q;
         }
         pub fn deinit(self: *Queue) void {
             self.buf.deinit();
         }
         pub fn push(self: *Queue, item: IngestItem) !void {
+            const wait_start = std.time.nanoTimestamp();
             self.mu.lock();
-            defer self.mu.unlock();
+            const acquired_ns = std.time.nanoTimestamp();
+            const wait_ns = acquired_ns - wait_start;
+            _ = self.metrics.queue_push_lock_acquisitions.fetchAdd(1, .monotonic);
+            if (wait_ns > lock_wait_threshold_ns) {
+                _ = self.metrics.queue_push_lock_wait_ns_total.fetchAdd(@as(u64, @intCast(wait_ns)), .monotonic);
+                _ = self.metrics.queue_push_lock_contention.fetchAdd(1, .monotonic);
+            }
+            defer {
+                const release_ns = std.time.nanoTimestamp();
+                const hold_ns = release_ns - acquired_ns;
+                _ = self.metrics.queue_push_lock_hold_ns_total.fetchAdd(@as(u64, @intCast(hold_ns)), .monotonic);
+                self.mu.unlock();
+            }
             if (self.closed) return error.Closed;
             try self.buf.append(item);
             self.cv.signal();
         }
         pub fn pop(self: *Queue) ?IngestItem {
+            const lock_begin = std.time.nanoTimestamp();
             self.mu.lock();
-            defer self.mu.unlock();
-            while (self.buf.items.len == 0 and !self.closed) {
-                self.cv.timedWait(&self.mu, std.time.ns_per_ms * 100) catch break;
+            var acquired_ns = std.time.nanoTimestamp();
+            var wait_ns = acquired_ns - lock_begin;
+            _ = self.metrics.queue_pop_lock_acquisitions.fetchAdd(1, .monotonic);
+            if (wait_ns > lock_wait_threshold_ns) {
+                _ = self.metrics.queue_pop_lock_wait_ns_total.fetchAdd(@as(u64, @intCast(wait_ns)), .monotonic);
+                _ = self.metrics.queue_pop_lock_contention.fetchAdd(1, .monotonic);
             }
-            if (self.buf.items.len == 0) return null;
-            return self.buf.orderedRemove(0);
+            var hold_start_ns = acquired_ns;
+            while (self.buf.items.len == 0 and !self.closed) {
+                const before_wait_ns = std.time.nanoTimestamp();
+                const hold_ns = before_wait_ns - hold_start_ns;
+                _ = self.metrics.queue_pop_lock_hold_ns_total.fetchAdd(@as(u64, @intCast(hold_ns)), .monotonic);
+                self.cv.timedWait(&self.mu, std.time.ns_per_ms * 100) catch break;
+                acquired_ns = std.time.nanoTimestamp();
+                wait_ns = acquired_ns - before_wait_ns;
+                if (wait_ns > lock_wait_threshold_ns) {
+                    _ = self.metrics.queue_pop_lock_wait_ns_total.fetchAdd(@as(u64, @intCast(wait_ns)), .monotonic);
+                    _ = self.metrics.queue_pop_lock_contention.fetchAdd(1, .monotonic);
+                }
+                hold_start_ns = acquired_ns;
+            }
+            if (self.buf.items.len == 0) {
+                const release_ns = std.time.nanoTimestamp();
+                const hold_ns = release_ns - hold_start_ns;
+                _ = self.metrics.queue_pop_lock_hold_ns_total.fetchAdd(@as(u64, @intCast(hold_ns)), .monotonic);
+                self.mu.unlock();
+                return null;
+            }
+            const point = self.buf.orderedRemove(0);
+            const release_ns = std.time.nanoTimestamp();
+            const hold_ns = release_ns - hold_start_ns;
+            _ = self.metrics.queue_pop_lock_hold_ns_total.fetchAdd(@as(u64, @intCast(hold_ns)), .monotonic);
+            self.mu.unlock();
+            return point;
         }
         pub fn close(self: *Queue) void {
             self.mu.lock();
@@ -109,6 +158,14 @@ pub const Engine = struct {
         queue_max_len: std.atomic.Value(usize),
         queue_len_sum: std.atomic.Value(u64),
         queue_len_samples: std.atomic.Value(u64),
+        queue_push_lock_wait_ns_total: std.atomic.Value(u64),
+        queue_push_lock_hold_ns_total: std.atomic.Value(u64),
+        queue_push_lock_acquisitions: std.atomic.Value(u64),
+        queue_push_lock_contention: std.atomic.Value(u64),
+        queue_pop_lock_wait_ns_total: std.atomic.Value(u64),
+        queue_pop_lock_hold_ns_total: std.atomic.Value(u64),
+        queue_pop_lock_acquisitions: std.atomic.Value(u64),
+        queue_pop_lock_contention: std.atomic.Value(u64),
 
         pub fn init() Metrics {
             return .{
@@ -122,6 +179,14 @@ pub const Engine = struct {
                 .queue_max_len = std.atomic.Value(usize).init(0),
                 .queue_len_sum = std.atomic.Value(u64).init(0),
                 .queue_len_samples = std.atomic.Value(u64).init(0),
+                .queue_push_lock_wait_ns_total = std.atomic.Value(u64).init(0),
+                .queue_push_lock_hold_ns_total = std.atomic.Value(u64).init(0),
+                .queue_push_lock_acquisitions = std.atomic.Value(u64).init(0),
+                .queue_push_lock_contention = std.atomic.Value(u64).init(0),
+                .queue_pop_lock_wait_ns_total = std.atomic.Value(u64).init(0),
+                .queue_pop_lock_hold_ns_total = std.atomic.Value(u64).init(0),
+                .queue_pop_lock_acquisitions = std.atomic.Value(u64).init(0),
+                .queue_pop_lock_contention = std.atomic.Value(u64).init(0),
             };
         }
     };
@@ -155,7 +220,7 @@ pub const Engine = struct {
             engine.data_dir.close();
             engine.config.deinit(engine.alloc);
         }
-        engine.queue = try Queue.init(alloc);
+        engine.queue = try Queue.init(alloc, &engine.metrics);
         errdefer {
             engine.queue.deinit();
             engine.alloc.destroy(engine.queue);

@@ -78,6 +78,7 @@ const SmallPoolAllocator = if (use_small_pool) struct {
     const bucket_count = bucket_sizes.len;
     const fallback_bucket_bounds = [_]usize{ 64, 128, 256, 512, 1024, 2048, 4096, 8192 };
     const fallback_bucket_count = fallback_bucket_bounds.len + 1;
+    const lock_wait_threshold_ns: i64 = 1_000;
 
     const FreeNode = struct {
         next: ?*FreeNode,
@@ -93,6 +94,10 @@ const SmallPoolAllocator = if (use_small_pool) struct {
         refills: usize,
         in_use: usize,
         high_water: usize,
+        lock_wait_ns_total: std.atomic.Value(u64),
+        lock_hold_ns_total: std.atomic.Value(u64),
+        lock_acquisitions: std.atomic.Value(u64),
+        lock_contention: std.atomic.Value(u64),
 
         fn init(size: usize, alloc_size: usize) Bucket {
             return .{
@@ -105,6 +110,10 @@ const SmallPoolAllocator = if (use_small_pool) struct {
                 .refills = 0,
                 .in_use = 0,
                 .high_water = 0,
+                .lock_wait_ns_total = std.atomic.Value(u64).init(0),
+                .lock_hold_ns_total = std.atomic.Value(u64).init(0),
+                .lock_acquisitions = std.atomic.Value(u64).init(0),
+                .lock_contention = std.atomic.Value(u64).init(0),
             };
         }
     };
@@ -170,11 +179,26 @@ const SmallPoolAllocator = if (use_small_pool) struct {
 
     fn allocBucket(self: *SmallPoolAllocator, idx: usize, ret_addr: usize) ?[*]u8 {
         var bucket = &self.buckets[idx];
+        const wait_start = std.time.nanoTimestamp();
         bucket.mutex.lock();
-        defer bucket.mutex.unlock();
+        const acquired_ns = std.time.nanoTimestamp();
+        const wait_ns = acquired_ns - wait_start;
+        _ = bucket.lock_acquisitions.fetchAdd(1, .monotonic);
+        _ = bucket.lock_wait_ns_total.fetchAdd(@as(u64, @intCast(wait_ns)), .monotonic);
+        if (wait_ns > lock_wait_threshold_ns) {
+            _ = bucket.lock_contention.fetchAdd(1, .monotonic);
+        }
+        var hold_start_ns = acquired_ns;
+        defer {
+            const release_ns = std.time.nanoTimestamp();
+            const hold_ns = release_ns - hold_start_ns;
+            _ = bucket.lock_hold_ns_total.fetchAdd(@as(u64, @intCast(hold_ns)), .monotonic);
+            bucket.mutex.unlock();
+        }
 
         if (bucket.free_list == null) {
             self.refillBucket(bucket, idx, ret_addr) catch return null;
+            hold_start_ns = std.time.nanoTimestamp();
         }
         const node = bucket.free_list orelse return null;
         bucket.free_list = node.next;
@@ -224,15 +248,30 @@ const SmallPoolAllocator = if (use_small_pool) struct {
         var idx: usize = 0;
         while (idx < bucket_count) : (idx += 1) {
             var bucket = &self.buckets[idx];
+            const wait_start = std.time.nanoTimestamp();
             bucket.mutex.lock();
+            const acquired_ns = std.time.nanoTimestamp();
+            const wait_ns = acquired_ns - wait_start;
+            _ = bucket.lock_acquisitions.fetchAdd(1, .monotonic);
+            _ = bucket.lock_wait_ns_total.fetchAdd(@as(u64, @intCast(wait_ns)), .monotonic);
+            if (wait_ns > lock_wait_threshold_ns) {
+                _ = bucket.lock_contention.fetchAdd(1, .monotonic);
+            }
+            const hold_start_ns = acquired_ns;
             if (pointerBelongsToBucket(bucket, ptr)) |block_ptr| {
                 const node = @as(*FreeNode, @ptrCast(@alignCast(block_ptr)));
                 node.* = .{ .next = bucket.free_list };
                 bucket.free_list = node;
                 if (bucket.in_use > 0) bucket.in_use -= 1;
+                const release_ns = std.time.nanoTimestamp();
+                const hold_ns = release_ns - hold_start_ns;
+                _ = bucket.lock_hold_ns_total.fetchAdd(@as(u64, @intCast(hold_ns)), .monotonic);
                 bucket.mutex.unlock();
                 return true;
             }
+            const release_ns = std.time.nanoTimestamp();
+            const hold_ns = release_ns - hold_start_ns;
+            _ = bucket.lock_hold_ns_total.fetchAdd(@as(u64, @intCast(hold_ns)), .monotonic);
             bucket.mutex.unlock();
         }
         return false;
@@ -320,6 +359,10 @@ const SmallPoolAllocator = if (use_small_pool) struct {
         high_water: usize,
         slabs: usize,
         free_nodes: usize,
+        lock_wait_ns_total: u64,
+        lock_hold_ns_total: u64,
+        lock_acquisitions: u64,
+        lock_contention: u64,
     };
 
     pub const Stats = struct {
@@ -375,6 +418,10 @@ const SmallPoolAllocator = if (use_small_pool) struct {
                 .high_water = bucket.high_water,
                 .slabs = slabs_len,
                 .free_nodes = free_nodes,
+                .lock_wait_ns_total = bucket.lock_wait_ns_total.load(.monotonic),
+                .lock_hold_ns_total = bucket.lock_hold_ns_total.load(.monotonic),
+                .lock_acquisitions = bucket.lock_acquisitions.load(.monotonic),
+                .lock_contention = bucket.lock_contention.load(.monotonic),
             };
             bucket.mutex.unlock();
         }

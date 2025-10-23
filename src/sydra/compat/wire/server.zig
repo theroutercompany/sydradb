@@ -273,22 +273,27 @@ fn handleSydraqlQuery(
         row_count += 1;
     }
 
+    const op_stats = try cursor.collectOperatorStats(alloc);
+    defer alloc.free(op_stats);
+    var rows_scanned: u64 = 0;
+    for (op_stats) |stat| {
+        if (std.ascii.eqlIgnoreCase(stat.name, "scan")) {
+            rows_scanned += stat.rows_out;
+        }
+    }
+    cursor.stats.rows_emitted = @as(u64, @intCast(row_count));
+    cursor.stats.rows_scanned = rows_scanned;
     const elapsed_us = std.time.microTimestamp() - start_time;
     const plan_us = cursor.stats.parse_us + cursor.stats.validate_us + cursor.stats.optimize_us + cursor.stats.physical_us + cursor.stats.pipeline_us;
     const stream_ms = @divTrunc(elapsed_us, 1000);
-    const plan_ms = @divTrunc(plan_us, 1000);
-    const tag = if (cursor.stats.trace_id.len != 0)
-        try std.fmt.allocPrint(
-            alloc,
-            "SELECT rows={d} stream_ms={d} plan_ms={d} trace_id={s}",
-            .{ row_count, stream_ms, plan_ms, cursor.stats.trace_id },
-        )
-    else
-        try std.fmt.allocPrint(
-            alloc,
-            "SELECT rows={d} stream_ms={d} plan_ms={d}",
-            .{ row_count, stream_ms, plan_ms },
-        );
+    const plan_ms = @divTrunc(@as(i64, @intCast(plan_us)), 1000);
+    for (op_stats) |stat| {
+        const elapsed_ms = @divTrunc(@as(i64, @intCast(stat.elapsed_us)), 1000);
+        const notice = try std.fmt.allocPrint(alloc, "operator={s} rows_out={d} elapsed_ms={d}", .{ stat.name, stat.rows_out, elapsed_ms });
+        defer alloc.free(notice);
+        try protocol.writeNoticeResponse(writer, notice);
+    }
+    const tag = try formatSelectTag(alloc, row_count, rows_scanned, stream_ms, plan_ms, cursor.stats.trace_id);
     defer alloc.free(tag);
     try protocol.writeCommandComplete(writer, tag);
     try protocol.writeReadyForQuery(writer, 'I');
@@ -407,4 +412,40 @@ fn anyWriter(writer: *std.Io.Writer) std.Io.AnyWriter {
             }
         }.call,
     };
+}
+
+fn formatSelectTag(
+    alloc: std.mem.Allocator,
+    rows_emitted: usize,
+    rows_scanned: u64,
+    stream_ms: i64,
+    plan_ms: i64,
+    trace_id: []const u8,
+) ![]const u8 {
+    if (trace_id.len != 0) {
+        return try std.fmt.allocPrint(
+            alloc,
+            "SELECT rows={d} scanned={d} stream_ms={d} plan_ms={d} trace_id={s}",
+            .{ rows_emitted, rows_scanned, stream_ms, plan_ms, trace_id },
+        );
+    }
+    return try std.fmt.allocPrint(
+        alloc,
+        "SELECT rows={d} scanned={d} stream_ms={d} plan_ms={d}",
+        .{ rows_emitted, rows_scanned, stream_ms, plan_ms },
+    );
+}
+
+test "formatSelectTag includes scanned rows" {
+    const alloc = std.testing.allocator;
+    const tag = try formatSelectTag(alloc, 5, 12, 20, 8, "");
+    defer alloc.free(tag);
+    try std.testing.expectEqualStrings("SELECT rows=5 scanned=12 stream_ms=20 plan_ms=8", tag);
+}
+
+test "formatSelectTag includes trace id when present" {
+    const alloc = std.testing.allocator;
+    const tag = try formatSelectTag(alloc, 2, 4, 15, 9, "ABC123");
+    defer alloc.free(tag);
+    try std.testing.expectEqualStrings("SELECT rows=2 scanned=4 stream_ms=15 plan_ms=9 trace_id=ABC123", tag);
 }

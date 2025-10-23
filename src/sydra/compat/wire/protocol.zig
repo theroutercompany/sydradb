@@ -200,6 +200,24 @@ pub fn writeErrorResponse(writer: anytype, severity: []const u8, code: []const u
     try writer.writeByte(0);
 }
 
+pub fn writeNoticeResponse(writer: anytype, message: []const u8) !void {
+    const severity = "NOTICE";
+    try writer.writeByte('N');
+    var length: u32 = 4 + 1;
+    length += @intCast(severity.len + 2);
+    length += @intCast(message.len + 2);
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], length, .big);
+    try writer.writeAll(buf[0..4]);
+    try writer.writeByte('S');
+    try writer.writeAll(severity);
+    try writer.writeByte(0);
+    try writer.writeByte('M');
+    try writer.writeAll(message);
+    try writer.writeByte(0);
+    try writer.writeByte(0);
+}
+
 pub fn formatParameters(params: []Parameter, writer: anytype) !void {
     var first = true;
     for (params) |param| {

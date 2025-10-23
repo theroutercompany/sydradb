@@ -31,9 +31,18 @@ pub const Operator = struct {
     payload: Payload,
     next_fn: *const fn (*Operator) ExecuteError!?Row,
     destroy_fn: *const fn (*Operator) void,
+    stats: Stats,
 
     pub fn next(self: *Operator) ExecuteError!?Row {
-        return self.next_fn(self);
+        const start = std.time.microTimestamp();
+        const result = self.next_fn(self);
+        const elapsed = std.time.microTimestamp() - start;
+        self.stats.elapsed_us += @as(u64, @intCast(elapsed));
+        const maybe_row = result catch |err| return err;
+        if (maybe_row) |_| {
+            self.stats.rows_out += 1;
+        }
+        return maybe_row;
     }
 
     pub fn destroy(self: *Operator) void {
@@ -55,6 +64,18 @@ pub const Operator = struct {
         sort: Sort,
         limit: Limit,
         test_source: TestSource,
+    };
+
+    pub const Stats = struct {
+        name: []const u8,
+        elapsed_us: u64 = 0,
+        rows_out: u64 = 0,
+    };
+
+    pub const StatsSnapshot = struct {
+        name: []const u8,
+        elapsed_us: u64,
+        rows_out: u64,
     };
 
     const Scan = struct {
@@ -134,6 +155,25 @@ pub const Operator = struct {
         values: []Value,
         keys: []Value,
     };
+
+    pub fn collectStats(self: *Operator, list: *ManagedArrayList(Operator.StatsSnapshot)) !void {
+        try list.append(.{
+            .name = self.stats.name,
+            .elapsed_us = self.stats.elapsed_us,
+            .rows_out = self.stats.rows_out,
+        });
+
+        switch (self.payload) {
+            .filter => |payload| try payload.child.collectStats(list),
+            .project => |payload| try payload.child.collectStats(list),
+            .aggregate => |payload| try payload.child.collectStats(list),
+            .limit => |payload| try payload.child.collectStats(list),
+            .scan,
+            .sort,
+            .test_source,
+            => {},
+        }
+    }
 };
 
 pub fn buildPipeline(allocator: std.mem.Allocator, engine: *engine_mod.Engine, node: *physical.Node) ExecuteError!*Operator {
@@ -162,7 +202,7 @@ pub fn buildPipeline(allocator: std.mem.Allocator, engine: *engine_mod.Engine, n
     };
 }
 
-fn createOperator(allocator: std.mem.Allocator, schema: []const plan.ColumnInfo, next_fn: *const fn (*Operator) ExecuteError!?Row, destroy_fn: *const fn (*Operator) void, payload: Operator.Payload) !*Operator {
+fn createOperator(allocator: std.mem.Allocator, schema: []const plan.ColumnInfo, name: []const u8, next_fn: *const fn (*Operator) ExecuteError!?Row, destroy_fn: *const fn (*Operator) void, payload: Operator.Payload) !*Operator {
     const op = try allocator.create(Operator);
     op.* = .{
         .allocator = allocator,
@@ -170,6 +210,7 @@ fn createOperator(allocator: std.mem.Allocator, schema: []const plan.ColumnInfo,
         .payload = payload,
         .next_fn = next_fn,
         .destroy_fn = destroy_fn,
+        .stats = .{ .name = name },
     };
     return op;
 }
@@ -201,7 +242,7 @@ fn createScanOperator(allocator: std.mem.Allocator, engine: *engine_mod.Engine, 
         try payload.engine.queryRange(sid, start_ts, end_ts, &payload.points);
     }
 
-    return try createOperator(allocator, schema, scanNext, scanDestroy, .{ .scan = payload });
+    return try createOperator(allocator, schema, "scan", scanNext, scanDestroy, .{ .scan = payload });
 }
 
 fn scanNext(op: *Operator) ExecuteError!?Row {
@@ -233,7 +274,7 @@ fn scanDestroy(op: *Operator) void {
 
 fn createFilterOperator(allocator: std.mem.Allocator, child: *Operator, predicate: *const ast.Expr, schema: []const plan.ColumnInfo) ExecuteError!*Operator {
     const payload = Operator.Filter{ .child = child, .predicate = predicate };
-    return try createOperator(allocator, schema, filterNext, filterDestroy, .{ .filter = payload });
+    return try createOperator(allocator, schema, "filter", filterNext, filterDestroy, .{ .filter = payload });
 }
 
 fn filterNext(op: *Operator) ExecuteError!?Row {
@@ -264,7 +305,7 @@ fn createProjectOperator(allocator: std.mem.Allocator, child: *Operator, columns
     const buffer = try allocator.alloc(Value, columns.len);
     for (buffer) |*slot| slot.* = Value.null;
     const payload = Operator.Project{ .child = child, .buffer = buffer };
-    return try createOperator(allocator, columns, projectNext, projectDestroy, .{ .project = payload });
+    return try createOperator(allocator, columns, "project", projectNext, projectDestroy, .{ .project = payload });
 }
 
 fn projectNext(op: *Operator) ExecuteError!?Row {
@@ -307,7 +348,7 @@ fn createAggregateOperator(allocator: std.mem.Allocator, child: *Operator, node:
 
     for (payload.output_buffer) |*slot| slot.* = Value.null;
 
-    return try createOperator(allocator, schema, aggregateNext, aggregateDestroy, .{ .aggregate = payload });
+    return try createOperator(allocator, schema, "aggregate", aggregateNext, aggregateDestroy, .{ .aggregate = payload });
 }
 
 const AggregateAnalysis = struct {
@@ -506,7 +547,7 @@ fn createSortOperator(
         }
     }
 
-    return try createOperator(allocator, schema, sortNext, sortDestroy, .{ .sort = .{ .rows = rows, .index = 0 } });
+    return try createOperator(allocator, schema, "sort", sortNext, sortDestroy, .{ .sort = .{ .rows = rows, .index = 0 } });
 }
 
 fn createLimitOperator(
@@ -517,7 +558,7 @@ fn createLimitOperator(
     take: usize,
 ) ExecuteError!*Operator {
     const payload = Operator.Limit{ .child = child, .offset = offset, .remaining = take };
-    return try createOperator(allocator, schema, limitNext, limitDestroy, .{ .limit = payload });
+    return try createOperator(allocator, schema, "limit", limitNext, limitDestroy, .{ .limit = payload });
 }
 
 fn createSortLimitOperator(
@@ -792,7 +833,7 @@ fn namesEqual(a: []const u8, b: []const u8) bool {
 
 fn createTestSourceOperator(allocator: std.mem.Allocator, schema: []const plan.ColumnInfo, rows: []([]Value)) ExecuteError!*Operator {
     const payload = Operator.TestSource{ .schema = schema, .rows = rows, .index = 0 };
-    return try createOperator(allocator, schema, testSourceNext, testSourceDestroy, .{ .test_source = payload });
+    return try createOperator(allocator, schema, "test_source", testSourceNext, testSourceDestroy, .{ .test_source = payload });
 }
 
 fn testSourceNext(op: *Operator) ExecuteError!?Row {
@@ -895,4 +936,55 @@ test "aggregate avg without grouping" {
     alloc.free(value_name);
     alloc.free(@constCast(avg_callee.value));
     alloc.free(agg_name);
+}
+
+test "operator stats track rows" {
+    const alloc = std.testing.allocator;
+    const common = @import("common.zig");
+
+    const value_name = try alloc.dupe(u8, "value");
+    const base_span = common.Span.init(0, 0);
+
+    const value_ident = ast.Identifier{ .value = value_name, .quoted = false, .span = base_span };
+    const value_expr = try alloc.create(ast.Expr);
+    value_expr.* = .{ .identifier = value_ident };
+
+    const columns = try alloc.alloc(plan.ColumnInfo, 1);
+    columns[0] = .{ .name = value_name, .expr = value_expr };
+
+    var row1 = try alloc.alloc(Value, 1);
+    row1[0] = Value{ .integer = 1 };
+    var row2 = try alloc.alloc(Value, 1);
+    row2[0] = Value{ .integer = 2 };
+
+    const data = try alloc.alloc([]Value, 2);
+    data[0] = row1;
+    data[1] = row2;
+
+    var source = try createTestSourceOperator(alloc, columns, data);
+    var source_owned = false;
+    defer if (!source_owned) source.destroy();
+
+    var limit = try createLimitOperator(alloc, source, columns, 0, 10);
+    source_owned = true;
+    defer limit.destroy();
+
+    while (try limit.next()) |_| {}
+
+    var snapshots = ManagedArrayList(Operator.StatsSnapshot).init(alloc);
+    defer snapshots.deinit();
+    try limit.collectStats(&snapshots);
+
+    try std.testing.expectEqual(@as(usize, 2), snapshots.items.len);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(snapshots.items[0].name, "limit"));
+    try std.testing.expectEqual(@as(u64, 2), snapshots.items[0].rows_out);
+    try std.testing.expect(std.ascii.eqlIgnoreCase(snapshots.items[1].name, "test_source"));
+    try std.testing.expectEqual(@as(u64, 2), snapshots.items[1].rows_out);
+
+    alloc.free(columns);
+    alloc.free(data);
+    alloc.free(row1);
+    alloc.free(row2);
+    alloc.destroy(value_expr);
+    alloc.free(value_name);
 }

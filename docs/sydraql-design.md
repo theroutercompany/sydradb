@@ -143,6 +143,11 @@ Each function entry should specify argument types, return type, and planner capa
 7. **Testing** – golden queries, fuzzing, planner snapshots, integration with storage fixtures.
 8. **Observability** – metrics (parse/plan/exec timings), structured logs, explain output for debugging.
 
+## Execution Telemetry
+- HTTP responses from `/api/v1/sydraql` stream a `stats` object alongside rows. The object reports elapsed times for each pipeline phase (parse/validate/optimize/physical/pipeline), `rows_emitted`, `rows_scanned`, a random `trace_id`, and an `operators` array containing `{name, rows_out, elapsed_ms}` entries for every operator in the execution tree.
+- pgwire command completion tags mirror the summary metrics (`rows`, `scanned`, `stream_ms`, `plan_ms`, optional `trace_id`). Additional `NOTICE` messages emit one line per operator with the same row counts and timings so libpq-compatible clients can surface diagnostics.
+- These fields are intended for dashboards and tracing; clients should treat them as part of the public API.
+
 ## Open Questions
 - Do we allow multi-series expressions in the first release (e.g., `select a.value / b.value` with alignment)?
 - How do we expose rollup metadata (system tables vs. planner introspection) for users to inspect?

@@ -4,6 +4,7 @@ const types = @import("types.zig");
 const config = @import("config.zig");
 const compat = @import("compat.zig");
 const query_exec = @import("query/exec.zig");
+const query_executor = @import("query/executor.zig");
 const query_value = @import("query/value.zig");
 
 pub fn runHttp(alloc: std.mem.Allocator, eng: *Engine, port: u16) !void {
@@ -169,28 +170,19 @@ fn handleSydraql(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
         row_count += 1;
     }
     try jw.endArray();
-    try jw.objectField("stats");
-    try jw.beginObject();
-    const elapsed_us = std.time.microTimestamp() - start_time;
-    try jw.objectField("stream_rows");
-    try jw.write(row_count);
-    try jw.objectField("stream_ms");
-    try jw.write(@as(f64, @floatFromInt(elapsed_us)) / 1000.0);
-    try jw.objectField("parse_ms");
-    try jw.write(usToMs(cursor.stats.parse_us));
-    try jw.objectField("validate_ms");
-    try jw.write(usToMs(cursor.stats.validate_us));
-    try jw.objectField("optimize_ms");
-    try jw.write(usToMs(cursor.stats.optimize_us));
-    try jw.objectField("physical_ms");
-    try jw.write(usToMs(cursor.stats.physical_us));
-    try jw.objectField("pipeline_ms");
-    try jw.write(usToMs(cursor.stats.pipeline_us));
-    if (cursor.stats.trace_id.len != 0) {
-        try jw.objectField("trace_id");
-        try jw.write(cursor.stats.trace_id);
+    const op_stats = try cursor.collectOperatorStats(alloc);
+    defer alloc.free(op_stats);
+    var rows_scanned: u64 = 0;
+    for (op_stats) |stat| {
+        if (std.ascii.eqlIgnoreCase(stat.name, "scan")) {
+            rows_scanned += stat.rows_out;
+        }
     }
-    try jw.endObject();
+    cursor.stats.rows_emitted = @as(u64, @intCast(row_count));
+    cursor.stats.rows_scanned = rows_scanned;
+    const elapsed_us_signed = std.time.microTimestamp() - start_time;
+    const elapsed_us = @as(u64, @intCast(elapsed_us_signed));
+    try writeStatsObject(&jw, row_count, elapsed_us, &cursor.stats, op_stats);
     try jw.endObject();
 
     try response.end();
@@ -231,6 +223,53 @@ fn writeJsonValue(jw: *std.json.Stringify, value: query_value.Value) !void {
     }
 }
 
+fn writeStatsObject(
+    jw: *std.json.Stringify,
+    stream_rows: usize,
+    stream_us: u64,
+    stats: *const query_executor.ExecutionStats,
+    operators: []const query_executor.OperatorStats,
+) !void {
+    try jw.objectField("stats");
+    try jw.beginObject();
+    try jw.objectField("stream_rows");
+    try jw.write(stream_rows);
+    try jw.objectField("stream_ms");
+    try jw.write(usToMs(stream_us));
+    try jw.objectField("parse_ms");
+    try jw.write(usToMs(stats.parse_us));
+    try jw.objectField("validate_ms");
+    try jw.write(usToMs(stats.validate_us));
+    try jw.objectField("optimize_ms");
+    try jw.write(usToMs(stats.optimize_us));
+    try jw.objectField("physical_ms");
+    try jw.write(usToMs(stats.physical_us));
+    try jw.objectField("pipeline_ms");
+    try jw.write(usToMs(stats.pipeline_us));
+    try jw.objectField("rows_emitted");
+    try jw.write(stats.rows_emitted);
+    try jw.objectField("rows_scanned");
+    try jw.write(stats.rows_scanned);
+    if (stats.trace_id.len != 0) {
+        try jw.objectField("trace_id");
+        try jw.write(stats.trace_id);
+    }
+    try jw.objectField("operators");
+    try jw.beginArray();
+    for (operators) |op| {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(op.name);
+        try jw.objectField("rows_out");
+        try jw.write(op.rows_out);
+        try jw.objectField("elapsed_ms");
+        try jw.write(usToMs(op.elapsed_us));
+        try jw.endObject();
+    }
+    try jw.endArray();
+    try jw.endObject();
+}
+
 fn usToMs(value: u64) f64 {
     return @as(f64, @floatFromInt(value)) / 1000.0;
 }
@@ -241,6 +280,36 @@ fn findHeader(req: *std.http.Server.Request, name: []const u8) ?[]const u8 {
         if (std.ascii.eqlIgnoreCase(header.name, name)) return header.value;
     }
     return null;
+}
+
+test "writeStatsObject emits operator metrics" {
+    const alloc = std.testing.allocator;
+    var buffer = std.ArrayList(u8).init(alloc);
+    defer buffer.deinit();
+    var writer = buffer.writer();
+    var jw = std.json.Stringify{ .writer = &writer };
+
+    try jw.beginObject();
+    var stats = query_executor.ExecutionStats{
+        .parse_us = 100,
+        .validate_us = 200,
+        .optimize_us = 300,
+        .physical_us = 400,
+        .pipeline_us = 500,
+        .trace_id = "",
+        .rows_emitted = 5,
+        .rows_scanned = 5,
+    };
+    const ops = [_]query_executor.OperatorStats{
+        .{ .name = "scan", .elapsed_us = 2000, .rows_out = 5 },
+    };
+    try writeStatsObject(&jw, 5, 5000, &stats, &ops);
+    try jw.endObject();
+
+    const json = buffer.items;
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"operators\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"rows_out\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"scan\"") != null);
 }
 
 fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
