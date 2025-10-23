@@ -15,9 +15,11 @@ zig build -Doptimize=ReleaseSafe
 ./zig-out/bin/sydradb            # serve using sydradb.toml
 curl -XPOST localhost:8080/api/v1/ingest --data-binary $'{"series":"weather.room1","ts":1694300000,"value":24.2}\n'
 
-# Alternative allocators (optional)
-zig build -Dallocator-mode=mimalloc      # use mimalloc globally
+# Allocator modes
+zig build                                # default: mimalloc global allocator
+zig build -Dallocator-mode=default       # use Zig GPA fallback
 zig build -Dallocator-mode=small_pool    # use slab allocator tuned for small writes
+zig build -Dallocator-mode=small_pool -Dallocator-shards=8  # enable sharded slab allocator
 ```
 
 ## Nix

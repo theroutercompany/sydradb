@@ -1,9 +1,11 @@
 const std = @import("std");
 const build_options = @import("build_options");
+const slab_shard = @import("alloc/slab_shard.zig");
 
 const allocator_mode = build_options.allocator_mode;
 const use_mimalloc = std.mem.eql(u8, allocator_mode, "mimalloc");
 const use_small_pool = std.mem.eql(u8, allocator_mode, "small_pool");
+const configured_shard_count: u32 = build_options.allocator_shards;
 
 pub const mode = allocator_mode;
 pub const is_mimalloc = use_mimalloc;
@@ -68,7 +70,10 @@ const MimallocAllocator = if (use_mimalloc) struct {
             .vtable = &vtable,
         };
     }
-} else struct {};
+} else struct {
+    pub const ThreadShardState = struct {};
+    pub const ShardManager = struct {};
+};
 
 const SmallPoolAllocator = if (use_small_pool) struct {
     const default_alignment = std.mem.Alignment.fromByteUnits(@sizeOf(usize));
@@ -79,6 +84,108 @@ const SmallPoolAllocator = if (use_small_pool) struct {
     const fallback_bucket_bounds = [_]usize{ 64, 128, 256, 512, 1024, 2048, 4096, 8192 };
     const fallback_bucket_count = fallback_bucket_bounds.len + 1;
     const lock_wait_threshold_ns: i64 = 1_000;
+    const shard_classes_table = buildSlabClasses();
+    const max_shard_size = shard_classes_table[shard_classes_table.len - 1].size;
+
+    const ThreadShardState = struct {
+        manager: ?*ShardManager = null,
+        shard_index: u32 = 0,
+    };
+
+    const ShardManager = struct {
+        allocator: std.mem.Allocator,
+        shards: []slab_shard.Shard,
+        assign_counter: std.atomic.Value(u32),
+
+        pub fn init(backing: std.mem.Allocator, config: slab_shard.ShardConfig, shard_count: usize) !ShardManager {
+            std.debug.assert(shard_count > 0);
+            var shards = try backing.alloc(slab_shard.Shard, shard_count);
+            var init_count: usize = 0;
+            errdefer {
+                var idx: usize = 0;
+                while (idx < init_count) : (idx += 1) {
+                    shards[idx].deinit();
+                }
+                backing.free(shards);
+            }
+            while (init_count < shard_count) : (init_count += 1) {
+                shards[init_count] = try slab_shard.Shard.init(backing, config);
+                shards[init_count].assignOwner();
+            }
+            return .{
+                .allocator = backing,
+                .shards = shards,
+                .assign_counter = std.atomic.Value(u32).init(0),
+            };
+        }
+
+        pub fn deinit(self: *ShardManager) void {
+            var idx: usize = 0;
+            while (idx < self.shards.len) : (idx += 1) {
+                self.shards[idx].deinit();
+            }
+            self.allocator.free(self.shards);
+            const state = getThreadState();
+            if (state.manager == self) {
+                state.manager = null;
+                state.shard_index = 0;
+            }
+        }
+
+        fn getThreadState() *ThreadShardState {
+            return &small_pool_tls_state;
+        }
+
+        fn assignShardIndex(self: *ShardManager) u32 {
+            if (self.shards.len == 0) return 0;
+            const ticket = self.assign_counter.fetchAdd(1, .monotonic);
+            const width: u32 = @intCast(self.shards.len);
+            return ticket % width;
+        }
+
+        pub fn currentShard(self: *ShardManager) *slab_shard.Shard {
+            const state = getThreadState();
+            if (state.manager != self) {
+                state.manager = self;
+                state.shard_index = self.assignShardIndex();
+            }
+            if (state.shard_index >= self.shards.len) {
+                state.shard_index = self.assignShardIndex();
+            }
+            return &self.shards[state.shard_index];
+        }
+
+        pub fn freeLocal(self: *ShardManager, ptr: [*]u8) bool {
+            return self.currentShard().free(ptr);
+        }
+
+        pub fn freeDeferred(self: *ShardManager, ptr: [*]u8) bool {
+            _ = self;
+            if (slab_shard.Shard.owningShard(ptr)) |owner| {
+                return owner.freeDeferred(ptr);
+            }
+            return false;
+        }
+
+        pub fn collectGarbage(self: *ShardManager) void {
+            var idx: usize = 0;
+            while (idx < self.shards.len) : (idx += 1) {
+                self.shards[idx].collectGarbage();
+            }
+        }
+
+        pub fn enterEpoch(self: *ShardManager) u64 {
+            return self.currentShard().currentEpoch();
+        }
+
+        pub fn leaveEpoch(self: *ShardManager, observed: u64) void {
+            self.currentShard().observeEpoch(observed);
+        }
+
+        pub fn advanceEpoch(self: *ShardManager) u64 {
+            return self.currentShard().advanceEpoch();
+        }
+    };
 
     const FreeNode = struct {
         next: ?*FreeNode,
@@ -118,6 +225,30 @@ const SmallPoolAllocator = if (use_small_pool) struct {
         }
     };
 
+    fn buildSlabClasses() [bucket_count]slab_shard.SlabClass {
+        var classes: [bucket_count]slab_shard.SlabClass = undefined;
+        var idx: usize = 0;
+        while (idx < bucket_count) : (idx += 1) {
+            const size = bucket_sizes[idx];
+            const alloc_size = computeAllocSize(size);
+            var per_slab = slab_bytes / alloc_size;
+            if (per_slab == 0) per_slab = 1;
+            classes[idx] = .{
+                .size = size,
+                .alloc_size = alloc_size,
+                .objects_per_slab = per_slab,
+            };
+        }
+        return classes;
+    }
+
+    fn shardConfig() slab_shard.ShardConfig {
+        return .{
+            .classes = shard_classes_table[0..],
+            .slab_bytes = slab_bytes,
+        };
+    }
+
     gpa: std.heap.GeneralPurposeAllocator(.{}),
     buckets: [bucket_count]Bucket,
     fallback_allocs: std.atomic.Value(u64),
@@ -125,6 +256,9 @@ const SmallPoolAllocator = if (use_small_pool) struct {
     fallback_resizes: std.atomic.Value(u64),
     fallback_remaps: std.atomic.Value(u64),
     fallback_sizes: [fallback_bucket_count]std.atomic.Value(u64),
+    shard_manager: ?ShardManager,
+    shard_alloc_hits: std.atomic.Value(u64),
+    shard_alloc_misses: std.atomic.Value(u64),
 
     pub fn init() SmallPoolAllocator {
         var self = SmallPoolAllocator{
@@ -135,12 +269,24 @@ const SmallPoolAllocator = if (use_small_pool) struct {
             .fallback_resizes = std.atomic.Value(u64).init(0),
             .fallback_remaps = std.atomic.Value(u64).init(0),
             .fallback_sizes = initFallbackArray(),
+            .shard_manager = null,
+            .shard_alloc_hits = std.atomic.Value(u64).init(0),
+            .shard_alloc_misses = std.atomic.Value(u64).init(0),
         };
         var idx: usize = 0;
         while (idx < bucket_count) : (idx += 1) {
             const size = bucket_sizes[idx];
             const alloc_size = computeAllocSize(size);
             self.buckets[idx] = Bucket.init(size, alloc_size);
+        }
+        if (configured_shard_count > 0) {
+            const shard_count = @as(usize, configured_shard_count);
+            if (shard_count != 0) {
+                const maybe_manager = ShardManager.init(self.backingAllocator(), shardConfig(), shard_count) catch null;
+                if (maybe_manager) |manager| {
+                    self.shard_manager = manager;
+                }
+            }
         }
         return self;
     }
@@ -168,6 +314,18 @@ const SmallPoolAllocator = if (use_small_pool) struct {
             _ = self.fallback_allocs.fetchAdd(1, .monotonic);
             self.recordFallback(len);
             return self.backingAllocator().rawAlloc(len, alignment, ret_addr);
+        }
+        if (self.shard_manager) |*manager| {
+            if (len <= max_shard_size) {
+                const shard = manager.currentShard();
+                if (shard.allocate(len, alignment, ret_addr)) |ptr| {
+                    _ = self.shard_alloc_hits.fetchAdd(1, .monotonic);
+                    return ptr;
+                } else {
+                    _ = self.shard_alloc_misses.fetchAdd(1, .monotonic);
+                    manager.collectGarbage();
+                }
+            }
         }
         if (bucketIndex(len)) |idx| {
             return self.allocBucket(idx, ret_addr);
@@ -317,6 +475,14 @@ const SmallPoolAllocator = if (use_small_pool) struct {
     fn freeFn(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
         const self = @as(*SmallPoolAllocator, @ptrCast(@alignCast(ctx)));
         if (memory.len == 0) return;
+        if (self.shard_manager) |*manager| {
+            const ptr = @as([*]u8, memory.ptr);
+            if (manager.freeLocal(ptr)) return;
+            if (manager.freeDeferred(ptr)) {
+                manager.collectGarbage();
+                return;
+            }
+        }
         if (self.freeSmall(memory)) return;
         _ = self.fallback_frees.fetchAdd(1, .monotonic);
         self.recordFallback(memory.len);
@@ -338,6 +504,10 @@ const SmallPoolAllocator = if (use_small_pool) struct {
     }
 
     pub fn deinit(self: *SmallPoolAllocator) void {
+        if (self.shard_manager) |*manager| {
+            manager.deinit();
+            self.shard_manager = null;
+        }
         const backing = self.backingAllocator();
         var idx: usize = 0;
         while (idx < bucket_count) : (idx += 1) {
@@ -348,6 +518,26 @@ const SmallPoolAllocator = if (use_small_pool) struct {
             bucket.slabs.deinit(backing);
         }
         _ = self.gpa.deinit();
+    }
+
+    pub fn enterEpoch(self: *SmallPoolAllocator) ?u64 {
+        if (self.shard_manager) |*manager| {
+            return manager.enterEpoch();
+        }
+        return null;
+    }
+
+    pub fn leaveEpoch(self: *SmallPoolAllocator, observed: u64) void {
+        if (self.shard_manager) |*manager| {
+            manager.leaveEpoch(observed);
+        }
+    }
+
+    pub fn advanceEpoch(self: *SmallPoolAllocator) ?u64 {
+        if (self.shard_manager) |*manager| {
+            return manager.advanceEpoch();
+        }
+        return null;
     }
 
     const BucketStats = struct {
@@ -373,6 +563,13 @@ const SmallPoolAllocator = if (use_small_pool) struct {
         fallback_remaps: u64,
         fallback_size_buckets: [fallback_bucket_count]u64,
         fallback_size_bounds: [fallback_bucket_count]?usize,
+        shard_enabled: bool,
+        shard_count: usize,
+        shard_alloc_hits: u64,
+        shard_alloc_misses: u64,
+        shard_deferred_total: usize,
+        shard_current_epoch: u64,
+        shard_min_epoch: u64,
     };
 
     fn countFreeList(head: ?*FreeNode) usize {
@@ -394,7 +591,32 @@ const SmallPoolAllocator = if (use_small_pool) struct {
             .fallback_remaps = self.fallback_remaps.load(.monotonic),
             .fallback_size_buckets = undefined,
             .fallback_size_bounds = undefined,
+            .shard_enabled = false,
+            .shard_count = 0,
+            .shard_alloc_hits = self.shard_alloc_hits.load(.monotonic),
+            .shard_alloc_misses = self.shard_alloc_misses.load(.monotonic),
+            .shard_deferred_total = 0,
+            .shard_current_epoch = 0,
+            .shard_min_epoch = std.math.maxInt(u64),
         };
+        if (self.shard_manager) |*manager| {
+            stats.shard_enabled = true;
+            stats.shard_count = manager.shards.len;
+            var min_epoch: u64 = std.math.maxInt(u64);
+            var max_epoch: u64 = 0;
+            var deferred_total: usize = 0;
+            for (manager.shards) |*shard| {
+                const summary = shard.summary();
+                deferred_total += summary.deferred_total;
+                if (summary.current_epoch > max_epoch) max_epoch = summary.current_epoch;
+                if (summary.min_observed_epoch < min_epoch) min_epoch = summary.min_observed_epoch;
+            }
+            stats.shard_deferred_total = deferred_total;
+            stats.shard_current_epoch = max_epoch;
+            stats.shard_min_epoch = if (min_epoch == std.math.maxInt(u64)) 0 else min_epoch;
+        } else {
+            stats.shard_min_epoch = 0;
+        }
         var bucket_idx: usize = 0;
         while (bucket_idx < fallback_bucket_count) : (bucket_idx += 1) {
             stats.fallback_size_buckets[bucket_idx] = self.fallback_sizes[bucket_idx].load(.monotonic);
@@ -449,7 +671,12 @@ const SmallPoolAllocator = if (use_small_pool) struct {
         }
         return fallback_bucket_bounds.len;
     }
-} else struct {};
+} else struct {
+    pub const ThreadShardState = struct {};
+    pub const ShardManager = struct {};
+};
+
+threadlocal var small_pool_tls_state: SmallPoolAllocator.ThreadShardState = .{};
 
 pub const AllocatorHandle = if (use_small_pool) struct {
     pool: SmallPoolAllocator,
@@ -464,6 +691,18 @@ pub const AllocatorHandle = if (use_small_pool) struct {
 
     pub fn snapshotSmallPoolStats(self: *AllocatorHandle) SmallPoolAllocator.Stats {
         return self.pool.snapshotStats();
+    }
+
+    pub fn enterEpoch(self: *AllocatorHandle) ?u64 {
+        return self.pool.enterEpoch();
+    }
+
+    pub fn leaveEpoch(self: *AllocatorHandle, observed: u64) void {
+        self.pool.leaveEpoch(observed);
+    }
+
+    pub fn advanceEpoch(self: *AllocatorHandle) ?u64 {
+        return self.pool.advanceEpoch();
     }
 
     pub fn deinit(self: *AllocatorHandle) void {

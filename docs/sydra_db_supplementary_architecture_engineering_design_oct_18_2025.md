@@ -81,9 +81,9 @@ tail-latency spikes surface whenever bursts contend for the global heap. We are
 standardising on a layered allocator strategy purpose-built for this workload:
 
 1. **mimalloc baseline**
-   - Link mimalloc as the global allocator behind `-Dallocator-mode=mimalloc` so
-     per-thread caches and tight small-object classes become the default fast
-     path.
+   - Build targets now link mimalloc by default (still overridable via
+     `-Dallocator-mode=default`) so per-thread caches and tight small-object
+     classes become the fast path without extra flags.
    - Keep mimalloc's chunk recycling enabled for steady RSS and expose knobs to
      tune its release-to-OS behaviour in perf profiles.
 2. **Sharded memory pools (SMP)**
@@ -92,6 +92,11 @@ standardising on a layered allocator strategy purpose-built for this workload:
    - Target initial bins at 16/24/32/48/64/96/128/192/256 bytes; trim once
      telemetry lands. Each shard owns its slab freelists to avoid cross-core
      locking.
+   - Initial scaffolding (`src/sydra/alloc/slab_shard.zig`) now models shard
+     configuration and lifetime management; pass `-Dallocator-shards=<N>` with
+     `-Dallocator-mode=small_pool` to enable the sharded path.
+   - Epoch APIs (`AllocatorHandle.enterEpoch/leaveEpoch/advanceEpoch`) and
+     deferred free queues exist, forming the basis for QSBR reclamation.
 3. **Append-only arenas**
    - WAL and memtable segments allocate via per-segment bump allocators;
      compaction or sealing drops the whole arena in one operation.

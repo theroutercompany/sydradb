@@ -6,13 +6,15 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const is015 = builtin.zig_version.major == 0 and builtin.zig_version.minor >= 15;
-    const allocator_mode_str = b.option([]const u8, "allocator-mode", "Allocator strategy: default | mimalloc | small_pool") orelse "default";
+    const allocator_mode_str = b.option([]const u8, "allocator-mode", "Allocator strategy (default: mimalloc): default | mimalloc | small_pool") orelse "mimalloc";
+    const allocator_shards = b.option(u32, "allocator-shards", "Number of shard allocators for small_pool (0 disables sharding)") orelse 0;
     const use_mimalloc = std.mem.eql(u8, allocator_mode_str, "mimalloc");
     const use_small_pool = std.mem.eql(u8, allocator_mode_str, "small_pool");
     if (use_mimalloc and use_small_pool) @panic("allocator-mode 'mimalloc' and 'small_pool' are mutually exclusive");
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "allocator_mode", allocator_mode_str);
+    build_options.addOption(u32, "allocator_shards", allocator_shards);
     const build_options_module = build_options.createModule();
 
     const mimalloc_include = b.path("vendor/mimalloc/include");
