@@ -260,3 +260,22 @@ test "shard allocates and frees blocks" {
     const ptr = shard.allocate(16, default_alignment, @returnAddress()) orelse return error.TestUnexpectedResult;
     try std.testing.expect(shard.free(ptr));
 }
+
+test "owningShard returns correct shard" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const base_classes = [_]SlabClass{
+        .{ .size = 32, .alloc_size = 32 + header_size, .objects_per_slab = 16 },
+    };
+    var shard = try Shard.init(arena.allocator(), .{
+        .classes = &base_classes,
+        .slab_bytes = 64 * 1024,
+    });
+    defer shard.deinit();
+    shard.assignOwner();
+
+    const ptr = shard.allocate(8, default_alignment, @returnAddress()) orelse return error.TestUnexpectedResult;
+    const owner = Shard.owningShard(ptr) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(owner == &shard);
+    try std.testing.expect(shard.free(ptr));
+}

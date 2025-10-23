@@ -155,12 +155,14 @@ const SmallPoolAllocator = if (use_small_pool) struct {
             return &self.shards[state.shard_index];
         }
 
-        pub fn freeLocal(self: *ShardManager, ptr: [*]u8) bool {
-            return self.currentShard().free(ptr);
+        pub fn freeLocal(_: *ShardManager, ptr: [*]u8) bool {
+            if (slab_shard.Shard.owningShard(ptr)) |owner| {
+                return owner.free(ptr);
+            }
+            return false;
         }
 
-        pub fn freeDeferred(self: *ShardManager, ptr: [*]u8) bool {
-            _ = self;
+        pub fn freeDeferred(_: *ShardManager, ptr: [*]u8) bool {
             if (slab_shard.Shard.owningShard(ptr)) |owner| {
                 return owner.freeDeferred(ptr);
             }
