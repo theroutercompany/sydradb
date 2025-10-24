@@ -88,7 +88,7 @@ fn cmdIngest(alloc: std.mem.Allocator, _: [][:0]u8) !void {
     var stdin_file = std.fs.File.stdin();
     var stdin_buf: [4096]u8 = undefined;
     var reader_state = stdin_file.reader(&stdin_buf);
-    var reader = &reader_state.interface;
+    const reader = std.Io.Reader.adaptToOldInterface(&reader_state.interface);
     var line_buf: [4096]u8 = undefined;
     var count: usize = 0;
     while (true) {

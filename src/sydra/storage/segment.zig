@@ -62,7 +62,7 @@ pub fn readAll(alloc: std.mem.Allocator, data_dir: std.fs.Dir, path: []const u8)
 
     var read_buf: [4096]u8 = undefined;
     var reader_state = f.reader(&read_buf);
-    var reader = &reader_state.interface;
+    const reader = std.Io.Reader.adaptToOldInterface(&reader_state.interface);
 
     var hdr: [6]u8 = undefined;
     try reader.readNoEof(&hdr);
@@ -122,7 +122,7 @@ pub fn queryRange(alloc: std.mem.Allocator, data_dir: std.fs.Dir, manifest: *man
 
         var read_buf: [4096]u8 = undefined;
         var reader_state = f.reader(&read_buf);
-        var reader = &reader_state.interface;
+        const reader = std.Io.Reader.adaptToOldInterface(&reader_state.interface);
 
         var hdr: [6]u8 = undefined;
         try reader.readNoEof(&hdr);

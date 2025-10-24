@@ -52,7 +52,7 @@ pub fn handleConnection(
     var out_buf: [4096]u8 = undefined;
     var reader_state = connection.stream.reader(&in_buf);
     var writer_state = connection.stream.writer(&out_buf);
-    const reader = reader_state.interface().any();
+    const reader = std.Io.Reader.adaptToOldInterface(reader_state.interface());
     const writer = anyWriter(&writer_state.interface);
 
     var session = session_mod.performHandshake(alloc, reader, writer, session_config) catch |err| {
@@ -324,6 +324,7 @@ fn writeRowDescription(writer: std.Io.AnyWriter, columns: []const plan.ColumnInf
     std.mem.writeInt(u16, buf2[0..2], @as(u16, @intCast(columns.len)), .big);
     try writer.writeAll(buf2[0..2]);
 
+    const default_type = query_functions.Type.init(.value, true);
     for (columns) |col| {
         try writer.writeAll(col.name);
         try writer.writeByte(0);
@@ -332,7 +333,7 @@ fn writeRowDescription(writer: std.Io.AnyWriter, columns: []const plan.ColumnInf
         try writer.writeAll(buf4[0..4]);
         std.mem.writeInt(u16, buf2[0..2], 0, .big);
         try writer.writeAll(buf2[0..2]);
-        const type_info = query_functions.pgTypeInfo(col.ty);
+        const type_info = query_functions.pgTypeInfo(default_type);
         std.mem.writeInt(u32, buf4[0..4], type_info.oid, .big);
         try writer.writeAll(buf4[0..4]);
         std.mem.writeInt(i16, buf2[0..2], type_info.len, .big);
@@ -349,15 +350,16 @@ fn formatSchemaNotice(alloc: std.mem.Allocator, columns: []const plan.ColumnInfo
     errdefer buf.deinit(alloc);
     var w = buf.writer(alloc);
     try w.writeAll("schema=[");
+    const default_type = query_functions.Type.init(.value, true);
     for (columns, 0..) |col, idx| {
         if (idx != 0) try w.writeAll(", ");
-        const type_name = query_functions.displayName(col.ty);
+        const type_name = query_functions.displayName(default_type);
         try w.writeAll("{name:\"");
         try w.writeAll(col.name);
         try w.writeAll("\",type:\"");
         try w.writeAll(type_name);
         try w.writeAll("\",nullable:");
-        if (col.ty.nullable) {
+        if (default_type.nullable) {
             try w.writeAll("true");
         } else {
             try w.writeAll("false");
