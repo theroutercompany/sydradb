@@ -291,19 +291,27 @@ pub const Engine = struct {
             const now = std.time.milliTimestamp();
             const mem_usage = self.mem.bytes.load(.monotonic);
             if (mem_usage >= self.config.memtable_max_bytes or (now - last_flush) >= self.flush_timer_ms) {
-                flushMemtable(self) catch {};
+                flushMemtable(self) catch |err| {
+                    std.log.warn("memtable flush failed: {s}", .{@errorName(err)});
+                };
                 last_flush = now;
                 // apply retention best-effort after flush
-                retention.apply(self.data_dir, &self.manifest, self.config.retention_days) catch {};
+                retention.apply(self.data_dir, &self.manifest, self.config.retention_days) catch |err| {
+                    std.log.warn("retention apply failed: {s}", .{@errorName(err)});
+                };
             }
             // fsync policy: interval
             if (self.config.fsync == .interval and (now - last_sync) >= self.flush_timer_ms) {
-                self.wal.file.sync() catch {};
+                self.wal.file.sync() catch |err| {
+                    std.log.warn("wal sync failed: {s}", .{@errorName(err)});
+                };
                 last_sync = now;
             }
         }
         // final flush
-        flushMemtable(self) catch {};
+        flushMemtable(self) catch |err| {
+            std.log.warn("final memtable flush failed: {s}", .{@errorName(err)});
+        };
     }
 
     fn flushMemtable(self: *Engine) !void {
@@ -314,20 +322,20 @@ pub const Engine = struct {
         var it = self.mem.series.iterator();
         while (it.next()) |entry| {
             const sid = entry.key_ptr.*;
-            var arr = entry.value_ptr.*;
-            if (arr.items.len == 0) continue;
-            std.sort.block(types.Point, arr.items, {}, struct {
+            const arr_ptr = entry.value_ptr;
+            if (arr_ptr.*.items.len == 0) continue;
+            std.sort.block(types.Point, arr_ptr.*.items, {}, struct {
                 fn lessThan(_: void, a: types.Point, b: types.Point) bool {
                     return a.ts < b.ts;
                 }
             }.lessThan);
             // Partition by hour (UTC)
             var start_idx: usize = 0;
-            while (start_idx < arr.items.len) {
-                const hour = hourBucket(arr.items[start_idx].ts);
+            while (start_idx < arr_ptr.*.items.len) {
+                const hour = hourBucket(arr_ptr.*.items[start_idx].ts);
                 var end_idx = start_idx + 1;
-                while (end_idx < arr.items.len and hourBucket(arr.items[end_idx].ts) == hour) : (end_idx += 1) {}
-                const slice = arr.items[start_idx..end_idx];
+                while (end_idx < arr_ptr.*.items.len and hourBucket(arr_ptr.*.items[end_idx].ts) == hour) : (end_idx += 1) {}
+                const slice = arr_ptr.*.items[start_idx..end_idx];
                 // write segment
                 const seg_path = try segment_mod.writeSegment(self.alloc, self.data_dir, sid, hour, slice);
                 const c: u32 = @intCast(slice.len);
@@ -351,9 +359,13 @@ pub const Engine = struct {
             std.log.info("flush completed: segments={d} points={d} duration_ms={d}", .{ segments_written, points_written, duration_ms });
         }
         // rotate WAL optionally
-        self.wal.rotateIfNeeded() catch {};
+        self.wal.rotateIfNeeded() catch |err| {
+            std.log.warn("wal rotation failed: {s}", .{@errorName(err)});
+        };
         // persist tag index snapshot (best-effort)
-        self.tags.save(self.data_dir) catch {};
+        self.tags.save(self.data_dir) catch |err| {
+            std.log.warn("tag index save failed: {s}", .{@errorName(err)});
+        };
     }
 
     fn hourBucket(ts: i64) i64 {
@@ -375,7 +387,9 @@ pub const Engine = struct {
             if (e.value_ptr.* == .string) {
                 const key = std.fmt.allocPrint(self.alloc, "{s}={s}", .{ e.key_ptr.*, e.value_ptr.string }) catch continue;
                 defer self.alloc.free(key);
-                self.tags.add(key, series_id) catch {};
+                self.tags.add(key, series_id) catch |err| {
+                    std.log.warn("tag index add failed: {s}", .{@errorName(err)});
+                };
             }
         }
     }

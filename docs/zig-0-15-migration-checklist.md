@@ -44,9 +44,9 @@ This plan captures every known change required to move the codebase and tooling 
 - When using `file.writer(&buf)` grab the interface via `writer_state.interface()` instead of the deprecated pointer hack.
 
 ## 6. Error Handling & API Tightening
-- Replace the `_ = err;` pattern in `src/sydra/engine.zig:189-193` with explicit error handling (e.g., a `catch |err| { std.log.warn(...); continue; }` block) because Zig 0.15 no longer allows silent discards.
-- Review any `catch` blocks that mention `error.EndOfStream`; the new reader error set differs. Either handle it explicitly or map it to your own error type.
-- Run `zig fmt` after all code edits; the formatter will catch lingering layout issues (e.g., `src/sydra/codec/zstd.zig`, `src/sydra/config.zig` were cited by pre-commit).
+- [x] Replace the `_ = err;` pattern in `src/sydra/engine.zig:189-193` with explicit error handling (e.g., a `catch |err| { std.log.warn(...); continue; }` block) because Zig 0.15 no longer allows silent discards.
+- [x] Review any `catch` blocks that mention `error.EndOfStream`; the new reader error set differs. Either handle it explicitly or map it to your own error type.
+- [x] Run `zig fmt` after all code edits; the formatter will catch lingering layout issues (e.g., `src/sydra/codec/zstd.zig`, `src/sydra/config.zig` were cited by pre-commit).
 
 ## 7. Verification Checklist
 - `zig fmt` (root)<br>
