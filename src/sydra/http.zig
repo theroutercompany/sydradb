@@ -217,8 +217,7 @@ fn handleAllocStats(handle: *alloc_mod.AllocatorHandle, req: *std.http.Server.Re
 }
 fn handleSydraql(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
     var body_buf: [1024]u8 = undefined;
-    const body_reader_state = req.readerExpectNone(&body_buf);
-    const reader = std.Io.Reader.adaptToOldInterface(body_reader_state);
+    const body_reader = req.readerExpectNone(&body_buf);
     const content_len = req.head.content_length orelse {
         return respondJsonError(alloc, req, .length_required, "length required");
     };
@@ -227,9 +226,9 @@ fn handleSydraql(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     }
 
     const len: usize = @intCast(content_len);
-    const body = try alloc.alloc(u8, len);
+    const body_slice = try body_reader.*.take(len);
+    const body = try alloc.dupe(u8, body_slice);
     defer alloc.free(body);
-    try reader.readNoEof(body);
 
     const sydraql = std.mem.trim(u8, body, " \t\r\n");
     if (sydraql.len == 0) {
@@ -630,20 +629,18 @@ fn handleStatus(req: *std.http.Server.Request) !void {
 
 fn handleIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
     var body_buf: [4096]u8 = undefined;
-    const body_reader_state = req.readerExpectNone(&body_buf);
-    const body_reader = std.Io.Reader.adaptToOldInterface(body_reader_state);
-    var line_buf: [4096]u8 = undefined;
+    const body_reader = req.readerExpectNone(&body_buf);
     var count: usize = 0;
 
     while (true) {
-        const maybe_slice = body_reader.readUntilDelimiterOrEof(&line_buf, '\n') catch |err| switch (err) {
+        const slice = body_reader.*.takeDelimiterExclusive('\n') catch |err| switch (err) {
             error.StreamTooLong => {
                 _ = req.respond("line too long", .{ .status = .payload_too_large, .keep_alive = false }) catch {};
                 return;
             },
+            error.EndOfStream => break,
             else => return err,
         };
-        const slice = maybe_slice orelse break;
         const trimmed = std.mem.trim(u8, slice, " \t\r\n");
         if (trimmed.len == 0) continue;
 
@@ -707,8 +704,7 @@ fn handleIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Re
 
 fn handleQuery(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
     var body_buf: [1024]u8 = undefined;
-    const body_reader_state = req.readerExpectNone(&body_buf);
-    const reader = std.Io.Reader.adaptToOldInterface(body_reader_state);
+    const body_reader = req.readerExpectNone(&body_buf);
     const content_len = req.head.content_length orelse {
         try req.respond("length required", .{ .status = .length_required, .keep_alive = false });
         return;
@@ -718,9 +714,9 @@ fn handleQuery(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Req
         return;
     }
     const alloc_len: usize = @intCast(content_len);
-    const body = try alloc.alloc(u8, alloc_len);
+    const body_slice = try body_reader.*.take(alloc_len);
+    const body = try alloc.dupe(u8, body_slice);
     defer alloc.free(body);
-    try reader.readNoEof(body);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
@@ -817,8 +813,7 @@ fn respondPoints(req: *std.http.Server.Request, points: []const types.Point) !vo
 
 fn handleFind(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
     var body_buf: [1024]u8 = undefined;
-    const body_reader_state = req.readerExpectNone(&body_buf);
-    const reader = std.Io.Reader.adaptToOldInterface(body_reader_state);
+    const body_reader = req.readerExpectNone(&body_buf);
     const content_len = req.head.content_length orelse {
         try req.respond("length required", .{ .status = .length_required, .keep_alive = false });
         return;
@@ -828,9 +823,9 @@ fn handleFind(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Requ
         return;
     }
     const alloc_len: usize = @intCast(content_len);
-    const body = try alloc.alloc(u8, alloc_len);
+    const body_slice = try body_reader.*.take(alloc_len);
+    const body = try alloc.dupe(u8, body_slice);
     defer alloc.free(body);
-    try reader.readNoEof(body);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
