@@ -52,7 +52,7 @@ pub fn handleConnection(
     var out_buf: [4096]u8 = undefined;
     var reader_state = connection.stream.reader(&in_buf);
     var writer_state = connection.stream.writer(&out_buf);
-    const reader = std.Io.Reader.adaptToOldInterface(reader_state.interface());
+    const reader = reader_state.interface().any();
     const writer = anyWriter(&writer_state.interface);
 
     var session = session_mod.performHandshake(alloc, reader, writer, session_config) catch |err| {

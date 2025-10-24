@@ -3,19 +3,19 @@
 This plan captures every known change required to move the codebase and tooling from Zig 0.14.x to Zig 0.15.x. Work through the sections in order; each bullet calls out the exact files and symbols to touch so we can execute without additional clarification.
 
 ## 1. Toolchain & Automation
-- Update `flake.nix:19` to pin `zig-0.15.x` (remove the `zig-0.14.0` fallback logic) and ensure `shell.nix:3` selects the same package so `nix develop` exposes the new compiler.
-- Bump both Zig installs in `.github/workflows/ci.yml` to `version: 0.15.x` (jobs `checks` and `release-artifacts`). Keep the current target matrix, just validate the new runner can build them.
-- After the bump, clear cached hooks (`pre-commit clean`) so `pre-commit run --all-files` pulls the 0.15 binary. No config change needed.
-- Revise onboarding docs that mention the Zig pin (`AGENTS.md` or any other references) so contributors install the correct release.
+- [x] Update `flake.nix:19` to pin `zig-0.15.x` (remove the `zig-0.14.0` fallback logic) and ensure `shell.nix:3` selects the same package so `nix develop` exposes the new compiler.
+- [x] Bump both Zig installs in `.github/workflows/ci.yml` to `version: 0.15.x` (jobs `checks` and `release-artifacts`). Keep the current target matrix, just validate the new runner can build them.
+- [x] After the bump, clear cached hooks (`pre-commit clean`) so `pre-commit run --all-files` pulls the 0.15 binary. No config change needed.
+- [x] Revise onboarding docs that mention the Zig pin (`AGENTS.md` or any other references) so contributors install the correct release.
 
 ## 2. Std I/O Accessors
-- Replace `std.io.getStdIn()`/`getStdErr()` usages with the new file helpers:
+- [x] Replace `std.io.getStdIn()`/`getStdErr()` usages with the new file helpers:
   - `src/sydra/server.zig:85` → use `var stdin_file = std.fs.File.stdin();` then `var reader_state = stdin_file.reader(&buf); const reader = reader_state.interface();`.
   - `examples/loadgen.zig:7` and `src/sydra/compat/log.zig:20` → use `std.fs.File.{stdout,stderr}().writer(&buf)` (keep the writer state alive and grab `.interface()` when needed).
-- Audit for any other direct `std.io.get*` calls and convert them to `std.fs.File.*`.
+- [x] Audit for any other direct `std.io.get*` calls and convert them to `std.fs.File.*`.
 
 ## 3. HTTP Server Plumbing
-- In `src/sydra/http.zig` allocate read/write buffers per connection, then call:
+- [x] In `src/sydra/http.zig` allocate read/write buffers per connection, then call:
   ```zig
   var reader_state = connection.stream.reader(&in_buf);
   var writer_state = connection.stream.writer(&out_buf);
@@ -28,13 +28,13 @@ This plan captures every known change required to move the codebase and tooling 
 - Ensure the writer state lives as long as the connection loop (don’t let it go out of scope).
 
 ## 4. Pgwire Server & Protocol
-- Wrap connections with explicit buffer states before the handshake (`src/sydra/compat/wire/server.zig:24-66`) and pass `reader_state.interface()`/`writer_state.interface()` into `session.performHandshake`.
+- [x] Wrap connections with explicit buffer states before the handshake (`src/sydra/compat/wire/server.zig:24-66`) and pass `reader_state.interface()`/`writer_state.interface()` into `session.performHandshake`.
 - Update `messageLoop` to accept `*std.Io.Reader`/`*std.Io.Writer` and replace `reader.*.readNoEof` with `reader.readNoEof`.
 - Adjust `protocol.zig` helpers (`readStartup`, writers, tests) to operate on interfaces rather than the legacy reader struct.
 - Fix tests in `session.zig` to build interface wrappers from `std.io.fixedBufferStream` via `.reader()`/`.writer()` → `.interface()`.
 
 ## 5. Storage & Codec Reads/Writes
-- For every `file.reader(&buf)` call (WAL, segments, tags, manifests) hold on to the state and interact through its `.interface()`:
+- [x] For every `file.reader(&buf)` call (WAL, segments, tags, manifests) hold on to the state and interact through its `.interface()`:
   ```zig
   var reader_state = f.reader(&buf);
   const reader = reader_state.interface();

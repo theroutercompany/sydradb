@@ -41,6 +41,14 @@ const ProducerContext = struct {
     series_offset: usize,
     ts_base: i64,
     thread_id: usize,
+    latencies: ?*std.ArrayList(u64) = null,
+    stress_result: ?*ThreadStressResult = null,
+};
+
+const ThreadStressResult = struct {
+    total_latency_ns: u128 = 0,
+    max_latency_ns: u64 = 0,
+    ops: usize = 0,
 };
 
 fn producer(ctx: ProducerContext) void {
@@ -48,6 +56,8 @@ fn producer(ctx: ProducerContext) void {
     const series = ctx.series_ids;
     if (ctx.ops == 0) return;
     var i: usize = 0;
+    var stress_total_ns: u128 = 0;
+    var stress_max_ns: u64 = 0;
     while (i < ctx.ops) : (i += 1) {
         const sid = series[(ctx.series_offset + i) % series.len];
         const ts = ctx.ts_base + @as(i64, @intCast(i));
@@ -58,10 +68,23 @@ fn producer(ctx: ProducerContext) void {
             .value = val,
             .tags_json = "{}",
         };
+        const start_ns = std.time.nanoTimestamp();
         if (eng.ingest(item)) |_| {} else |err| {
             std.debug.print("ingest error on thread {d}: {s}\n", .{ ctx.thread_id, @errorName(err) });
             return;
         }
+        const end_ns = std.time.nanoTimestamp();
+        const latency_ns = @as(u64, @intCast(end_ns - start_ns));
+        if (ctx.latencies) |buffer| {
+            buffer.appendAssumeCapacity(latency_ns);
+        }
+        stress_total_ns += latency_ns;
+        if (latency_ns > stress_max_ns) stress_max_ns = latency_ns;
+    }
+    if (ctx.stress_result) |result| {
+        result.total_latency_ns = stress_total_ns;
+        result.max_latency_ns = stress_max_ns;
+        result.ops = ctx.ops;
     }
 }
 
@@ -73,6 +96,8 @@ fn parseArgs(alloc: std.mem.Allocator) !struct {
     poll_ms: u32,
     flush_interval_ms: u32,
     memtable_max_bytes: usize,
+    stress_seconds: usize,
+    stress_ops: usize,
 } {
     var args = try std.process.argsWithAllocator(alloc);
     defer args.deinit();
@@ -85,6 +110,8 @@ fn parseArgs(alloc: std.mem.Allocator) !struct {
     var poll_ms: u32 = 5;
     var flush_interval_ms: u32 = 200;
     var memtable_mb: usize = 32;
+    var stress_seconds: usize = 0;
+    var stress_ops: usize = 10_000;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--ops")) {
@@ -115,16 +142,24 @@ fn parseArgs(alloc: std.mem.Allocator) !struct {
             if (args.next()) |val| {
                 memtable_mb = try std.fmt.parseInt(usize, val, 10);
             } else return error.InvalidArgs;
+        } else if (std.mem.eql(u8, arg, "--stress-seconds")) {
+            if (args.next()) |val| {
+                stress_seconds = try std.fmt.parseInt(usize, val, 10);
+            } else return error.InvalidArgs;
+        } else if (std.mem.eql(u8, arg, "--stress-ops")) {
+            if (args.next()) |val| {
+                stress_ops = try std.fmt.parseInt(usize, val, 10);
+            } else return error.InvalidArgs;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             std.debug.print(
-                "Usage: bench_alloc [--ops N] [--concurrency N] [--series N] [--drain-timeout-ms N] [--poll-ms N] [--flush-ms N] [--memtable-mb N]\n",
+                "Usage: bench_alloc [--ops N] [--concurrency N] [--series N] [--drain-timeout-ms N] [--poll-ms N] [--flush-ms N] [--memtable-mb N] [--stress-seconds N] [--stress-ops N]\n",
                 .{},
             );
             std.process.exit(0);
         }
     }
 
-    if (concurrency == 0 or series == 0 or total_ops == 0) return error.InvalidArgs;
+    if (concurrency == 0 or series == 0 or (total_ops == 0 and stress_seconds == 0)) return error.InvalidArgs;
     const memtable_max_bytes = memtable_mb * 1024 * 1024;
     return .{
         .ops = total_ops,
@@ -134,7 +169,125 @@ fn parseArgs(alloc: std.mem.Allocator) !struct {
         .poll_ms = poll_ms,
         .flush_interval_ms = flush_interval_ms,
         .memtable_max_bytes = memtable_max_bytes,
+        .stress_seconds = stress_seconds,
+        .stress_ops = stress_ops,
     };
+}
+
+fn percentile(sorted: []u64, ratio: f64) u64 {
+    if (sorted.len == 0) return 0;
+    const max_index = sorted.len - 1;
+    const position = ratio * @as(f64, @floatFromInt(max_index));
+    const lower = @as(usize, @intCast(@floor(position)));
+    const upper = if (lower >= max_index) max_index else lower + 1;
+    const weight = position - @floor(position);
+    if (upper == lower) return sorted[lower];
+    const lower_val = sorted[lower];
+    const upper_val = sorted[upper];
+    return @as(u64, @intFromFloat(@as(f64, @floatFromInt(lower_val)) * (1.0 - weight) + @as(f64, @floatFromInt(upper_val)) * weight));
+}
+
+fn printLatencySummary(latencies: []u64) void {
+    if (latencies.len == 0) {
+        std.debug.print("latency_summary no samples collected\n", .{});
+        return;
+    }
+    std.sort.sort(u64, latencies, {}, std.sort.asc(u64));
+    const p50 = percentile(latencies, 0.50);
+    const p95 = percentile(latencies, 0.95);
+    const p99 = percentile(latencies, 0.99);
+    const p999 = percentile(latencies, 0.999);
+    const nsToUs = struct {
+        fn convert(ns: u64) f64 {
+            return @as(f64, @floatFromInt(ns)) / 1000.0;
+        }
+    }.convert;
+    std.debug.print(
+        "latency_summary us p50={d:.2} p95={d:.2} p99={d:.2} p999={d:.2}\n",
+        .{
+            nsToUs(p50),
+            nsToUs(p95),
+            nsToUs(p99),
+            nsToUs(p999),
+        },
+    );
+}
+
+fn runStress(
+    allocator: std.mem.Allocator,
+    handle: *alloc_mod.AllocatorHandle,
+    eng: *engine.Engine,
+    series_ids: []const types.SeriesId,
+    threads: []std.Thread,
+    contexts: []ProducerContext,
+    stress_ops: usize,
+    stress_seconds: usize,
+) !void {
+    if (stress_seconds == 0 or stress_ops == 0) return;
+
+    std.debug.print("stress_run seconds={d} ops_per_batch={d}\n", .{ stress_seconds, stress_ops });
+    var stress_results = try allocator.alloc(ThreadStressResult, threads.len);
+    defer allocator.free(stress_results);
+
+    const stop_time = @as(i128, std.time.nanoTimestamp()) + @as(i128, @intCast(stress_seconds)) * std.time.ns_per_s;
+    var batches: usize = 0;
+    var total_ops: usize = 0;
+    var total_latency_ns: f128 = 0;
+    var max_latency_ns: u64 = 0;
+    var max_deferred: usize = 0;
+    var global_series_offset: usize = 0;
+    var global_ts_base: i64 = 0;
+
+    const thread_count = threads.len;
+
+    while (@as(i128, std.time.nanoTimestamp()) < stop_time) : (batches += 1) {
+        var idx: usize = 0;
+        while (idx < thread_count) : (idx += 1) {
+            contexts[idx].ops = stress_ops;
+            contexts[idx].series_offset = global_series_offset;
+            contexts[idx].ts_base = global_ts_base;
+            contexts[idx].latencies = null;
+            contexts[idx].stress_result = &stress_results[idx];
+            stress_results[idx] = .{};
+            threads[idx] = try std.Thread.spawn(.{}, producer, .{contexts[idx]});
+            global_series_offset += stress_ops;
+            global_ts_base += @as(i64, @intCast(stress_ops)) << 4;
+        }
+        idx = thread_count;
+        while (idx > 0) : (idx -= 1) {
+            threads[idx - 1].join();
+        }
+
+        var thread_idx: usize = 0;
+        while (thread_idx < thread_count) : (thread_idx += 1) {
+            const result = stress_results[thread_idx];
+            total_ops += result.ops;
+            total_latency_ns += @as(f128, @floatFromInt(result.total_latency_ns));
+            if (result.max_latency_ns > max_latency_ns) {
+                max_latency_ns = result.max_latency_ns;
+            }
+        }
+
+        if (alloc_mod.is_small_pool) {
+            if (handle.advanceEpoch()) |epoch| handle.leaveEpoch(epoch);
+            const stats = handle.snapshotSmallPoolStats();
+            if (stats.shard_enabled and stats.shard_deferred_total > max_deferred) {
+                max_deferred = stats.shard_deferred_total;
+            }
+        }
+    }
+
+    const avg_latency_ns = if (total_ops > 0)
+        total_latency_ns / @as(f128, @floatFromInt(total_ops))
+    else
+        0.0;
+    const avg_latency_us = @as(f64, @floatCast(avg_latency_ns)) / 1000.0;
+    const max_latency_us = @as(f64, @floatFromInt(max_latency_ns)) / 1000.0;
+
+    std.debug.print(
+        "stress_summary batches={d} total_ops={d} avg_latency_us={d:.2} max_latency_us={d:.2} max_deferred={d}\n",
+        .{ batches, total_ops, avg_latency_us, max_latency_us, max_deferred },
+    );
 }
 
 pub fn main() !void {
@@ -178,6 +331,20 @@ pub fn main() !void {
     defer alloc.free(threads);
     var contexts = try alloc.alloc(ProducerContext, thread_count);
     defer alloc.free(contexts);
+    var latency_lists = try alloc.alloc(std.ArrayList(u64), thread_count);
+    defer {
+        var li: usize = 0;
+        while (li < thread_count) : (li += 1) {
+            latency_lists[li].deinit();
+        }
+        alloc.free(latency_lists);
+    }
+    {
+        var li: usize = 0;
+        while (li < thread_count) : (li += 1) {
+            latency_lists[li] = std.ArrayList(u64).init(alloc);
+        }
+    }
 
     const ops_total = arg_state.ops;
     const base_ops = ops_total / thread_count;
@@ -197,7 +364,10 @@ pub fn main() !void {
             .series_offset = series_offset,
             .ts_base = ts_base,
             .thread_id = thread_idx,
+            .latencies = &latency_lists[thread_idx],
+            .stress_result = null,
         };
+        try latency_lists[thread_idx].ensureTotalCapacity(ops);
         threads[thread_idx] = try std.Thread.spawn(.{}, producer, .{contexts[thread_idx]});
         series_offset += ops;
         ts_base += @as(i64, @intCast(ops)) << 4;
@@ -406,7 +576,33 @@ pub fn main() !void {
         }
     }
 
+    if (ops_total > 0) {
+        var merged = std.ArrayList(u64).init(alloc);
+        defer merged.deinit();
+        try merged.ensureTotalCapacity(ops_total);
+        thread_idx = 0;
+        while (thread_idx < thread_count) : (thread_idx += 1) {
+            try merged.appendSlice(latency_lists[thread_idx].items);
+        }
+        printLatencySummary(merged.items);
+    } else {
+        std.debug.print("latency_summary skipped (ops=0)\n", .{});
+    }
+
     if (timed_out) {
         std.debug.print("warning: writer drain timed out after {d} ms\n", .{arg_state.drain_timeout_ms});
+    }
+
+    if (arg_state.stress_seconds > 0) {
+        try runStress(
+            alloc,
+            &allocator_handle,
+            &eng,
+            series_ids,
+            threads,
+            contexts,
+            arg_state.stress_ops,
+            arg_state.stress_seconds,
+        );
     }
 }

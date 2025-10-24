@@ -8,19 +8,19 @@ const plan = @import("query/plan.zig");
 const query_executor = @import("query/executor.zig");
 const query_value = @import("query/value.zig");
 const query_functions = @import("query/functions.zig");
+const alloc_mod = @import("alloc.zig");
 
-pub fn runHttp(alloc: std.mem.Allocator, eng: *Engine, port: u16) !void {
+pub fn runHttp(handle: *alloc_mod.AllocatorHandle, eng: *Engine, port: u16) !void {
     var address = try std.net.Address.parseIp4("0.0.0.0", port);
     var server = try address.listen(.{ .reuse_address = true });
     defer server.deinit();
-    _ = alloc;
 
     while (true) {
         const connection = server.accept() catch |err| switch (err) {
             error.ConnectionResetByPeer, error.ConnectionAborted => continue,
             else => return err,
         };
-        const worker = std.Thread.spawn(.{}, connectionWorker, .{ eng, connection }) catch |spawn_err| {
+        const worker = std.Thread.spawn(.{}, connectionWorker, .{ handle, eng, connection }) catch |spawn_err| {
             std.log.err("http spawn failed: {s}", .{@errorName(spawn_err)});
             connection.stream.close();
             continue;
@@ -29,15 +29,15 @@ pub fn runHttp(alloc: std.mem.Allocator, eng: *Engine, port: u16) !void {
     }
 }
 
-fn connectionWorker(eng: *Engine, connection: std.net.Server.Connection) void {
+fn connectionWorker(handle: *alloc_mod.AllocatorHandle, eng: *Engine, connection: std.net.Server.Connection) void {
     const alloc = std.heap.c_allocator;
-    handleConnection(alloc, eng, connection) catch |err| switch (err) {
+    handleConnection(handle, alloc, eng, connection) catch |err| switch (err) {
         error.HttpConnectionClosing, error.HttpRequestTruncated => {},
         else => std.log.warn("http connection error: {s}", .{@errorName(err)}),
     };
 }
 
-fn handleConnection(alloc: std.mem.Allocator, eng: *Engine, connection: std.net.Server.Connection) !void {
+fn handleConnection(handle: *alloc_mod.AllocatorHandle, alloc: std.mem.Allocator, eng: *Engine, connection: std.net.Server.Connection) !void {
     defer connection.stream.close();
 
     var in_buf: [4096]u8 = undefined;
@@ -51,7 +51,7 @@ fn handleConnection(alloc: std.mem.Allocator, eng: *Engine, connection: std.net.
             error.HttpConnectionClosing, error.HttpRequestTruncated => return,
             else => return err,
         };
-        handleRequest(alloc, eng, &req) catch |err| switch (err) {
+        handleRequest(handle, alloc, eng, &req) catch |err| switch (err) {
             error.HttpExpectationFailed => {
                 _ = req.respond("expectation failed", .{ .status = .expectation_failed, .keep_alive = false }) catch {};
                 return;
@@ -61,7 +61,7 @@ fn handleConnection(alloc: std.mem.Allocator, eng: *Engine, connection: std.net.
     }
 }
 
-fn handleRequest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+fn handleRequest(handle: *alloc_mod.AllocatorHandle, alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
     const target = req.head.target;
     var path = target;
     var query: []const u8 = "";
@@ -93,6 +93,9 @@ fn handleRequest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     if (std.mem.eql(u8, path, "/debug/compat/catalog") and method == .GET) {
         return try handleCompatCatalog(alloc, req);
     }
+    if (std.mem.eql(u8, path, "/debug/alloc/stats") and method == .GET) {
+        return try handleAllocStats(handle, req);
+    }
     if (std.mem.eql(u8, path, "/status") and method == .GET) {
         return try handleStatus(req);
     }
@@ -115,10 +118,106 @@ fn handleRequest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     try req.respond("not found", .{ .status = .not_found });
 }
 
+fn handleAllocStats(handle: *alloc_mod.AllocatorHandle, req: *std.http.Server.Request) !void {
+    if (!alloc_mod.is_small_pool) {
+        try req.respond("allocator mode does not expose small_pool stats", .{ .status = .not_found });
+        return;
+    }
+
+    const stats = handle.snapshotSmallPoolStats();
+    var send_buf: [512]u8 = undefined;
+    var response = try req.respondStreaming(&send_buf, .{
+        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    errdefer response.end() catch {};
+
+    var writer = response.writer;
+    var jw = std.json.Stringify{ .writer = &writer };
+    try jw.beginObject();
+    try jw.objectField("allocator_mode");
+    try jw.write(alloc_mod.mode);
+    try jw.objectField("small_pool");
+    try jw.beginObject();
+    try jw.objectField("shard_enabled");
+    try jw.write(stats.shard_enabled);
+    try jw.objectField("shard_count");
+    try jw.write(stats.shard_count);
+    try jw.objectField("shard_alloc_hits");
+    try jw.write(stats.shard_alloc_hits);
+    try jw.objectField("shard_alloc_misses");
+    try jw.write(stats.shard_alloc_misses);
+    try jw.objectField("shard_deferred_total");
+    try jw.write(stats.shard_deferred_total);
+    try jw.objectField("shard_epoch_current");
+    try jw.write(stats.shard_current_epoch);
+    try jw.objectField("shard_epoch_min");
+    try jw.write(stats.shard_min_epoch);
+
+    try jw.objectField("fallback");
+    try jw.beginObject();
+    try jw.objectField("allocs");
+    try jw.write(stats.fallback_allocs);
+    try jw.objectField("frees");
+    try jw.write(stats.fallback_frees);
+    try jw.objectField("resizes");
+    try jw.write(stats.fallback_resizes);
+    try jw.objectField("remaps");
+    try jw.write(stats.fallback_remaps);
+    try jw.objectField("size_buckets");
+    try jw.beginArray();
+    inline for (stats.fallback_size_buckets, 0..) |count, idx| {
+        try jw.beginObject();
+        try jw.objectField("count");
+        try jw.write(count);
+        try jw.objectField("upper_bound");
+        if (stats.fallback_size_bounds[idx]) |bound| {
+            try jw.write(bound);
+        } else {
+            try jw.writeNull();
+        }
+        try jw.endObject();
+    }
+    try jw.endArray();
+    try jw.endObject(); // fallback
+
+    try jw.objectField("buckets");
+    try jw.beginArray();
+    inline for (stats.buckets) |bucket| {
+        try jw.beginObject();
+        try jw.objectField("size");
+        try jw.write(bucket.size);
+        try jw.objectField("alloc_size");
+        try jw.write(bucket.alloc_size);
+        try jw.objectField("allocations");
+        try jw.write(bucket.allocations);
+        try jw.objectField("in_use");
+        try jw.write(bucket.in_use);
+        try jw.objectField("high_water");
+        try jw.write(bucket.high_water);
+        try jw.objectField("refills");
+        try jw.write(bucket.refills);
+        try jw.objectField("slabs");
+        try jw.write(bucket.slabs);
+        try jw.objectField("free_nodes");
+        try jw.write(bucket.free_nodes);
+        try jw.objectField("lock_wait_ns_total");
+        try jw.write(bucket.lock_wait_ns_total);
+        try jw.objectField("lock_hold_ns_total");
+        try jw.write(bucket.lock_hold_ns_total);
+        try jw.objectField("lock_acquisitions");
+        try jw.write(bucket.lock_acquisitions);
+        try jw.objectField("lock_contention");
+        try jw.write(bucket.lock_contention);
+        try jw.endObject();
+    }
+    try jw.endArray();
+    try jw.endObject(); // small_pool
+    try jw.endObject();
+    try response.end();
+}
 fn handleSydraql(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
     var body_buf: [1024]u8 = undefined;
-    const reader_ptr = req.readerExpectNone(&body_buf);
-    const reader = std.Io.Reader.adaptToOldInterface(reader_ptr);
+    const reader = req.readerExpectNone(&body_buf);
     const content_len = req.head.content_length orelse {
         return respondJsonError(alloc, req, .length_required, "length required");
     };
@@ -528,8 +627,7 @@ fn handleStatus(req: *std.http.Server.Request) !void {
 
 fn handleIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
     var body_buf: [4096]u8 = undefined;
-    const body_reader_ptr = req.readerExpectNone(&body_buf);
-    const body_reader = std.Io.Reader.adaptToOldInterface(body_reader_ptr);
+    const body_reader = req.readerExpectNone(&body_buf);
     var line_buf: [4096]u8 = undefined;
     var count: usize = 0;
 
@@ -605,8 +703,7 @@ fn handleIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Re
 
 fn handleQuery(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
     var body_buf: [1024]u8 = undefined;
-    const reader_ptr = req.readerExpectNone(&body_buf);
-    const reader = std.Io.Reader.adaptToOldInterface(reader_ptr);
+    const reader = req.readerExpectNone(&body_buf);
     const content_len = req.head.content_length orelse {
         try req.respond("length required", .{ .status = .length_required, .keep_alive = false });
         return;
@@ -715,8 +812,7 @@ fn respondPoints(req: *std.http.Server.Request, points: []const types.Point) !vo
 
 fn handleFind(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
     var body_buf: [1024]u8 = undefined;
-    const reader_ptr = req.readerExpectNone(&body_buf);
-    const reader = std.Io.Reader.adaptToOldInterface(reader_ptr);
+    const reader = req.readerExpectNone(&body_buf);
     const content_len = req.head.content_length orelse {
         try req.respond("length required", .{ .status = .length_required, .keep_alive = false });
         return;

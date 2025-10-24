@@ -4,8 +4,10 @@ const engine_mod = @import("engine.zig");
 const http = @import("http.zig");
 const catalog = @import("catalog.zig");
 const compat = @import("compat.zig");
+const alloc_mod = @import("alloc.zig");
 
-pub fn run(alloc: std.mem.Allocator) !void {
+pub fn run(handle: *alloc_mod.AllocatorHandle) !void {
+    const alloc = handle.allocator();
     const args = try std.process.argsAlloc(alloc);
     defer std.process.argsFree(alloc, args);
     if (args.len <= 1 or std.mem.eql(u8, args[1], "serve")) {
@@ -15,7 +17,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
         defer eng.deinit();
         try catalog.bootstrap(alloc);
         std.debug.print("sydradb serve :{d}\n", .{cfg.http_port});
-        try http.runHttp(alloc, eng, cfg.http_port);
+        try http.runHttp(handle, eng, cfg.http_port);
         return;
     }
 
@@ -26,7 +28,7 @@ pub fn run(alloc: std.mem.Allocator) !void {
     if (std.mem.eql(u8, cmd, "compact")) return cmdCompact(alloc, args);
     if (std.mem.eql(u8, cmd, "snapshot")) return cmdSnapshot(alloc, args);
     if (std.mem.eql(u8, cmd, "restore")) return cmdRestore(alloc, args);
-    if (std.mem.eql(u8, cmd, "stats")) return cmdStats(alloc, args);
+    if (std.mem.eql(u8, cmd, "stats")) return cmdStats(handle, alloc, args);
 }
 
 fn loadConfigOrDefault(alloc: std.mem.Allocator) !config.Config {
@@ -86,7 +88,7 @@ fn cmdIngest(alloc: std.mem.Allocator, _: [][:0]u8) !void {
     var stdin_file = std.fs.File.stdin();
     var stdin_buf: [4096]u8 = undefined;
     var reader_state = stdin_file.reader(&stdin_buf);
-    var reader = std.Io.Reader.adaptToOldInterface(&reader_state.interface);
+    var reader = &reader_state.interface;
     var line_buf: [4096]u8 = undefined;
     var count: usize = 0;
     while (true) {
@@ -137,7 +139,7 @@ fn cmdCompact(alloc: std.mem.Allocator, _: [][:0]u8) !void {
     try @import("storage/compact.zig").compactAll(alloc, data_dir, &manifest);
 }
 
-fn cmdStats(alloc: std.mem.Allocator, _: [][:0]u8) !void {
+fn cmdStats(handle: *alloc_mod.AllocatorHandle, alloc: std.mem.Allocator, _: [][:0]u8) !void {
     var cfg = try loadConfigOrDefault(alloc);
     defer cfg.deinit(alloc);
     var d = try std.fs.cwd().openDir(cfg.data_dir, .{ .iterate = true });
@@ -162,6 +164,32 @@ fn cmdStats(alloc: std.mem.Allocator, _: [][:0]u8) !void {
         }
     }
     std.debug.print("segments_total {d}\n", .{seg_count});
+
+    if (alloc_mod.is_small_pool) {
+        const stats = handle.snapshotSmallPoolStats();
+        if (stats.shard_enabled) {
+            std.debug.print(
+                "small_pool.shards count={d} hits={d} misses={d} deferred={d} epoch_current={d} epoch_min={d}\n",
+                .{
+                    stats.shard_count,
+                    stats.shard_alloc_hits,
+                    stats.shard_alloc_misses,
+                    stats.shard_deferred_total,
+                    stats.shard_current_epoch,
+                    stats.shard_min_epoch,
+                },
+            );
+        } else {
+            std.debug.print(
+                "small_pool.shards disabled hits={d} misses={d}\n",
+                .{ stats.shard_alloc_hits, stats.shard_alloc_misses },
+            );
+        }
+        std.debug.print(
+            "small_pool.fallback allocs={d} frees={d} resizes={d} remaps={d}\n",
+            .{ stats.fallback_allocs, stats.fallback_frees, stats.fallback_resizes, stats.fallback_remaps },
+        );
+    }
 }
 
 fn cmdSnapshot(alloc: std.mem.Allocator, args: [][:0]u8) !void {

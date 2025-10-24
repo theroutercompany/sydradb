@@ -113,7 +113,7 @@ fn replayFile(alloc: std.mem.Allocator, wal_dir: std.fs.Dir, file_name: []const 
 
     var read_buf: [4096]u8 = undefined;
     var reader_state = file.reader(&read_buf);
-    const reader = std.Io.Reader.adaptToOldInterface(&reader_state.interface);
+    var reader = &reader_state.interface;
 
     while (true) {
         var len_buf: [4]u8 = undefined;
@@ -145,7 +145,7 @@ fn replayFile(alloc: std.mem.Allocator, wal_dir: std.fs.Dir, file_name: []const 
     }
 }
 
-fn readExact(reader: std.Io.AnyReader, buf: []u8) !void {
+fn readExact(reader: *std.Io.Reader, buf: []u8) !void {
     var offset: usize = 0;
     while (offset < buf.len) {
         const n = try reader.read(buf[offset..]);

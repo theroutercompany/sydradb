@@ -113,12 +113,13 @@ We need a custom allocator that meets the performance and telemetry expectations
 - Ensure regression checks fail loudly if deferred queue spikes or contention climbs.
 
 **Status**
-- `bench_alloc` prints shard-level stats (hits/misses, deferred count, epoch bounds); profiling percentiles and stress harness remain TODO.
+- `tools/bench_alloc` now emits latency percentiles, shard/fallback counters, and an optional `--stress-seconds` churn harness that records deferred backlog and latency drift. Outputs feed into regression comparisons.
 
 ### Phase 6 – Documentation & Cleanup
 - Update README and design doc with new allocator options, metrics, expected behavior.
 - Add diagrams or tables summarizing shard architecture.
 - Ensure code comments describe tricky bits (TLS, epoch reclamation).
+- Surfaced shard/fallback metrics through CLI `sydradb stats` and HTTP `/debug/alloc/stats` for live inspection.
 
 ## Risks & Mitigations
 - **Cross-shard misuse**: rely on debug assertions and unit tests; document API expectations.
