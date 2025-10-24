@@ -345,7 +345,7 @@ pub const Engine = struct {
                 segments_written += 1;
                 start_idx = end_idx;
             }
-            arr.clearRetainingCapacity();
+            arr_ptr.*.clearRetainingCapacity();
         }
         self.mem.bytes.store(0, .monotonic);
         if (segments_written > 0) {
