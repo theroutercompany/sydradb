@@ -105,7 +105,7 @@ pub fn decodeF64(alloc: std.mem.Allocator, reader: anytype, count: usize) ![]f64
 }
 
 fn encodeZigZagVarint(buf: []u8, v: i64) usize {
-    const uv: u64 = @bitCast((v << 1) ^ (v >> 63));
+    const uv = zigZagEncode(v);
     var x = uv;
     var i: usize = 0;
     while (x >= 0x80) : (i += 1) {
@@ -125,10 +125,55 @@ fn decodeZigZagVarint(reader: anytype) !i64 {
         if ((b & 0x80) == 0) break;
         shift += 7;
     }
-    const tmp: i64 = @bitCast((result >> 1) ^ (~result & 1));
-    return tmp;
+    return zigZagDecode(result);
+}
+
+inline fn zigZagEncode(v: i64) u64 {
+    const bits: u64 = @bitCast(v);
+    const sign: u64 = @bitCast(v >> 63);
+    return (bits << 1) ^ sign;
+}
+
+inline fn zigZagDecode(uv: u64) i64 {
+    const shifted = @as(i64, @intCast(uv >> 1));
+    const neg_mask = -@as(i64, @intCast(uv & 1));
+    return shifted ^ neg_mask;
 }
 
 inline fn readByte(reader: anytype) !u8 {
     return try reader.readByte();
+}
+
+test "zigzag encode/decode round-trip" {
+    const cases = [_]i64{ 0, 1, -1, 2, -2, 123456789, -987654321 };
+    for (cases) |value| {
+        const encoded = zigZagEncode(value);
+        const decoded = zigZagDecode(encoded);
+        try std.testing.expectEqual(value, decoded);
+    }
+}
+
+test "encodeTsDoD/decodeTsDoD preserves timestamps" {
+    const types = @import("../types.zig");
+    var buf: [64]u8 = undefined;
+    var stream = std.io.fixedBufferStream(&buf);
+    const writer = stream.writer();
+    const points = [_]types.Point{
+        .{ .ts = 1697040000, .value = 1.23 },
+        .{ .ts = 1697040010, .value = 2.0 },
+        .{ .ts = 1697040050, .value = 3.0 },
+    };
+    try encodeTsDoD(writer, points[0].ts, &points);
+    const written = stream.getWritten();
+
+    var reader_stream = std.io.fixedBufferStream(written);
+    const reader = reader_stream.reader();
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+    const decoded = try decodeTsDoD(alloc, reader, points.len, points[0].ts);
+    defer alloc.free(decoded);
+    for (decoded, 0..) |ts, idx| {
+        try std.testing.expectEqual(points[idx].ts, ts);
+    }
 }
