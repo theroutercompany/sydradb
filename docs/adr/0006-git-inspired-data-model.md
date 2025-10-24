@@ -62,4 +62,3 @@ Proposed
 ## References
 - Issue #61 (Allocator), upcoming data-model issue (to be opened).
 - Git internal docs as inspiration: commits, trees, blobs, refs.
-

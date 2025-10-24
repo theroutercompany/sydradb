@@ -24,7 +24,7 @@ We need a custom allocator that meets the performance and telemetry expectations
 ## Implementation Phases
 
 ### Phase 1 – ShardManager & TLS Wiring
-*Status: completed (`SmallPoolAllocator.ShardManager`, unit test “shard manager assigns per-thread shards”)* 
+*Status: completed (`SmallPoolAllocator.ShardManager`, unit test “shard manager assigns per-thread shards”)*
 **Decisions**
 - `ShardManager` owns an array of `Shard` instances plus a fallback allocator.
 - Threads obtain a shard ID via TLS; initial assignment can use round-robin on creation.
@@ -40,7 +40,7 @@ We need a custom allocator that meets the performance and telemetry expectations
 - Unit test confirming two threads map to different shard IDs.
 
 ### Phase 2 – Integrate Shard Alloc/Free into Fast Path
-*Status: completed (`SmallPoolAllocator.allocInternal/freeFn`, stats surfaced via `snapshotSmallPoolStats()` and tested)* 
+*Status: completed (`SmallPoolAllocator.allocInternal/freeFn`, stats surfaced via `snapshotSmallPoolStats()` and tested)*
 **Decisions**
 - Allocation order: shard → legacy bucket → GPA fallback.
 - Free order mirrors allocation.
