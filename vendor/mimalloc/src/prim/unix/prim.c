@@ -732,12 +732,15 @@ bool _mi_prim_getenv(const char* name, char* result, size_t result_size) {
 #if defined(__APPLE__)
 
 #include <AvailabilityMacros.h>
-#if defined(MAC_OS_X_VERSION_10_10) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_10
+#if defined(MAC_OS_X_VERSION_10_10) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_10 && \
+    __has_include(<CommonCrypto/CommonRandom.h>)
 #include <CommonCrypto/CommonCryptoError.h>
 #include <CommonCrypto/CommonRandom.h>
+#define MI_HAS_COMMON_CRYPTO 1
 #endif
 bool _mi_prim_random_buf(void* buf, size_t buf_len) {
-  #if defined(MAC_OS_X_VERSION_10_15) && MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_15
+  #if defined(MI_HAS_COMMON_CRYPTO) && defined(MAC_OS_X_VERSION_10_15) && \
+      MAC_OS_X_VERSION_MAX_ALLOWED >= MAC_OS_X_VERSION_10_15
     // We prefere CCRandomGenerateBytes as it returns an error code while arc4random_buf
     // may fail silently on macOS. See PR #390, and <https://opensource.apple.com/source/Libc/Libc-1439.40.11/gen/FreeBSD/arc4random.c.auto.html>
     return (CCRandomGenerateBytes(buf, buf_len) == kCCSuccess);
