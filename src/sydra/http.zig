@@ -627,6 +627,33 @@ fn handleStatus(req: *std.http.Server.Request) !void {
     try req.respond("{\"status\":\"ok\"}", .{ .extra_headers = &headers });
 }
 
+const default_tags_json = "{}";
+
+const TagsJson = struct {
+    value: []const u8,
+    owned: ?[]u8 = null,
+};
+
+fn extractTagsJson(alloc: std.mem.Allocator, maybe_value: ?std.json.Value) !TagsJson {
+    if (maybe_value) |val| {
+        if (val == .object) {
+            var list = std.array_list.Managed(u8).init(alloc);
+            errdefer list.deinit();
+            var writer = list.writer();
+            var tmp: [128]u8 = undefined;
+            var adapter = writer.adaptToNewApi(&tmp);
+            var iface = &adapter.new_interface;
+            var stream = std.json.Stringify{ .writer = iface };
+            try stream.write(val);
+            try iface.flush();
+            if (adapter.err) |write_err| return write_err;
+            const owned = try list.toOwnedSlice();
+            return .{ .value = owned, .owned = owned };
+        }
+    }
+    return .{ .value = default_tags_json };
+}
+
 fn handleIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
     var body_buf: [4096]u8 = undefined;
     const body_reader = req.readerExpectNone(&body_buf);
@@ -670,29 +697,11 @@ fn handleIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Re
             }
             break :blk 0;
         };
-        const default_tags = [_]u8{ '{', '}' };
-        var tags_json: []const u8 = &default_tags;
-        var tags_owned: ?[]u8 = null;
-        if (obj.get("tags")) |v| {
-            if (v == .object) {
-                var tags_buf = std.array_list.Managed(u8).init(alloc);
-                defer tags_buf.deinit();
-                var tags_writer = tags_buf.writer();
-                var tags_tmp: [128]u8 = undefined;
-                var tags_adapter = tags_writer.adaptToNewApi(&tags_tmp);
-                var tags_iface = &tags_adapter.new_interface;
-                var stream = std.json.Stringify{ .writer = tags_iface };
-                try stream.write(v);
-                try tags_iface.flush();
-                if (tags_adapter.err) |write_err| return write_err;
-                tags_owned = try tags_buf.toOwnedSlice();
-                tags_json = tags_owned.?;
-            }
-        }
-        const sid = types.seriesIdFrom(series, tags_json);
-        try eng.ingest(.{ .series_id = sid, .ts = ts, .value = value, .tags_json = try alloc.dupe(u8, tags_json) });
-        eng.noteTags(sid, tags_json);
-        if (tags_owned) |buf| alloc.free(buf);
+        const tags = try extractTagsJson(alloc, obj.get("tags"));
+        defer if (tags.owned) |buf| alloc.free(buf);
+        const sid = types.seriesIdFrom(series, tags.value);
+        try eng.ingest(.{ .series_id = sid, .ts = ts, .value = value, .tags_json = try alloc.dupe(u8, tags.value) });
+        eng.noteTags(sid, tags.value);
         count += 1;
     }
 
@@ -722,7 +731,13 @@ fn handleQuery(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Req
     defer parsed.deinit();
     const obj = parsed.value.object;
     var series_id: ?types.SeriesId = null;
-    if (obj.get("series_id")) |v| series_id = @intCast(v.integer) else if (obj.get("series")) |v| series_id = types.hash64(v.string);
+    if (obj.get("series_id")) |v| {
+        series_id = @intCast(v.integer);
+    } else if (obj.get("series")) |v| {
+        const tags = try extractTagsJson(alloc, obj.get("tags"));
+        defer if (tags.owned) |buf| alloc.free(buf);
+        series_id = types.seriesIdFrom(v.string, tags.value);
+    }
     const start_val = obj.get("start") orelse {
         try req.respond("missing start", .{ .status = .bad_request, .keep_alive = false });
         return;
@@ -747,6 +762,7 @@ fn handleQueryGet(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.
     }
     var series_opt: ?[]const u8 = null;
     var series_id_opt: ?types.SeriesId = null;
+    var tags_opt: ?[]const u8 = null;
     var start_opt: ?i64 = null;
     var end_opt: ?i64 = null;
     var it = std.mem.splitScalar(u8, query, '&');
@@ -762,13 +778,15 @@ fn handleQueryGet(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.
             };
         } else if (std.mem.eql(u8, key, "series")) {
             series_opt = value;
+        } else if (std.mem.eql(u8, key, "tags")) {
+            tags_opt = value;
         } else if (std.mem.eql(u8, key, "start")) {
             start_opt = std.fmt.parseInt(i64, value, 10) catch null;
         } else if (std.mem.eql(u8, key, "end")) {
             end_opt = std.fmt.parseInt(i64, value, 10) catch null;
         }
     }
-    const sid = series_id_opt orelse (if (series_opt) |name| types.hash64(name) else null) orelse {
+    const sid = series_id_opt orelse (if (series_opt) |name| types.seriesIdFrom(name, tags_opt orelse default_tags_json) else null) orelse {
         try req.respond("missing series or series_id", .{ .status = .bad_request, .keep_alive = false });
         return;
     };
