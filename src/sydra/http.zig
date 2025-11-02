@@ -44,7 +44,7 @@ fn handleConnection(handle: *alloc_mod.AllocatorHandle, alloc: std.mem.Allocator
     var out_buf: [4096]u8 = undefined;
     var reader_state = connection.stream.reader(&in_buf);
     var writer_state = connection.stream.writer(&out_buf);
-    var http_server = std.http.Server.init(reader_state.interface(), writer_state.interface());
+    var http_server = std.http.Server.init(reader_state.interface(), &writer_state.interface);
 
     while (true) {
         var req = http_server.receiveHead() catch |err| switch (err) {
