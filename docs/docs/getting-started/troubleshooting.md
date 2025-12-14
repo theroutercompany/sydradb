@@ -82,4 +82,3 @@ If you are batch-ingesting, split large payloads into smaller lines and smaller 
 - `GET /metrics` – Prometheus-style metrics for ingest/flush/WAL/queue/memtable
 - `GET /debug/alloc/stats` – allocator stats (only in `small_pool` allocator mode)
 - `GET /debug/compat/stats` and `GET /debug/compat/catalog` – PostgreSQL compatibility counters/catalog snapshot
-

@@ -38,3 +38,6 @@ If Pages is not yet enabled in the repository settings:
 1. Go to `Settings → Pages`
 2. Set **Source** to **GitHub Actions**
 
+See also:
+
+- [CI and releases](./ci)

@@ -44,6 +44,8 @@ pip install pre-commit
 pre-commit run --all-files --show-diff-on-failure
 ```
 
+See: `Reference/Source Reference/Repository/.pre-commit-config.yaml`
+
 ## Docs contributions
 
 The documentation site lives under `docs/` and is deployed to GitHub Pages from `main`.
@@ -69,4 +71,3 @@ npm run build
 - CLI tools: `cmd/`
 - Demos: `examples/`
 - Docs: `docs/docs/` (Docusaurus content)
-

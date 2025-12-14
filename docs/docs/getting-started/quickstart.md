@@ -28,6 +28,10 @@ By default, `sydradb` runs the HTTP server (equivalent to `serve`):
 
 The server loads `./sydradb.toml` from the current working directory. If the file is missing, it falls back to built-in defaults.
 
+Important: the current config loader is a minimal parser and does not reliably support inline comments (for example `auth_token = ""  # ...`). If the server appears to ignore your config or fails to parse it, remove inline comments.
+
+See: [Configuration](../reference/configuration).
+
 ## Ingest a point
 
 The HTTP ingest endpoint accepts NDJSON (one JSON object per line):
@@ -56,4 +60,3 @@ To build a reproducible package:
 nix build
 ./result/bin/sydradb
 ```
-

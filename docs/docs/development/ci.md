@@ -42,3 +42,6 @@ Repo setting required (one-time):
 
 - `Settings → Pages → Source = GitHub Actions`
 
+See also:
+
+- `Reference/Source Reference/Repository/.github/workflows/*`

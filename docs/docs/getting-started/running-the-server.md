@@ -19,6 +19,10 @@ The server binds to `0.0.0.0:<http_port>` as configured in `sydradb.toml`.
 
 `sydradb` loads `sydradb.toml` from the current working directory (CWD). If it is missing or unreadable, the server uses built-in defaults (mirroring `sydradb.toml.example`).
 
+Important: the current config loader is a minimal parser and does not reliably support inline comments after values. If you copy `sydradb.toml` or `sydradb.toml.example` from the repo, remove inline comments before running.
+
+See: [Configuration](../reference/configuration).
+
 ## Authentication
 
 If `auth_token` is non-empty in config, all routes under `/api/*` require:
@@ -52,4 +56,3 @@ Defaults:
 
 - `address`: `127.0.0.1`
 - `port`: `6432`
-
