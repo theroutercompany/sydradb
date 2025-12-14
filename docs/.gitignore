@@ -1,0 +1,6 @@
+/node_modules/
+/.docusaurus/
+/.cache/
+/build/
+*.log
+.DS_Store

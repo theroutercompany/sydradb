@@ -1,0 +1,39 @@
+title,body,labels,milestone
+Repo scaffold & Zig build,"Initialize repository with Zig 0.13+ toolchain, `build.zig`, `src/`, `examples/`, and CI. Include `.editorconfig`, `zig fmt` pre-commit, and `README` stub.","infra,good first issue,M0",M0 Bootstrap
+CI: Zig build + test matrix,"Set up GitHub Actions to run `zig build` and `zig build test` on macOS (arm64), Linux (x86_64, aarch64). Cache `~/.cache/zig`.","infra,ci,M0",M0 Bootstrap
+Decide project license,Add LICENSE (Apache-2.0 recommended) and NOTICE file. Document third-party licenses.,"infra,docs,M0",M0 Bootstrap
+Style & lint guidelines,"Document code style (`zig fmt`), error handling patterns, and module layout in `CONTRIBUTING.md`.","docs,M0",M0 Bootstrap
+Label & issue templates,Create labels and `.github/ISSUE_TEMPLATE/` for bug/feature/docs. Add `PULL_REQUEST_TEMPLATE.md`.,"infra,docs,M0",M0 Bootstrap
+Minimal storage file layout RFC,"Write an RFC describing WAL + segment files (.seg), index (.idx), and manifest (.mf) formats. Include page sizes and endianness.","rfc,storage,M0",M0 Bootstrap
+Select compression codecs,"Decide initial codecs: Gorilla (delta-of-delta), RLE, bit-pack; zstd for blocks. Document rationale.","rfc,storage,compression,M0",M0 Bootstrap
+Decide concurrency model,RFC on single-writer/multi-reader with cooperative async (event loop) vs dedicated writer thread + channels.,"rfc,concurrency,M0",M0 Bootstrap
+Prototype: mmap helpers,Implement safe wrappers for `mmap`/`msync`/`madvise` in Zig with bounds checks & fallbacks.,"storage,perf,M0",M0 Bootstrap
+Name & branding,Confirm project name `sydraDB` and add logo placeholder & crate/banner in README.,"docs,branding,M0",M0 Bootstrap
+Define record & series IDs,"Type defs: `SeriesId(u64)`, `Timestamp(i64 ns)`, `Value(f64|i64)`, `TagSet` encoding. Decide ns vs µs for TS.","rfc,api,M1",M1 MVP
+Write-ahead log (WAL) v0,"Append-only WAL with CRC32, fsync on configurable policy (always/interval). Replay on startup.","storage,reliability,M1",M1 MVP
+Segment writer v0,Flush from WAL to immutable `.seg` blocks with time-sorted chunks; block index at tail.,"storage,perf,M1",M1 MVP
+Time index v0,Coarse-grained time-to-segment index (hourly partitions).,"index,storage,M1",M1 MVP
+Tag index v0 (in-memory),"Simple in-memory map<TagKey,TagValue>→SeriesId with snapshot to disk (JSON/compact bin).","index,M1",M1 MVP
+HTTP ingest endpoint,Implement `/api/v1/ingest` accepting newline-delimited JSON points. Batched append -> WAL.,"api,http,ingest,M1",M1 MVP
+Read path: range scan,Implement `/api/v1/query/range?series_id&start&end` that merges blocks & applies downcast to f64.,"api,query,M1",M1 MVP
+CLI tool `sydradb`,"Subcommands: `ingest`, `query`, `compact`, `stats`.","cli,tooling,M1",M1 MVP
+Config file & env vars,"Read `sydradb.toml` with paths, retention, fsync policy, HTTP port. Support env overrides.","infra,config,M1",M1 MVP
+Basic metrics & logs,Expose `/metrics` (Prometheus text) and structured logs (JSON) with log levels.,"observability,M1",M1 MVP
+Compactor v0,Background merge from small → large segments; dedupe + reorder + recompress; watermark-aware.,"storage,compaction,perf,M2",M2 Core
+Retention policy,Time-based TTL per namespace; implement segment dropper & disk space reclamation.,"storage,retention,M2",M2 Core
+Downsampling pipeline,"Periodic rollups (1m/5m/1h) with aggregates (min/max/avg/sum/count, last).","storage,downsampling,M2",M2 Core
+Cardinality guardrails,Configurable caps & eviction for new high-cardinality tag series. Emit warnings/metrics.,"reliability,limits,M2",M2 Core
+Roaring bitmaps for tags,Replace in-memory map with on-disk roaring bitmaps for tag filters.,"index,perf,M2",M2 Core
+Query: tag filter + range,"Support `/api/v1/query/select?match[]=env=prod,cpu` with AND/OR on tags (basic).","api,query,M2",M2 Core
+Snapshot/backup,Quiesce writer and emit consistent snapshot manifest. Provide `restore` command.,"reliability,backup,M2",M2 Core
+Line Protocol adapter,Add Influx LP and Prom remote_write adapters behind feature flags.,"api,interop,M3",M3 Alpha
+WASM UDF hook (experimental),Optional per-chunk transform via WASM sandbox for derived metrics.,"extensibility,experimental,M3",M3 Alpha
+Rate-limited fsync policy,Dynamic fsync throttling based on queue depth and latency SLO.,"perf,reliability,M3",M3 Alpha
+Memory accounting,Central arena tracking & per-subsystem quotas; OOM fails fast with diagnostics.,"perf,reliability,M3",M3 Alpha
+Crash-recovery tests,Fault-injection tests: power-cut during WAL append/segment finalize/manifest rewrite.,"testing,reliability,M3",M3 Alpha
+Docs: storage format v1,Finalize and publish the file format spec v1 with diagrams.,"docs,storage,M3",M3 Alpha
+Packaging & releases,Produce static binaries for macOS arm64 and Linux x86_64/aarch64. Release notes template.,"infra,release,M3",M3 Alpha
+Benchmarks: ingest,"Benchmark sustained ingest (points/s) at 1/10/100 series, report CPU/RAM/IO.","perf,benchmarks,M3",M3 Alpha
+Benchmarks: query,Benchmark range scans & tag filters; publish median/95p latencies.,"perf,benchmarks,M3",M3 Alpha
+Security pass,"Threat model doc, auth (token/bearer) for HTTP, and safe defaults.","security,docs,M3",M3 Alpha
+Dockerfile (optional),Multi-stage Dockerfile for Linux images; document volumes and ports.,"infra,release,M3",M3 Alpha

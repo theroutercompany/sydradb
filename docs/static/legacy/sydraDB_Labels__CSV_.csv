@@ -1,0 +1,33 @@
+name,description
+infra,"CICD, packaging, configs"
+ci,Continuous integration
+docs,Documentation tasks
+rfc,Design discussion before implementation
+storage,"On-disk, WAL, segments"
+compression,Codecs and compression
+concurrency,"Scheduling, async, threading"
+api,HTTP and client APIs
+http,HTTP server work
+ingest,Write path
+query,Read path & filters
+cli,Command-line tooling
+tooling,Dev tooling & helpers
+observability,Metrics & logs
+compaction,Merging segments
+retention,TTL and deletion
+downsampling,Rollup pipelines
+index,Tag/time indexing
+reliability,Durability & recovery
+limits,Guardrails & quotas
+backup,Snapshot/restore
+interop,External protocol compatibility
+experimental,Risky/optional features
+perf,Performance work
+benchmarks,Micro/macro benchmarks
+security,"Auth, threats"
+branding,"Name, logo, visuals"
+good first issue,Small tasks for newcomers
+M0,Bootstrap milestone
+M1,MVP milestone
+M2,Core milestone
+M3,Alpha milestone
