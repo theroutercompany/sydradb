@@ -43,6 +43,24 @@ Important fields:
 - `writer_thread: ?std.Thread` – background writer
 - `stop_flag: bool` – shutdown coordination
 
+```zig title="Engine struct fields (excerpt)"
+pub const Engine = struct {
+    alloc: std.mem.Allocator,
+    config: cfg.Config,
+    data_dir: std.fs.Dir,
+    wal: wal_mod.WAL,
+    mem: MemTable,
+    manifest: manifest_mod.Manifest,
+    tags: tags_mod.TagIndex,
+    flush_timer_ms: u32,
+    metrics: Metrics,
+    writer_thread: ?std.Thread = null,
+    stop_flag: bool = false,
+    queue: *Queue,
+    // ...
+};
+```
+
 #### `pub fn init(alloc: std.mem.Allocator, config: cfg.Config) !*Engine`
 
 Creates an engine instance:
@@ -55,6 +73,21 @@ Creates an engine instance:
 4. Allocates the ingest queue (`Queue.init`).
 5. Calls `recover()` to replay the WAL and flush recovered points.
 6. Spawns the background writer thread (`writerLoop`).
+
+```zig title="Engine.init happy-path (excerpt)"
+pub fn init(alloc: std.mem.Allocator, config: cfg.Config) !*Engine {
+    std.fs.cwd().makePath(config.data_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
+    const data_dir = try std.fs.cwd().openDir(config.data_dir, .{ .iterate = true });
+    const wal = try wal_mod.WAL.open(alloc, data_dir, config.fsync);
+
+    // allocate Engine, load manifest/tags, create queue, recover, spawn writer thread
+    // ...
+}
+```
 
 #### `pub fn deinit(self: *Engine) void`
 
@@ -71,9 +104,35 @@ Enqueues an ingest item and updates queue length metrics (`queue_len_sum`, `queu
 
 The actual WAL append + memtable insert happens asynchronously in `writerLoop`.
 
+```zig title="Ingest enqueue + queue depth metrics (excerpt)"
+pub fn ingest(self: *Engine, item: IngestItem) !void {
+    try self.queue.push(item);
+
+    const len_now = self.queue.len();
+    const len_now_u64: u64 = @intCast(len_now);
+    _ = self.metrics.queue_len_sum.fetchAdd(len_now_u64, .monotonic);
+    _ = self.metrics.queue_len_samples.fetchAdd(1, .monotonic);
+
+    // update queue_max_len using a cmpxchgWeak loop
+    // ...
+}
+```
+
 #### `pub fn queryRange(self: *Engine, series_id: types.SeriesId, start_ts: i64, end_ts: i64, out: *Managed(Point)) !void`
 
 Delegates range querying to `segment_mod.queryRange(...)` using the manifest and on-disk data directory.
+
+```zig title="Range query delegate (excerpt)"
+pub fn queryRange(
+    self: *Engine,
+    series_id: types.SeriesId,
+    start_ts: i64,
+    end_ts: i64,
+    out: *std.array_list.Managed(types.Point),
+) !void {
+    try segment_mod.queryRange(self.alloc, self.data_dir, &self.manifest, series_id, start_ts, end_ts, out);
+}
+```
 
 #### `pub fn noteTags(self: *Engine, series_id: types.SeriesId, tags: []const u8) void`
 
@@ -149,4 +208,3 @@ Inline tests cover:
 - ingest → flush → range query (`test "engine ingests, flushes, and queries range"`)
 - WAL replay on startup (`test "engine replays wal on startup"`)
 - metrics tracking (`test "engine metrics track ingest and flush"`)
-

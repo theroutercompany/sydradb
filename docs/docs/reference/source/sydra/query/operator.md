@@ -30,6 +30,15 @@ Composite error set:
   - `UnsupportedPlan`
   - `UnsupportedAggregate`
 
+```zig title="ExecuteError (from src/sydra/query/operator.zig)"
+const QueryRangeError = @typeInfo(@typeInfo(@TypeOf(engine_mod.Engine.queryRange)).@"fn".return_type.?).error_union.error_set;
+
+pub const ExecuteError = std.mem.Allocator.Error || expression.EvalError || QueryRangeError || error{
+    UnsupportedPlan,
+    UnsupportedAggregate,
+};
+```
+
 ### `pub const Row`
 
 Row returned by `Operator.next()`:
@@ -77,6 +86,20 @@ Behavior notes:
 
 - `Operator.next()` wraps `next_fn` to measure elapsed time (`std.time.microTimestamp`) and increments `rows_out` when a row is produced.
 - `Operator.destroy()` calls the payload destroy routine then frees the operator allocation.
+
+```zig title="Operator.next() wrapper (excerpt)"
+pub fn next(self: *Operator) ExecuteError!?Row {
+    const start = std.time.microTimestamp();
+    const result = self.next_fn(self);
+    const elapsed = std.time.microTimestamp() - start;
+    self.stats.elapsed_us += @as(u64, @intCast(elapsed));
+    const maybe_row = result catch |err| return err;
+    if (maybe_row) |_| {
+        self.stats.rows_out += 1;
+    }
+    return maybe_row;
+}
+```
 
 ### `pub fn buildPipeline(allocator, engine, node: *physical.Node) ExecuteError!*Operator`
 
@@ -126,6 +149,20 @@ Backs scan plans by materializing points from storage:
   - Only supports identifier columns named `time` and `value` (case-insensitive)
   - Any non-identifier output column or unknown identifier name returns `UnsupportedPlan`
 - Destruction (`scanDestroy`): frees points and buffer
+
+```zig title="scanNext column mapping (excerpt)"
+for (op.schema, 0..) |column, idx| {
+    if (column.expr.* != .identifier) return error.UnsupportedPlan;
+    const name = column.expr.identifier.value;
+    if (namesEqual(name, "time")) {
+        payload.buffer[idx] = Value{ .integer = point.ts };
+    } else if (namesEqual(name, "value")) {
+        payload.buffer[idx] = Value{ .float = point.value };
+    } else {
+        return error.UnsupportedPlan;
+    }
+}
+```
 
 ### `filter`
 

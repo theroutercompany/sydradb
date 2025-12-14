@@ -57,6 +57,25 @@ Appends a single Put record:
 
 Returns the total bytes written for the record.
 
+```zig title="append record encoding (excerpt)"
+pub fn append(self: *WAL, series_id: u64, ts: i64, value: f64) !u32 {
+    var buf: [1 + 8 + 8 + 8]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const w = fbs.writer();
+
+    try w.writeByte(1); // type = Put
+    try w.writeInt(u64, series_id, .little);
+    try w.writeInt(i64, ts, .little);
+    const uv: u64 = @bitCast(value);
+    try w.writeInt(u64, uv, .little);
+
+    const payload = fbs.getWritten();
+
+    // [u32 payload_len][payload][u32 crc32(payload)]
+    // ...
+}
+```
+
 ### `pub fn rotateIfNeeded(self: *WAL) !void`
 
 When `bytes_written >= 64 MiB`:
@@ -79,3 +98,15 @@ Replay contract:
   - Payload length bounds (rejects `0` and `> 1<<20`)
   - CRC32 mismatch
 
+```zig title="replay corruption checks (excerpt)"
+const payload_len = std.mem.readInt(u32, &len_buf, .little);
+if (payload_len == 0 or payload_len > (1 << 20)) return error.CorruptWal;
+
+try readExact(reader, payload);
+try readExact(reader, crc_buf[0..4]);
+
+const expected_crc = std.mem.readInt(u32, &crc_buf, .little);
+var crc = std.hash.Crc32.init();
+crc.update(payload);
+if (crc.final() != expected_crc) return error.CorruptWal;
+```

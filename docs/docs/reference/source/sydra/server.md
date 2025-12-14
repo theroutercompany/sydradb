@@ -36,6 +36,29 @@ The `handle` is used to:
 - Expose allocator statistics for `stats`
 - Pass through to the HTTP server entrypoint
 
+```zig title="Command dispatch (excerpt)"
+pub fn run(handle: *alloc_mod.AllocatorHandle) !void {
+    const alloc = handle.allocator();
+    const args = try std.process.argsAlloc(alloc);
+    defer std.process.argsFree(alloc, args);
+
+    if (args.len <= 1 or std.mem.eql(u8, args[1], "serve")) {
+        // starts the engine + HTTP server
+        // ...
+        return;
+    }
+
+    const cmd = args[1];
+    if (std.mem.eql(u8, cmd, "pgwire")) return cmdPgWire(alloc, args);
+    if (std.mem.eql(u8, cmd, "ingest")) return cmdIngest(alloc, args);
+    if (std.mem.eql(u8, cmd, "query")) return cmdQuery(alloc, args);
+    if (std.mem.eql(u8, cmd, "compact")) return cmdCompact(alloc, args);
+    if (std.mem.eql(u8, cmd, "snapshot")) return cmdSnapshot(alloc, args);
+    if (std.mem.eql(u8, cmd, "restore")) return cmdRestore(alloc, args);
+    if (std.mem.eql(u8, cmd, "stats")) return cmdStats(handle, alloc, args);
+}
+```
+
 ## Key internal helpers
 
 ### `fn loadConfigOrDefault(alloc: std.mem.Allocator) !config.Config`
@@ -56,6 +79,24 @@ Notable defaults:
 - `retention_ns = StringHashMap(u32)` (per-namespace retention map)
 
 Callers must `deinit` the returned config to free owned allocations.
+
+```zig title="loadConfigOrDefault (full function)"
+fn loadConfigOrDefault(alloc: std.mem.Allocator) !config.Config {
+    return config.load(alloc, "sydradb.toml") catch config.Config{
+        .data_dir = try alloc.dupe(u8, "./data"),
+        .http_port = 8080,
+        .fsync = .interval,
+        .flush_interval_ms = 2000,
+        .memtable_max_bytes = 8 * 1024 * 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = true,
+        .mem_limit_bytes = 256 * 1024 * 1024,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+}
+```
 
 ## Commands
 
@@ -87,6 +128,17 @@ Series IDs:
 
 - This command uses `types.hash64(series)` (hashes only the series name).
 - HTTP ingest uses a different `series_id` derivation when tags are present (see `Reference/Series IDs`).
+
+```zig title="cmdIngest series_id derivation (excerpt)"
+const series = obj.get("series").?.string;
+const ts: i64 = @intCast(obj.get("ts").?.integer);
+const value = obj.get("value").?.float;
+
+// CLI ingest hashes only the series name (tags are not part of the SeriesId here).
+const sid = @import("types.zig").hash64(series);
+
+try eng.ingest(.{ .series_id = sid, .ts = ts, .value = value, .tags_json = "{}" });
+```
 
 ### `fn cmdQuery(alloc: std.mem.Allocator, args: [][:0]u8) !void`
 
@@ -130,4 +182,3 @@ Calls `snapshot.zig` to restore from a snapshot.
 
 - Counts segment files under `<data_dir>/segments/**` and prints `segments_total`.
 - If built with the `small_pool` allocator mode, prints allocator stats via `handle.snapshotSmallPoolStats()`.
-

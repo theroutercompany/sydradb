@@ -67,6 +67,26 @@ Returns an `Adapter` backed by file-scoped arrays that model:
 - types: a small set of common scalar and array types (e.g. `int4`, `text`, `_int4`, `_text`, …)
 - columns: a minimal `pg_type` “shape” with fields like `oid`, `typname`, `typlen`, `typbyval`, etc.
 
+```zig title="defaultAdapter (excerpt)"
+const default_namespaces = [_]NamespaceInfo{
+    .{ .name = "pg_catalog" },
+    .{ .name = "public" },
+};
+
+const default_relations = [_]RelationInfo{
+    .{ .namespace = "pg_catalog", .name = "pg_type", .kind = .table },
+};
+
+pub fn defaultAdapter() Adapter {
+    return Adapter{
+        .namespaces = &default_namespaces,
+        .relations = &default_relations,
+        .types = &default_types,
+        .columns = &default_columns,
+    };
+}
+```
+
 ### `pub fn loadIntoStore(store: *compat.catalog.Store, alloc: std.mem.Allocator, adapter: Adapter) !void`
 
 Loads the adapter into a compatibility catalog store:
@@ -89,6 +109,12 @@ Bootstraps the default catalog into the global store:
 
 - `refreshGlobal(alloc, defaultAdapter())`
 
+```zig title="bootstrap (full function)"
+pub fn bootstrap(alloc: std.mem.Allocator) !void {
+    try refreshGlobal(alloc, defaultAdapter());
+}
+```
+
 ## Key internal helpers
 
 The module contains conversion helpers that allocate and fill spec arrays:
@@ -99,4 +125,3 @@ The module contains conversion helpers that allocate and fill spec arrays:
 - `toColumnSpecs`
 
 Each returns an empty static slice (`&[_]T{}`) when the input slice is empty.
-

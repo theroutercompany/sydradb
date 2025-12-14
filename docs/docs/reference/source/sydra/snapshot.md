@@ -36,6 +36,28 @@ Opens `src_path` under the current working directory and copies back into `data_
 - `segments/` recursively (if present)
 - `tags.json` (if present)
 
+```zig title="snapshot/restore (excerpt)"
+pub fn snapshot(alloc: std.mem.Allocator, data_dir: std.fs.Dir, dst_path: []const u8) !void {
+    // Simple manifested copy: copy MANIFEST, wal/, segments/, tags.json
+    try std.fs.cwd().makePath(dst_path);
+    var dst = try std.fs.cwd().openDir(dst_path, .{ .iterate = true });
+    defer dst.close();
+    try copyIfExists(data_dir, dst, "MANIFEST");
+    try copyDirRecursive(alloc, data_dir, dst, "wal");
+    try copyDirRecursive(alloc, data_dir, dst, "segments");
+    try copyIfExists(data_dir, dst, "tags.json");
+}
+
+pub fn restore(alloc: std.mem.Allocator, data_dir: std.fs.Dir, src_path: []const u8) !void {
+    var src = try std.fs.cwd().openDir(src_path, .{ .iterate = true });
+    defer src.close();
+    try copyIfExists(src, data_dir, "MANIFEST");
+    try copyDirRecursive(alloc, src, data_dir, "wal");
+    try copyDirRecursive(alloc, src, data_dir, "segments");
+    try copyIfExists(src, data_dir, "tags.json");
+}
+```
+
 ## Key internal helpers
 
 ### `fn copyIfExists(from: std.fs.Dir, to: std.fs.Dir, name: []const u8) !void`
@@ -53,4 +75,3 @@ Recursively copies a directory tree:
   - directories: recurse
 
 Note: `alloc` is currently unused by the implementation.
-

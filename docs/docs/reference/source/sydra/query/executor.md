@@ -66,6 +66,36 @@ Ownership notes:
 - `collectOperatorStats` returns an owned slice; callers must free it with the allocator they passed in.
 - If `arena` is non-null, it is owned by the cursor and is freed by `deinit()` (this is how `exec.execute` keeps AST/plan pointers alive for the cursor lifetime).
 
+```zig title="ExecutionCursor (excerpt)"
+pub const ExecutionCursor = struct {
+    allocator: std.mem.Allocator,
+    operator: *operator.Operator,
+    columns: []const plan.ColumnInfo,
+    arena: ?*std.heap.ArenaAllocator = null,
+    stats: ExecutionStats = .{},
+
+    pub fn next(self: *ExecutionCursor) ExecuteError!?operator.Row {
+        return self.operator.next();
+    }
+
+    pub fn deinit(self: *ExecutionCursor) void {
+        self.operator.destroy();
+        if (self.arena) |arena_ptr| {
+            arena_ptr.deinit();
+            self.allocator.destroy(arena_ptr);
+            self.arena = null;
+        }
+    }
+
+    pub fn collectOperatorStats(self: *ExecutionCursor, allocator: std.mem.Allocator) ![]OperatorStats {
+        var list = ManagedArrayList(OperatorStats).init(allocator);
+        errdefer list.deinit();
+        try self.operator.collectStats(&list);
+        return try list.toOwnedSlice();
+    }
+};
+```
+
 ### `pub const Executor`
 
 Creates an `ExecutionCursor` from a physical plan:
