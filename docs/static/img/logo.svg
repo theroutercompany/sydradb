@@ -1,8 +1,8 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 80" role="img" aria-label="SydraDB">
-  <rect width="240" height="80" rx="14" fill="#0b1220"/>
+  <rect width="240" height="80" rx="14" fill="#0b0c0f"/>
   <g transform="translate(18,14)">
     <rect width="52" height="52" rx="12" fill="#85befd"/>
     <path d="M14 18c0-4 3-7 7-7h10c4 0 7 3 7 7s-3 7-7 7H21c-4 0-7-3-7-7Zm0 16c0-4 3-7 7-7h10c4 0 7 3 7 7s-3 7-7 7H21c-4 0-7-3-7-7Z" fill="#fff"/>
   </g>
-  <text x="84" y="50" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial" font-size="28" fill="#e6edf3">SydraDB</text>
+  <text x="84" y="50" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial" font-size="28" fill="#fff">SydraDB</text>
 </svg>

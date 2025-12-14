@@ -74,7 +74,7 @@ const config = {
                         ],
                     },
                     {
-                        title: "GitHub",
+                        title: "Links",
                         items: [
                             {
                                 label: "Issues",

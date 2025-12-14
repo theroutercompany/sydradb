@@ -1,16 +1,141 @@
-:root {
-    --ifm-color-primary: #85befd;
-    --ifm-color-primary-dark: #5ea9fb;
-    --ifm-color-primary-darker: #4ea1fa;
-    --ifm-color-primary-darkest: #1682f6;
-    --ifm-color-primary-light: #acd3fe;
-    --ifm-color-primary-lighter: #bce0ff;
-    --ifm-color-primary-lightest: #e6f3ff;
+:root,
+html[data-theme="dark"] {
+    --sydra-accent: #85befd;
+    --sydra-bg: #0b0c0f;
+    --sydra-surface-1: #101216;
+    --sydra-surface-2: #151821;
+    --sydra-text: #e6e6e6;
+    --sydra-text-muted: #b8b8b8;
+    --sydra-line: #ffffff;
+
+    --ifm-color-primary: var(--sydra-accent);
+    --ifm-color-primary-dark: var(--sydra-accent);
+    --ifm-color-primary-darker: var(--sydra-accent);
+    --ifm-color-primary-darkest: var(--sydra-accent);
+    --ifm-color-primary-light: var(--sydra-accent);
+    --ifm-color-primary-lighter: var(--sydra-accent);
+    --ifm-color-primary-lightest: var(--sydra-accent);
+
+    --ifm-background-color: var(--sydra-bg);
+    --ifm-background-surface-color: var(--sydra-surface-1);
+
+    --ifm-navbar-background-color: var(--sydra-bg);
+    --ifm-navbar-shadow: none;
+    --ifm-navbar-link-color: var(--sydra-line);
+    --ifm-navbar-link-hover-color: var(--sydra-line);
+
+    --ifm-footer-background-color: var(--sydra-bg);
+
+    --ifm-font-color-base: var(--sydra-text);
+    --ifm-font-color-secondary: var(--sydra-text-muted);
+    --ifm-heading-color: var(--sydra-line);
+
+    --ifm-link-color: var(--sydra-accent);
+    --ifm-link-hover-color: var(--sydra-accent);
+    --ifm-link-hover-decoration: underline;
+
+    --ifm-toc-border-color: var(--sydra-line);
+    --ifm-hr-background-color: var(--sydra-line);
+    --ifm-table-border-color: var(--sydra-line);
+
+    --ifm-global-shadow-lw: none;
+    --ifm-global-shadow-md: none;
+    --ifm-global-shadow-tl: none;
+
+    --ifm-code-background: var(--sydra-surface-2);
+    --ifm-code-color: var(--sydra-text);
+
+    --prism-background-color: var(--sydra-surface-1);
+    --prism-color: var(--sydra-text);
+    --prism-comment: #9a9a9a;
+    --prism-punctuation: var(--sydra-text);
+    --prism-namespace: var(--sydra-text);
+    --prism-property: var(--sydra-text);
+    --prism-boolean: var(--sydra-text);
+    --prism-number: var(--sydra-text);
+    --prism-string: #d0d0d0;
+    --prism-operator: var(--sydra-text);
+    --prism-keyword: var(--sydra-accent);
+    --prism-function: var(--sydra-line);
+    --prism-variable: var(--sydra-text);
+    --prism-regex: var(--sydra-text);
+    --prism-interpolation: var(--sydra-text);
+    --prism-selector: var(--sydra-text);
+    --prism-constant: var(--sydra-text);
+    --prism-symbol: var(--sydra-text);
+    --prism-tag: var(--sydra-text);
+    --prism-attr-name: var(--sydra-text);
+    --prism-attr-value: #d0d0d0;
+    --prism-class-name: var(--sydra-text);
+    --prism-builtin: var(--sydra-text);
+    --prism-entity: var(--sydra-text);
+    --prism-important: var(--sydra-text);
+    --prism-url: var(--sydra-accent);
+    --prism-inserted: #d0d0d0;
+    --prism-deleted: #d0d0d0;
+}
+
+html {
+    color-scheme: dark;
+}
+
+::selection {
+    background: var(--sydra-accent);
+    color: var(--sydra-bg);
+}
+
+:focus-visible {
+    outline: 2px solid var(--sydra-accent);
+    outline-offset: 2px;
+}
+
+.navbar {
+    border-bottom: 1px solid var(--sydra-line);
+}
+
+.footer {
+    border-top: 1px solid var(--sydra-line);
 }
 
 .footer--dark {
-    --ifm-footer-background-color: #242526;
     background-color: var(--ifm-footer-background-color);
+}
+
+.markdown hr {
+    opacity: 1;
+}
+
+.navbar svg,
+.footer svg,
+.menu svg,
+.table-of-contents svg,
+.breadcrumbs svg,
+.pagination-nav svg,
+.alert svg,
+.iconExternalLink {
+    color: var(--sydra-line);
+    fill: currentColor;
+}
+
+.alert {
+    border: 1px solid var(--sydra-line);
+    background-color: var(--sydra-surface-1);
+    color: var(--sydra-text);
+}
+
+.alert a {
+    color: var(--sydra-accent);
+}
+
+.alert--secondary {
+    border-left: 4px solid var(--sydra-line);
+}
+
+.alert--info,
+.alert--success,
+.alert--warning,
+.alert--danger {
+    border-left: 4px solid var(--sydra-accent);
 }
 
 .button.homepageCta {
@@ -22,14 +147,14 @@
     height: 34px;
     padding: 0 0.9rem;
     font-size: 0.85rem;
-    background-color: #85befd;
-    border-color: #85befd;
-    color: #0b1b2b;
+    background-color: var(--sydra-accent);
+    border-color: var(--sydra-accent);
+    color: var(--sydra-bg);
 }
 
 .button.homepageCta:hover,
 .button.homepageCta:focus {
-    background-color: #5ea9fb;
-    border-color: #5ea9fb;
-    color: #0b1b2b;
+    background-color: var(--sydra-accent);
+    border-color: var(--sydra-line);
+    color: var(--sydra-bg);
 }
