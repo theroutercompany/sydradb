@@ -1,9 +1,9 @@
 :root,
 html[data-theme="dark"] {
     --sydra-accent: #85befd;
-    --sydra-bg: #0b0c0f;
-    --sydra-surface-1: #101216;
-    --sydra-surface-2: #151821;
+    --sydra-bg: #0b0b0b;
+    --sydra-surface-1: #0b0b0b;
+    --sydra-surface-2: #0b0b0b;
     --sydra-text: #e6e6e6;
     --sydra-text-muted: #b8b8b8;
     --sydra-line: #ffffff;
@@ -87,6 +87,30 @@ html {
 :focus-visible {
     outline: 2px solid var(--sydra-accent);
     outline-offset: 2px;
+}
+
+.markdown :not(pre) > code {
+    background-color: transparent;
+    border: 1px solid var(--sydra-line);
+    color: var(--sydra-line);
+}
+
+.theme-code-block {
+    border: 1px solid var(--sydra-line);
+}
+
+.theme-code-block-title {
+    background-color: var(--sydra-bg);
+    border-bottom: 1px solid var(--sydra-line);
+    color: var(--sydra-line);
+}
+
+.theme-code-block pre {
+    background-color: var(--sydra-bg);
+}
+
+.theme-code-block pre code {
+    background-color: transparent;
 }
 
 .navbar {
