@@ -59,11 +59,6 @@ const config = {
                         label: "GitHub",
                         position: "right",
                     },
-                    {
-                        href: "https://github.com/theroutercompany/sydradb/issues",
-                        label: "Issues",
-                        position: "right",
-                    },
                 ],
             },
             footer: {
@@ -81,10 +76,6 @@ const config = {
                     {
                         title: "GitHub",
                         items: [
-                            {
-                                label: "Repository",
-                                href: "https://github.com/theroutercompany/sydradb",
-                            },
                             {
                                 label: "Issues",
                                 href: "https://github.com/theroutercompany/sydradb/issues",
