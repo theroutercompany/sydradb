@@ -9,7 +9,7 @@ title: src/sydra/query/type_inference.zig
 
 Infers expression types (and whether an expression references time) to support planning and validation.
 
-## Public API
+## Definition index (public)
 
 ### `pub const ExprInfo`
 
@@ -21,6 +21,11 @@ Infers expression types (and whether an expression references time) to support p
 Default type used when the system cannot infer a tighter type: `Type(.value, nullable=true)`.
 
 ### `pub fn inferExpression(allocator, expr) !ExprInfo`
+
+Error set:
+
+- `functions.TypeCheckError`
+- `std.mem.Allocator.Error`
 
 Inference rules (high level):
 
@@ -41,3 +46,15 @@ Fast boolean check for time presence.
 
 Trailing-segment check for `time`.
 
+## Internal helpers (non-public)
+
+The implementation uses internal helpers for the core decisions:
+
+- `identifierType(ident)`:
+  - `time` → `timestamp` (non-null)
+  - `tag.*` → `string` (nullable)
+  - trailing segment `value` → `value` (nullable)
+  - fallback to `default_value_type`
+- `literalType(literal)` maps AST literals into `functions.Type`
+- `typeForUnary` and `typeForBinary` define operator typing rules
+- `hasTagPrefix(slice)` treats `tag.<k>` as tag lookups

@@ -11,7 +11,11 @@ Builds a logical plan from the sydraQL AST.
 
 Logical plans are later optimized and lowered into a physical plan.
 
-## Public API
+## Definition index (public)
+
+### `pub const BuildError = error { ... }`
+
+- `UnsupportedStatement` — currently only `SELECT` is supported by the logical planner
 
 ### `pub const Node = union(enum)`
 
@@ -24,16 +28,27 @@ Logical node kinds:
 - `sort`
 - `limit`
 
-### `pub const ColumnInfo`
+### `pub const ColumnInfo = struct { ... }`
 
 - `name: []const u8`
 - `expr: *const ast.Expr`
+
+This is the “schema” that flows through planning and execution.
+
+### `pub const RollupHint = struct { ... }`
+
+- `bucket_expr: *const ast.Expr` — currently used to mark `time_bucket(...)` grouping expressions
 
 ### `pub fn nodeOutput(node: *Node) []const ColumnInfo`
 
 Returns the output schema for a node.
 
 ### `pub const Builder`
+
+Fields:
+
+- `allocator: std.mem.Allocator`
+- `column_counter: usize = 0` — used to generate stable column names across multiple SELECT lists
 
 Key methods:
 
@@ -52,7 +67,50 @@ Key methods:
   - Uses explicit aliases when present
   - Otherwise uses identifier name, or `fnName_<n>`, or `_col<n>`
 
+## Node payload structs (public)
+
+Each `Node` tag has a corresponding payload struct:
+
+- `Scan`:
+  - `source: *const ast.Select`
+  - `selector: ?ast.Selector`
+  - `output: []const ColumnInfo`
+- `Filter`:
+  - `input: *Node`
+  - `predicate: *const ast.Expr` — combined predicate (may re-build an AND chain)
+  - `output: []const ColumnInfo`
+  - `conjunctive_predicates: []const *const ast.Expr` — flattened `AND` clauses from the WHERE predicate
+- `Project`:
+  - `input: *Node`
+  - `projections: []const ast.Projection`
+  - `output: []const ColumnInfo`
+- `Aggregate`:
+  - `input: *Node`
+  - `groupings: []const ast.GroupExpr`
+  - `projections: []const ast.Projection`
+  - `fill: ?ast.FillClause`
+  - `rollup_hint: ?RollupHint`
+  - `output: []const ColumnInfo`
+- `Sort`:
+  - `input: *Node`
+  - `ordering: []const ast.OrderExpr`
+  - `output: []const ColumnInfo`
+- `Limit`:
+  - `input: *Node`
+  - `limit: ast.LimitClause`
+  - `output: []const ColumnInfo`
+
+## Internal helpers (non-public)
+
+Important builder helpers in the implementation:
+
+- `buildSelect` — constructs the node chain in this order:
+  - `scan` → optional `filter` → optional `aggregate` → `project` → optional `sort` → optional `limit`
+- `collectPredicates` — flattens `a AND b` binary expressions into a slice
+- `combinePredicates` — rebuilds a single AND-chain expression and unions spans
+- `inferProjectionName` — generates output column names when no alias is provided
+- `defaultScanColumns` — creates synthetic identifier expressions for `time` and `value`
+
 ## Tests
 
 Inline tests cover simple select planning, conjunctive predicates, rollup hints, and alias retention.
-

@@ -9,7 +9,25 @@ title: src/sydra/query/executor.zig
 
 Wraps the operator pipeline with a cursor API suitable for HTTP/pgwire surfaces.
 
-## Public API
+## Definition index (public)
+
+### `pub const Value`
+
+Alias:
+
+- `value.Value` from `src/sydra/query/value.zig`
+
+### `pub const ExecuteError`
+
+Alias:
+
+- `operator.ExecuteError`
+
+### `pub const OperatorStats`
+
+Alias:
+
+- `operator.Operator.StatsSnapshot`
 
 ### `pub const ExecutionStats`
 
@@ -19,14 +37,22 @@ Timing and counters set by `exec.execute`, including:
 - `trace_id`
 - `rows_emitted`, `rows_scanned`
 
+Full field list:
+
+- `parse_us`, `validate_us`, `optimize_us`, `physical_us`, `pipeline_us`
+- `trace_id: []const u8`
+- `rows_emitted: u64`
+- `rows_scanned: u64`
+
 ### `pub const ExecutionCursor`
 
 Fields:
 
-- `operator: *Operator` – root of the operator pipeline
-- `columns: []const plan.ColumnInfo` – output schema
-- `arena: ?*ArenaAllocator` – optionally owned arena for AST/plan lifetime
-- `stats: ExecutionStats`
+- `allocator: std.mem.Allocator` – allocator used for operator + optional arena cleanup
+- `operator: *operator.Operator` – root of the operator pipeline
+- `columns: []const plan.ColumnInfo` – output schema (from `physical.nodeOutput(root)`)
+- `arena: ?*std.heap.ArenaAllocator` – optionally owned arena for AST/plan lifetime
+- `stats: ExecutionStats` – timings/counters; filled by `exec.execute`
 
 Methods:
 
@@ -34,10 +60,27 @@ Methods:
 - `deinit()` – destroys the operator and (if present) frees the arena
 - `collectOperatorStats(allocator)` – returns a snapshot list from the pipeline
 
+Ownership notes:
+
+- `next()` returns `operator.Row` values that are owned by the underlying operator; treat them as valid until the next `next()` call on the same cursor/operator.
+- `collectOperatorStats` returns an owned slice; callers must free it with the allocator they passed in.
+- If `arena` is non-null, it is owned by the cursor and is freed by `deinit()` (this is how `exec.execute` keeps AST/plan pointers alive for the cursor lifetime).
+
 ### `pub const Executor`
 
 Creates an `ExecutionCursor` from a physical plan:
 
 - `Executor.init(allocator, engine, physical_plan)`
 - `run()` → `ExecutionCursor`
+- `deinit()` – no-op (present for symmetry)
 
+Fields:
+
+- `allocator: std.mem.Allocator`
+- `engine: *Engine`
+- `plan: physical.PhysicalPlan`
+
+Behavior notes:
+
+- `run()` builds the operator pipeline (`operator.buildPipeline`) and sets `columns` from `physical.nodeOutput(plan.root)`.
+- `run()` returns a cursor with `arena = null` and zeroed stats; the orchestration entrypoint (`exec.execute`) wraps this and fills the timing fields + attaches an arena.

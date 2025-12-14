@@ -11,7 +11,13 @@ Lowers a logical plan into a physical plan with execution-oriented metadata.
 
 The physical plan carries hints such as extracted time bounds for scan pushdown.
 
-## Public API
+## Definition index (public)
+
+### `pub const BuildError`
+
+Alias:
+
+- `std.mem.Allocator.Error`
 
 ### `pub const PhysicalPlan`
 
@@ -36,7 +42,51 @@ Recursively transforms logical nodes into physical nodes, propagating context (n
 
 Returns the output schema for a physical node.
 
-## Time bounds extraction
+## Node payload structs (public)
+
+Physical nodes are “execution oriented” versions of logical nodes:
+
+- `Scan`:
+  - `selector: ?ast.Selector`
+  - `output: []const plan.ColumnInfo`
+  - `rollup_hint: ?plan.RollupHint`
+  - `time_bounds: TimeBounds`
+- `Filter`:
+  - `predicate: *const ast.Expr`
+  - `output: []const plan.ColumnInfo`
+  - `child: *Node`
+  - `conjunction_count: usize` — number of flattened conjuncts in the logical filter
+  - `time_bounds: TimeBounds` — bounds extracted from the filter conjuncts
+- `Project`:
+  - `columns: []const plan.ColumnInfo`
+  - `child: *Node`
+  - `reuse_child_schema: bool` — true when the child is also a project
+- `Aggregate`:
+  - `groupings: []const ast.GroupExpr`
+  - `rollup_hint: ?plan.RollupHint`
+  - `output: []const plan.ColumnInfo`
+  - `child: *Node`
+  - `requires_hash: bool` — true when `GROUP BY` exists
+  - `has_fill_clause: bool` — true when a fill clause exists
+- `Sort`:
+  - `ordering: []const ast.OrderExpr`
+  - `child: *Node`
+  - `is_stable: bool` — currently always `true`
+  - `output: []const plan.ColumnInfo`
+- `Limit`:
+  - `limit: ast.LimitClause`
+  - `child: *Node`
+  - `offset: usize` — `limit.offset orelse 0`
+  - `output: []const plan.ColumnInfo`
+
+### `pub const TimeBounds = struct { ... }`
+
+Represents extracted time constraints:
+
+- `min: ?i64` / `min_inclusive: bool`
+- `max: ?i64` / `max_inclusive: bool`
+
+## Time bounds extraction (as implemented)
 
 `TimeBounds` is derived from filter conjunctive predicates when it recognizes comparisons between:
 
@@ -49,3 +99,11 @@ Supported operators include:
 
 Extracted bounds are merged and propagated down into the scan node to constrain `Engine.queryRange`.
 
+Important notes:
+
+- Only the identifier value `time` is recognized (it does not match `tag.time` or other dotted identifiers).
+- Only integer literals are accepted for bound extraction (no floats, strings, or `now()` yet).
+- Bounds are merged across conjuncts using “tightest wins” semantics:
+  - higher minimum replaces lower minimum
+  - lower maximum replaces higher maximum
+  - equal bounds combine inclusivity

@@ -9,7 +9,11 @@ title: src/sydra/query/value.zig
 
 Defines a runtime value representation used during query execution and expression evaluation.
 
-## Public API
+## Definition index (public)
+
+### `pub const ConvertError = error { ... }`
+
+- `TypeMismatch`
 
 ### `pub const Value = union(enum)`
 
@@ -29,3 +33,16 @@ Helpers:
 - `compareNumeric(a, b)` – ordering comparison using float conversion
 - `copySlice(allocator, values)` – shallow copy a `[]Value` slice
 
+## Conversion rules (as implemented)
+
+- `asBool` accepts only `.boolean`.
+- `asInt` accepts only `.integer`.
+- `asString` accepts only `.string`.
+- `asFloat` accepts:
+  - `.float` as-is
+  - `.integer` by converting to `f64`
+
+## Equality rules (as implemented)
+
+- `.integer` and `.float` compare equal if their `f64` values are equal.
+- Other mixed-type comparisons return `false`.
