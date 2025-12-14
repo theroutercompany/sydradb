@@ -1,6 +1,6 @@
 # sydraQL Design
 
-This document defines the initial design for sydraQL, the native time-series query language for sydraDB. It expands on the backlog in `/legacy/sydraQL-issues.csv` and sets the scope for the parser, planner, and execution work.
+This document defines the initial design for sydraQL, the native time-series query language for SydraDB. It expands on the backlog in `/legacy/sydraQL-issues.csv` and sets the scope for the parser, planner, and execution work.
 
 ## Goals
 - **Time-series first**: expressive range scans, tag filters, downsampling, and rates without exposing the full SQL surface.

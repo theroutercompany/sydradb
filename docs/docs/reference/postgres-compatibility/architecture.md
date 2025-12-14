@@ -1,3 +1,8 @@
+---
+sidebar_position: 2
+sidebar_label: Architecture
+---
+
 # PostgreSQL Compatibility Architecture
 
 This note decomposes the compatibility layer into the modules we are building and documents the current ownership boundaries. It should evolve alongside the implementation.

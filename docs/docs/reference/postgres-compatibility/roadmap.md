@@ -1,6 +1,11 @@
+---
+sidebar_position: 5
+sidebar_label: Roadmap
+---
+
 # PostgreSQL Compatibility Roadmap
 
-This document explains how we are bringing a PostgreSQL-compatible surface to sydraDB. It partners with `./compat-matrix-v0.1` (feature status) and `./testing` (test plan).
+This document explains how we are bringing a PostgreSQL-compatible surface to SydraDB. It partners with `./compat-matrix-v0.1` (feature status) and `./testing` (test plan).
 
 ## Objectives
 - Provide a PG v3 wire endpoint so existing clients connect without code changes.

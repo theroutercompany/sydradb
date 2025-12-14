@@ -1,3 +1,8 @@
+---
+sidebar_position: 3
+sidebar_label: Catalog shim
+---
+
 # Catalog Shim Design Notes
 
 This memo captures the minimum viable definitions for the PostgreSQL catalog views we plan to emulate. It should be read alongside `./compat-matrix-v0.1` (§B) and updated as soon as implementations land.

@@ -1,3 +1,8 @@
+---
+sidebar_position: 4
+sidebar_label: Testing
+---
+
 # Compatibility Testing Strategy
 
 This document sketches the guard-rails we need while the PostgreSQL compatibility layer comes online. It complements `./roadmap` by describing concrete test suites and the automation required to keep us close to upstream behaviour.

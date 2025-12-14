@@ -1,11 +1,20 @@
-Awesome—here’s a **first‑pass compatibility matrix (v0.1)** plus the **exact pg_catalog / information_schema surface** I recommend synthesizing so Django, Rails/ActiveRecord, Prisma, SQLAlchemy, Hibernate, etc. “just work.”
-I’m assuming a typical modern engine baseline; where I don’t know sydraDB’s internals I mark items as **Target**, and you can flip them to **Native/Partial/Unsupported** as you confirm.
+---
+sidebar_position: 1
+sidebar_label: Compatibility Matrix
+---
+
+# Compatibility Matrix (v0.1)
+
+This document tracks SydraDB’s PostgreSQL-compatibility surface at a feature-matrix level.
+
+- **Current** describes where the implementation is today.
+- **Target** describes the intended end-state for the v0.1 compatibility milestone.
 
 ---
 
 ## Legend
 
-- **Native** — implemented in sydraDB core (ideal).
+- **Native** — implemented in SydraDB core (ideal).
 - **Shim** — emulated/translated by the PG‑compat layer (wire, translator, catalog views).
 - **Partial** — works for common cases; edge cases documented.
 - **Scaffold** — implementation scaffolding landed (builders, counters, fixtures) but not yet an end-to-end user-facing feature.
@@ -317,4 +326,7 @@ Replicate the idea for `pg_attribute`, `pg_type`, `pg_index`, `pg_constraint`, `
 
 ---
 
-If you share which pieces of A–I are already **Native** in sydraDB, I can flip the statuses and produce a sharper “v0.1 reality matrix” plus a tiny **catalog conformance test pack** (SQL snippets) you can run in CI.
+## Updating this matrix
+
+- When a feature lands, update its **Current** status and link to the code/tests that prove it (fixtures, harnesses, or integration suites).
+- Keep `Verification touchpoints` synchronized with the actual test commands and debug endpoints.
