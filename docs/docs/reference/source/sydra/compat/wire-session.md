@@ -64,7 +64,45 @@ Handshake steps:
 
 The function returns an owned `Session` whose `deinit()` must be called by the caller.
 
+```zig title="User parameter required (excerpt)"
+const user_param = startup.find("user") orelse {
+    protocol.writeErrorResponse(writer, "FATAL", "28000", "user parameter required") catch return HandshakeError.InvalidStartup;
+    return HandshakeError.MissingUser;
+};
+```
+
+```zig title="Backend handshake responses (excerpt)"
+protocol.writeAuthenticationOk(writer) catch return HandshakeError.InvalidStartup;
+
+for (status_pairs) |pair| {
+    protocol.writeParameterStatus(writer, pair.key, pair.value) catch return HandshakeError.InvalidStartup;
+}
+
+protocol.writeReadyForQuery(writer, 'I') catch return HandshakeError.InvalidStartup;
+```
+
 ## Key internal helpers
 
 - `duplicateParameters(alloc, params) ![]protocol.Parameter` deep-copies startup parameters and frees partially-constructed output on error.
 
+```zig title="duplicateParameters (excerpt)"
+fn duplicateParameters(alloc: std.mem.Allocator, params: []protocol.Parameter) ![]protocol.Parameter {
+    const out = try alloc.alloc(protocol.Parameter, params.len);
+    var idx: usize = 0;
+    errdefer {
+        var i: usize = 0;
+        while (i < idx) : (i += 1) {
+            alloc.free(@constCast(out[i].key));
+            alloc.free(@constCast(out[i].value));
+        }
+        alloc.free(out);
+    }
+    while (idx < params.len) : (idx += 1) {
+        out[idx] = .{
+            .key = try alloc.dupe(u8, params[idx].key),
+            .value = try alloc.dupe(u8, params[idx].value),
+        };
+    }
+    return out;
+}
+```

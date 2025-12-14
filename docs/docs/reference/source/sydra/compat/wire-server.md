@@ -60,6 +60,25 @@ Handled message types:
   - `ErrorResponse("0A000", "message type not implemented")`
   - `ReadyForQuery('I')`
 
+```zig title="messageLoop dispatch (excerpt)"
+switch (type_byte) {
+    'X' => return,
+    'Q' => {
+        try handleSimpleQuery(alloc, writer, payload_storage, engine);
+    },
+    'P' => {
+        try handleParseMessage(alloc, writer, payload_storage);
+    },
+    'S' => {
+        try protocol.writeReadyForQuery(writer, 'I');
+    },
+    else => {
+        try protocol.writeErrorResponse(writer, "ERROR", "0A000", "message type not implemented");
+        try protocol.writeReadyForQuery(writer, 'I');
+    },
+}
+```
+
 ## Simple Query execution
 
 ### `fn handleSimpleQuery(alloc, writer, payload, engine) !void`
@@ -77,7 +96,31 @@ Behavior:
     - calls `handleSydraqlQuery(…, sydraql)`
   - on translation failure:
     - writes `ErrorResponse(ERROR, failure.sqlstate, failure.message or "translation failed")`
-  - always ends with `ReadyForQuery('I')`
+- always ends with `ReadyForQuery('I')`
+
+```zig title="SQL → sydraQL translation (excerpt)"
+const translation = translator.translate(alloc, trimmed) catch |err| switch (err) {
+    error.OutOfMemory => {
+        try protocol.writeErrorResponse(writer, "FATAL", "53100", "out of memory during translation");
+        try protocol.writeReadyForQuery(writer, 'I');
+        return;
+    },
+};
+
+switch (translation) {
+    .success => |success| {
+        defer alloc.free(success.sydraql);
+        try handleSydraqlQuery(alloc, writer, engine, success.sydraql);
+        try protocol.writeReadyForQuery(writer, 'I');
+        return;
+    },
+    .failure => |failure| {
+        const msg = if (failure.message.len == 0) "translation failed" else failure.message;
+        try protocol.writeErrorResponse(writer, "ERROR", failure.sqlstate, msg);
+        try protocol.writeReadyForQuery(writer, 'I');
+    },
+}
+```
 
 ## Extended protocol parse (partial)
 
@@ -158,4 +201,3 @@ Text formatting rules:
 - `parseAddress` parses IPv4 or IPv6.
 - `anyWriter` adapts a `std.Io.Writer` into `std.Io.AnyWriter`.
 - `formatSelectTag` formats the `CommandComplete` tag (with optional `trace_id`).
-

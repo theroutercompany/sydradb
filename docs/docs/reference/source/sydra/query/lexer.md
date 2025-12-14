@@ -89,6 +89,39 @@ Public methods:
 - `peek() LexError!Token` — lookahead without consuming (`next` + rewind)
 - `reset() void` — rewinds to the start (`index = 0`)
 
+```zig title="Lexer.next() (excerpt)"
+pub fn next(self: *Lexer) LexError!Token {
+    self.skipWhitespaceAndComments();
+    if (self.index >= self.source.len) {
+        return eofToken(self.source.len);
+    }
+
+    const start = self.index;
+    const ch = self.source[self.index];
+
+    if (isIdentifierStart(ch)) return self.scanIdentifier(start);
+    if (ch == '"' or ch == '\'') return self.scanString(start, ch);
+    if (isDigit(ch)) return self.scanNumber(start);
+
+    switch (ch) {
+        ',' => return self.makeSimpleToken(TokenKind.comma, start, 1),
+        '-' => {
+            if (self.matchChar('>')) return self.makeSimpleToken(TokenKind.arrow, start, 2);
+            return self.makeSimpleToken(TokenKind.minus, start, 1);
+        },
+        '=' => {
+            if (self.matchChar('~')) return self.makeSimpleToken(TokenKind.regex_match, start, 2);
+            return self.makeSimpleToken(TokenKind.equal, start, 1);
+        },
+        // ... many more single/two-char tokens ...
+        else => {},
+    }
+
+    self.index += 1;
+    return Token{ .kind = TokenKind.unknown, .lexeme = self.source[start..self.index], .span = common.Span.init(start, self.index) };
+}
+```
+
 ## Lexing rules (as implemented)
 
 ### Whitespace and comments
@@ -99,6 +132,36 @@ Comments:
 
 - `-- line comments`
 - `/* block comments */` (unterminated block comment falls through to EOF)
+
+```zig title="Whitespace + comment skipping (excerpt)"
+fn skipWhitespaceAndComments(self: *Lexer) void {
+    while (self.index < self.source.len) {
+        const ch = self.source[self.index];
+        switch (ch) {
+            ' ', '\t', '\n', '\r' => {
+                self.index += 1;
+            },
+            '-' => {
+                if (self.matchAhead("--")) {
+                    self.index += 2;
+                    self.skipLineComment();
+                    continue;
+                }
+                return;
+            },
+            '/' => {
+                if (self.matchAhead("/*")) {
+                    self.index += 2;
+                    self.skipBlockComment();
+                    continue;
+                }
+                return;
+            },
+            else => return,
+        }
+    }
+}
+```
 
 ### Identifiers and keywords
 

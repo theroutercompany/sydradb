@@ -126,6 +126,38 @@ Expression parsing is a classic recursive-descent precedence ladder:
 8. calls: `identifier(...)`
 9. primary: literals, identifiers, parenthesized expressions
 
+```zig title="Precedence ladder entrypoints (excerpt)"
+fn parseExpression(self: *Parser) ParseError!*const ast.Expr {
+    return self.parseLogicalOr();
+}
+
+fn parseLogicalOr(self: *Parser) ParseError!*const ast.Expr {
+    var expr = try self.parseLogicalAnd();
+    while (true) {
+        if (try self.matchLogicalOr()) |_| {
+            const right = try self.parseLogicalAnd();
+            expr = try self.makeBinary(ast.BinaryOp.logical_or, expr, right);
+            continue;
+        }
+        break;
+    }
+    return expr;
+}
+
+fn parseLogicalAnd(self: *Parser) ParseError!*const ast.Expr {
+    var expr = try self.parseEquality();
+    while (true) {
+        if (try self.matchLogicalAnd()) |_| {
+            const right = try self.parseEquality();
+            expr = try self.makeBinary(ast.BinaryOp.logical_and, expr, right);
+            continue;
+        }
+        break;
+    }
+    return expr;
+}
+```
+
 ### Literals
 
 - Numbers are parsed into `i64` or `f64` based on whether the token contains `.` or `e`/`E`.

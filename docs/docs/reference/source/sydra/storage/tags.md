@@ -37,6 +37,17 @@ key=value
 - Inserts `series_id` into the list for `key`.
 - Performs naive deduplication by scanning the existing list.
 
+```zig title="add() naive dedup (from src/sydra/storage/tags.zig)"
+pub fn add(self: *TagIndex, key: []const u8, series_id: types.SeriesId) !void {
+    var gop = try self.map.getOrPut(key);
+    if (!gop.found_existing) gop.value_ptr.* = .{};
+
+    // naive dedup: scan existing list
+    for (gop.value_ptr.items) |sid| if (sid == series_id) return;
+    try gop.value_ptr.append(self.alloc, series_id);
+}
+```
+
 ### `pub fn get(self, key: []const u8) []const SeriesId`
 
 Returns the series-id list for `key`, or an empty slice if missing.
@@ -49,6 +60,25 @@ Notes:
 
 - The file is written manually (not via `std.json.Stringify`) and does not escape keys.
 
+```zig title="save() JSON writer (excerpt)"
+try w.writeAll("{");
+var it = self.map.iterator();
+var first = true;
+while (it.next()) |e| {
+    if (!first) try w.writeAll(",");
+    first = false;
+    try w.print("\"{s}\":[", .{e.key_ptr.*});
+    var first2 = true;
+    for (e.value_ptr.items) |sid| {
+        if (!first2) try w.writeAll(",");
+        first2 = false;
+        try w.print("{d}", .{sid});
+    }
+    try w.writeAll("]");
+}
+try w.writeAll("}");
+```
+
 ### `pub fn deinit(self: *TagIndex) void`
 
 Deinitializes all stored `ArrayListUnmanaged` values and the map itself.
@@ -57,4 +87,3 @@ Deinitializes all stored `ArrayListUnmanaged` values and the map itself.
 
 - `Engine.noteTags` parses a tags JSON object and adds `key=value` entries into this index.
 - HTTP `handleFind` queries this index via `eng.tags.get(...)`.
-

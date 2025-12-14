@@ -97,6 +97,39 @@ Supported operators include:
 
 - `>=`, `>`, `<=`, `<`, `=`
 
+```zig title="timeBoundsFromExpr (excerpt)"
+fn timeBoundsFromExpr(expr: *const ast.Expr) ?TimeBounds {
+    if (expr.* != .binary) return null;
+    const bin = expr.binary;
+    const lhs_time = exprIsTimeIdentifier(bin.left);
+    const rhs_time = exprIsTimeIdentifier(bin.right);
+    if (!lhs_time and !rhs_time) return null;
+
+    const op = bin.op;
+    if (lhs_time and rhs_time) return null;
+
+    const literal = if (lhs_time) convertTimeLiteral(bin.right) else convertTimeLiteral(bin.left);
+    if (literal == null) return null;
+    const value = literal.?;
+
+    var bounds = TimeBounds{};
+    if (lhs_time) {
+        switch (op) {
+            .greater_equal => { bounds.min = value; bounds.min_inclusive = true; },
+            .greater => { bounds.min = value; bounds.min_inclusive = false; },
+            .less_equal => { bounds.max = value; bounds.max_inclusive = true; },
+            .less => { bounds.max = value; bounds.max_inclusive = false; },
+            .equal => { bounds.min = value; bounds.max = value; },
+            else => return null,
+        }
+    } else {
+        // time on right side flips the bounds direction
+        // ...
+    }
+    return bounds;
+}
+```
+
 Extracted bounds are merged and propagated down into the scan node to constrain `Engine.queryRange`.
 
 Important notes:

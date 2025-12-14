@@ -32,6 +32,22 @@ Encodes one varint per point:
 
 Practical note: in the segment writer, `start_ts` is typically `points[0].ts`, making the first `dod` value `0`.
 
+```zig title="encodeTsDoD loop (from src/sydra/codec/gorilla.zig)"
+pub fn encodeTsDoD(writer: anytype, start_ts: i64, points: []const @import("../types.zig").Point) !void {
+    var prev_ts: i64 = start_ts;
+    var prev_delta: i64 = 0;
+    for (points) |p| {
+        const delta: i64 = p.ts - prev_ts;
+        const dod: i64 = delta - prev_delta;
+        var buf: [10]u8 = undefined;
+        const n = encodeZigZagVarint(&buf, dod);
+        try writer.writeAll(buf[0..n]);
+        prev_delta = delta;
+        prev_ts = p.ts;
+    }
+}
+```
+
 #### `pub fn decodeTsDoD(alloc, reader, count: usize, start_ts: i64) ![]i64`
 
 Decodes `count` timestamps:
@@ -63,6 +79,33 @@ Encoding uses a 1-byte marker per value:
       - `[lz:u8][tz:u8][nbytes:u8]`
       - `payload` as `nbytes` little-endian bytes, where `payload = x >> tz`
 
+```zig title="encodeF64 markers (excerpt)"
+const bits: u64 = @bitCast(v);
+if (idx == 0) {
+    try writer.writeByte(2);
+    // write 8 raw bytes...
+    prev_bits = bits;
+    continue;
+}
+const x = bits ^ prev_bits;
+if (x == 0) {
+    try writer.writeByte(0); // same
+} else {
+    const lz: u8 = @intCast(@clz(x));
+    const tz: u8 = @intCast(@ctz(x));
+    const sig_bits_usize = 64 - @as(usize, lz) - @as(usize, tz);
+    const tz6: u6 = @intCast(tz);
+    const payload: u64 = x >> tz6;
+
+    const nbytes: u8 = @intCast((sig_bits_usize + 7) / 8);
+    try writer.writeByte(1);
+    try writer.writeByte(lz);
+    try writer.writeByte(tz);
+    try writer.writeByte(nbytes);
+    // write nbytes of payload...
+}
+```
+
 #### `pub fn decodeF64(alloc, reader, count: usize) ![]f64`
 
 Decodes `count` values:
@@ -76,6 +119,25 @@ Decodes `count` values:
   - `bits = prev_bits ^ x`
 
 Returns an allocator-owned `[]f64` slice (caller frees).
+
+```zig title="decodeF64 marker handling (excerpt)"
+const marker = try readByte(reader);
+switch (marker) {
+    2 => {
+        // raw 8 bytes
+    },
+    0 => {
+        // repeat previous value
+    },
+    1 => {
+        _ = try readByte(reader); // lz (ignored in simplified decode)
+        const tz = try readByte(reader);
+        const nbytes = try readByte(reader);
+        // read payload, reconstruct x = payload << tz, then prev_bits ^= x
+    },
+    else => return error.InvalidEncoding,
+}
+```
 
 ## Key internal helpers
 
@@ -95,4 +157,3 @@ Returns an allocator-owned `[]f64` slice (caller frees).
 
 - `test "zigzag encode/decode round-trip"`
 - `test "encodeTsDoD/decodeTsDoD preserves timestamps"`
-

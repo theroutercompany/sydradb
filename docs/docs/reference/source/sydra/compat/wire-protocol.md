@@ -71,6 +71,48 @@ Key errors surfaced by this function:
 - `error.UnsupportedProtocol`
 - `error.CancelRequestUnsupported`
 
+```zig title="SSL request handling loop (excerpt)"
+while (true) {
+    const total_len = try readU32(reader);
+    if (total_len < 8) return error.InvalidStartupLength;
+    const body_len = total_len - 4;
+
+    var body = try alloc.alloc(u8, body_len);
+    defer alloc.free(body);
+    try reader.readNoEof(body);
+
+    const protocol = std.mem.readInt(u32, @as(*const [4]u8, @ptrCast(body[0..4].ptr)), .big);
+
+    if (protocol == ssl_request_code) {
+        try writer.writeAll(if (options.allow_ssl) "S" else "N");
+        ssl_seen = true;
+        continue;
+    }
+
+    if (protocol == cancel_request_code) return error.CancelRequestUnsupported;
+    if ((protocol & 0xFFFF0000) != protocol_version_3) return error.UnsupportedProtocol;
+    // parse key/value parameters...
+    break;
+}
+```
+
+```zig title="Parameter parsing (excerpt)"
+var idx: usize = 4;
+while (idx < body.len) {
+    const key_end = std.mem.indexOfScalarPos(u8, body, idx, 0) orelse return error.MalformedStartupPacket;
+    if (key_end == idx) break; // trailing NUL
+
+    const val_start = key_end + 1;
+    if (val_start >= body.len) return error.MalformedStartupPacket;
+    const val_end = std.mem.indexOfScalarPos(u8, body, val_start, 0) orelse return error.MalformedStartupPacket;
+
+    const key_slice = body[idx..key_end];
+    const value_slice = body[val_start..val_end];
+    try appendParameter(alloc, &params, key_slice, value_slice);
+    idx = val_end + 1;
+}
+```
+
 ## Message writers
 
 All message writers write a complete backend message in one call.
@@ -121,6 +163,27 @@ Writes an `ErrorResponse` with fields:
 
 Each field is NUL-terminated; the entire message ends with an extra NUL byte.
 
+```zig title="writeErrorResponse framing (excerpt)"
+try writer.writeByte('E');
+var length: u32 = 4 + 1; // length field + terminating zero
+length += @intCast(severity.len + code.len + message.len + 3);
+
+var buf: [4]u8 = undefined;
+std.mem.writeInt(u32, buf[0..4], length, .big);
+try writer.writeAll(buf[0..4]);
+
+try writer.writeByte('S');
+try writer.writeAll(severity);
+try writer.writeByte(0);
+try writer.writeByte('C');
+try writer.writeAll(code);
+try writer.writeByte(0);
+try writer.writeByte('M');
+try writer.writeAll(message);
+try writer.writeByte(0);
+try writer.writeByte(0);
+```
+
 ### `pub fn writeNoticeResponse(writer, message) !void`
 
 Writes a `NoticeResponse` with fields:
@@ -131,4 +194,3 @@ Writes a `NoticeResponse` with fields:
 ### `pub fn formatParameters(params: []Parameter, writer) !void`
 
 Formats parameter pairs as `key=value, key=value, ...` (used for debugging/logging).
-
