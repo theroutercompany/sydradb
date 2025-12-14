@@ -43,6 +43,20 @@ const config = {
         ],
     ],
 
+    plugins: [
+        [
+            require.resolve("@easyops-cn/docusaurus-search-local"),
+            {
+                hashed: true,
+                language: ["en"],
+                indexDocs: true,
+                indexPages: true,
+                indexBlog: false,
+                docsRouteBasePath: "/docs",
+            },
+        ],
+    ],
+
     themeConfig:
         /** @type {import('@docusaurus/preset-classic').ThemeConfig} */
         ({
@@ -53,6 +67,14 @@ const config = {
                         to: "/docs/intro",
                         label: "Docs",
                         position: "left",
+                    },
+                    {
+                        type: "docsVersionDropdown",
+                        position: "right",
+                    },
+                    {
+                        type: "search",
+                        position: "right",
                     },
                     {
                         href: "https://github.com/theroutercompany/sydradb",

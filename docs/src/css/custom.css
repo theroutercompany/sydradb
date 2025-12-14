@@ -23,6 +23,9 @@ html[data-theme="dark"] {
     --ifm-navbar-shadow: none;
     --ifm-navbar-link-color: var(--sydra-line);
     --ifm-navbar-link-hover-color: var(--sydra-line);
+    --ifm-navbar-search-input-background-color: var(--sydra-bg);
+    --ifm-navbar-search-input-color: var(--sydra-line);
+    --ifm-navbar-search-input-placeholder-color: var(--sydra-text-muted);
 
     --ifm-footer-background-color: var(--sydra-bg);
 
@@ -73,6 +76,16 @@ html[data-theme="dark"] {
     --prism-url: var(--sydra-accent);
     --prism-inserted: #d0d0d0;
     --prism-deleted: #d0d0d0;
+
+    --search-local-modal-background: var(--sydra-bg);
+    --search-local-modal-shadow: 0 0 0 1px var(--sydra-line);
+    --search-local-hit-background: var(--sydra-bg);
+    --search-local-hit-shadow: 0 0 0 1px var(--sydra-line);
+    --search-local-hit-color: var(--sydra-text);
+    --search-local-muted-color: var(--sydra-line);
+    --search-local-highlight-color: var(--sydra-accent);
+    --search-local-hit-active-color: var(--sydra-bg);
+    --search-local-input-active-border-color: var(--sydra-accent);
 }
 
 html {
@@ -115,6 +128,15 @@ html {
 
 .navbar {
     border-bottom: 1px solid var(--sydra-line);
+}
+
+.navbar__search-input {
+    border: 1px solid var(--sydra-line);
+}
+
+.navbar__search-input:focus,
+.navbar__search-input:focus-visible {
+    border-color: var(--sydra-accent);
 }
 
 .footer {
