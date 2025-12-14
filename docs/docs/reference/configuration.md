@@ -13,10 +13,27 @@ sidebar_position: 1
 The current config loader is a **minimal line-based parser**, not a full TOML implementation.
 
 - Comments are only supported as **full-line** comments starting with `#`.
-- Inline `# ...` comments after a value are not reliably supported.
+- Inline `# ...` comments after a value are **not reliably supported** and may:
+  - cause parse failures (fallback to defaults), or
+  - change the interpreted value (e.g. a quoted string no longer ends at `"`).
 - String values should be quoted as `"..."` with no trailing comment text.
 
-Use `sydradb.toml.example` as a starting point, but remove inline comments if you run into parsing issues.
+The checked-in `sydradb.toml` and `sydradb.toml.example` include inline comments for humans; if you use them, **remove inline comments** before running the server.
+
+## Known-good minimal config (no inline comments)
+
+```toml
+data_dir = "./data"
+http_port = 8080
+fsync = "interval"
+flush_interval_ms = 2000
+memtable_max_bytes = 8388608
+mem_limit_bytes = 268435456
+auth_token = ""
+enable_influx = false
+enable_prom = true
+retention_days = 0
+```
 
 ## Settings
 
@@ -100,5 +117,5 @@ retention.weather = 30
 Notes:
 
 - Namespace is derived as the substring before the first `.` in the series name (e.g. `weather.room1` → `weather`).
-- The current engine retention pass operates on `retention_days`; namespace overrides may require additional wiring depending on runtime implementation.
-
+- There is no built-in “default namespace” — `retention.default` only applies to series whose namespace is literally `default` (e.g. `default.cpu`).
+- The config parser loads namespace overrides, but the current engine retention pass operates on `retention_days`; namespace overrides may require additional wiring depending on runtime implementation.

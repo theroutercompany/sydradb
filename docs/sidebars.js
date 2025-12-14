@@ -57,6 +57,8 @@ const sidebars = {
             label: "Development",
             collapsed: true,
             items: [
+                "development/contributing",
+                "development/ci",
                 "development/docs-site",
                 "development/zig-0.15-migration-checklist",
                 "development/sydraql-roadmap",
