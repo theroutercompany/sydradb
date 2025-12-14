@@ -19,7 +19,6 @@ curl -XPOST localhost:8080/api/v1/ingest --data-binary $'{"series":"weather.room
 zig build                                # default: mimalloc global allocator
 zig build -Dallocator-mode=default       # use Zig GPA fallback
 zig build -Dallocator-mode=small_pool    # use slab allocator tuned for small writes
-zig build -Dallocator-mode=small_pool -Dallocator-shards=8  # enable sharded slab allocator
 ```
 
 ## Nix

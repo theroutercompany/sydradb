@@ -96,7 +96,7 @@ fn handleRequest(handle: *alloc_mod.AllocatorHandle, alloc: std.mem.Allocator, e
     if (std.mem.eql(u8, path, "/debug/alloc/stats") and method == .GET) {
         return try handleAllocStats(handle, req);
     }
-    if (std.mem.eql(u8, path, "/status") and method == .GET) {
+    if (td.mem.eql(u8, path, "/status") and method == .GET) {
         return try handleStatus(req);
     }
     if (std.mem.eql(u8, path, "/api/v1/ingest") and method == .POST) {
