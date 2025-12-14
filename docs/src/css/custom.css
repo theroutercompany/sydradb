@@ -95,9 +95,15 @@ html {
 
 .footer {
     border-top: 1px solid var(--sydra-line);
+    background-color: var(--sydra-bg);
 }
 
 .footer--dark {
+    --ifm-footer-background-color: var(--sydra-bg);
+    --ifm-footer-title-color: var(--sydra-line);
+    --ifm-footer-link-color: var(--sydra-text);
+    --ifm-footer-link-hover-color: var(--sydra-accent);
+    --ifm-footer-color: var(--sydra-text-muted);
     background-color: var(--ifm-footer-background-color);
 }
 
