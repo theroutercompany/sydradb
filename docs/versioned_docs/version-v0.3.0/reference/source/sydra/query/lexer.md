@@ -9,6 +9,13 @@ title: src/sydra/query/lexer.zig
 
 Tokenizes sydraQL source text into a stream of tokens for the parser.
 
+## See also
+
+- [Common utilities](./common.md) (`Span`)
+- [Parser](./parser.md)
+- [Diagnostics and error codes](./errors.md)
+- [Query pipeline overview](./overview.md)
+
 ## Definition index (public)
 
 ### `pub const TokenKind = enum { ... }`

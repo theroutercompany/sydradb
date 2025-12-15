@@ -18,13 +18,20 @@ Core ingest/query engine:
 
 ## Key imports and dependencies
 
-- `src/sydra/config.zig` – runtime configuration
-- `src/sydra/types.zig` – `SeriesId`, `Point`
-- `src/sydra/storage/wal.zig` – write-ahead log
-- `src/sydra/storage/segment.zig` – segment writer + range query implementation
-- `src/sydra/storage/manifest.zig` – segment manifest persisted on disk
-- `src/sydra/storage/tags.zig` – tag index
-- `src/sydra/storage/retention.zig` – retention pass (segment deletion)
+- [`src/sydra/config.zig`](./config.md) – runtime configuration
+- [`src/sydra/types.zig`](./types.md) – `SeriesId`, `Point`
+- [`src/sydra/storage/wal.zig`](./storage/wal.md) – write-ahead log
+- [`src/sydra/storage/segment.zig`](./storage/segment.md) – segment writer + range query implementation
+- [`src/sydra/storage/manifest.zig`](./storage/manifest.md) – segment manifest persisted on disk
+- [`src/sydra/storage/tags.zig`](./storage/tags.md) – tag index
+- [`src/sydra/storage/retention.zig`](./storage/retention.md) – retention pass (segment deletion)
+
+## See also
+
+- [Reference: HTTP API](../../http-api.md) (ingest, range query, sydraQL endpoint)
+- [Reference: Series IDs](../../series-ids.md)
+- [Reference: On-Disk Format v0 (Draft)](../../on-disk-format.md)
+- [Query pipeline overview](./query/overview.md)
 
 ## Public API (Engine)
 

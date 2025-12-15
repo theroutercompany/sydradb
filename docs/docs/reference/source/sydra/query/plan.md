@@ -7,9 +7,16 @@ title: src/sydra/query/plan.zig
 
 ## Purpose
 
-Builds a logical plan from the sydraQL AST.
+Builds a logical plan from the sydraQL AST ([`ast.zig`](./ast.md)).
 
 Logical plans are later optimized and lowered into a physical plan.
+
+## See also
+
+- [Validator](./validator.md) (ensures the AST is semantically valid)
+- [Optimizer](./optimizer.md)
+- [Physical plan builder](./physical.md)
+- [Operator pipeline](./operator.md)
 
 ## Definition index (public)
 

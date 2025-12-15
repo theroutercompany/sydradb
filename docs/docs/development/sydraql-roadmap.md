@@ -5,13 +5,13 @@ This roadmap translates the sydraQL language vision into a sequenced engineering
 ## Phase 0 – Specification Lockdown & Readiness (1–2 weeks, prerequisite for all build phases)
 
 - **Objectives**
-  - Finalise the sydraQL surface area for v0 in alignment with `docs/sydraql-design.md` and the resolved open questions (single-series math, virtual rollup tables, numeric + JSON insert payloads, half-open delete windows).
+  - Finalise the sydraQL surface area for v0 in alignment with [sydraQL Design](../concepts/sydraql-design.md) and the resolved open questions (single-series math, virtual rollup tables, numeric + JSON insert payloads, half-open delete windows).
   - Produce canonical examples that drive parser tests, planner expectations, and HTTP contract fixtures.
   - Ensure tooling (zig 0.15.x, nix shell, CI matrix) is green and repeatable.
 - **Deliverables**
-  - Updated `docs/sydraql-design.md` reflecting locked answers, grammar, and function catalogue with argument/return typing.
+  - Updated [sydraQL Design](../concepts/sydraql-design.md) reflecting locked answers, grammar, and function catalogue with argument/return typing.
   - Expanded examples appendix with at least: range scan, downsample + fill, rate computation, insert with fields, delete retention case, error scenarios.
-  - Issue breakdown in `docs/sydraQL-issues.csv` tagged with phase identifiers and size estimates.
+  - Issue breakdown in [sydraQL backlog](./sydraql-backlog.md) tagged with phase identifiers and size estimates.
 - **Key Tasks**
   - Cross-reference Postgres compatibility doc to flag unsupported SQL forms and document translation fallbacks.
   - Define numeric limits (`MAX_POINTS`, `MAX_SERIES`, `MAX_QUERY_DURATION`) and failure codes in a shared Zig enum under `src/sydra/query/errors.zig`.
@@ -19,14 +19,14 @@ This roadmap translates the sydraQL language vision into a sequenced engineering
 - **Acceptance Criteria**
   - Stakeholders sign off on spec in review PR; no open TODOs remain in design doc.
   - CI job `zig build test` passes with new tests covering enum additions.
-  - Readiness checklist tracked in `docs/sydraql-readiness.md` (new file) completed.
+  - Readiness checklist tracked in [sydraQL readiness](./sydraql-readiness.md) completed.
 - **Risks & Mitigations**
   - *Risk*: Scope creep reintroducing multi-series math. *Mitigation*: document deferral in design, add follow-up issue.
   - *Risk*: Compatibility gaps discovered late. *Mitigation*: run translator spike queries early and log deltas.
 - **Inputs & Dependencies**
-  - Existing catalog schema description in `docs/catalog_shim_notes.md` to confirm rollup exposure paths.
-  - Storage retention behaviour outlined in `docs/compatibility_architecture.md`; treat as source of truth for delete semantics.
-  - Zig toolchain pinned in `flake.nix`; verify contributors use same version by updating `docs/FORMAT.md`.
+  - Existing catalog schema description in [Catalog shim notes](../reference/postgres-compatibility/catalog-shim-notes.md) to confirm rollup exposure paths.
+  - Storage retention behaviour outlined in [PostgreSQL compatibility architecture](../reference/postgres-compatibility/architecture.md); treat as source of truth for delete semantics.
+  - Zig toolchain pinned in `flake.nix`; keep [Contributing](./contributing.md) and [Zig 0.15 migration checklist](./zig-0.15-migration-checklist.md) up to date.
 - **Key Engineering Decisions to Capture**
   - Canonical enum names for error codes and whether they map 1:1 with HTTP status families.
   - Duration literal canonicalisation rules (store as `std.time.Duration` vs custom struct).
@@ -273,7 +273,7 @@ This roadmap translates the sydraQL language vision into a sequenced engineering
   - Add pagination/limit enforcement on server side.
   - Wire CLI command `sydradb query <file|inline>`.
   - Hook translator: `sql_to_sydraql(sql)` returning AST or error; share error codes.
-  - Update `docs/compatibility.md` with mapping table; add CLI examples to `docs/FORMAT.md` or new quickstart.
+  - Update the [PostgreSQL compatibility matrix](../reference/postgres-compatibility/compat-matrix-v0.1.md) with a mapping table; add CLI examples to [CLI](../reference/cli.md) and [Quickstart](../getting-started/quickstart.md).
 - **Testing**
   - HTTP integration tests under `tests/http/` using in-memory server harness.
   - CLI snapshot tests verifying output formatting.
@@ -316,7 +316,7 @@ This roadmap translates the sydraQL language vision into a sequenced engineering
   - Implement `scripts/gen-function-docs.zig` to export function registry into Markdown in `docs/sydraql-functions.md`.
   - Wire query execution metrics into Prometheus exporter: parse latency, plan latency, execution time, memory usage.
   - Configure CI jobs: unit tests, integration tests, fuzz smoke (short run), benchmark smoke (with tolerated variance).
-  - Document developer workflow in `docs/FORMAT.md` (new section).
+  - Document developer workflow in [Contributing](./contributing.md) and [Docusaurus toolbox](./docusaurus-toolbox.md).
 - **Acceptance Criteria**
   - CI pipeline includes new checks and passes on main branch.
   - Fuzz harness runs nightly (document job) with flakes tracked.
@@ -335,7 +335,7 @@ This roadmap translates the sydraQL language vision into a sequenced engineering
 - **Implementation Notes**
   - Integrate with OSS-Fuzz style corpus; ensure reproducibility by storing seeds in repo.
   - Build doc generator from `functions.zig` to Markdown with auto-updated table (hook into CI diff check).
-  - Add `zig fmt` hook as pre-commit to keep docs consistent (update `docs/FORMAT.md`).
+  - Add `zig fmt` hook as pre-commit to keep docs consistent; document it in [Contributing](./contributing.md).
   - Provide `./tools/sydraql-lint` script to run subset of checks locally.
 - **Extended Testing**
   - Nightly fuzz results summarised in `docs/sydraql-fuzz-report.md`.
@@ -510,7 +510,7 @@ This roadmap translates the sydraQL language vision into a sequenced engineering
 - Provide VS Code snippets/task configs for running parser/engine tests quickly.
 - Add `justfile` or `Makefile` shortcuts (`just parser-tests`, `just engine-bench`).
 - Integrate Zig language server diagnostics to highlight sydraQL doc grammar mismatches.
-- Deliver onboarding guide appended to `docs/FORMAT.md` with step-by-step environment setup.
+- Deliver onboarding guide via [Quickstart](../getting-started/quickstart.md) + [Contributing](./contributing.md) with step-by-step environment setup.
 
 ## Open Follow-Up Work (Post-v0 Backlog Seeds)
 
@@ -526,4 +526,4 @@ This roadmap translates the sydraQL language vision into a sequenced engineering
 - Shared dashboard tracking phase completion, test status, and performance targets.
 - Release readiness reviews at Phase 4, Phase 6, and Phase 8 gates with stakeholders from storage, ops, and product.
 
-This roadmap should be reviewed at the end of each phase and adjusted as implementation feedback arrives. Align issues in `docs/sydraQL-issues.csv` with the phase headers above to keep backlog prioritisation transparent.
+This roadmap should be reviewed at the end of each phase and adjusted as implementation feedback arrives. Align issues in the [sydraQL backlog](./sydraql-backlog.md) with the phase headers above to keep backlog prioritisation transparent.

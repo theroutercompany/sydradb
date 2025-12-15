@@ -11,6 +11,11 @@ Loads SQL→sydraQL translation test cases from a JSONL (JSON Lines) fixture fil
 
 The module is used by tests (see `tests/translator/cases.jsonl`) to validate translator behavior against a fixed suite of inputs.
 
+## See also
+
+- [SQL → sydraQL translator](../query/translator.md)
+- [Compatibility: SQLSTATE](./sqlstate.md) (error cases)
+
 ## JSONL file format
 
 Each non-empty line is a JSON object with fields:

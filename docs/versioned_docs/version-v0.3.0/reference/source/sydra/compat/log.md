@@ -14,6 +14,11 @@ This is intended for:
 - observing translation behavior in real traffic
 - collecting samples for debugging and compatibility testing
 
+## Used by
+
+- [SQL → sydraQL translator](../query/translator.md) (records every translation/fallback)
+- [Translation stats](./stats.md) (counters updated by `record`)
+
 ## Public API
 
 ### `pub const Recorder = struct { ... }`

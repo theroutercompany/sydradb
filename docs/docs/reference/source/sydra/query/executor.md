@@ -9,6 +9,13 @@ title: src/sydra/query/executor.zig
 
 Wraps the operator pipeline with a cursor API suitable for HTTP/pgwire surfaces.
 
+## See also
+
+- [Operator pipeline](./operator.md)
+- [Physical plan builder](./physical.md)
+- [Orchestration entrypoint](./exec.md)
+- [pgwire server](../compat/wire-server.md) (streams cursor results over pgwire)
+
 ## Definition index (public)
 
 ### `pub const Value`

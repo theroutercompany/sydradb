@@ -1,12 +1,24 @@
+---
+title: "ADR 0006: Git-Inspired Storage Model for SydraDB"
+sidebar_position: 6
+---
+
 # ADR 0006: Git-Inspired Storage Model for SydraDB
 
 ## Status
 Proposed
 
+Implementation reference (current, related subsystems):
+
+- [On-disk format](../../reference/on-disk-format.md)
+- [Object store module](../../reference/source/sydra/storage/object-store.md)
+- [Manifest module](../../reference/source/sydra/storage/manifest.md)
+- [Allocator roadmap ADR](./0007-allocator-shard-roadmap.md)
+
 ## Context
 - SydraDB currently relies on WAL segments and columnar time-series segments without a first-class versioned metadata model.
 - We plan to support advanced retention, branching, and replay scenarios reminiscent of DVCS workflows (branching, commits, diffs).
-- The allocator roadmap (#61) will introduce shard-local arenas that can benefit from an object-store style layout.
+- The allocator roadmap ([#61](https://github.com/theroutercompany/sydradb/issues/61)) will introduce shard-local arenas that can benefit from an object-store style layout.
 
 ## Goals
 - Provide a content-addressable object graph for series metadata, schemas, and compaction manifests.
@@ -21,7 +33,7 @@ Proposed
 4. Refs: named pointers (`main`, `snapshots/<date>`) resolved lazily; stored as plain text files within ref namespace for quick updates.
 
 ### Storage Layout
-- Content-addressable store under `data/object/<first-two-bytes>/<full-hash>.obj`.
+- Content-addressable store under `<data_dir>/objects/<prefix>/<hex>` (aligns with the current `object_store` layout).
 - Separate ref namespace `data/refs/*` mimicking Git's `refs/heads`, `refs/tags`.
 - Object serialization uses Zig-friendly framing (length-prefixed sections) to avoid zlib; compression delegated to codec layer.
 
@@ -60,5 +72,5 @@ Proposed
 3. Adopt content-addressable object store (chosen): fits allocator roadmap, extensible for branching.
 
 ## References
-- Issue #61 (Allocator), upcoming data-model issue (to be opened).
+- Issue [#61](https://github.com/theroutercompany/sydradb/issues/61) (allocator shards), upcoming data-model issue (to be opened).
 - Git internal docs as inspiration: commits, trees, blobs, refs.

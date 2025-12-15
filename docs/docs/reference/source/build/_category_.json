@@ -1,5 +1,7 @@
 {
     "label": "Build",
-    "position": 0
+    "position": 0,
+    "link": {
+        "type": "generated-index"
+    }
 }
-

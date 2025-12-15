@@ -11,6 +11,12 @@ Provides simple, process-wide counters used by the Postgres-compatibility transl
 
 The counters are atomic so they can be incremented from multiple threads.
 
+## Used by
+
+- [SQL → sydraQL translator](../query/translator.md)
+- [Translation log (JSONL)](./log.md)
+- [pgwire server](./wire-server.md) and [HTTP debug endpoints](../http.md)
+
 ## Public API
 
 ### `pub const Snapshot`

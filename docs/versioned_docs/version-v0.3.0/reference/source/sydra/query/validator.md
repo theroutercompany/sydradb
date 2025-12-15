@@ -9,7 +9,14 @@ title: src/sydra/query/validator.zig
 
 Performs semantic checks over the AST and produces diagnostics.
 
-This stage is used by `exec.execute` before planning.
+This stage is used by [`exec.execute`](./exec.md) before planning.
+
+## See also
+
+- [Parser](./parser.md) and [AST](./ast.md)
+- [Diagnostics and error codes](./errors.md)
+- [Function registry](./functions.md)
+- [Logical plan builder](./plan.md)
 
 ## Definition index (public)
 

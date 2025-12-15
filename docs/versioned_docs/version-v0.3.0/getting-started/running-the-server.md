@@ -15,6 +15,11 @@ zig build
 
 The server binds to `0.0.0.0:<http_port>` as configured in `sydradb.toml`.
 
+See:
+
+- [Configuration – `http_port`](../reference/configuration.md#http_port-integer)
+- [HTTP server implementation](../reference/source/sydra/http.md)
+
 ## Config file lookup
 
 `sydradb` loads `sydradb.toml` from the current working directory (CWD). If it is missing or unreadable, the server uses built-in defaults (mirroring `sydradb.toml.example`).
@@ -25,7 +30,7 @@ See: [Configuration](../reference/configuration).
 
 ## Authentication
 
-If `auth_token` is non-empty in config, all routes under `/api/*` require:
+If [`auth_token`](../reference/configuration.md#auth_token-string) is non-empty in config, all routes under `/api/*` require:
 
 ```
 Authorization: Bearer <auth_token>
@@ -35,11 +40,11 @@ Non-`/api/` routes (for example `/metrics` and `/debug/*`) are not gated by this
 
 ## Endpoints
 
-- `/metrics` (GET) – Prometheus-style text metrics
-- `/api/v1/ingest` (POST) – NDJSON ingest
-- `/api/v1/query/range` (GET/POST) – time range query by `series` or `series_id`
-- `/api/v1/query/find` (POST) – tag-based series lookup
-- `/api/v1/sydraql` (POST) – sydraQL query execution (request body is plain text)
+- [`/metrics`](../reference/http-api.md#get-metrics) (GET) – Prometheus-style text metrics
+- [`/api/v1/ingest`](../reference/http-api.md#post-apiv1ingest) (POST) – NDJSON ingest
+- [`/api/v1/query/range`](../reference/http-api.md#post-apiv1queryrange) (GET/POST) – time range query by `series` or `series_id`
+- [`/api/v1/query/find`](../reference/http-api.md#post-apiv1queryfind) (POST) – tag-based series lookup
+- [`/api/v1/sydraql`](../reference/http-api.md#post-apiv1sydraql) (POST) – sydraQL query execution (request body is plain text)
 - `/debug/compat/stats` (GET) – compatibility counters
 - `/debug/compat/catalog` (GET) – compatibility catalog snapshot
 - `/debug/alloc/stats` (GET) – allocator stats (only in `small_pool` allocator mode)
@@ -56,3 +61,7 @@ Defaults:
 
 - `address`: `127.0.0.1`
 - `port`: `6432`
+
+See also:
+
+- [CLI](../reference/cli.md#pgwire-address-port)

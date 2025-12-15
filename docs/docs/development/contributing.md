@@ -8,6 +8,12 @@ This page is a practical checklist for making changes to SydraDB without fightin
 
 For repository-wide conventions, also see `AGENTS.md` (mirrored in `Reference/Source Reference/Repository/AGENTS.md`).
 
+See also:
+
+- [Documentation site](./docs-site.md)
+- [Docusaurus toolbox](./docusaurus-toolbox.md)
+- [Documentation coverage plan](./documentation-plan.md)
+
 ## Prerequisites
 
 - Zig `0.15.x` (recommended: use the pinned Nix toolchain)

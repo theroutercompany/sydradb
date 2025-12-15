@@ -38,6 +38,8 @@ npm start
 
 By default the HTTP server listens on port `8080`. If you see “address already in use”, either stop the other process or set `http_port` in `sydradb.toml`.
 
+See: [Configuration – `http_port`](../reference/configuration.md#http_port-integer).
+
 ### Config file not being picked up
 
 `sydradb` loads `./sydradb.toml` from the current working directory (CWD). If you run the binary from another directory, it will not see the config unless you copy/symlink it there.
@@ -65,17 +67,21 @@ See: [Configuration](../reference/configuration).
 
 ### `401 unauthorized` on `/api/*`
 
-If `auth_token` is set in `sydradb.toml`, all `/api/*` routes require:
+If [`auth_token`](../reference/configuration.md#auth_token-string) is set in `sydradb.toml`, all `/api/*` routes require:
 
 ```
 Authorization: Bearer <auth_token>
 ```
+
+See: [HTTP API – Authentication](../reference/http-api.md#authentication).
 
 ### Ingest returns `413 Payload Too Large`
 
 `POST /api/v1/ingest` buffers input lines. A single NDJSON line that exceeds the internal buffer fails the request.
 
 If you are batch-ingesting, split large payloads into smaller lines and smaller requests.
+
+See: [HTTP API – `POST /api/v1/ingest`](../reference/http-api.md#post-apiv1ingest).
 
 ## Debugging and introspection
 

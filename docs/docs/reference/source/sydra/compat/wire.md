@@ -13,9 +13,9 @@ Module aggregator for the Postgres wire-protocol (“pgwire”) server implement
 
 Re-exports submodules:
 
-- `pub const protocol` → `wire/protocol.zig`
-- `pub const session` → `wire/session.zig`
-- `pub const server` → `wire/server.zig`
+- `pub const protocol` → [`wire/protocol.zig`](./wire-protocol.md)
+- `pub const session` → [`wire/session.zig`](./wire-session.md)
+- `pub const server` → [`wire/server.zig`](./wire-server.md)
 
 ## Code excerpt
 

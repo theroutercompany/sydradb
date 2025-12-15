@@ -1,5 +1,7 @@
 {
     "label": "storage",
-    "position": 50
+    "position": 50,
+    "link": {
+        "type": "generated-index"
+    }
 }
-

@@ -7,7 +7,14 @@ title: src/sydra/query/parser.zig
 
 ## Purpose
 
-Parses sydraQL text into an AST (`ast.zig`) using the lexer (`lexer.zig`).
+Parses sydraQL text into an AST ([`ast.zig`](./ast.md)) using the lexer ([`lexer.zig`](./lexer.md)).
+
+## See also
+
+- [Query pipeline overview](./overview.md)
+- [Lexer](./lexer.md)
+- [AST types](./ast.md)
+- [Validator](./validator.md)
 
 ## Definition index (public)
 

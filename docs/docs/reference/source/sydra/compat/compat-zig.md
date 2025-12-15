@@ -13,12 +13,12 @@ Acts as a single import point for SydraDB’s PostgreSQL compatibility layer, re
 
 This file exports module aliases:
 
-- `pub const stats` → `compat/stats.zig`
-- `pub const sqlstate` → `compat/sqlstate.zig`
-- `pub const clog` → `compat/log.zig`
-- `pub const fixtures.translator` → `compat/fixtures/translator.zig`
-- `pub const catalog` → `compat/catalog.zig`
-- `pub const wire` → `compat/wire.zig`
+- `pub const stats` → [`compat/stats.zig`](./stats.md)
+- `pub const sqlstate` → [`compat/sqlstate.zig`](./sqlstate.md)
+- `pub const clog` → [`compat/log.zig`](./log.md)
+- `pub const fixtures.translator` → [`compat/fixtures/translator.zig`](./fixtures-translator.md)
+- `pub const catalog` → [`compat/catalog.zig`](./catalog.md)
+- `pub const wire` → [`compat/wire.zig`](./wire.md)
 
 Notes:
 

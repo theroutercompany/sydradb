@@ -1,6 +1,22 @@
+---
+sidebar_position: 2
+tags:
+  - sydraql
+  - design
+---
+
 # sydraQL Design
 
-This document defines the initial design for sydraQL, the native time-series query language for SydraDB. It expands on the backlog in `/legacy/sydraQL-issues.csv` and sets the scope for the parser, planner, and execution work.
+This document defines the initial design for sydraQL, the native time-series query language for SydraDB. It complements the engineering roadmap in [Development: sydraQL roadmap](../development/sydraql-roadmap.md) and sets the scope for lexer/parser, planning, and execution work.
+
+Implementation reference (current code):
+
+- HTTP surface: [HTTP API – `POST /api/v1/sydraql`](../reference/http-api.md#post-apiv1sydraql) and [`handleSydraql`](../reference/source/sydra/http.md#fn-handlesydraql-void)
+- Query pipeline: [overview](../reference/source/sydra/query/overview.md), [lexer](../reference/source/sydra/query/lexer.md), [parser](../reference/source/sydra/query/parser.md), [validator](../reference/source/sydra/query/validator.md)
+- Planning/execution: [logical plan](../reference/source/sydra/query/plan.md), [optimizer](../reference/source/sydra/query/optimizer.md), [physical plan](../reference/source/sydra/query/physical.md), [operators](../reference/source/sydra/query/operator.md)
+- PostgreSQL translation: [translator](../reference/source/sydra/query/translator.md) and [compatibility matrix](../reference/postgres-compatibility/compat-matrix-v0.1.md)
+
+Note: this doc is a design target; the “Source Reference” pages describe what is implemented today.
 
 ## Goals
 - **Time-series first**: expressive range scans, tag filters, downsampling, and rates without exposing the full SQL surface.
@@ -130,7 +146,7 @@ Each function entry should specify argument types, return type, and planner capa
 
 ## Integration & Compatibility
 - PostgreSQL translator targets sydraQL AST: only SQL constructs with direct translation are accepted; others produce explicit SQLSTATE warnings.
-- Document mapping table (`compatibility.md` appendix) enumerating supported SQL features and their sydraQL equivalents.
+- Document mapping table: [PostgreSQL compatibility matrix](../reference/postgres-compatibility/compat-matrix-v0.1.md) enumerating supported SQL features and their sydraQL equivalents.
 - HTTP API responds with JSON: metadata (execution stats, trace ids) plus rows.
 
 ## Implementation Roadmap
@@ -155,3 +171,8 @@ Each function entry should specify argument types, return type, and planner capa
 - What retention/TTL semantics should `DELETE` enforce when interacting with compaction?
 
 Feedback welcome—update this document as decisions land or scope evolves.
+
+## See also
+
+- [Source: query errors and diagnostics](../reference/source/sydra/query/errors.md)
+- [Development: sydraQL roadmap](../development/sydraql-roadmap.md)

@@ -9,6 +9,12 @@ title: src/sydra/query/type_inference.zig
 
 Infers expression types (and whether an expression references time) to support planning and validation.
 
+## See also
+
+- [Function registry](./functions.md) (type rules + return strategies)
+- [Validator](./validator.md)
+- [Logical plan builder](./plan.md)
+
 ## Definition index (public)
 
 ### `pub const ExprInfo`

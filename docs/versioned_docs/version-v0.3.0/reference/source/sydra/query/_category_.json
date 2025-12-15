@@ -1,5 +1,7 @@
 {
     "label": "query",
-    "position": 40
+    "position": 40,
+    "link": {
+        "type": "generated-index"
+    }
 }
-

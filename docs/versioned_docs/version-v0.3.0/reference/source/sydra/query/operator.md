@@ -11,6 +11,13 @@ Implements the physical execution pipeline as a tree of operators producing rows
 
 This is the core runtime layer used by `executor.zig`.
 
+## See also
+
+- [Executor](./executor.md)
+- [Physical plan builder](./physical.md)
+- [Expression evaluation](./expression.md) and [Value representation](./value.md)
+- [Engine](../engine.md) (scan operator delegates to `Engine.queryRange`)
+
 ## Definition index (public)
 
 ### `pub const Value`

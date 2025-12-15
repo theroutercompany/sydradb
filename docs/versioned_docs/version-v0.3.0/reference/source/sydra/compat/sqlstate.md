@@ -11,6 +11,12 @@ Defines a small, canonical subset of PostgreSQL SQLSTATE identifiers SydraDB aim
 
 This module is used by compatibility surfaces (e.g. pgwire translation failures) to return structured error codes.
 
+## Used by
+
+- [SQL → sydraQL translator](../query/translator.md) (fallback errors)
+- [pgwire server](./wire-server.md) (client-visible errors)
+- [pgwire protocol writers](./wire-protocol.md) (`ErrorResponse` fields)
+
 ## Public API
 
 ### `pub const Code = enum { ... }`

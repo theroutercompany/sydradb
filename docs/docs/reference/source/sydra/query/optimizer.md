@@ -9,6 +9,12 @@ title: src/sydra/query/optimizer.zig
 
 Applies logical rewrites to improve the plan before physical lowering.
 
+## See also
+
+- [Logical plan builder](./plan.md)
+- [Physical plan builder](./physical.md)
+- [Orchestration entrypoint](./exec.md) (calls `optimize` during execution)
+
 ## Definition index (public)
 
 ### `pub const OptimizeError`

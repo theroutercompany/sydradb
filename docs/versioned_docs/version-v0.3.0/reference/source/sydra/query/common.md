@@ -9,6 +9,12 @@ title: src/sydra/query/common.zig
 
 Defines shared low-level utilities used throughout the sydraQL pipeline.
 
+## Used by
+
+- [Lexer](./lexer.md) (token spans)
+- [Parser](./parser.md) and [AST](./ast.md) (node spans)
+- [Errors](./errors.md) and [Validator](./validator.md) (diagnostic ranges)
+
 ## Public API
 
 ### `pub const Span`

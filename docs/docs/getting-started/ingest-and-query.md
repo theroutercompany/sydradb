@@ -1,18 +1,21 @@
 ---
 sidebar_position: 3
+tags:
+  - getting-started
+  - api
 ---
 
 # Ingest and query
 
 ## Ingest (HTTP)
 
-`POST /api/v1/ingest` accepts NDJSON (newline-delimited JSON). Each line is an object with:
+[`POST /api/v1/ingest`](../reference/http-api.md#post-apiv1ingest) accepts NDJSON (newline-delimited JSON). Each line is an object with:
 
 - `series` (string, required)
 - `ts` (integer, required)
 - `value` (number, optional)
 - `fields` (object, optional): if `value` is missing, the first numeric field is used
-- `tags` (object, optional): converted to a JSON string and hashed into the series id
+- `tags` (object, optional): converted to a JSON string and hashed into the series id (see [Series IDs](../reference/series-ids.md))
 
 Example:
 
@@ -30,7 +33,7 @@ Response:
 
 ### POST JSON
 
-`POST /api/v1/query/range` takes JSON:
+[`POST /api/v1/query/range`](../reference/http-api.md#post-apiv1queryrange) takes JSON:
 
 ```json
 {"series":"weather.room1","start":1694290000,"end":1694310000}
@@ -46,7 +49,7 @@ The response is a JSON array of points:
 
 ### GET query parameters
 
-`GET /api/v1/query/range` supports:
+[`GET /api/v1/query/range`](../reference/http-api.md#get-apiv1queryrange) supports:
 
 - `series_id=<u64>` (preferred) or `series=<string>`
 - `tags=<string>` (defaults to `{}`) — passed into the series hash as-is
@@ -61,7 +64,7 @@ curl 'http://localhost:8080/api/v1/query/range?series=weather.room1&start=169429
 
 ## Find series by tags (HTTP)
 
-`POST /api/v1/query/find` accepts JSON:
+[`POST /api/v1/query/find`](../reference/http-api.md#post-apiv1queryfind) accepts JSON:
 
 - `tags` (object): exact-match on tag key/value pairs
 - `op` (string, optional): `"and"` (default) or `"or"` for combining tag filters
@@ -70,7 +73,12 @@ Response is an array of matching `series_id` values.
 
 ## sydraQL (HTTP)
 
-`POST /api/v1/sydraql` expects the request body to be **plain text** containing a sydraQL query.
+[`POST /api/v1/sydraql`](../reference/http-api.md#post-apiv1sydraql) expects the request body to be **plain text** containing a sydraQL query.
+
+See also:
+
+- [sydraQL design](../concepts/sydraql-design.md)
+- [Source: query execution entrypoint](../reference/source/sydra/query/exec.md)
 
 Response shape:
 
@@ -92,3 +100,7 @@ cat points.ndjson | ./zig-out/bin/sydradb ingest
 ./zig-out/bin/sydradb query 123 1694290000 1694310000
 ```
 
+See also:
+
+- [CLI](../reference/cli.md)
+- [On-disk format](../reference/on-disk-format.md)

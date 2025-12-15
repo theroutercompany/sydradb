@@ -9,6 +9,12 @@ title: src/sydra/query/errors.zig
 
 Defines diagnostic structures for sydraQL validation.
 
+## See also
+
+- [Common utilities](./common.md) (`Span`)
+- [Validator](./validator.md) (produces diagnostics)
+- [Orchestration entrypoint](./exec.md) (returns `ValidationFailed`)
+
 ## Definition index (public)
 
 ### `pub const ErrorCode = enum { ... }`

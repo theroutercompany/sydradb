@@ -1,10 +1,22 @@
+---
+title: "ADR 0007: Sharded Small-Pool Allocator Implementation Plan"
+sidebar_position: 7
+---
+
 # ADR 0007: Sharded Small-Pool Allocator Implementation Plan
 
 ## Status
 Accepted
 
 ## Context
-We need a custom allocator that meets the performance and telemetry expectations outlined in ADR 0006 and the supplementary architecture design. The allocator must deliver predictable tail latency for tiny allocations, isolate shard contention, and provide strong instrumentation hooks. This document captures the detailed implementation plan before we start modifying the allocator core.
+We need a custom allocator that meets the performance and telemetry expectations outlined in [ADR 0006](./0006-git-inspired-data-model.md) and the [supplementary architecture design](../../architecture/supplementary-design-2025-10-18.md). The allocator must deliver predictable tail latency for tiny allocations, isolate shard contention, and provide strong instrumentation hooks. This document captures the detailed implementation plan before we start modifying the allocator core.
+
+Implementation reference (current code):
+
+- Allocator entrypoints and stats: [`src/sydra/alloc.zig`](../../reference/source/sydra/alloc/alloc-zig.md)
+- Slab shard implementation: [`src/sydra/alloc/slab_shard.zig`](../../reference/source/sydra/alloc/slab-shard.md)
+- Bench harness: [`tools/bench_alloc.zig`](../../reference/source/tools/bench-alloc.md)
+- Telemetry surfaces: [CLI `stats`](../../reference/cli.md#stats) and [HTTP `/debug/alloc/stats`](../../reference/http-api.md#debug-endpoints)
 
 ## Workload & Constraints
 - Hot objects: 16–256 B, bursty, multi-writer with many concurrent readers.
@@ -87,7 +99,7 @@ We need a custom allocator that meets the performance and telemetry expectations
 - Stats struct now aggregates shard hits/misses, deferred totals, and epoch bounds; bench driver emits the new metrics.
 
 **Tasks**
-1. Add atomic counters in `shard_shard`.
+1. Add atomic counters in `slab_shard`.
 2. Update `alloc.zig` stats structs & HTTP/CLI telemetry surfaces.
 3. Document metrics in README/supplementary doc.
 
@@ -128,6 +140,6 @@ We need a custom allocator that meets the performance and telemetry expectations
 - **Concurrency bugs**: use atomics and per-shard locks carefully; keep critical sections short.
 
 ## References
-- adr/0006-git-inspired-data-model.md (allocator section).
-- `../../architecture/supplementary-design-2025-10-18` updates.
-- Existing `SmallPoolAllocator` and `bench_alloc` tooling.
+- [ADR 0006](./0006-git-inspired-data-model.md) (allocator section)
+- [Supplementary architecture design](../../architecture/supplementary-design-2025-10-18.md)
+- Current implementation: [`src/sydra/alloc.zig`](../../reference/source/sydra/alloc/alloc-zig.md), [`src/sydra/alloc/slab_shard.zig`](../../reference/source/sydra/alloc/slab-shard.md), [`tools/bench_alloc.zig`](../../reference/source/tools/bench-alloc.md)

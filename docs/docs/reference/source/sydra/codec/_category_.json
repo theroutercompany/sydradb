@@ -1,5 +1,7 @@
 {
     "label": "codec",
-    "position": 20
+    "position": 20,
+    "link": {
+        "type": "generated-index"
+    }
 }
-

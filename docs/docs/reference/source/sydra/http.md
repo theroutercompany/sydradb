@@ -13,7 +13,14 @@ Implements SydraDB’s HTTP server:
 - Routes requests to API handlers (`/api/v1/*`, `/metrics`, `/debug/*`)
 - Bridges HTTP requests into the engine (ingest/query) and sydraQL execution
 
-For the user-facing contract, see `Reference/HTTP API`.
+For the user-facing contract, see [Reference: HTTP API](../../http-api.md).
+
+## See also
+
+- [Engine](./engine.md) (ingest queue, WAL, memtable, retention)
+- [Types](./types.md) (`SeriesId`, `Point`, hashing helpers)
+- [Query execution entrypoint](./query/exec.md) (`POST /api/v1/sydraql`)
+- [Compatibility layer overview](./compat/overview.md) (debug endpoints under `/debug/compat/*`)
 
 ## Public API
 
@@ -128,8 +135,8 @@ Emits Prometheus text exposition from engine counters, including:
 
 Consumes NDJSON and ingests each line:
 
-- Computes `series_id` using `types.seriesIdFrom(series, tags_json)`.
-- If `tags` is present, it is stringified to JSON (`extractTagsJson`) and also recorded via `eng.noteTags(...)`.
+- Computes `series_id` using `types.seriesIdFrom(series, tags_json)` (see [Types](./types.md)).
+- If `tags` is present, it is stringified to JSON (`extractTagsJson`) and also recorded via `eng.noteTags(...)` (see [Engine](./engine.md)).
 - If `value` is missing, it will search `fields` for the first numeric value (iteration order dependent).
 
 Returns `{"ingested":<count>}`.

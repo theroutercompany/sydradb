@@ -37,7 +37,11 @@ Implications:
 
 - The exact `tags_json` string participates in the hash; differing whitespace or key order will produce different series IDs.
 
-See also: `Reference/Series IDs`.
+See also:
+
+- [Reference: Series IDs](../../series-ids.md)
+- [Engine](./engine.md) (ingest and range query use `SeriesId`)
+- [HTTP server](./http.md) (derives `SeriesId` during ingest)
 
 ## Code (full file)
 

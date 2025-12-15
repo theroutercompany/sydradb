@@ -17,6 +17,15 @@ The server:
 - translates SQL → sydraQL and executes it via the regular query pipeline
 - writes results as `RowDescription` + `DataRow` messages
 
+## See also
+
+- [wire protocol](./wire-protocol.md) (message framing + startup/response writers)
+- [wire session](./wire-session.md) (handshake + session config)
+- [wire re-exports](./wire.md)
+- [SQL → sydraQL translator](../query/translator.md)
+- [sydraQL execution entrypoint](../query/exec.md)
+- [Reference: PostgreSQL Compatibility](../../../postgres-compatibility/architecture.md)
+
 ## Public API
 
 ### `pub const ServerConfig`
@@ -90,7 +99,7 @@ Behavior:
 - If empty:
   - writes `EmptyQueryResponse` then `ReadyForQuery('I')`
 - Otherwise:
-  - calls `translator.translate(alloc, sql)`
+  - calls `translator.translate(alloc, sql)` (see [SQL → sydraQL translator](../query/translator.md))
     - on OOM: `ErrorResponse(FATAL, 53100, "out of memory during translation")`
   - on translation success:
     - calls `handleSydraqlQuery(…, sydraql)`
@@ -147,7 +156,7 @@ No prepared statement state is stored, and no subsequent `Bind/Execute` messages
 
 Execution:
 
-- Calls `query_exec.execute(alloc, engine, sydraql)` to create an `ExecutionCursor`.
+- Calls [`query_exec.execute`](../query/exec.md) to create an `ExecutionCursor`.
 - Streams:
   1. `RowDescription` (even for zero columns; then `columns.len` is `0`)
   2. `DataRow` for each row returned by `cursor.next()`
@@ -174,7 +183,7 @@ Writes pgwire `RowDescription` (`'T'`) using:
 
 - the column name (`plan.ColumnInfo.name`)
 - placeholder table/attribute identifiers (`0`)
-- a single “default type” mapping for every column (`query_functions.pgTypeInfo(Type.init(.value, true))`)
+- a single “default type” mapping for every column (`query_functions.pgTypeInfo(Type.init(.value, true))`; see [src/sydra/query/functions.zig](../query/functions.md))
 
 ### `fn writeDataRow(writer, values, row_buffer, value_buffer) !void`
 

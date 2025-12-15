@@ -16,6 +16,7 @@ const config = {
 
     onBrokenLinks: "throw",
     markdown: {
+        mermaid: true,
         hooks: {
             onBrokenMarkdownLinks: "warn",
         },
@@ -34,6 +35,9 @@ const config = {
                 docs: {
                     sidebarPath: require.resolve("./sidebars.js"),
                     routeBasePath: "/docs",
+                    editUrl: "https://github.com/theroutercompany/sydradb/edit/main/docs/",
+                    showLastUpdateTime: true,
+                    showLastUpdateAuthor: true,
                 },
                 blog: false,
                 theme: {
@@ -56,6 +60,7 @@ const config = {
             },
         ],
     ],
+    themes: ["@docusaurus/theme-mermaid"],
 
     themeConfig:
         /** @type {import('@docusaurus/preset-classic').ThemeConfig} */
@@ -66,6 +71,11 @@ const config = {
                     {
                         to: "/docs/intro",
                         label: "Docs",
+                        position: "left",
+                    },
+                    {
+                        type: "custom-docs-tags",
+                        label: "Tags",
                         position: "left",
                     },
                     {
@@ -83,6 +93,12 @@ const config = {
                     },
                 ],
             },
+            docs: {
+                sidebar: {
+                    hideable: true,
+                    autoCollapseCategories: true,
+                },
+            },
             footer: {
                 style: "dark",
                 links: [
@@ -92,6 +108,10 @@ const config = {
                             {
                                 label: "Introduction",
                                 to: "/docs/intro",
+                            },
+                            {
+                                label: "Tags",
+                                to: "/docs/tags",
                             },
                         ],
                     },
@@ -110,7 +130,7 @@ const config = {
             prism: {
                 theme: lightCodeTheme,
                 darkTheme: darkCodeTheme,
-                additionalLanguages: ["zig"],
+                additionalLanguages: ["bash", "json", "toml", "yaml", "zig"],
             },
         }),
 };

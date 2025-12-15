@@ -13,6 +13,13 @@ This is not a full SQL parser; it uses case-insensitive substring searches and s
 
 The main consumer is the pgwire server (`src/sydra/compat/wire/server.zig`), which translates SQL from Postgres clients into sydraQL before running the normal sydraQL pipeline.
 
+## See also
+
+- [pgwire server](../compat/wire-server.md)
+- [Compatibility: SQLSTATE](../compat/sqlstate.md) and [Compatibility: translation log](../compat/log.md)
+- [Compatibility: translator fixtures loader](../compat/fixtures-translator.md)
+- [Query pipeline overview](./overview.md)
+
 ## Definition index (public)
 
 ### `pub const Result = union(enum)`

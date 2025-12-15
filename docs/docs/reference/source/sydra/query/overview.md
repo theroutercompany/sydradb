@@ -9,19 +9,20 @@ This directory implements the sydraQL parsing, planning, and execution pipeline 
 
 ## High-level stages
 
-1. **Lexing**: `lexer.zig`
-2. **Parsing (AST)**: `parser.zig` → `ast.zig`
-3. **Validation / diagnostics**: `validator.zig` (+ `errors.zig`, `type_inference.zig`, `functions.zig`)
-4. **Logical planning**: `plan.zig`
-5. **Optimization**: `optimizer.zig`
-6. **Physical planning**: `physical.zig`
-7. **Execution**: `operator.zig` + `executor.zig`
-8. **Orchestration entrypoint**: `exec.zig` (ties it together and returns an `ExecutionCursor`)
+1. **Lexing**: [`lexer.zig`](./lexer.md)
+2. **Parsing (AST)**: [`parser.zig`](./parser.md) → [`ast.zig`](./ast.md)
+3. **Validation / diagnostics**: [`validator.zig`](./validator.md) (+ [`errors.zig`](./errors.md), [`type_inference.zig`](./type-inference.md), [`functions.zig`](./functions.md))
+4. **Logical planning**: [`plan.zig`](./plan.md)
+5. **Optimization**: [`optimizer.zig`](./optimizer.md)
+6. **Physical planning**: [`physical.zig`](./physical.md)
+7. **Execution**: [`operator.zig`](./operator.md) + [`executor.zig`](./executor.md)
+8. **Orchestration entrypoint**: [`exec.zig`](./exec.md) (ties it together and returns an `ExecutionCursor`)
 
 ## Related docs
 
-- Language design: `Concepts/sydraQL Design`
-- Supplemental implementation notes: `Architecture/sydraDB Architecture & Engineering Design (Supplementary, Oct 18 2025)`
+- User-facing HTTP surface: [Reference: HTTP API](../../../http-api.md) (`POST /api/v1/sydraql`)
+- Language design: [Concepts: sydraQL Design](../../../../concepts/sydraql-design.md)
+- Supplemental implementation notes: [Architecture & Engineering Design (Supplementary, Oct 18 2025)](../../../../architecture/supplementary-design-2025-10-18.md)
 
 ## Code excerpt (pipeline entrypoint)
 

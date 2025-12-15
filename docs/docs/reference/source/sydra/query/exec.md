@@ -13,6 +13,13 @@ This module orchestrates:
 
 - parse → validate → logical plan → optimize → physical plan → execute
 
+## See also
+
+- [Query pipeline overview](./overview.md)
+- [HTTP server](../http.md) (`POST /api/v1/sydraql`)
+- [pgwire server](../compat/wire-server.md) (SQL → sydraQL → execute)
+- Pipeline stages: [lexer](./lexer.md), [parser](./parser.md), [validator](./validator.md), [plan](./plan.md), [optimizer](./optimizer.md), [physical](./physical.md), [executor](./executor.md)
+
 ## Definition index (public)
 
 ### `pub const ExecuteError`

@@ -1,8 +1,15 @@
 ---
 sidebar_position: 1
+tags:
+  - config
 ---
 
 # Configuration (`sydradb.toml`)
+
+Implementation reference:
+
+- [`src/sydra/config.zig`](./source/sydra/config.md)
+- [`sydradb.toml` and `sydradb.toml.example`](./source/repository/configuration-files.md)
 
 ## File location
 
@@ -11,6 +18,8 @@ sidebar_position: 1
 ## Parser notes (important)
 
 The current config loader is a **minimal line-based parser**, not a full TOML implementation.
+
+Implementation notes: [`parseToml` behavior](./source/sydra/config.md#parsing-behavior-parsetoml).
 
 - Comments are only supported as **full-line** comments starting with `#`.
 - Inline `# ...` comments after a value are **not reliably supported** and may:

@@ -1,10 +1,17 @@
 ---
 sidebar_position: 3
+tags:
+  - docs
 ---
 
 # Documentation site
 
 This repository’s documentation site is a Docusaurus project rooted at `docs/`.
+
+See also:
+
+- [Docusaurus toolbox](./docusaurus-toolbox.md) (built-in features and authoring patterns)
+- [Documentation coverage plan](./documentation-plan.md) (how to document the repo line-by-line)
 
 ## Local development
 

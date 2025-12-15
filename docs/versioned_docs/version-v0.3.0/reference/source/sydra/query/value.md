@@ -9,6 +9,12 @@ title: src/sydra/query/value.zig
 
 Defines a runtime value representation used during query execution and expression evaluation.
 
+## See also
+
+- [Expression evaluation](./expression.md)
+- [Operator pipeline](./operator.md)
+- [pgwire server](../compat/wire-server.md) (formats `Value` into text rows)
+
 ## Definition index (public)
 
 ### `pub const ConvertError = error { ... }`

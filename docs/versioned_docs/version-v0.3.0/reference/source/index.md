@@ -2,6 +2,22 @@
 sidebar_position: 1
 ---
 
+import React from "react";
+import DocCardList from "@theme/DocCardList";
+import {
+    filterDocCardListItems,
+    useCurrentSidebarCategory,
+} from "@docusaurus/plugin-content-docs/client";
+import { useLocation } from "@docusaurus/router";
+
+export function BrowseByArea() {
+    const { pathname } = useLocation();
+    const items = filterDocCardListItems(useCurrentSidebarCategory().items).filter(
+        (item) => item?.href !== pathname,
+    );
+    return <DocCardList items={items} />;
+}
+
 # Source reference
 
 This section documents SydraDB’s source tree at the module level, with a focus on:
@@ -21,7 +37,10 @@ This is written against the repository sources (e.g. `src/**`, `cmd/**`) without
 
 ## Where to start
 
-- For process startup and CLI routing: `Entrypoints`.
-- For HTTP endpoints: `src/sydra/http.zig` (under `src/sydra`).
-- For core ingest/query mechanics: `src/sydra/engine.zig` (under `src/sydra`).
+- For process startup and CLI routing: [Entrypoints](./entrypoints/src-main.md).
+- For HTTP endpoints: [src/sydra/http.zig](./sydra/http.md).
+- For core ingest/query mechanics: [src/sydra/engine.zig](./sydra/engine.md).
 
+## Browse by area
+
+<BrowseByArea />

@@ -1,19 +1,22 @@
 ---
 sidebar_position: 5
+tags:
+  - storage
+  - format
 ---
 
 # On-disk format (as implemented)
 
-SydraDB persists state under `data_dir` (default `./data`), using a small set of files/directories.
+SydraDB persists state under [`data_dir`](./configuration.md#data_dir-string) (default `./data`), using a small set of files/directories.
 
 For module-level details, see:
 
-- `Reference/Source Reference/src/sydra/storage/wal.zig`
-- `Reference/Source Reference/src/sydra/storage/segment.zig`
-- `Reference/Source Reference/src/sydra/storage/manifest.zig`
-- `Reference/Source Reference/src/sydra/storage/tags.zig`
-- `Reference/Source Reference/src/sydra/storage/object_store.zig`
-- `Reference/Source Reference/src/sydra/snapshot.zig`
+- [`src/sydra/storage/wal.zig`](./source/sydra/storage/wal.md)
+- [`src/sydra/storage/segment.zig`](./source/sydra/storage/segment.md)
+- [`src/sydra/storage/manifest.zig`](./source/sydra/storage/manifest.md)
+- [`src/sydra/storage/tags.zig`](./source/sydra/storage/tags.md)
+- [`src/sydra/storage/object_store.zig`](./source/sydra/storage/object-store.md)
+- [`src/sydra/snapshot.zig`](./source/sydra/snapshot.md)
 
 ## Directory layout
 
@@ -69,6 +72,8 @@ Default codecs written by the engine:
 - `ts_codec = 1` – delta-of-delta + ZigZag varint (`src/sydra/codec/gorilla.zig.encodeTsDoD`)
 - `val_codec = 1` – Gorilla-style XOR encoding (`src/sydra/codec/gorilla.zig.encodeF64`)
 
+See also: [`src/sydra/codec/gorilla.zig`](./source/sydra/codec/gorilla.md).
+
 ### v0: `SYSEG1` (back-compat)
 
 - Timestamp deltas encoded as ZigZag varints
@@ -81,7 +86,7 @@ The manifest tracks segment entries and is used to:
 - find candidate segments during range queries
 - build per-series “highwater marks” during WAL recovery (so old WAL points aren’t duplicated)
 
-See `Reference/Source Reference/src/sydra/storage/manifest.zig` for the in-memory model and load/save behavior.
+See [`src/sydra/storage/manifest.zig`](./source/sydra/storage/manifest.md) for the in-memory model and load/save behavior.
 
 ## Snapshot/restore
 
@@ -93,3 +98,8 @@ The snapshot mechanism is a directory copy of:
 - `tags.json`
 
 See `Reference/Source Reference/src/sydra/snapshot.zig`.
+
+See also:
+
+- [Configuration](./configuration.md) (`data_dir`, retention)
+- [Source: engine orchestration](./source/sydra/engine.md) (flush, compaction, retention triggers)

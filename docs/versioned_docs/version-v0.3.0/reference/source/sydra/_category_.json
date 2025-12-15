@@ -1,5 +1,7 @@
 {
     "label": "src/sydra",
-    "position": 2
+    "position": 2,
+    "link": {
+        "type": "generated-index"
+    }
 }
-

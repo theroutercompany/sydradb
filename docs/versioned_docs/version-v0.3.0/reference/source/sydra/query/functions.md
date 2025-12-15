@@ -13,6 +13,12 @@ Defines the sydraQL function registry and type-checking rules used by:
 - type inference (`type_inference.zig`)
 - (indirectly) execution/planning decisions via planner hints
 
+## See also
+
+- [Validator](./validator.md)
+- [Type inference](./type-inference.md)
+- [Expression evaluation](./expression.md)
+
 ## Definition index (public)
 
 ### `pub const FunctionKind = enum { ... }`

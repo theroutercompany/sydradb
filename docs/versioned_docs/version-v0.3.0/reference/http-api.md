@@ -1,20 +1,29 @@
 ---
 sidebar_position: 3
+tags:
+  - http
+  - api
 ---
 
 # HTTP API
 
+Implementation reference: [`src/sydra/http.zig`](./source/sydra/http.md).
+
 ## Authentication
 
-If `auth_token` is set in `sydradb.toml`, all routes under `/api/*` require:
+If [`auth_token`](./configuration.md#auth_token-string) is set in `sydradb.toml`, all routes under `/api/*` require:
 
 ```
 Authorization: Bearer <auth_token>
 ```
 
+Implementation: [`handleRequest` auth guard](./source/sydra/http.md#request-routing-and-auth).
+
 ## `GET /metrics`
 
 Returns Prometheus text exposition.
+
+Implementation: [`handleMetrics`](./source/sydra/http.md#fn-handlemetrics-void).
 
 ## `POST /api/v1/ingest`
 
@@ -25,6 +34,8 @@ Consumes NDJSON (newline-delimited JSON). Each line is an object with:
 - `value` (number, optional)
 - `fields` (object, optional): if `value` is missing, the first numeric field is used
 - `tags` (object, optional)
+
+Implementation: [`handleIngest`](./source/sydra/http.md#fn-handleingest-void).
 
 Returns:
 
@@ -51,6 +62,8 @@ Returns a JSON array:
 [{"ts":1694300000,"value":24.2}]
 ```
 
+Implementation: [`handleQuery` (POST JSON)](./source/sydra/http.md#fn-handlequery-void-post-json).
+
 ## `GET /api/v1/query/range?...`
 
 Query parameters:
@@ -62,6 +75,8 @@ Query parameters:
 
 Returns the same JSON array as the POST form.
 
+Implementation: [`handleQueryGet` (GET query string)](./source/sydra/http.md#fn-handlequeryget-void-get-query-string).
+
 ## `POST /api/v1/query/find`
 
 Request JSON:
@@ -70,6 +85,8 @@ Request JSON:
 - `op` (string, optional): `"and"` (default) or `"or"`
 
 Response JSON: array of matching `series_id` values.
+
+Implementation: [`handleFind`](./source/sydra/http.md#fn-handlefind-void).
 
 ## `POST /api/v1/sydraql`
 
@@ -81,9 +98,18 @@ Response JSON object:
 - `rows`: array of row arrays
 - `stats`: execution timings and operator stats
 
+Implementation:
+
+- [`handleSydraql`](./source/sydra/http.md#fn-handlesydraql-void)
+- [Query execution entrypoint (`exec.execute`)](./source/sydra/query/exec.md)
+
 ## Debug endpoints
 
 - `GET /debug/compat/stats` – JSON counters
 - `GET /debug/compat/catalog` – JSON snapshot of compat catalog objects
 - `GET /debug/alloc/stats` – JSON allocator stats (only in `small_pool` allocator mode)
 
+See also:
+
+- [`SeriesId` derivation and caveats](./series-ids.md)
+- [Configuration](./configuration.md) (auth, ports, data dir)

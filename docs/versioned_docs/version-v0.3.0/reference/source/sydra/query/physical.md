@@ -11,6 +11,12 @@ Lowers a logical plan into a physical plan with execution-oriented metadata.
 
 The physical plan carries hints such as extracted time bounds for scan pushdown.
 
+## See also
+
+- [Logical plan builder](./plan.md) and [Optimizer](./optimizer.md)
+- [Operator pipeline](./operator.md)
+- [Engine](../engine.md) (scan delegates to `Engine.queryRange`)
+
 ## Definition index (public)
 
 ### `pub const BuildError`

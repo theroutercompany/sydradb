@@ -12,6 +12,13 @@ Evaluates AST expressions against either:
 - an abstract resolver (`Resolver`), or
 - a concrete row (`RowContext`), for use in filter/project execution.
 
+## See also
+
+- [AST types](./ast.md)
+- [Value representation](./value.md)
+- [Function registry](./functions.md)
+- [Operator pipeline](./operator.md) (filter/project evaluation)
+
 ## Definition index (public)
 
 ### `pub const Value`
