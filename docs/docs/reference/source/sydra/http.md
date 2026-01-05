@@ -205,6 +205,4 @@ defer cursor.deinit();
 - `fn writeStatsObject(...) !void` – emits the `stats` object for sydraQL responses
 - `fn findHeader(...) ?[]const u8` – case-insensitive header lookup
 
-## Known issues (as observed in source)
 
-- The `/status` route check uses `td.mem.eql` (typo) instead of `std.mem.eql`, which will prevent building until corrected in the source.
