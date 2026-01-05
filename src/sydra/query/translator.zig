@@ -1,5 +1,6 @@
 const std = @import("std");
 const compat = @import("../compat.zig");
+const parser = @import("parser.zig");
 
 fn startsWithCaseInsensitive(text: []const u8, prefix: []const u8) bool {
     if (text.len < prefix.len) return false;
@@ -74,10 +75,11 @@ pub const Failure = struct {
 };
 
 pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
-    const trimmed = std.mem.trim(u8, sql, " \t\r\n");
+    const trimmed_input = std.mem.trim(u8, sql, " \t\r\n");
+    const trimmed = std.mem.trimRight(u8, trimmed_input, " \t\r\n;");
     const start = std.time.nanoTimestamp();
     if (std.ascii.eqlIgnoreCase(trimmed, "SELECT 1")) {
-        const out = try alloc.dupe(u8, "select const 1");
+        const out = try alloc.dupe(u8, "select 1");
         const duration = std.time.nanoTimestamp() - start;
         const duration_ns: u64 = @intCast(@max(duration, @as(i128, 0)));
         compat.clog.global().record(trimmed, out, false, false, duration_ns);
@@ -99,13 +101,7 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
                 if (table_part.len != 0) {
                     var builder = std.array_list.Managed(u8).init(alloc);
                     defer builder.deinit();
-                    try builder.appendSlice("from ");
-                    try builder.appendSlice(table_part);
-                    if (where_part) |cond| {
-                        try builder.appendSlice(" where ");
-                        try builder.appendSlice(cond);
-                    }
-                    try builder.appendSlice(" select ");
+                    try builder.appendSlice("select ");
                     var col_iter = std.mem.splitScalar(u8, cols_raw, ',');
                     var first = true;
                     while (col_iter.next()) |raw| {
@@ -116,6 +112,12 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
                         try builder.appendSlice(trimmed_col);
                     }
                     if (!first) {
+                        try builder.appendSlice(" from ");
+                        try builder.appendSlice(table_part);
+                        if (where_part) |cond| {
+                            try builder.appendSlice(" where ");
+                            try builder.appendSlice(cond);
+                        }
                         const sydra_str = try builder.toOwnedSlice();
                         const duration = std.time.nanoTimestamp() - start;
                         const duration_ns: u64 = @intCast(@max(duration, @as(i128, 0)));
@@ -163,39 +165,31 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
                             const values_inner = std.mem.trim(u8, inserted[cursor + 1 .. values_close], " \t\r\n");
                             var remainder = inserted[values_close + 1 ..];
                             remainder = std.mem.trim(u8, remainder, " \t\r\n;");
-                            if (remainder.len == 0 or startsWithCaseInsensitive(remainder, "RETURNING")) {
-                                const returning_clause = if (remainder.len == 0)
-                                    null
-                                else blk: {
-                                    const clause = std.mem.trim(u8, remainder["RETURNING".len..], " \t\r\n");
-                                    if (clause.len == 0) break :blk null;
-                                    break :blk clause;
-                                };
-                                if (remainder.len != 0 and returning_clause == null) {
-                                    // Malformed RETURNING clause; allow fallback below.
-                                } else {
-                                    var builder = std.array_list.Managed(u8).init(alloc);
-                                    defer builder.deinit();
-                                    try builder.appendSlice("insert into ");
-                                    try builder.appendSlice(table_name);
-                                    if (columns_slice) |cols| {
-                                        try builder.appendSlice(" (");
-                                        try builder.appendSlice(cols);
-                                        try builder.appendSlice(")");
-                                    }
-                                    try builder.appendSlice(" values (");
-                                    try builder.appendSlice(values_inner);
+                            if (remainder.len == 0) {
+                                var builder = std.array_list.Managed(u8).init(alloc);
+                                defer builder.deinit();
+                                try builder.appendSlice("insert into ");
+                                try builder.appendSlice(table_name);
+                                if (columns_slice) |cols| {
+                                    try builder.appendSlice(" (");
+                                    try builder.appendSlice(cols);
                                     try builder.appendSlice(")");
-                                    if (returning_clause) |clause| {
-                                        try builder.appendSlice(" returning ");
-                                        try builder.appendSlice(clause);
-                                    }
-                                    const sydra_str = try builder.toOwnedSlice();
-                                    const duration = std.time.nanoTimestamp() - start;
-                                    const duration_ns: u64 = @intCast(@max(duration, @as(i128, 0)));
-                                    compat.clog.global().record(trimmed, sydra_str, false, false, duration_ns);
-                                    return Result{ .success = .{ .sydraql = sydra_str } };
                                 }
+                                try builder.appendSlice(" values (");
+                                try builder.appendSlice(values_inner);
+                                try builder.appendSlice(")");
+                                const sydra_str = try builder.toOwnedSlice();
+                                const duration = std.time.nanoTimestamp() - start;
+                                const duration_ns: u64 = @intCast(@max(duration, @as(i128, 0)));
+                                compat.clog.global().record(trimmed, sydra_str, false, false, duration_ns);
+                                return Result{ .success = .{ .sydraql = sydra_str } };
+                            }
+                            if (startsWithCaseInsensitive(remainder, "RETURNING")) {
+                                const payload = compat.sqlstate.buildPayload(.feature_not_supported, null, null, null);
+                                const duration = std.time.nanoTimestamp() - start;
+                                const duration_ns: u64 = @intCast(@max(duration, @as(i128, 0)));
+                                compat.clog.global().record(trimmed, "", false, true, duration_ns);
+                                return Result{ .failure = .{ .sqlstate = payload.sqlstate, .message = payload.message } };
                             }
                         }
                     }
@@ -205,84 +199,26 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
     }
 
     if (startsWithCaseInsensitive(trimmed, "UPDATE ")) {
-        const after_update = std.mem.trim(u8, trimmed["UPDATE ".len..], " \t\r\n");
-        if (after_update.len != 0) {
-            if (findCaseInsensitive(after_update, " SET ")) |set_idx| {
-                const table_raw = std.mem.trim(u8, after_update[0..set_idx], " \t\r\n");
-                if (table_raw.len != 0) {
-                    var remainder = std.mem.trim(u8, after_update[set_idx + " SET ".len ..], " \t\r\n");
-                    if (remainder.len != 0) {
-                        var returning_clause: ?[]const u8 = null;
-                        if (findLastCaseInsensitive(remainder, "RETURNING")) |ret_idx| {
-                            const before_ok = ret_idx == 0 or std.ascii.isWhitespace(remainder[ret_idx - 1]);
-                            const after_idx = ret_idx + "RETURNING".len;
-                            const after_ok = after_idx >= remainder.len or std.ascii.isWhitespace(remainder[after_idx]);
-                            if (before_ok and after_idx <= remainder.len and after_ok) {
-                                const clause_raw = std.mem.trim(u8, remainder[after_idx..], " \t\r\n;");
-                                if (clause_raw.len != 0) {
-                                    returning_clause = clause_raw;
-                                    remainder = std.mem.trimRight(u8, remainder[0..ret_idx], " \t\r\n;");
-                                }
-                            }
-                        }
-                        remainder = std.mem.trimRight(u8, remainder, " \t\r\n;");
-                        if (remainder.len != 0) {
-                            var set_clause = remainder;
-                            var where_clause: ?[]const u8 = null;
-                            if (findCaseInsensitive(remainder, " WHERE ")) |where_idx| {
-                                const before_where = std.mem.trimRight(u8, remainder[0..where_idx], " \t\r\n;");
-                                const after_where = std.mem.trim(u8, remainder[where_idx + " WHERE ".len ..], " \t\r\n;");
-                                if (after_where.len != 0 and before_where.len != 0) {
-                                    set_clause = before_where;
-                                    where_clause = after_where;
-                                } else {
-                                    where_clause = null;
-                                    set_clause = remainder;
-                                }
-                            }
-                            set_clause = std.mem.trimRight(u8, set_clause, " \t\r\n;");
-                            if (set_clause.len != 0) {
-                                var builder = std.array_list.Managed(u8).init(alloc);
-                                defer builder.deinit();
-                                try builder.appendSlice("update ");
-                                try builder.appendSlice(table_raw);
-                                try builder.appendSlice(" set ");
-                                try builder.appendSlice(set_clause);
-                                if (where_clause) |wc| {
-                                    try builder.appendSlice(" where ");
-                                    try builder.appendSlice(wc);
-                                }
-                                if (returning_clause) |rc| {
-                                    try builder.appendSlice(" returning ");
-                                    try builder.appendSlice(rc);
-                                }
-                                const sydra_str = try builder.toOwnedSlice();
-                                const duration = std.time.nanoTimestamp() - start;
-                                const duration_ns: u64 = @intCast(@max(duration, @as(i128, 0)));
-                                compat.clog.global().record(trimmed, sydra_str, false, false, duration_ns);
-                                return Result{ .success = .{ .sydraql = sydra_str } };
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        const payload = compat.sqlstate.buildPayload(.feature_not_supported, null, null, null);
+        const duration = std.time.nanoTimestamp() - start;
+        const duration_ns: u64 = @intCast(@max(duration, @as(i128, 0)));
+        compat.clog.global().record(trimmed, "", false, true, duration_ns);
+        return Result{ .failure = .{ .sqlstate = payload.sqlstate, .message = payload.message } };
     }
 
     if (startsWithCaseInsensitive(trimmed, "DELETE FROM ")) {
         var remainder = std.mem.trim(u8, trimmed["DELETE FROM ".len..], " \t\r\n");
         if (remainder.len != 0) {
-            var returning_clause: ?[]const u8 = null;
             if (findLastCaseInsensitive(remainder, "RETURNING")) |ret_idx| {
                 const before_ok = ret_idx == 0 or std.ascii.isWhitespace(remainder[ret_idx - 1]);
                 const after_idx = ret_idx + "RETURNING".len;
                 const after_ok = after_idx >= remainder.len or std.ascii.isWhitespace(remainder[after_idx]);
                 if (before_ok and after_idx <= remainder.len and after_ok) {
-                    const clause_raw = std.mem.trim(u8, remainder[after_idx..], " \t\r\n;");
-                    if (clause_raw.len != 0) {
-                        returning_clause = clause_raw;
-                        remainder = std.mem.trimRight(u8, remainder[0..ret_idx], " \t\r\n;");
-                    }
+                    const payload = compat.sqlstate.buildPayload(.feature_not_supported, null, null, null);
+                    const duration = std.time.nanoTimestamp() - start;
+                    const duration_ns: u64 = @intCast(@max(duration, @as(i128, 0)));
+                    compat.clog.global().record(trimmed, "", false, true, duration_ns);
+                    return Result{ .failure = .{ .sqlstate = payload.sqlstate, .message = payload.message } };
                 }
             }
             remainder = std.mem.trimRight(u8, remainder, " \t\r\n;");
@@ -309,10 +245,6 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
                     if (where_clause) |wc| {
                         try builder.appendSlice(" where ");
                         try builder.appendSlice(wc);
-                    }
-                    if (returning_clause) |rc| {
-                        try builder.appendSlice(" returning ");
-                        try builder.appendSlice(rc);
                     }
                     const sydra_str = try builder.toOwnedSlice();
                     const duration = std.time.nanoTimestamp() - start;
@@ -354,6 +286,10 @@ test "translator fixtures" {
             .success => |expected| {
                 try std.testing.expect(result == .success);
                 try std.testing.expectEqualStrings(expected.sydraql, result.success.sydraql);
+                var arena = std.heap.ArenaAllocator.init(alloc);
+                defer arena.deinit();
+                var parser_inst = parser.Parser.init(arena.allocator(), result.success.sydraql);
+                _ = try parser_inst.parse();
                 expected_translations += 1;
             },
             .failure => |expected| {
