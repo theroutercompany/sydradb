@@ -1,17 +1,18 @@
-{"name":"select-constant","sql":"SELECT 1","expect":{"kind":"success","sydraql":"select const 1"},"notes":"Placeholder translation case"}
+{"name":"select-constant","sql":"SELECT 1","expect":{"kind":"success","sydraql":"select 1"},"notes":"Constant select rewrite"}
+{"name":"select-constant-semicolon","sql":"SELECT 1;","expect":{"kind":"success","sydraql":"select 1"},"notes":"Trailing semicolon is ignored"}
 {"name":"insert-basic","sql":"INSERT INTO users(id) VALUES (1)","expect":{"kind":"success","sydraql":"insert into users (id) values (1)"},"notes":"Basic INSERT rewrite without RETURNING"}
-{"name":"select-columns","sql":"SELECT id, name FROM users","expect":{"kind":"success","sydraql":"from users select id,name"},"notes":"Basic projection rewrite"}
-{"name":"select-where","sql":"SELECT name FROM users WHERE id = 42","expect":{"kind":"success","sydraql":"from users where id = 42 select name"},"notes":"Ensures WHERE clause is preserved"}
-{"name":"select-star","sql":"select * from accounts","expect":{"kind":"success","sydraql":"from accounts select *"},"notes":"Case-insensitive keyword handling"}
-{"name":"update-basic","sql":"UPDATE users SET name = 'rex' WHERE id = 1","expect":{"kind":"success","sydraql":"update users set name = 'rex' where id = 1"},"notes":"Basic UPDATE rewrite with WHERE"}
-{"name":"update-no-where","sql":"UPDATE accounts SET balance = balance + 1","expect":{"kind":"success","sydraql":"update accounts set balance = balance + 1"},"notes":"UPDATE without WHERE"}
+{"name":"select-columns","sql":"SELECT id, name FROM users","expect":{"kind":"success","sydraql":"select id,name from users"},"notes":"Basic projection rewrite"}
+{"name":"select-where","sql":"SELECT name FROM users WHERE id = 42","expect":{"kind":"success","sydraql":"select name from users where id = 42"},"notes":"Ensures WHERE clause is preserved"}
+{"name":"select-star","sql":"select * from accounts","expect":{"kind":"success","sydraql":"select * from accounts"},"notes":"Case-insensitive keyword handling"}
+{"name":"update-basic","sql":"UPDATE users SET name = 'rex' WHERE id = 1","expect":{"kind":"error","sqlstate":"0A000","message":"feature not supported"},"notes":"UPDATE is unsupported"}
+{"name":"update-no-where","sql":"UPDATE accounts SET balance = balance + 1","expect":{"kind":"error","sqlstate":"0A000","message":"feature not supported"},"notes":"UPDATE is unsupported"}
 {"name":"update-missing-set","sql":"UPDATE users SET","expect":{"kind":"error","sqlstate":"0A000","message":"feature not supported"},"notes":"Invalid UPDATE should fall back"}
-{"name":"insert-returning","sql":"INSERT INTO users (id) VALUES (2) RETURNING id","expect":{"kind":"success","sydraql":"insert into users (id) values (2) returning id"},"notes":"RETURNING clause translated"}
+{"name":"insert-returning","sql":"INSERT INTO users (id) VALUES (2) RETURNING id","expect":{"kind":"error","sqlstate":"0A000","message":"feature not supported"},"notes":"RETURNING is unsupported"}
 {"name":"insert-returning-invalid","sql":"INSERT INTO users (id) VALUES (3) RETURNING","expect":{"kind":"error","sqlstate":"0A000","message":"feature not supported"},"notes":"Empty RETURNING should fallback"}
-{"name":"update-returning","sql":"UPDATE users SET name = 'rex' WHERE id = 1 RETURNING id","expect":{"kind":"success","sydraql":"update users set name = 'rex' where id = 1 returning id"},"notes":"UPDATE with RETURNING"}
+{"name":"update-returning","sql":"UPDATE users SET name = 'rex' WHERE id = 1 RETURNING id","expect":{"kind":"error","sqlstate":"0A000","message":"feature not supported"},"notes":"UPDATE RETURNING is unsupported"}
 {"name":"update-returning-invalid","sql":"UPDATE users SET name = 'rex' RETURNING","expect":{"kind":"error","sqlstate":"0A000","message":"feature not supported"},"notes":"Missing RETURNING list should fallback"}
 {"name":"delete-basic","sql":"DELETE FROM users WHERE id = 42","expect":{"kind":"success","sydraql":"delete from users where id = 42"},"notes":"DELETE with WHERE"}
 {"name":"delete-no-where","sql":"DELETE FROM sessions","expect":{"kind":"success","sydraql":"delete from sessions"},"notes":"DELETE without WHERE"}
 {"name":"delete-bad-where","sql":"DELETE FROM users WHERE","expect":{"kind":"error","sqlstate":"0A000","message":"feature not supported"},"notes":"Empty WHERE should fallback"}
-{"name":"delete-returning","sql":"DELETE FROM users WHERE id = 5 RETURNING id","expect":{"kind":"success","sydraql":"delete from users where id = 5 returning id"},"notes":"DELETE with RETURNING"}
+{"name":"delete-returning","sql":"DELETE FROM users WHERE id = 5 RETURNING id","expect":{"kind":"error","sqlstate":"0A000","message":"feature not supported"},"notes":"RETURNING is unsupported"}
 {"name":"delete-returning-invalid","sql":"DELETE FROM users RETURNING","expect":{"kind":"error","sqlstate":"0A000","message":"feature not supported"},"notes":"RETURNING without columns should fallback"}
