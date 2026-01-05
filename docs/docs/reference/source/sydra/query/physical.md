@@ -34,6 +34,7 @@ Alias:
 Physical node kinds:
 
 - `scan`
+- `one_row`
 - `filter`
 - `project`
 - `aggregate`
@@ -57,6 +58,8 @@ Physical nodes are “execution oriented” versions of logical nodes:
   - `output: []const plan.ColumnInfo`
   - `rollup_hint: ?plan.RollupHint`
   - `time_bounds: TimeBounds`
+- `OneRow`:
+  - `output: []const plan.ColumnInfo` — empty schema seed for constant `SELECT`
 - `Filter`:
   - `predicate: *const ast.Expr`
   - `output: []const plan.ColumnInfo`

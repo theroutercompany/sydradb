@@ -70,6 +70,7 @@ An operator is a heap-allocated struct with:
 Operator types (payload variants):
 
 - `scan`
+- `one_row`
 - `filter`
 - `project`
 - `aggregate`
@@ -122,6 +123,7 @@ Notable constraints (as implemented):
 Physical-to-operator mapping:
 
 - `scan` → `scan`
+- `one_row` → `one_row`
 - `filter` → `filter` (recursively builds child)
 - `project` → `project` (may be elided when schema is reusable)
 - `aggregate` → `aggregate` (recursively builds child)
@@ -170,6 +172,16 @@ for (op.schema, 0..) |column, idx| {
     }
 }
 ```
+
+### `one_row`
+
+Single-row source used for constant `SELECT` without a selector:
+
+- Payload: `{ emitted: bool }`
+- Row production (`oneRowNext`):
+  - first call returns a row with empty schema/values
+  - second call returns `null`
+- Destruction (`oneRowDestroy`): no-op
 
 ### `filter`
 

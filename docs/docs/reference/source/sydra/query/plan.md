@@ -29,6 +29,7 @@ Logical plans are later optimized and lowered into a physical plan.
 Logical node kinds:
 
 - `scan`
+- `one_row`
 - `filter`
 - `project`
 - `aggregate`
@@ -82,6 +83,8 @@ Each `Node` tag has a corresponding payload struct:
   - `source: *const ast.Select`
   - `selector: ?ast.Selector`
   - `output: []const ColumnInfo`
+- `OneRow`:
+  - `output: []const ColumnInfo` — empty schema seed for constant `SELECT`
 - `Filter`:
   - `input: *Node`
   - `predicate: *const ast.Expr` — combined predicate (may re-build an AND chain)
@@ -112,7 +115,8 @@ Each `Node` tag has a corresponding payload struct:
 Important builder helpers in the implementation:
 
 - `buildSelect` — constructs the node chain in this order:
-  - `scan` → optional `filter` → optional `aggregate` → `project` → optional `sort` → optional `limit`
+  - `one_row` (no selector) or `scan` (selector present)
+  - optional `filter` → optional `aggregate` → `project` → optional `sort` → optional `limit`
 - `collectPredicates` — flattens `a AND b` binary expressions into a slice
 - `combinePredicates` — rebuilds a single AND-chain expression and unions spans
 - `inferProjectionName` — generates output column names when no alias is provided
@@ -127,6 +131,7 @@ Inline tests cover simple select planning, conjunctive predicates, rollup hints,
 ```zig title="src/sydra/query/plan.zig (node chain + buildSelect excerpt)"
 pub const Node = union(enum) {
     scan: Scan,
+    one_row: OneRow,
     filter: Filter,
     project: Project,
     aggregate: Aggregate,
@@ -138,14 +143,23 @@ fn buildSelect(self: *Builder, select: *const ast.Select) (BuildError || std.mem
     const projection_columns = try self.buildColumns(select.projections);
     self.column_counter += projection_columns.len;
 
-    const scan_columns = try self.defaultScanColumns();
-    var current = try self.makeNode(.{
-        .scan = .{
-            .source = select,
-            .selector = select.selector,
-            .output = scan_columns,
-        },
-    });
+    var current: *Node = undefined;
+    if (select.selector == null) {
+        current = try self.makeNode(.{
+            .one_row = .{
+                .output = empty_columns[0..],
+            },
+        });
+    } else {
+        const scan_columns = try self.defaultScanColumns();
+        current = try self.makeNode(.{
+            .scan = .{
+                .source = select,
+                .selector = select.selector,
+                .output = scan_columns,
+            },
+        });
+    }
 
     var filter_list = ManagedArrayList(*const ast.Expr).init(self.allocator);
     try self.collectPredicates(select.predicate, &filter_list);

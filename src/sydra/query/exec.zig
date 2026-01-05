@@ -6,6 +6,7 @@ const plan_builder = @import("plan.zig");
 const optimizer = @import("optimizer.zig");
 const physical = @import("physical.zig");
 const executor = @import("executor.zig");
+const cfg = @import("../config.zig");
 const engine_mod = @import("../engine.zig");
 
 pub const ExecuteError = parser.ParseError || validator.AnalyzeError || plan_builder.BuildError || optimizer.OptimizeError || physical.BuildError || executor.ExecuteError || std.mem.Allocator.Error || error{ValidationFailed};
@@ -72,4 +73,44 @@ fn randomTraceId(allocator: std.mem.Allocator) ![]const u8 {
     }
 
     return buf;
+}
+
+test "execute supports select 1" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/data", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try engine_mod.Engine.init(talloc, config);
+    defer engine.deinit();
+
+    var cursor = try execute(talloc, engine, "select 1");
+    defer cursor.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), cursor.columns.len);
+
+    const first = try cursor.next();
+    try std.testing.expect(first != null);
+    const row = first.?;
+    try std.testing.expectEqual(@as(usize, 1), row.values.len);
+    try std.testing.expect(executor.Value.equals(row.values[0], executor.Value{ .integer = 1 }));
+
+    const second = try cursor.next();
+    try std.testing.expect(second == null);
 }
