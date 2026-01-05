@@ -43,10 +43,11 @@ Methods:
 
 ### Time predicate requirement
 
-`SELECT` and `DELETE` require a time predicate:
+`DELETE` always requires a time predicate. `SELECT` requires one only when a selector is present:
 
-- If `WHERE` is missing, the analyzer emits `time_range_required`.
-- If `WHERE` exists but does not reference `time`, the analyzer emits `time_range_required`.
+- If `SELECT` has a selector and `WHERE` is missing, the analyzer emits `time_range_required`.
+- If `SELECT` has a selector and `WHERE` exists but does not reference `time`, the analyzer emits `time_range_required`.
+- `SELECT` without a selector does not require a time predicate, but expressions are still validated.
 
 The analyzer detects “time” references by scanning identifiers and treating an identifier as “time” when its trailing segment (after the last `.`) equals `time` case-insensitively.
 
@@ -85,13 +86,13 @@ pub fn analyze(self: *Analyzer, statement: *ast.Statement) AnalyzeError!AnalyzeR
 }
 
 fn validateSelect(self: *Analyzer, select: *const ast.Select, result: *AnalyzeResult) AnalyzeError!void {
-    var predicate_has_time = false;
+    const requires_time_predicate = select.selector != null;
     if (select.predicate) |pred| {
-        predicate_has_time = try self.visitExpression(pred, result);
-        if (!predicate_has_time) {
+        const predicate_has_time = try self.visitExpression(pred, result);
+        if (requires_time_predicate and !predicate_has_time) {
             try self.addDiagnostic(result, .time_range_required, "time range predicate is required", exprSpan(pred));
         }
-    } else {
+    } else if (requires_time_predicate) {
         try self.addDiagnostic(result, .time_range_required, "select requires time predicate", select.span);
     }
 

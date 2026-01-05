@@ -55,13 +55,13 @@ pub const Analyzer = struct {
     }
 
     fn validateSelect(self: *Analyzer, select: *const ast.Select, result: *AnalyzeResult) AnalyzeError!void {
-        var predicate_has_time = false;
+        const requires_time_predicate = select.selector != null;
         if (select.predicate) |pred| {
-            predicate_has_time = try self.visitExpression(pred, result);
-            if (!predicate_has_time) {
+            const predicate_has_time = try self.visitExpression(pred, result);
+            if (requires_time_predicate and !predicate_has_time) {
                 try self.addDiagnostic(result, .time_range_required, "time range predicate is required", exprSpan(pred));
             }
-        } else {
+        } else if (requires_time_predicate) {
             try self.addDiagnostic(result, .time_range_required, "select requires time predicate", select.span);
         }
 
