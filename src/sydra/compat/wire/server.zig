@@ -75,13 +75,15 @@ pub fn handleConnection(
         .{ session.borrowedUser(), session.borrowedDatabase(), session.borrowedApplicationName() },
     );
 
-    try messageLoop(alloc, reader, writer, engine);
+    try writer_state.interface.flush();
+    try messageLoop(alloc, reader, writer, &writer_state.interface, engine);
 }
 
 fn messageLoop(
     alloc: std.mem.Allocator,
     reader: std.Io.AnyReader,
     writer: std.Io.AnyWriter,
+    flush_writer: *std.Io.Writer,
     engine: *engine_mod.Engine,
 ) !void {
     while (true) {
@@ -116,6 +118,7 @@ fn messageLoop(
                 try protocol.writeReadyForQuery(writer, 'I');
             },
         }
+        try flush_writer.flush();
     }
 }
 
@@ -304,7 +307,11 @@ fn handleSydraqlQuery(
         defer alloc.free(notice);
         try protocol.writeNoticeResponse(writer, notice);
     }
-    const tag = try formatSelectTag(alloc, row_count, rows_scanned, stream_ms, plan_ms, cursor.stats.trace_id);
+    const metrics_notice = try formatMetricsNotice(alloc, row_count, rows_scanned, stream_ms, plan_ms);
+    defer alloc.free(metrics_notice);
+    try protocol.writeNoticeResponse(writer, metrics_notice);
+
+    const tag = try formatSelectTag(alloc, row_count);
     defer alloc.free(tag);
     try protocol.writeCommandComplete(writer, tag);
     try protocol.writeReadyForQuery(writer, 'I');
@@ -372,6 +379,20 @@ fn formatSchemaNotice(alloc: std.mem.Allocator, columns: []const plan.ColumnInfo
 
 fn formatTraceNotice(alloc: std.mem.Allocator, trace_id: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "trace_id={s}", .{trace_id});
+}
+
+fn formatMetricsNotice(
+    alloc: std.mem.Allocator,
+    rows_emitted: usize,
+    rows_scanned: u64,
+    stream_ms: i64,
+    plan_ms: i64,
+) ![]u8 {
+    return try std.fmt.allocPrint(
+        alloc,
+        "metrics rows={d} scanned={d} stream_ms={d} plan_ms={d}",
+        .{ rows_emitted, rows_scanned, stream_ms, plan_ms },
+    );
 }
 
 fn writeDataRow(
@@ -459,37 +480,22 @@ fn anyWriter(writer: *std.Io.Writer) std.Io.AnyWriter {
 fn formatSelectTag(
     alloc: std.mem.Allocator,
     rows_emitted: usize,
-    rows_scanned: u64,
-    stream_ms: i64,
-    plan_ms: i64,
-    trace_id: []const u8,
 ) ![]const u8 {
-    if (trace_id.len != 0) {
-        return try std.fmt.allocPrint(
-            alloc,
-            "SELECT rows={d} scanned={d} stream_ms={d} plan_ms={d} trace_id={s}",
-            .{ rows_emitted, rows_scanned, stream_ms, plan_ms, trace_id },
-        );
-    }
-    return try std.fmt.allocPrint(
-        alloc,
-        "SELECT rows={d} scanned={d} stream_ms={d} plan_ms={d}",
-        .{ rows_emitted, rows_scanned, stream_ms, plan_ms },
-    );
+    return try std.fmt.allocPrint(alloc, "SELECT {d}", .{rows_emitted});
 }
 
-test "formatSelectTag includes scanned rows" {
+test "formatSelectTag uses standard select tag" {
     const alloc = std.testing.allocator;
-    const tag = try formatSelectTag(alloc, 5, 12, 20, 8, "");
+    const tag = try formatSelectTag(alloc, 5);
     defer alloc.free(tag);
-    try std.testing.expectEqualStrings("SELECT rows=5 scanned=12 stream_ms=20 plan_ms=8", tag);
+    try std.testing.expectEqualStrings("SELECT 5", tag);
 }
 
-test "formatSelectTag includes trace id when present" {
+test "formatMetricsNotice renders metrics" {
     const alloc = std.testing.allocator;
-    const tag = try formatSelectTag(alloc, 2, 4, 15, 9, "ABC123");
-    defer alloc.free(tag);
-    try std.testing.expectEqualStrings("SELECT rows=2 scanned=4 stream_ms=15 plan_ms=9 trace_id=ABC123", tag);
+    const notice = try formatMetricsNotice(alloc, 1, 0, 0, 0);
+    defer alloc.free(notice);
+    try std.testing.expectEqualStrings("metrics rows=1 scanned=0 stream_ms=0 plan_ms=0", notice);
 }
 
 test "formatTraceNotice renders id" {
