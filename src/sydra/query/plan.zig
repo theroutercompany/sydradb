@@ -24,6 +24,7 @@ const empty_columns = [_]ColumnInfo{};
 
 pub const Node = union(enum) {
     scan: Scan,
+    one_row: OneRow,
     filter: Filter,
     project: Project,
     aggregate: Aggregate,
@@ -34,6 +35,10 @@ pub const Node = union(enum) {
 pub const Scan = struct {
     source: *const ast.Select,
     selector: ?ast.Selector,
+    output: []const ColumnInfo,
+};
+
+pub const OneRow = struct {
     output: []const ColumnInfo,
 };
 
@@ -74,6 +79,7 @@ pub const Limit = struct {
 pub fn nodeOutput(node: *Node) []const ColumnInfo {
     return switch (node.*) {
         .scan => node.scan.output,
+        .one_row => node.one_row.output,
         .filter => node.filter.output,
         .project => node.project.output,
         .aggregate => node.aggregate.output,
@@ -101,14 +107,23 @@ pub const Builder = struct {
         const projection_columns = try self.buildColumns(select.projections);
         self.column_counter += projection_columns.len;
 
-        const scan_columns = try self.defaultScanColumns();
-        var current = try self.makeNode(.{
-            .scan = .{
-                .source = select,
-                .selector = select.selector,
-                .output = scan_columns,
-            },
-        });
+        var current: *Node = undefined;
+        if (select.selector == null) {
+            current = try self.makeNode(.{
+                .one_row = .{
+                    .output = empty_columns[0..],
+                },
+            });
+        } else {
+            const scan_columns = try self.defaultScanColumns();
+            current = try self.makeNode(.{
+                .scan = .{
+                    .source = select,
+                    .selector = select.selector,
+                    .output = scan_columns,
+                },
+            });
+        }
         var filter_list = ManagedArrayList(*const ast.Expr).init(self.allocator);
         try self.collectPredicates(select.predicate, &filter_list);
         var filter_conditions: []const *const ast.Expr = &.{};

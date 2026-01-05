@@ -41,7 +41,9 @@ fn pruneProjects(allocator: std.mem.Allocator, node: *plan.Node) !void {
         .limit => |limit| {
             try pruneProjects(allocator, limit.input);
         },
-        .scan => {},
+        .scan,
+        .one_row,
+        => {},
     }
 }
 
@@ -97,10 +99,14 @@ fn pushdownPredicates(node: *plan.Node, allocator: std.mem.Allocator) !void {
                     try pushFilterBelowAggregate(node, allocator);
                     return try pushdownPredicates(node, allocator);
                 },
-                .scan => {},
+                .scan,
+                .one_row,
+                => {},
             }
         },
-        .scan => {},
+        .scan,
+        .one_row,
+        => {},
     }
 }
 

@@ -11,6 +11,7 @@ pub const PhysicalPlan = struct {
 
 pub const Node = union(enum) {
     scan: Scan,
+    one_row: OneRow,
     filter: Filter,
     project: Project,
     aggregate: Aggregate,
@@ -23,6 +24,10 @@ pub const Scan = struct {
     output: []const plan.ColumnInfo,
     rollup_hint: ?plan.RollupHint,
     time_bounds: TimeBounds,
+};
+
+pub const OneRow = struct {
+    output: []const plan.ColumnInfo,
 };
 
 pub const Filter = struct {
@@ -81,6 +86,7 @@ pub fn build(allocator: std.mem.Allocator, logical: *plan.Node) BuildError!Physi
 pub fn nodeOutput(node: *Node) []const plan.ColumnInfo {
     return switch (node.*) {
         .scan => node.scan.output,
+        .one_row => node.one_row.output,
         .filter => node.filter.output,
         .project => node.project.columns,
         .aggregate => node.aggregate.output,
@@ -94,6 +100,9 @@ fn buildNode(allocator: std.mem.Allocator, logical: *plan.Node, ctx: Context) Bu
     switch (logical.*) {
         .scan => |scan| {
             node.* = .{ .scan = .{ .selector = scan.selector, .output = scan.output, .rollup_hint = detectScanRollup(scan), .time_bounds = ctx.time_bounds } };
+        },
+        .one_row => |one_row| {
+            node.* = .{ .one_row = .{ .output = one_row.output } };
         },
         .filter => |filter| {
             const extracted = extractTimeBounds(filter.conjunctive_predicates);

@@ -13,6 +13,8 @@ const ManagedArrayList = std.array_list.Managed;
 
 pub const Value = value_mod.Value;
 
+const empty_values = [_]Value{};
+
 const QueryRangeError = @typeInfo(@typeInfo(@TypeOf(engine_mod.Engine.queryRange)).@"fn".return_type.?).error_union.error_set;
 
 pub const ExecuteError = std.mem.Allocator.Error || expression.EvalError || QueryRangeError || error{
@@ -58,6 +60,7 @@ pub const Operator = struct {
 
     const Payload = union(enum) {
         scan: Scan,
+        one_row: OneRow,
         filter: Filter,
         project: Project,
         aggregate: Aggregate,
@@ -85,6 +88,10 @@ pub const Operator = struct {
         points: std.array_list.Managed(types.Point),
         index: usize,
         buffer: []Value,
+    };
+
+    const OneRow = struct {
+        emitted: bool,
     };
 
     const Filter = struct {
@@ -169,6 +176,7 @@ pub const Operator = struct {
             .aggregate => |payload| try payload.child.collectStats(list),
             .limit => |payload| try payload.child.collectStats(list),
             .scan,
+            .one_row,
             .sort,
             .test_source,
             => {},
@@ -179,6 +187,7 @@ pub const Operator = struct {
 pub fn buildPipeline(allocator: std.mem.Allocator, engine: *engine_mod.Engine, node: *physical.Node) ExecuteError!*Operator {
     return switch (node.*) {
         .scan => |scan| try createScanOperator(allocator, engine, scan, physical.nodeOutput(node)),
+        .one_row => |one_row| try createOneRowOperator(allocator, one_row.output),
         .filter => |filter| {
             const child = try buildPipeline(allocator, engine, filter.child);
             return try createFilterOperator(allocator, child, filter.predicate, physical.nodeOutput(node));
@@ -270,6 +279,22 @@ fn scanDestroy(op: *Operator) void {
     var payload = &op.payload.scan;
     payload.points.deinit();
     op.allocator.free(payload.buffer);
+}
+
+fn createOneRowOperator(allocator: std.mem.Allocator, schema: []const plan.ColumnInfo) ExecuteError!*Operator {
+    const payload = Operator.OneRow{ .emitted = false };
+    return try createOperator(allocator, schema, "one_row", oneRowNext, oneRowDestroy, .{ .one_row = payload });
+}
+
+fn oneRowNext(op: *Operator) ExecuteError!?Row {
+    var payload = &op.payload.one_row;
+    if (payload.emitted) return null;
+    payload.emitted = true;
+    return Row{ .schema = op.schema, .values = empty_values[0..] };
+}
+
+fn oneRowDestroy(op: *Operator) void {
+    _ = op;
 }
 
 fn createFilterOperator(allocator: std.mem.Allocator, child: *Operator, predicate: *const ast.Expr, schema: []const plan.ColumnInfo) ExecuteError!*Operator {
