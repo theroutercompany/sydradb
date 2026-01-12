@@ -240,7 +240,6 @@ fn exprIsGroupingKey(identifier: *const ast.Identifier, aggregate: *const plan.A
             const other = group_expr.expr.identifier;
             if (std.mem.eql(u8, other.value, identifier.value)) return true;
         }
-        if (group_expr.expr == @as(*const ast.Expr, @ptrCast(identifier))) return true;
     }
     if (identifierAliasMatchesGrouping(identifier.value, aggregate)) return true;
     return false;

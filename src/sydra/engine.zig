@@ -1,6 +1,7 @@
 const std = @import("std");
 const cfg = @import("config.zig");
 const types = @import("types.zig");
+const AtomicU64 = @import("atomic_util.zig").AtomicU64;
 const manifest_mod = @import("storage/manifest.zig");
 const wal_mod = @import("storage/wal.zig");
 const segment_mod = @import("storage/segment.zig");
@@ -148,45 +149,45 @@ pub const Engine = struct {
     };
 
     pub const Metrics = struct {
-        ingest_total: std.atomic.Value(u64),
-        flush_total: std.atomic.Value(u64),
-        flush_ns_total: std.atomic.Value(u64),
-        flush_points_total: std.atomic.Value(u64),
-        wal_bytes_total: std.atomic.Value(u64),
-        queue_pop_total: std.atomic.Value(u64),
-        queue_wait_ns_total: std.atomic.Value(u64),
+        ingest_total: AtomicU64,
+        flush_total: AtomicU64,
+        flush_ns_total: AtomicU64,
+        flush_points_total: AtomicU64,
+        wal_bytes_total: AtomicU64,
+        queue_pop_total: AtomicU64,
+        queue_wait_ns_total: AtomicU64,
         queue_max_len: std.atomic.Value(usize),
-        queue_len_sum: std.atomic.Value(u64),
-        queue_len_samples: std.atomic.Value(u64),
-        queue_push_lock_wait_ns_total: std.atomic.Value(u64),
-        queue_push_lock_hold_ns_total: std.atomic.Value(u64),
-        queue_push_lock_acquisitions: std.atomic.Value(u64),
-        queue_push_lock_contention: std.atomic.Value(u64),
-        queue_pop_lock_wait_ns_total: std.atomic.Value(u64),
-        queue_pop_lock_hold_ns_total: std.atomic.Value(u64),
-        queue_pop_lock_acquisitions: std.atomic.Value(u64),
-        queue_pop_lock_contention: std.atomic.Value(u64),
+        queue_len_sum: AtomicU64,
+        queue_len_samples: AtomicU64,
+        queue_push_lock_wait_ns_total: AtomicU64,
+        queue_push_lock_hold_ns_total: AtomicU64,
+        queue_push_lock_acquisitions: AtomicU64,
+        queue_push_lock_contention: AtomicU64,
+        queue_pop_lock_wait_ns_total: AtomicU64,
+        queue_pop_lock_hold_ns_total: AtomicU64,
+        queue_pop_lock_acquisitions: AtomicU64,
+        queue_pop_lock_contention: AtomicU64,
 
         pub fn init() Metrics {
             return .{
-                .ingest_total = std.atomic.Value(u64).init(0),
-                .flush_total = std.atomic.Value(u64).init(0),
-                .flush_ns_total = std.atomic.Value(u64).init(0),
-                .flush_points_total = std.atomic.Value(u64).init(0),
-                .wal_bytes_total = std.atomic.Value(u64).init(0),
-                .queue_pop_total = std.atomic.Value(u64).init(0),
-                .queue_wait_ns_total = std.atomic.Value(u64).init(0),
+                .ingest_total = AtomicU64.init(0),
+                .flush_total = AtomicU64.init(0),
+                .flush_ns_total = AtomicU64.init(0),
+                .flush_points_total = AtomicU64.init(0),
+                .wal_bytes_total = AtomicU64.init(0),
+                .queue_pop_total = AtomicU64.init(0),
+                .queue_wait_ns_total = AtomicU64.init(0),
                 .queue_max_len = std.atomic.Value(usize).init(0),
-                .queue_len_sum = std.atomic.Value(u64).init(0),
-                .queue_len_samples = std.atomic.Value(u64).init(0),
-                .queue_push_lock_wait_ns_total = std.atomic.Value(u64).init(0),
-                .queue_push_lock_hold_ns_total = std.atomic.Value(u64).init(0),
-                .queue_push_lock_acquisitions = std.atomic.Value(u64).init(0),
-                .queue_push_lock_contention = std.atomic.Value(u64).init(0),
-                .queue_pop_lock_wait_ns_total = std.atomic.Value(u64).init(0),
-                .queue_pop_lock_hold_ns_total = std.atomic.Value(u64).init(0),
-                .queue_pop_lock_acquisitions = std.atomic.Value(u64).init(0),
-                .queue_pop_lock_contention = std.atomic.Value(u64).init(0),
+                .queue_len_sum = AtomicU64.init(0),
+                .queue_len_samples = AtomicU64.init(0),
+                .queue_push_lock_wait_ns_total = AtomicU64.init(0),
+                .queue_push_lock_hold_ns_total = AtomicU64.init(0),
+                .queue_push_lock_acquisitions = AtomicU64.init(0),
+                .queue_push_lock_contention = AtomicU64.init(0),
+                .queue_pop_lock_wait_ns_total = AtomicU64.init(0),
+                .queue_pop_lock_hold_ns_total = AtomicU64.init(0),
+                .queue_pop_lock_acquisitions = AtomicU64.init(0),
+                .queue_pop_lock_contention = AtomicU64.init(0),
             };
         }
     };
