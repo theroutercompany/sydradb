@@ -144,8 +144,8 @@ fn buildStartupBuffer(allocator: std.mem.Allocator, params: []const protocol.Par
     defer body.deinit();
 
     var buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, buf[0..4], protocol.protocol_version_3);
-    try body.appendSlice(buf[0..4]);
+    std.mem.writeInt(u32, &buf, protocol.protocol_version_3, .big);
+    try body.appendSlice(&buf);
 
     for (params) |param| {
         try body.appendSlice(param.key);
@@ -164,10 +164,10 @@ fn buildStartupBuffer(allocator: std.mem.Allocator, params: []const protocol.Par
 
 fn appendSslRequest(buffer: *std.array_list.Managed(u8)) !void {
     var len_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, len_buf[0..4], 8, .big);
-    try buffer.appendSlice(len_buf);
-    std.mem.writeInt(u32, len_buf[0..4], protocol.ssl_request_code, .big);
-    try buffer.appendSlice(len_buf);
+    std.mem.writeInt(u32, &len_buf, 8, .big);
+    try buffer.appendSlice(&len_buf);
+    std.mem.writeInt(u32, &len_buf, protocol.ssl_request_code, .big);
+    try buffer.appendSlice(&len_buf);
 }
 
 test "performHandshake returns session metadata and writes responses" {

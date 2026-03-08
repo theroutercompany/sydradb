@@ -5,6 +5,7 @@ const alloc_mod = sydra.alloc;
 const cfg = sydra.config;
 const engine = sydra.engine;
 const types = sydra.types;
+const ManagedArrayList = std.array_list.Managed;
 
 fn sleepMs(ms: u64) void {
     if (@hasDecl(std.time, "sleep")) {
@@ -41,7 +42,7 @@ const ProducerContext = struct {
     series_offset: usize,
     ts_base: i64,
     thread_id: usize,
-    latencies: ?*std.ArrayList(u64) = null,
+    latencies: ?*ManagedArrayList(u64) = null,
     stress_result: ?*ThreadStressResult = null,
 };
 
@@ -178,7 +179,7 @@ fn percentile(sorted: []u64, ratio: f64) u64 {
     if (sorted.len == 0) return 0;
     const max_index = sorted.len - 1;
     const position = ratio * @as(f64, @floatFromInt(max_index));
-    const lower = @as(usize, @intCast(@floor(position)));
+    const lower = @as(usize, @intFromFloat(@floor(position)));
     const upper = if (lower >= max_index) max_index else lower + 1;
     const weight = position - @floor(position);
     if (upper == lower) return sorted[lower];
@@ -192,7 +193,7 @@ fn printLatencySummary(latencies: []u64) void {
         std.debug.print("latency_summary no samples collected\n", .{});
         return;
     }
-    std.sort.sort(u64, latencies, {}, std.sort.asc(u64));
+    std.sort.block(u64, latencies, {}, std.sort.asc(u64));
     const p50 = percentile(latencies, 0.50);
     const p95 = percentile(latencies, 0.95);
     const p99 = percentile(latencies, 0.99);
@@ -216,8 +217,6 @@ fn printLatencySummary(latencies: []u64) void {
 fn runStress(
     allocator: std.mem.Allocator,
     handle: *alloc_mod.AllocatorHandle,
-    eng: *engine.Engine,
-    series_ids: []const types.SeriesId,
     threads: []std.Thread,
     contexts: []ProducerContext,
     stress_ops: usize,
@@ -331,7 +330,7 @@ pub fn main() !void {
     defer alloc.free(threads);
     var contexts = try alloc.alloc(ProducerContext, thread_count);
     defer alloc.free(contexts);
-    var latency_lists = try alloc.alloc(std.ArrayList(u64), thread_count);
+    var latency_lists = try alloc.alloc(ManagedArrayList(u64), thread_count);
     defer {
         var li: usize = 0;
         while (li < thread_count) : (li += 1) {
@@ -342,7 +341,7 @@ pub fn main() !void {
     {
         var li: usize = 0;
         while (li < thread_count) : (li += 1) {
-            latency_lists[li] = std.ArrayList(u64).init(alloc);
+            latency_lists[li] = ManagedArrayList(u64).init(alloc);
         }
     }
 
@@ -577,7 +576,7 @@ pub fn main() !void {
     }
 
     if (ops_total > 0) {
-        var merged = std.ArrayList(u64).init(alloc);
+        var merged = ManagedArrayList(u64).init(alloc);
         defer merged.deinit();
         try merged.ensureTotalCapacity(ops_total);
         thread_idx = 0;
@@ -597,8 +596,6 @@ pub fn main() !void {
         try runStress(
             alloc,
             &allocator_handle,
-            &eng,
-            series_ids,
             threads,
             contexts,
             arg_state.stress_ops,

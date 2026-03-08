@@ -173,7 +173,7 @@ fn handleAllocStats(handle: *alloc_mod.AllocatorHandle, req: *std.http.Server.Re
         if (stats.fallback_size_bounds[idx]) |bound| {
             try jw.write(bound);
         } else {
-            try jw.writeNull();
+            try jw.write(null);
         }
         try jw.endObject();
     }
@@ -654,6 +654,62 @@ fn extractTagsJson(alloc: std.mem.Allocator, maybe_value: ?std.json.Value) !Tags
     return .{ .value = default_tags_json };
 }
 
+fn collectMatchingSeriesIds(
+    alloc: std.mem.Allocator,
+    eng: *Engine,
+    tags_value: std.json.Value,
+    op_and: bool,
+) !std.array_list.Managed(types.SeriesId) {
+    var result = std.AutoHashMap(types.SeriesId, void).init(alloc);
+    defer result.deinit();
+
+    if (tags_value != .object) {
+        return std.array_list.Managed(types.SeriesId).init(alloc);
+    }
+
+    var saw_constraint = false;
+    var it = tags_value.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .string) continue;
+        const key = try std.fmt.allocPrint(alloc, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.string });
+        defer alloc.free(key);
+        const matches = eng.tags.get(key);
+        if (!saw_constraint) {
+            for (matches) |sid| try result.put(sid, {});
+            saw_constraint = true;
+            continue;
+        }
+        if (op_and) {
+            var result_it = result.iterator();
+            while (result_it.next()) |match| {
+                var found = false;
+                for (matches) |sid| {
+                    if (sid == match.key_ptr.*) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) _ = result.remove(match.key_ptr.*);
+            }
+        } else {
+            for (matches) |sid| try result.put(sid, {});
+        }
+    }
+
+    var ids = std.array_list.Managed(types.SeriesId).init(alloc);
+    errdefer ids.deinit();
+    var key_it = result.keyIterator();
+    while (key_it.next()) |sid| {
+        try ids.append(sid.*);
+    }
+    std.sort.block(types.SeriesId, ids.items, {}, struct {
+        fn lessThan(_: void, a: types.SeriesId, b: types.SeriesId) bool {
+            return a < b;
+        }
+    }.lessThan);
+    return ids;
+}
+
 fn handleIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
     var body_buf: [4096]u8 = undefined;
     const body_reader = req.readerExpectNone(&body_buf);
@@ -730,11 +786,16 @@ fn handleQuery(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Req
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
     const obj = parsed.value.object;
+    const tags_value = obj.get("tags");
+    var op_and = true;
+    if (obj.get("op")) |v| {
+        if (v == .string and std.ascii.eqlIgnoreCase(v.string, "or")) op_and = false;
+    }
     var series_id: ?types.SeriesId = null;
     if (obj.get("series_id")) |v| {
         series_id = @intCast(v.integer);
     } else if (obj.get("series")) |v| {
-        const tags = try extractTagsJson(alloc, obj.get("tags"));
+        const tags = try extractTagsJson(alloc, tags_value);
         defer if (tags.owned) |buf| alloc.free(buf);
         series_id = types.seriesIdFrom(v.string, tags.value);
     }
@@ -749,6 +810,9 @@ fn handleQuery(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Req
     const start_ts: i64 = @intCast(start_val.integer);
     const end_ts: i64 = @intCast(end_val.integer);
     const sid = series_id orelse {
+        if (tags_value) |tag_selector| {
+            return queryByTagsAndRespond(alloc, eng, req, tag_selector, op_and, start_ts, end_ts);
+        }
         try req.respond("missing series identifier", .{ .status = .bad_request, .keep_alive = false });
         return;
     };
@@ -808,6 +872,49 @@ fn queryAndRespond(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server
     try respondPoints(req, points.items);
 }
 
+fn queryByTagsAndRespond(
+    alloc: std.mem.Allocator,
+    eng: *Engine,
+    req: *std.http.Server.Request,
+    tags_value: std.json.Value,
+    op_and: bool,
+    start_ts: i64,
+    end_ts: i64,
+) !void {
+    var series_ids = try collectMatchingSeriesIds(alloc, eng, tags_value, op_and);
+    defer series_ids.deinit();
+
+    var send_buffer: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{
+            .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        },
+    });
+    errdefer response.end() catch {};
+
+    const resp_writer = &response.writer;
+    try resp_writer.writeAll("{\"series\":[");
+    var first_series = true;
+    for (series_ids.items) |sid| {
+        var points = std.array_list.Managed(types.Point).init(alloc);
+        defer points.deinit();
+        try eng.queryRange(sid, start_ts, end_ts, &points);
+
+        if (!first_series) try resp_writer.writeAll(",");
+        first_series = false;
+        try resp_writer.print("{{\"series_id\":{d},\"points\":[", .{sid});
+        var first_point = true;
+        for (points.items) |pnt| {
+            if (!first_point) try resp_writer.writeAll(",");
+            first_point = false;
+            try resp_writer.print("{{\"ts\":{d},\"value\":{d}}}", .{ pnt.ts, pnt.value });
+        }
+        try resp_writer.writeAll("]}");
+    }
+    try resp_writer.writeAll("]}");
+    try response.end();
+}
+
 fn respondPoints(req: *std.http.Server.Request, points: []const types.Point) !void {
     var send_buffer: [1024]u8 = undefined;
     var response = try req.respondStreaming(&send_buffer, .{
@@ -852,43 +959,11 @@ fn handleFind(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Requ
     if (obj.get("op")) |v| {
         if (v == .string and std.ascii.eqlIgnoreCase(v.string, "or")) op_and = false;
     }
-    var sets = try std.array_list.Managed([]const u64).initCapacity(alloc, 0);
-    defer sets.deinit();
-    if (obj.get("tags")) |t| {
-        if (t == .object) {
-            var it = t.object.iterator();
-            while (it.next()) |e| {
-                const key = std.fmt.allocPrint(alloc, "{s}={s}", .{ e.key_ptr.*, e.value_ptr.string }) catch continue;
-                defer alloc.free(key);
-                try sets.append(eng.tags.get(key));
-            }
-        }
-    }
-    var result = std.AutoHashMap(u64, void).init(alloc);
+    var result = if (obj.get("tags")) |t|
+        try collectMatchingSeriesIds(alloc, eng, t, op_and)
+    else
+        std.array_list.Managed(types.SeriesId).init(alloc);
     defer result.deinit();
-    var first = true;
-    for (sets.items) |arr| {
-        if (first) {
-            for (arr) |sid| result.put(sid, {}) catch {};
-            first = false;
-            continue;
-        }
-        if (op_and) {
-            var it = result.iterator();
-            while (it.next()) |entry| {
-                var found = false;
-                for (arr) |sid| {
-                    if (sid == entry.key_ptr.*) {
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) _ = result.remove(entry.key_ptr.*);
-            }
-        } else {
-            for (arr) |sid| result.put(sid, {}) catch {};
-        }
-    }
 
     var send_buffer: [512]u8 = undefined;
     var response = try req.respondStreaming(&send_buffer, .{
@@ -900,12 +975,11 @@ fn handleFind(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Requ
 
     const resp_writer = &response.writer;
     try resp_writer.writeAll("[");
-    var it2 = result.keyIterator();
     var first2 = true;
-    while (it2.next()) |k| {
+    for (result.items) |sid| {
         if (!first2) try resp_writer.writeAll(",");
         first2 = false;
-        try resp_writer.print("{d}", .{k.*});
+        try resp_writer.print("{d}", .{sid});
     }
     try resp_writer.writeAll("]");
     try response.end();

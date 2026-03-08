@@ -196,9 +196,9 @@ fn cmdSnapshot(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     if (args.len < 3) return error.Invalid;
     var cfg = try loadConfigOrDefault(alloc);
     defer cfg.deinit(alloc);
-    var data_dir = try std.fs.cwd().openDir(cfg.data_dir, .{ .iterate = true });
-    defer data_dir.close();
-    try @import("snapshot.zig").snapshot(alloc, data_dir, args[2]);
+    var eng = try engine_mod.Engine.init(alloc, cfg);
+    defer eng.deinit();
+    try eng.snapshotTo(args[2]);
 }
 
 fn cmdRestore(alloc: std.mem.Allocator, args: [][:0]u8) !void {

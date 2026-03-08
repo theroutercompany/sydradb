@@ -245,6 +245,19 @@ pub const Engine = struct {
         self.alloc.destroy(self);
     }
 
+    pub fn snapshotTo(self: *Engine, dst_path: []const u8) !void {
+        try waitForQueueEmpty(self, 5_000);
+        self.stop_flag = true;
+        self.queue.close();
+        if (self.writer_thread) |t| {
+            t.join();
+            self.writer_thread = null;
+        }
+        try flushMemtable(self);
+        try self.wal.file.sync();
+        try @import("snapshot.zig").snapshot(self.alloc, self.data_dir, dst_path);
+    }
+
     pub fn ingest(self: *Engine, item: IngestItem) !void {
         try self.queue.push(item);
         const len_now = self.queue.len();
@@ -449,6 +462,15 @@ fn waitForFlush(engine: *Engine, expected_entries: usize, timeout_ms: u64) waitE
     return waitError.Timeout;
 }
 
+fn waitForQueueEmpty(engine: *Engine, timeout_ms: u64) waitError!void {
+    const deadline: i64 = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    while (std.time.milliTimestamp() < deadline) {
+        if (engine.queue.len() == 0) return;
+        sleepMs(10);
+    }
+    return waitError.Timeout;
+}
+
 test "engine ingests, flushes, and queries range" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -582,4 +604,80 @@ test "engine metrics track ingest and flush" {
     try std.testing.expect(wal_bytes > 0);
     const flush_ns = engine.metrics.flush_ns_total.load(.monotonic);
     try std.testing.expect(flush_ns > 0);
+}
+
+test "engine snapshotTo captures a restorable point-in-time copy" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/data", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    const snapshot_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/snapshot", .{tmp.sub_path});
+    defer talloc.free(snapshot_path);
+    const restore_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/restore", .{tmp.sub_path});
+    defer talloc.free(restore_path);
+
+    const sid = types.hash64("snapshot.series");
+
+    {
+        const config = cfg.Config{
+            .data_dir = try talloc.dupe(u8, data_path),
+            .http_port = 0,
+            .fsync = .none,
+            .flush_interval_ms = 5,
+            .memtable_max_bytes = 512,
+            .retention_days = 0,
+            .auth_token = try talloc.dupe(u8, ""),
+            .enable_influx = false,
+            .enable_prom = false,
+            .mem_limit_bytes = 1024 * 1024,
+            .retention_ns = std.StringHashMap(u32).init(talloc),
+        };
+
+        var engine = try Engine.init(talloc, config);
+        defer engine.deinit();
+
+        try engine.ingest(.{ .series_id = sid, .ts = 1_000, .value = 10.0, .tags_json = "{}" });
+        try engine.ingest(.{ .series_id = sid, .ts = 1_005, .value = 11.0, .tags_json = "{}" });
+        engine.noteTags(sid, "{\"host\":\"snapshot\"}");
+
+        try engine.snapshotTo(snapshot_path);
+    }
+
+    {
+        try std.fs.cwd().makePath(restore_path);
+        var restore_dir = try std.fs.cwd().openDir(restore_path, .{ .iterate = true });
+        defer restore_dir.close();
+        try @import("snapshot.zig").restore(talloc, restore_dir, snapshot_path);
+
+        const restored_cfg = cfg.Config{
+            .data_dir = try talloc.dupe(u8, restore_path),
+            .http_port = 0,
+            .fsync = .none,
+            .flush_interval_ms = 5,
+            .memtable_max_bytes = 512,
+            .retention_days = 0,
+            .auth_token = try talloc.dupe(u8, ""),
+            .enable_influx = false,
+            .enable_prom = false,
+            .mem_limit_bytes = 1024 * 1024,
+            .retention_ns = std.StringHashMap(u32).init(talloc),
+        };
+
+        var restored = try Engine.init(talloc, restored_cfg);
+        defer restored.deinit();
+
+        var results = std.array_list.Managed(types.Point).init(talloc);
+        defer results.deinit();
+        try restored.queryRange(sid, 0, 10_000, &results);
+        try std.testing.expectEqual(@as(usize, 2), results.items.len);
+        try std.testing.expectEqual(@as(i64, 1_000), results.items[0].ts);
+        try std.testing.expectApproxEqAbs(@as(f64, 10.0), results.items[0].value, 1e-9);
+        try std.testing.expectEqual(@as(i64, 1_005), results.items[1].ts);
+
+        const matches = restored.tags.get("host=snapshot");
+        try std.testing.expectEqual(@as(usize, 1), matches.len);
+        try std.testing.expectEqual(sid, matches[0]);
+    }
 }

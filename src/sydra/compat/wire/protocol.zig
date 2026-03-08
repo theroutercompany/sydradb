@@ -232,8 +232,8 @@ fn buildStartupMessage(allocator: std.mem.Allocator, pairs: []const Parameter) !
     defer body.deinit();
 
     var buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, buf[0..4], protocol_version_3);
-    try body.appendSlice(buf[0..4]);
+    std.mem.writeInt(u32, &buf, protocol_version_3, .big);
+    try body.appendSlice(&buf);
 
     for (pairs) |param| {
         try body.appendSlice(param.key);

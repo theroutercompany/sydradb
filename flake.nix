@@ -16,8 +16,8 @@
       let
         pkgs = import nixpkgs { inherit system; overlays = [ zig-overlay.overlays.default ]; };
         zigPkgs = zig-overlay.packages.${system} or {};
-        zigPinned = if builtins.hasAttr "zig-0.15.0" zigPkgs then zigPkgs."zig-0.15.0"
-                    else if builtins.hasAttr "0.15.0" zigPkgs then zigPkgs."0.15.0"
+        zigPinned = if builtins.hasAttr "zig-0.15.1" zigPkgs then zigPkgs."zig-0.15.1"
+                    else if builtins.hasAttr "0.15.1" zigPkgs then zigPkgs."0.15.1"
                     else (pkgs.zig_0_15 or pkgs.zig);
       in f pkgs zigPinned);
   in {

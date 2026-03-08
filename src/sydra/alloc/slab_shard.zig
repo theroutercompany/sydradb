@@ -132,14 +132,11 @@ pub const Shard = struct {
         var expected = state.deferred.load(.monotonic);
         while (true) {
             node.next = expected;
-            const result = state.deferred.compareExchangeWeak(expected, node, .monotonic, .monotonic);
-            switch (result) {
-                .success => return true,
-                .failure => |actual| {
-                    expected = actual;
-                    continue;
-                },
+            if (state.deferred.cmpxchgWeak(expected, node, .monotonic, .monotonic)) |actual| {
+                expected = actual;
+                continue;
             }
+            return true;
         }
     }
 
@@ -151,7 +148,7 @@ pub const Shard = struct {
                 const node = head orelse break;
                 if (node.epoch > min_epoch) break;
                 const next = node.next;
-                if (state.deferred.compareExchangeWeak(head, next, .monotonic, .monotonic) == .success) {
+                if (state.deferred.cmpxchgWeak(head, next, .monotonic, .monotonic) == null) {
                     node.next = state.free_list;
                     state.free_list = node;
                     if (state.in_use > 0) state.in_use -= 1;
@@ -207,8 +204,8 @@ pub const Shard = struct {
 
     fn refill(self: *Shard, state: *ClassState, ret_addr: usize) !void {
         const total_bytes = state.info.alloc_size * state.info.objects_per_slab;
-        const memory = try self.allocator.rawAlloc(total_bytes, default_alignment, ret_addr);
-        const slab = Slab{ .memory = memory };
+        const memory = self.allocator.rawAlloc(total_bytes, default_alignment, ret_addr) orelse return error.OutOfMemory;
+        const slab = Slab{ .memory = memory[0..total_bytes] };
         try state.slabs.append(self.allocator, slab);
         var offset: usize = 0;
         while (offset + state.info.alloc_size <= total_bytes) : (offset += state.info.alloc_size) {

@@ -88,7 +88,7 @@ pub fn build(b: *std.Build) void {
     b.step("test", "Run tests").dependOn(&test_run.step);
 
     const pgwire_tests = if (is015) blk3: {
-        const mod = b.createModule(.{ .root_source_file = b.path("src/sydra/compat/wire/server.zig"), .target = target, .optimize = optimize });
+        const mod = b.createModule(.{ .root_source_file = b.path("src/compat_wire_tests.zig"), .target = target, .optimize = optimize });
         mod.addImport("build_options", build_options_module);
         if (use_mimalloc) {
             mod.addIncludePath(mimalloc_include);
@@ -96,7 +96,7 @@ pub fn build(b: *std.Build) void {
         }
         break :blk3 b.addTest(.{ .root_module = mod });
     } else blk3: {
-        const compat_step = b.addTest(.{ .root_source_file = b.path("src/sydra/compat/wire/server.zig"), .target = target, .optimize = optimize });
+        const compat_step = b.addTest(.{ .root_source_file = b.path("src/compat_wire_tests.zig"), .target = target, .optimize = optimize });
         compat_step.root_module.addImport("build_options", build_options_module);
         if (use_mimalloc) {
             compat_step.addIncludePath(mimalloc_include);
