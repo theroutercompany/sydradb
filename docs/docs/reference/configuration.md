@@ -80,7 +80,7 @@ Default: `8388608` (8 MiB)
 
 ### `mem_limit_bytes` (integer)
 
-Memory limit for the engine process. (Parsed by config; current enforcement depends on runtime implementation.)
+Parsed by config, but not currently enforced as a global runtime memory quota.
 
 Default: `268435456` (256 MiB)
 
@@ -96,13 +96,13 @@ Default: empty (auth disabled)
 
 ### `enable_influx` (bool)
 
-Toggles the Influx-compatible surface. (Parsed by config; current behavior depends on runtime implementation.)
+Parsed by config, but not currently a promise of a production-ready Influx-compatible adapter surface.
 
 Default: `false`
 
 ### `enable_prom` (bool)
 
-Toggles Prometheus-style metrics. (Parsed by config; current behavior depends on runtime implementation.)
+Parsed by config, but not currently a promise of a production-ready Prometheus remote-write adapter surface.
 
 Default: `true`
 

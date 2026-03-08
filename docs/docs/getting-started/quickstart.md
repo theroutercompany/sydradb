@@ -8,7 +8,7 @@ tags:
 
 ## Prerequisites
 
-- Zig `0.15.x` (recommended: use the pinned toolchain via Nix; see below)
+- Zig `0.15.1` (recommended: use the pinned toolchain via Nix; see below)
 
 ## Build
 

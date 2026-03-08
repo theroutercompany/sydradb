@@ -8,7 +8,7 @@ sidebar_position: 4
 
 ### Zig version mismatch
 
-This repo targets Zig `0.15.x`. If you see compile errors that look like stdlib API mismatches, confirm your Zig version:
+This repo targets Zig `0.15.1`. If you see compile errors that look like stdlib API mismatches, confirm your Zig version:
 
 ```sh
 zig version

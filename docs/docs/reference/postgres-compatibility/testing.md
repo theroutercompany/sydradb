@@ -5,7 +5,7 @@ sidebar_label: Testing
 
 # Compatibility Testing Strategy
 
-This document sketches the guard-rails we need while the PostgreSQL compatibility layer comes online. It complements `./roadmap` by describing concrete test suites and the automation required to keep us close to upstream behaviour.
+This document sketches the guard-rails for the PostgreSQL compatibility bridge. It mixes current coverage with later-stage plans; for the current alpha contract, treat the simple-query path as the supported center of gravity.
 
 ## Guiding Principles
 
@@ -26,33 +26,33 @@ This document sketches the guard-rails we need while the PostgreSQL compatibilit
 ### 2. Protocol Wire Tests
 
 - Stand up the PG wire front-end inside a test harness.
-- Use synthetic libpq/psql scripts to exercise startup, auth, simple + extended queries, COPY, transactions.
+- Use synthetic libpq/psql scripts to exercise startup, auth, and simple query flows first.
 - Assert network-level behaviour (messages, SQLSTATE, parameter status) **and** verify structured logs capture handshake + query events.
-- Execute inside CI using a dedicated `zig build compat-wire-test` step.
+- Extended protocol, COPY, and transaction-heavy suites remain later work.
 
 ### 3. Trace Replay Harness
 
-- Capture real SQL traffic by proxying a Postgres database during sample application runs (Django, Rails, Prisma, etc.).
+- Capture real SQL traffic only after the simple-query bridge is stable enough to justify replay work.
 - Store anonymised traces in `tests/traces/<app>/trace.jsonl` with metadata (session, parameters, expected results).
 - Provide a replay tool (`zig build compat-replay --trace tests/traces/...`) that feeds the translator and compares results against a local Postgres instance.
 - Failures should emit diff files with SQLSTATE, payload, execution stats, and include the relevant JSONL log excerpt for debugging.
 
 ### 4. ORM Smoke Suites
 
-- Provision containerised sample apps (Django polls, Rails blog, Prisma todo, SQLAlchemy models).
+- Provision containerised sample apps only after the translator/catalog surface is broad enough to make the signal worthwhile.
 - Each suite starts the sydra PG endpoint, runs the ORM migrations/tests, and records metrics.
 - Capture translator logs + stats snapshots at suite start/end to quantify coverage.
 - Managed via Nix flake outputs for reproducibility; triggered nightly and on release branches.
 
 ### 5. Postgres Regression Subset
 
-- Vendor the relevant SQL files from the upstream PG regression suite (`src/test/regress/sql/*.sql`).
+- Vendor the relevant SQL files from the upstream PG regression suite only after the bridge supports more than the current narrow subset.
 - Execute them through the translator, comparing outputs to a real Postgres run.
 - Maintain a skiplist for features we intentionally do not support yet; log changes to keep the matrix updated.
 
 ### 6. Performance Budgets
 
-- pgbench-style workloads (CRUD, COPY bulk load, analytics queries) executed against both sydra and Postgres.
+- pgbench-style workloads are later work once the compatibility surface is larger than startup + simple query.
 - Capture latency/QPS metrics; fail CI if we regress relative to the baseline by more than a threshold.
 - Export results to `./compat-matrix-v0.1` (or a future replacement) for transparency.
 
@@ -77,9 +77,8 @@ This document sketches the guard-rails we need while the PostgreSQL compatibilit
 
 ## Immediate Next Steps
 
-1. Scaffold `tests/README.md` with instructions for running translator and wire tests.
-2. Build the translator unit test harness alongside the upcoming SQL parser work.
-3. Prototype the trace recorder against a staging Postgres instance to validate data format.
-4. Add CI jobs for `zig build test` (fast) and `zig build compat-wire-test` (medium) to gate PRs.
+1. Keep translator fixtures current and runnable under `zig build test`.
+2. Make the wire smoke path honest and buildable for the supported simple-query contract.
+3. Defer trace replay, ORM suites, and heavier regression work until the bridge intentionally widens.
 
 Feedback welcome; we will evolve this doc as the compatibility layer matures.

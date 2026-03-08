@@ -90,12 +90,11 @@ See [`src/sydra/storage/manifest.zig`](./source/sydra/storage/manifest.md) for t
 
 ## Snapshot/restore
 
-The snapshot mechanism is a directory copy of:
+Current snapshot behavior is conservative:
 
-- `MANIFEST`
-- `wal/`
-- `segments/`
-- `tags.json`
+- the snapshot content is `MANIFEST`, `wal/`, `segments/`, and `tags.json`
+- the low-level copy mechanism is directory/file based
+- callers should still treat snapshotting as an admin or offline operation unless the higher-level command explicitly documents stronger coordination semantics
 
 See `Reference/Source Reference/src/sydra/snapshot.zig`.
 

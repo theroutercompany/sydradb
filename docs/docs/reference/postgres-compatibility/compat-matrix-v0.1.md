@@ -37,11 +37,11 @@ This document tracks SydraDB’s PostgreSQL-compatibility surface at a feature-m
 ### A1. Connectivity & Protocol
 | Area | Current | Target | Notes |
 |---|---|---|---|
-| Wire protocol v3 (Simple & Extended) | **Plan** | **Shim** | Parse/Bind/Describe/Execute/Sync; prepared statements & portals. |
+| Wire protocol v3 (Simple query only) | **Partial** | **Shim** | Startup/auth flow plus simple query path exist today; extended protocol and portals remain later work. |
 | SSL/TLS & sslmode | **Plan** | **Shim** | `disable/prefer/require/verify-ca/verify-full`. |
 | Auth: SCRAM‑SHA‑256 | **Plan** | **Shim** | MD5 fallback optional; prefer SCRAM only. |
 | COPY (text, binary) | **Plan** | **Shim** | Map to sydra bulk loader; stream backpressure. |
-| ParameterStatus / GUCs | **Plan** | **Shim** | Implement core ones below (A7). |
+| ParameterStatus / GUCs | **Partial** | **Shim** | Basic parameter status flow exists; broader GUC surface remains later work. |
 
 ### A2. Transactions & Concurrency
 | Feature | Current | Target | Notes |
@@ -63,10 +63,10 @@ This document tracks SydraDB’s PostgreSQL-compatibility surface at a feature-m
 ### A4. DML & Query
 | Feature | Current | Target | Notes |
 |---|---|---|---|
-| Basic `SELECT` projection + `WHERE` | **Scaffold** | **Native** | Translator rewrites `SELECT <cols> FROM <table> [WHERE ...]` into sydraQL (`src/sydra/query/translator.zig`); fixtures in `tests/translator/cases.jsonl`. |
-| `INSERT` (single `VALUES`, optional `RETURNING`) | **Scaffold** | **Shim** | Translator rewrites to `insert into <table> (...) values (...) [returning ...]`; see `tests/translator/cases.jsonl`. |
-| `UPDATE` (`SET` assignments, optional `WHERE/RETURNING`) | **Scaffold** | **Shim** | Translator emits `update <table> set <assignments> [where ...] [returning ...]`; fixtures cover WHERE/non-WHERE/RETURNING cases. |
-| `DELETE` (optional `WHERE/RETURNING`) | **Scaffold** | **Shim** | Translator emits `delete from <table> [where ...] [returning ...]`; fixtures cover WHERE/non-WHERE/RETURNING cases. |
+| Basic `SELECT` projection + `WHERE` | **Partial** | **Native** | Simple query translation/execution exists for the current subset; broader SQL coverage remains limited. |
+| `INSERT` (single `VALUES`, optional `RETURNING`) | **Partial** | **Shim** | Single `VALUES` translation exists; `RETURNING` is not part of the supported alpha contract. |
+| `UPDATE` (`SET` assignments, optional `WHERE/RETURNING`) | **Plan** | **Shim** | Not part of the currently supported translator subset. |
+| `DELETE` (optional `WHERE/RETURNING`) | **Partial** | **Shim** | Basic translation exists; `RETURNING` and broader edge cases remain out of scope for now. |
 | Upsert (`ON CONFLICT`) | **Plan** | **Shim / Partial** | Matches arbiter semantics; composite keys. |
 | CTEs (WITH) | **Plan** | **Shim / Partial** | Recursive optional (Plan if costly). |
 | Window functions | **Plan** | **Partial** | Add subset later if not native. |
@@ -97,7 +97,7 @@ This document tracks SydraDB’s PostgreSQL-compatibility surface at a feature-m
 | Introspection funcs (see A8) | **Plan** | **Shim** | |
 
 ### A7. Server identity & GUCs to support
-_Current status: **Plan** (session layer not yet in place). Target values once the wire handler lands:_
+_Current status: **Partial**. Basic session/parameter status flow exists, but the broader GUC contract below is still the target._
 
 Return sensible values on `SHOW`/`current_setting()`:
 

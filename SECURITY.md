@@ -1,21 +1,46 @@
 # Security Policy
 
-## Supported Versions
+## Current status
 
-Use this section to tell people about which versions of your project are
-currently being supported with security updates.
+SydraDB is pre-alpha software. Security hardening is in progress and the project does not yet make broad deployment guarantees.
 
-| Version | Supported          |
-| ------- | ------------------ |
-| 5.1.x   | :white_check_mark: |
-| 5.0.x   | :x:                |
-| 4.0.x   | :white_check_mark: |
-| < 4.0   | :x:                |
+The current release focus is:
 
-## Reporting a Vulnerability
+- single-node TSDB behavior
+- HTTP ingest and query correctness
+- narrow PostgreSQL simple-query compatibility
+- accurate documentation of supported versus unsupported surfaces
 
-Use this section to tell people how to report a vulnerability.
+## Supported versions
 
-Tell them where to go, how often they can expect to get an update on a
-reported vulnerability, what to expect if the vulnerability is accepted or
-declined, etc.
+Only the current `main` branch and the most recent tagged release should be treated as candidates for security fixes.
+
+Older tags may remain available for reproducibility, but they should not be assumed to receive coordinated security updates.
+
+## Reporting a vulnerability
+
+Please report vulnerabilities privately to the maintainer rather than opening a public GitHub issue.
+
+Use:
+
+- GitHub private security advisory, if enabled for the repository
+- or a direct maintainer contact channel if one is listed on the repository profile
+
+Include:
+
+- affected version or commit
+- impact summary
+- reproduction steps or proof of concept
+- any suggested mitigation
+
+## Response expectations
+
+- Initial acknowledgement target: within 7 days
+- Triage target: severity and reproduction assessment as soon as the issue can be reproduced
+- Fix timing: best effort, based on impact and maintainer availability
+
+## Current caveats
+
+- If `auth_token` is empty, `/api/*` endpoints are unauthenticated
+- `enable_influx` and `enable_prom` config flags are not a promise of production-ready adapter surfaces
+- `small_pool`, 32-bit targets, and broader PostgreSQL compatibility are not treated as hardened deployment surfaces in the current cycle

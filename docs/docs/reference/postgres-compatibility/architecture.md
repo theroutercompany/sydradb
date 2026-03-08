@@ -5,13 +5,13 @@ sidebar_label: Architecture
 
 # PostgreSQL Compatibility Architecture
 
-This note decomposes the compatibility layer into the modules we are building and documents the current ownership boundaries. It should evolve alongside the implementation.
+This note describes the intended ownership boundaries of the PostgreSQL compatibility bridge. It currently mixes implemented pieces with planned ones; for the supported alpha surface, treat [`roadmap`](./roadmap.md) as the more important source of truth.
 
 ## High-Level Components
 
 1. **Protocol Front-End**
-   - Accepts TCP connections, performs SSL negotiation, and speaks the PostgreSQL v3 wire protocol (startup, authentication, simple/extended query cycle, COPY).
-   - Owns session state: prepared statements, portals, transaction status, GUC overrides.
+   - Current: accepts TCP connections, performs the startup/auth-ok flow, and supports the implemented simple-query path.
+   - Planned later: TLS, extended protocol, COPY, and richer session state.
    - Emits decoded SQL queries to the translator and receives sydraQL execution results from the engine.
 
 2. **SQL Translator**
@@ -20,14 +20,13 @@ This note decomposes the compatibility layer into the modules we are building an
    - Integrates with `compat.sqlstate` to standardise error payloads and with `compat.log` for structured observability.
 
 3. **Catalog & Introspection Shim**
-   - Exposes `pg_catalog` tables and `information_schema` views backed by sydra metadata providers (`sydra_meta.tables()`, `columns()`, etc.).
-   - Generates stable OIDs stored in catalog persistence so regclass/regtype casts behave as drivers expect.
-   - Hosts compatibility functions (`version()`, `current_setting`, `pg_get_serial_sequence`, etc.) that bridge sydra internals.
+   - Current: a small in-memory catalog snapshot/debug surface.
+   - Planned later: broader `pg_catalog` and `information_schema` coverage plus richer compatibility helpers.
 
 4. **Execution Bridge**
    - Receives sydraQL plans from the translator, executes them against the engine, and maps results into PostgreSQL wire tuples.
-   - Handles COPY in/out streaming, respecting backpressure semantics and transaction boundaries.
-   - Converts sydra errors into PostgreSQL SQLSTATE payloads.
+   - Current focus: supported translator subset plus SQLSTATE/error mapping for the implemented path.
+   - Planned later: COPY in/out streaming and broader compatibility semantics.
 
 5. **Migration & Tooling**
    - A CLI pipeline that introspects source PostgreSQL schemas, emits sydra DDL, and orchestrates data movement (bulk load + CDC).
@@ -47,9 +46,9 @@ client SQL --> protocol frontend --> translator --> sydra engine --> protocol fr
 
 ## Concurrency Model
 
-- Each client connection runs in a dedicated async task. The protocol layer delegates execution to the existing sydra runtime (thread pool + event loop).
-- COPY streaming uses bounded channels to avoid unbounded buffering; backpressure is surfaced to the client via standard PG CopyBoth flow control.
-- Translator caches (e.g., prepared statement plans) are scoped to sessions; global caches must be lock-free or sharded to avoid contention.
+- Each client connection is currently handled in a straightforward connection loop against the existing sydra runtime.
+- COPY-specific buffering and prepared-statement cache design remain future work.
+- Translator caches and broader session-state design should stay explicit as the bridge expands.
 
 ## Observability Hooks
 

@@ -1,12 +1,38 @@
 # sydraDB
 
-A fast, embeddable time-series database in Zig.
+SydraDB is a single-node time-series database written in Zig.
 
-## Why
+## Alpha statement
 
-- Local-first, single binary
-- Crash-safe WAL → columnar TS segments
-- Simple query layer (sydraQL)
+Current alpha focus:
+
+- HTTP ingest
+- HTTP range queries
+- Basic sydraQL
+- Snapshot/restore
+- Narrow PostgreSQL simple-query compatibility
+
+This is intentionally not a broad PostgreSQL replacement. The current compatibility layer is a small bridge for startup/auth flow, simple query execution, the current SQL translator subset, and standard `CommandComplete` behavior.
+
+## Supported contract
+
+- Zig: `0.15.1`
+- Supported build targets:
+  - `x86_64-linux-gnu`
+  - `aarch64-linux-gnu`
+  - `x86_64-macos`
+  - `aarch64-macos`
+- Supported allocator modes:
+  - `mimalloc` (default)
+  - `default`
+- Experimental, not a release gate this cycle:
+  - `small_pool`
+- Explicitly unsupported this cycle:
+  - 32-bit targets
+  - Influx LP / Prom remote_write adapters
+  - full PostgreSQL catalog coverage
+  - prepared statements / extended protocol / COPY
+  - migration tooling
 
 ## Quick start
 
@@ -17,8 +43,8 @@ curl -XPOST localhost:8080/api/v1/ingest --data-binary $'{"series":"weather.room
 
 # Allocator modes
 zig build                                # default: mimalloc global allocator
-zig build -Dallocator-mode=default       # use Zig GPA fallback
-zig build -Dallocator-mode=small_pool    # use slab allocator tuned for small writes
+zig build -Dallocator-mode=default       # supported Zig allocator path
+zig build -Dallocator-mode=small_pool    # experimental allocator path
 ```
 
 ## Nix
@@ -36,7 +62,7 @@ nix build
 
 Notes
 
-- The flake integrates `mitchellh/zig-overlay` and prefers Zig 0.15.1. With a flake.lock committed, Zig is fully pinned and consistent for all contributors.
+- The flake integrates `mitchellh/zig-overlay` and pins Zig `0.15.1`.
 - To (re)pin: `nix flake lock --update-input nixpkgs --update-input zig-overlay` then commit the updated `flake.lock`.
 
 ## Direnv (auto-activate dev shell)
@@ -55,7 +81,7 @@ From now on, entering the directory will auto‑activate the correct toolchain.
 
 ## Status
 
-Pre-alpha. Expect dragons.
+Pre-alpha. The goal of the current cycle is to make the existing TSDB core and narrow compatibility surface more honest, tighter, and better documented rather than broader.
 
 ## License
 
@@ -64,7 +90,7 @@ Apache-2.0
 ## CLI
 
 ```bash
-./zig-out/bin/sydradb             # serve (HTTP): /api/v1/ingest, /api/v1/query/range, /metrics
+./zig-out/bin/sydradb             # serve (HTTP): /api/v1/ingest, /api/v1/query/range, /api/v1/sydraql, /metrics
 ./zig-out/bin/sydradb ingest      # read NDJSON from stdin into local WAL
 ./zig-out/bin/sydradb query <series_id> <start_ts> <end_ts>
 ./zig-out/bin/sydradb compact     # merge small→large segments (v2 stub)
@@ -88,3 +114,9 @@ enable_prom = true
 # Per-namespace TTL
 retention.weather = 30
 ```
+
+Config notes:
+
+- `mem_limit_bytes` is parsed, but it is not currently enforced as a global runtime quota.
+- `enable_influx` and `enable_prom` remain parseable config flags, but they should be treated as placeholder or experimental toggles until real adapter surfaces land.
+- `auth_token` is the only built-in API auth mechanism today; if it is empty, `/api/*` is unauthenticated.

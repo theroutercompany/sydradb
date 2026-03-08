@@ -16,7 +16,7 @@ See also:
 
 ## Prerequisites
 
-- Zig `0.15.x` (recommended: use the pinned Nix toolchain)
+- Zig `0.15.1` (recommended: use the pinned Nix toolchain)
 - Node.js + npm (only required for docs development under `docs/`)
 
 ## Recommended workflow
