@@ -288,7 +288,7 @@ fn handleSydraqlQuery(
     cursor.stats.rows_emitted = @as(u64, @intCast(row_count));
     cursor.stats.rows_scanned = rows_scanned;
     const elapsed_us = std.time.microTimestamp() - start_time;
-    const plan_us = cursor.stats.parse_us + cursor.stats.validate_us + cursor.stats.optimize_us + cursor.stats.physical_us + cursor.stats.pipeline_us;
+    const plan_us = cursor.stats.parse_us + cursor.stats.validate_us + cursor.stats.bind_us + cursor.stats.compile_us + cursor.stats.logical_us + cursor.stats.optimize_us + cursor.stats.physical_us + cursor.stats.pipeline_us;
     const stream_ms = @divTrunc(elapsed_us, 1000);
     const plan_ms = @divTrunc(@as(i64, @intCast(plan_us)), 1000);
     if (cursor.columns.len != 0) {
@@ -300,6 +300,14 @@ fn handleSydraqlQuery(
         const trace_notice = try formatTraceNotice(alloc, cursor.stats.trace_id);
         defer alloc.free(trace_notice);
         try protocol.writeNoticeResponse(writer, trace_notice);
+    }
+    const mode_notice = try std.fmt.allocPrint(alloc, "execution_mode={s} legacy_fallback={}", .{ cursor.stats.execution_mode, cursor.stats.legacy_fallback });
+    defer alloc.free(mode_notice);
+    try protocol.writeNoticeResponse(writer, mode_notice);
+    if (cursor.stats.fallback_reason.len != 0) {
+        const fallback_notice = try std.fmt.allocPrint(alloc, "fallback_reason={s}", .{cursor.stats.fallback_reason});
+        defer alloc.free(fallback_notice);
+        try protocol.writeNoticeResponse(writer, fallback_notice);
     }
     for (op_stats) |stat| {
         const elapsed_ms = @divTrunc(@as(i64, @intCast(stat.elapsed_us)), 1000);

@@ -14,12 +14,18 @@ pub const ExecuteError = operator.ExecuteError;
 pub const ExecutionStats = struct {
     parse_us: u64 = 0,
     validate_us: u64 = 0,
+    bind_us: u64 = 0,
+    compile_us: u64 = 0,
+    logical_us: u64 = 0,
     optimize_us: u64 = 0,
     physical_us: u64 = 0,
     pipeline_us: u64 = 0,
     trace_id: []const u8 = "",
     rows_emitted: u64 = 0,
     rows_scanned: u64 = 0,
+    execution_mode: []const u8 = "legacy",
+    legacy_fallback: bool = false,
+    fallback_reason: []const u8 = "",
 };
 
 pub const OperatorStats = operator.Operator.StatsSnapshot;

@@ -350,6 +350,12 @@ fn writeStatsObject(
     try jw.write(usToMs(stats.parse_us));
     try jw.objectField("validate_ms");
     try jw.write(usToMs(stats.validate_us));
+    try jw.objectField("bind_ms");
+    try jw.write(usToMs(stats.bind_us));
+    try jw.objectField("compile_ms");
+    try jw.write(usToMs(stats.compile_us));
+    try jw.objectField("logical_ms");
+    try jw.write(usToMs(stats.logical_us));
     try jw.objectField("optimize_ms");
     try jw.write(usToMs(stats.optimize_us));
     try jw.objectField("physical_ms");
@@ -360,6 +366,14 @@ fn writeStatsObject(
     try jw.write(stats.rows_emitted);
     try jw.objectField("rows_scanned");
     try jw.write(stats.rows_scanned);
+    try jw.objectField("execution_mode");
+    try jw.write(stats.execution_mode);
+    try jw.objectField("legacy_fallback");
+    try jw.write(stats.legacy_fallback);
+    if (stats.fallback_reason.len != 0) {
+        try jw.objectField("fallback_reason");
+        try jw.write(stats.fallback_reason);
+    }
     if (stats.trace_id.len != 0) {
         try jw.objectField("trace_id");
         try jw.write(stats.trace_id);
@@ -756,6 +770,7 @@ fn handleIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Re
         const tags = try extractTagsJson(alloc, obj.get("tags"));
         defer if (tags.owned) |buf| alloc.free(buf);
         const sid = types.seriesIdFrom(series, tags.value);
+        try eng.registerSeries(series, tags.value, sid);
         try eng.ingest(.{ .series_id = sid, .ts = ts, .value = value, .tags_json = try alloc.dupe(u8, tags.value) });
         eng.noteTags(sid, tags.value);
         count += 1;
