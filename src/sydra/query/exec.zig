@@ -94,6 +94,7 @@ test "execute supports select 1" {
         .enable_influx = false,
         .enable_prom = false,
         .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
         .retention_ns = std.StringHashMap(u32).init(talloc),
     };
 

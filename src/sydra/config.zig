@@ -1,6 +1,8 @@
 const std = @import("std");
 
 pub const FsyncPolicy = enum { always, interval, none };
+pub const CasMode = enum { off, dual_write };
+pub const QueryCompilerMode = enum { legacy, shadow, compiled };
 
 pub const Config = struct {
     data_dir: []const u8,
@@ -13,6 +15,8 @@ pub const Config = struct {
     enable_influx: bool,
     enable_prom: bool,
     mem_limit_bytes: usize,
+    cas_mode: CasMode,
+    query_compiler_mode: QueryCompilerMode = .legacy,
     retention_ns: std.StringHashMap(u32),
 
     pub fn deinit(self: *Config, alloc: std.mem.Allocator) void {
@@ -44,6 +48,8 @@ fn parseToml(alloc: std.mem.Allocator, text: []const u8) !Config {
         .enable_influx = false,
         .enable_prom = true,
         .mem_limit_bytes = 256 * 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .legacy,
         .retention_ns = std.StringHashMap(u32).init(alloc),
     };
     var it = std.mem.tokenizeAny(u8, text, "\n\r");
@@ -84,6 +90,28 @@ fn parseToml(alloc: std.mem.Allocator, text: []const u8) !Config {
         } else if (std.mem.eql(u8, key_raw, "enable_prom")) {
             const v2 = std.mem.trim(u8, val_raw, " \t");
             cfg.enable_prom = std.mem.eql(u8, v2, "true");
+        } else if (std.mem.eql(u8, key_raw, "cas_mode")) {
+            var v2 = val_raw;
+            if (v2.len >= 2 and v2[0] == '"' and v2[v2.len - 1] == '"') v2 = v2[1 .. v2.len - 1];
+            if (std.mem.eql(u8, v2, "off")) {
+                cfg.cas_mode = .off;
+            } else if (std.mem.eql(u8, v2, "dual_write")) {
+                cfg.cas_mode = .dual_write;
+            } else {
+                return error.InvalidCasMode;
+            }
+        } else if (std.mem.eql(u8, key_raw, "query_compiler_mode")) {
+            var v2 = val_raw;
+            if (v2.len >= 2 and v2[0] == '"' and v2[v2.len - 1] == '"') v2 = v2[1 .. v2.len - 1];
+            if (std.mem.eql(u8, v2, "legacy")) {
+                cfg.query_compiler_mode = .legacy;
+            } else if (std.mem.eql(u8, v2, "shadow")) {
+                cfg.query_compiler_mode = .shadow;
+            } else if (std.mem.eql(u8, v2, "compiled")) {
+                cfg.query_compiler_mode = .compiled;
+            } else {
+                return error.InvalidQueryCompilerMode;
+            }
         } else if (std.mem.startsWith(u8, key_raw, "retention.")) {
             const ns = key_raw["retention.".len..];
             const days: u32 = @intCast(try std.fmt.parseInt(u32, val_raw, 10));

@@ -23,7 +23,9 @@ pub const TagIndex = struct {
             if (entry.value_ptr.* != .array) continue;
             var arr = std.ArrayListUnmanaged(types.SeriesId){};
             for (entry.value_ptr.array.items) |v| if (v == .integer) try arr.append(alloc, @intCast(v.integer));
-            try idx.map.put(key, arr);
+            const owned_key = try alloc.dupe(u8, key);
+            errdefer alloc.free(owned_key);
+            try idx.map.put(owned_key, arr);
         }
         return idx;
     }
@@ -31,17 +33,24 @@ pub const TagIndex = struct {
     pub fn deinit(self: *TagIndex) void {
         var it = self.map.iterator();
         while (it.next()) |e| {
+            self.alloc.free(e.key_ptr.*);
             e.value_ptr.deinit(self.alloc);
         }
         self.map.deinit();
     }
 
     pub fn add(self: *TagIndex, key: []const u8, series_id: types.SeriesId) !void {
-        var gop = try self.map.getOrPut(key);
-        if (!gop.found_existing) gop.value_ptr.* = .{};
-        // naive dedup: check last few entries
-        for (gop.value_ptr.items) |sid| if (sid == series_id) return;
-        try gop.value_ptr.append(self.alloc, series_id);
+        if (self.map.getPtr(key)) |existing| {
+            for (existing.items) |sid| if (sid == series_id) return;
+            try existing.append(self.alloc, series_id);
+            return;
+        }
+
+        const owned_key = try self.alloc.dupe(u8, key);
+        errdefer self.alloc.free(owned_key);
+        try self.map.put(owned_key, .{});
+        const inserted = self.map.getPtr(owned_key).?;
+        try inserted.append(self.alloc, series_id);
     }
 
     pub fn get(self: *TagIndex, key: []const u8) []const types.SeriesId {

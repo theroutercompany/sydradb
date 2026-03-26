@@ -27,6 +27,7 @@ This is intentionally not a broad PostgreSQL replacement. The current compatibil
   - `default`
 - Experimental, not a release gate this cycle:
   - `small_pool`
+  - `cas_mode = "dual_write"` metadata-first CAS commit graph
 - Explicitly unsupported this cycle:
   - 32-bit targets
   - Influx LP / Prom remote_write adapters
@@ -111,6 +112,7 @@ mem_limit_bytes = 268435456
 auth_token = ""  # set non-empty to require Bearer auth on /api/*
 enable_influx = false
 enable_prom = true
+cas_mode = "off"  # off|dual_write
 # Per-namespace TTL
 retention.weather = 30
 ```
@@ -118,5 +120,7 @@ retention.weather = 30
 Config notes:
 
 - `mem_limit_bytes` is parsed, but it is not currently enforced as a global runtime quota.
+- `cas_mode = "dual_write"` writes immutable metadata commits and `refs/heads/main` alongside the legacy storage path.
+- In this first ADR 0006 phase, query serving and WAL replay still use the legacy `MANIFEST`/`segments`/`wal` layout.
 - `enable_influx` and `enable_prom` remain parseable config flags, but they should be treated as placeholder or experimental toggles until real adapter surfaces land.
 - `auth_token` is the only built-in API auth mechanism today; if it is empty, `/api/*` is unauthenticated.

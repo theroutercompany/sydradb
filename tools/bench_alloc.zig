@@ -31,6 +31,7 @@ fn makeConfig(alloc: std.mem.Allocator, data_dir: []const u8, flush_interval: u3
         .enable_influx = false,
         .enable_prom = false,
         .mem_limit_bytes = 512 * 1024 * 1024,
+        .cas_mode = .off,
         .retention_ns = std.StringHashMap(u32).init(alloc),
     };
 }

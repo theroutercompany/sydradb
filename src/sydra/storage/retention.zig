@@ -3,20 +3,34 @@ const manifest_mod = @import("manifest.zig");
 
 pub fn apply(data_dir: std.fs.Dir, manifest: *manifest_mod.Manifest, ttl_days: u32) !void {
     if (ttl_days == 0) return; // keep forever
+    _ = try applyWithResult(data_dir, manifest, ttl_days);
+}
+
+pub fn applyWithResult(data_dir: std.fs.Dir, manifest: *manifest_mod.Manifest, ttl_days: u32) !bool {
+    if (ttl_days == 0) return false; // keep forever
     const now_secs: i64 = @intCast(std.time.timestamp());
     const ttl_secs: i64 = @as(i64, @intCast(ttl_days)) * 24 * 3600;
     var keep = std.ArrayListUnmanaged(manifest_mod.Entry){};
-    defer keep.deinit(manifest.alloc);
+    errdefer keep.deinit(manifest.alloc);
+    var changed = false;
     for (manifest.entries.items) |e| {
         if ((now_secs - e.end_ts) > ttl_secs) {
             // delete segment file best-effort
             data_dir.deleteFile(e.path) catch {};
+            manifest.alloc.free(e.path);
+            changed = true;
             continue;
         }
         try keep.append(manifest.alloc, e);
     }
+    if (!changed) {
+        keep.deinit(manifest.alloc);
+        return false;
+    }
     manifest.entries.deinit(manifest.alloc);
     manifest.entries = keep;
+    try manifest.rewriteCheckpoint(data_dir);
+    return true;
 }
 
 test "retention removes expired segments" {

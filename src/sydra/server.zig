@@ -5,6 +5,7 @@ const http = @import("http.zig");
 const catalog = @import("catalog.zig");
 const compat = @import("compat.zig");
 const alloc_mod = @import("alloc.zig");
+const cas_mod = @import("storage/cas.zig");
 
 pub fn run(handle: *alloc_mod.AllocatorHandle) !void {
     const alloc = handle.allocator();
@@ -43,6 +44,7 @@ fn loadConfigOrDefault(alloc: std.mem.Allocator) !config.Config {
         .enable_influx = false,
         .enable_prom = true,
         .mem_limit_bytes = 256 * 1024 * 1024,
+        .cas_mode = .off,
         .retention_ns = std.StringHashMap(u32).init(alloc),
     };
 }
@@ -108,6 +110,7 @@ fn cmdIngest(alloc: std.mem.Allocator, _: [][:0]u8) !void {
         const ts: i64 = @intCast(obj.get("ts").?.integer);
         const value = obj.get("value").?.float;
         const sid = @import("types.zig").hash64(series);
+        try eng.registerSeries(series, "{}", sid);
         try eng.ingest(.{ .series_id = sid, .ts = ts, .value = value, .tags_json = "{}" });
         count += 1;
     }
@@ -136,7 +139,20 @@ fn cmdCompact(alloc: std.mem.Allocator, _: [][:0]u8) !void {
     defer data_dir.close();
     var manifest = try @import("storage/manifest.zig").Manifest.loadOrInit(alloc, data_dir);
     defer manifest.deinit();
-    try @import("storage/compact.zig").compactAll(alloc, data_dir, &manifest);
+    var tags = try @import("storage/tags.zig").TagIndex.loadOrInit(alloc, data_dir);
+    defer tags.deinit();
+
+    var cas_manager: ?cas_mod.CasManager = null;
+    defer if (cas_manager) |*cas| cas.deinit();
+    if (cfg.cas_mode == .dual_write) {
+        cas_manager = try cas_mod.CasManager.init(alloc, cfg.data_dir);
+        _ = try cas_manager.?.bootstrapIfMissing(data_dir, &manifest, &tags);
+    }
+
+    const changed = try @import("storage/compact.zig").compactAllWithResult(alloc, data_dir, &manifest);
+    if (changed and cas_manager != null) {
+        _ = try cas_manager.?.syncLegacySnapshot(data_dir, &manifest, &tags, "compaction");
+    }
 }
 
 fn cmdStats(handle: *alloc_mod.AllocatorHandle, alloc: std.mem.Allocator, _: [][:0]u8) !void {

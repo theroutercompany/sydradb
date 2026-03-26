@@ -74,6 +74,10 @@ pub const Manifest = struct {
         return result;
     }
 
+    pub fn appendEntry(self: *Manifest, entry: Entry) !void {
+        try self.entries.append(self.alloc, entry);
+    }
+
     pub fn add(self: *Manifest, data_dir: std.fs.Dir, sid: types.SeriesId, hour: i64, start_ts: i64, end_ts: i64, count: u32, path: []const u8) !void {
         // append line to MANIFEST
         const OpenFlags = std.fs.File.OpenFlags;
@@ -87,11 +91,49 @@ pub const Manifest = struct {
         var write_buf: [4096]u8 = undefined;
         var writer_state = file.writer(&write_buf);
         var writer = anyWriter(&writer_state.interface);
-        try writer.print("{{\"series_id\":{d},\"hour_bucket\":{d},\"start_ts\":{d},\"end_ts\":{d},\"count\":{d},\"path\":\"{s}\"}}\n", .{ sid, hour, start_ts, end_ts, count, path });
+        try writeEntry(&writer, .{
+            .series_id = sid,
+            .hour_bucket = hour,
+            .start_ts = start_ts,
+            .end_ts = end_ts,
+            .count = count,
+            .path = @constCast(path),
+        });
         try writer_state.end();
-        try self.entries.append(self.alloc, .{ .series_id = sid, .hour_bucket = hour, .start_ts = start_ts, .end_ts = end_ts, .count = count, .path = try self.alloc.dupe(u8, path) });
+        try self.entries.append(self.alloc, .{
+            .series_id = sid,
+            .hour_bucket = hour,
+            .start_ts = start_ts,
+            .end_ts = end_ts,
+            .count = count,
+            .path = try self.alloc.dupe(u8, path),
+        });
+    }
+
+    pub fn rewriteCheckpoint(self: *Manifest, data_dir: std.fs.Dir) !void {
+        const temp_name = "MANIFEST.tmp";
+        var file = try data_dir.createFile(temp_name, .{ .truncate = true, .read = true });
+        defer file.close();
+        errdefer data_dir.deleteFile(temp_name) catch {};
+
+        var write_buf: [4096]u8 = undefined;
+        var writer_state = file.writer(&write_buf);
+        var writer = anyWriter(&writer_state.interface);
+        for (self.entries.items) |entry| {
+            try writeEntry(&writer, entry);
+        }
+        try writer_state.end();
+        try file.sync();
+        try data_dir.rename(temp_name, "MANIFEST");
     }
 };
+
+fn writeEntry(writer: *std.Io.AnyWriter, entry: Entry) !void {
+    try writer.print(
+        "{{\"series_id\":{d},\"hour_bucket\":{d},\"start_ts\":{d},\"end_ts\":{d},\"count\":{d},\"path\":\"{s}\"}}\n",
+        .{ entry.series_id, entry.hour_bucket, entry.start_ts, entry.end_ts, entry.count, entry.path },
+    );
+}
 
 fn anyWriter(writer: *std.Io.Writer) std.Io.AnyWriter {
     return .{

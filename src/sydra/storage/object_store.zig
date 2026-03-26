@@ -10,6 +10,17 @@ pub const ObjectType = enum(u8) {
 pub const ObjectId = struct {
     hash: [32]u8,
 
+    pub fn eql(self: ObjectId, other: ObjectId) bool {
+        return std.mem.eql(u8, self.hash[0..], other.hash[0..]);
+    }
+
+    pub fn fromHex(hex: []const u8) !ObjectId {
+        if (hex.len != 64) return error.InvalidObjectIdHex;
+        var hash_bytes: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(hash_bytes[0..], hex);
+        return .{ .hash = hash_bytes };
+    }
+
     pub fn toHex(self: ObjectId) [64]u8 {
         var out: [64]u8 = undefined;
         _ = std.fmt.bufPrint(&out, "{s}", .{std.fmt.fmtSliceHexLower(self.hash[0..])}) catch unreachable;
@@ -135,4 +146,12 @@ test "object store write/read round-trip" {
 
     try std.testing.expect(loaded.obj_type == .blob);
     try std.testing.expectEqualStrings(payload, loaded.payload);
+}
+
+test "object id hex round-trip" {
+    const payload = "hex round trip";
+    const id = hash(.blob, payload);
+    const hex = id.toHex();
+    const parsed = try ObjectId.fromHex(hex[0..]);
+    try std.testing.expect(parsed.eql(id));
 }

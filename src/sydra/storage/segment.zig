@@ -8,6 +8,17 @@ const manifest_mod = @import("manifest.zig");
 // payload depends on codecs (default: ts=dod+zigzag varint, val=gorilla-xor byte-aligned)
 // Back-compat: v0 (SYSEG1) supports ts delta varint + raw f64 values.
 
+pub const SegmentMetadata = struct {
+    series_id: types.SeriesId,
+    hour_bucket: i64,
+    count: u32,
+    start_ts: i64,
+    end_ts: i64,
+    ts_codec: u8,
+    val_codec: u8,
+    file_size: u64,
+};
+
 pub fn writeSegment(alloc: std.mem.Allocator, data_dir: std.fs.Dir, series_id: types.SeriesId, hour: i64, points: []const types.Point) ![]const u8 {
     // Ensure directory for hour exists
     var hour_buf: [32]u8 = undefined;
@@ -110,6 +121,59 @@ pub fn readAll(alloc: std.mem.Allocator, data_dir: std.fs.Dir, path: []const u8)
         points[idx] = .{ .ts = ts, .value = vals[idx] };
     }
     return points;
+}
+
+pub fn inspectMetadata(data_dir: std.fs.Dir, path: []const u8) !SegmentMetadata {
+    var f = try data_dir.openFile(path, .{});
+    defer f.close();
+
+    const stat = try f.stat();
+
+    var read_buf: [4096]u8 = undefined;
+    var reader_state = f.reader(&read_buf);
+    const reader = std.Io.Reader.adaptToOldInterface(&reader_state.interface);
+
+    var hdr: [6]u8 = undefined;
+    try reader.readNoEof(&hdr);
+    var tmp8: [8]u8 = undefined;
+    try reader.readNoEof(tmp8[0..8]);
+    const series_id = std.mem.readInt(u64, &tmp8, .little);
+    try reader.readNoEof(tmp8[0..8]);
+    const hour_bucket = std.mem.readInt(i64, &tmp8, .little);
+    var tmp4: [4]u8 = undefined;
+    try reader.readNoEof(tmp4[0..4]);
+    const count = std.mem.readInt(u32, &tmp4, .little);
+    try reader.readNoEof(tmp8[0..8]);
+    const start_ts = std.mem.readInt(i64, &tmp8, .little);
+    try reader.readNoEof(tmp8[0..8]);
+    const end_ts = std.mem.readInt(i64, &tmp8, .little);
+
+    if (std.mem.eql(u8, hdr[0..6], "SYSEG1")) {
+        return .{
+            .series_id = series_id,
+            .hour_bucket = hour_bucket,
+            .count = count,
+            .start_ts = start_ts,
+            .end_ts = end_ts,
+            .ts_codec = 0,
+            .val_codec = 0,
+            .file_size = stat.size,
+        };
+    }
+    if (!std.mem.eql(u8, hdr[0..6], "SYSEG2")) return error.UnknownSegmentFormat;
+
+    const ts_codec = try readByte(reader);
+    const val_codec = try readByte(reader);
+    return .{
+        .series_id = series_id,
+        .hour_bucket = hour_bucket,
+        .count = count,
+        .start_ts = start_ts,
+        .end_ts = end_ts,
+        .ts_codec = ts_codec,
+        .val_codec = val_codec,
+        .file_size = stat.size,
+    };
 }
 
 pub fn queryRange(alloc: std.mem.Allocator, data_dir: std.fs.Dir, manifest: *manifest_mod.Manifest, series_id: types.SeriesId, start_ts: i64, end_ts: i64, out: *std.array_list.Managed(types.Point)) !void {

@@ -2,10 +2,12 @@ const std = @import("std");
 const cfg = @import("config.zig");
 const types = @import("types.zig");
 const manifest_mod = @import("storage/manifest.zig");
+const series_catalog_mod = @import("storage/series_catalog.zig");
 const wal_mod = @import("storage/wal.zig");
 const segment_mod = @import("storage/segment.zig");
 const tags_mod = @import("storage/tags.zig");
 const retention = @import("storage/retention.zig");
+const cas_mod = @import("storage/cas.zig");
 
 fn sleepMs(ms: u64) void {
     if (@hasDecl(std.time, "sleep")) {
@@ -23,11 +25,13 @@ pub const Engine = struct {
     mem: MemTable,
     manifest: manifest_mod.Manifest,
     tags: tags_mod.TagIndex,
+    series_catalog: series_catalog_mod.SeriesCatalog,
     flush_timer_ms: u32,
     metrics: Metrics,
     writer_thread: ?std.Thread = null,
     stop_flag: bool = false,
     queue: *Queue,
+    cas: ?cas_mod.CasManager = null,
 
     pub const MemTable = struct {
         alloc: std.mem.Allocator,
@@ -208,14 +212,17 @@ pub const Engine = struct {
             .mem = MemTable.init(alloc),
             .manifest = try manifest_mod.Manifest.loadOrInit(alloc, data_dir),
             .tags = try tags_mod.TagIndex.loadOrInit(alloc, data_dir),
+            .series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(alloc, data_dir, config.fsync),
             .flush_timer_ms = config.flush_interval_ms,
             .metrics = Metrics.init(),
             .queue = undefined,
+            .cas = null,
         };
         errdefer {
             engine.mem.deinit();
             engine.manifest.deinit();
             engine.tags.deinit();
+            engine.series_catalog.deinit();
             engine.wal.close();
             engine.data_dir.close();
             engine.config.deinit(engine.alloc);
@@ -224,6 +231,11 @@ pub const Engine = struct {
         errdefer {
             engine.queue.deinit();
             engine.alloc.destroy(engine.queue);
+        }
+        if (engine.config.cas_mode == .dual_write) {
+            engine.cas = try cas_mod.CasManager.init(alloc, engine.config.data_dir);
+            errdefer if (engine.cas) |*cas| cas.deinit();
+            _ = try engine.cas.?.bootstrapIfMissing(engine.data_dir, &engine.manifest, &engine.tags);
         }
         try engine.recover();
         engine.writer_thread = try std.Thread.spawn(.{}, writerLoop, .{engine});
@@ -237,10 +249,12 @@ pub const Engine = struct {
         self.mem.deinit();
         self.manifest.deinit();
         self.tags.deinit();
+        self.series_catalog.deinit();
         self.wal.close();
         self.data_dir.close();
         self.queue.deinit();
         self.alloc.destroy(self.queue);
+        if (self.cas) |*cas| cas.deinit();
         self.config.deinit(self.alloc);
         self.alloc.destroy(self);
     }
@@ -253,7 +267,8 @@ pub const Engine = struct {
             t.join();
             self.writer_thread = null;
         }
-        try flushMemtable(self);
+        const flushed = try flushMemtable(self);
+        if (flushed) try self.syncCasSnapshot("snapshot-flush");
         try self.wal.file.sync();
         try @import("snapshot.zig").snapshot(self.alloc, self.data_dir, dst_path);
     }
@@ -304,14 +319,27 @@ pub const Engine = struct {
             const now = std.time.milliTimestamp();
             const mem_usage = self.mem.bytes.load(.monotonic);
             if (mem_usage >= self.config.memtable_max_bytes or (now - last_flush) >= self.flush_timer_ms) {
-                flushMemtable(self) catch |err| {
+                const flushed = flushMemtable(self) catch |err| blk: {
                     std.log.warn("memtable flush failed: {s}", .{@errorName(err)});
+                    break :blk false;
                 };
                 last_flush = now;
                 // apply retention best-effort after flush
-                retention.apply(self.data_dir, &self.manifest, self.config.retention_days) catch |err| {
+                const retention_changed = retention.applyWithResult(self.data_dir, &self.manifest, self.config.retention_days) catch |err| blk: {
                     std.log.warn("retention apply failed: {s}", .{@errorName(err)});
+                    break :blk false;
                 };
+                if (flushed or retention_changed) {
+                    const reason = if (flushed and retention_changed)
+                        "flush+retention"
+                    else if (flushed)
+                        "flush"
+                    else
+                        "retention";
+                    self.syncCasSnapshot(reason) catch |err| {
+                        std.log.warn("cas sync failed: {s}", .{@errorName(err)});
+                    };
+                }
             }
             // fsync policy: interval
             if (self.config.fsync == .interval and (now - last_sync) >= self.flush_timer_ms) {
@@ -322,12 +350,18 @@ pub const Engine = struct {
             }
         }
         // final flush
-        flushMemtable(self) catch |err| {
+        const flushed = flushMemtable(self) catch |err| blk: {
             std.log.warn("final memtable flush failed: {s}", .{@errorName(err)});
+            break :blk false;
         };
+        if (flushed) {
+            self.syncCasSnapshot("shutdown-flush") catch |err| {
+                std.log.warn("cas sync failed: {s}", .{@errorName(err)});
+            };
+        }
     }
 
-    fn flushMemtable(self: *Engine) !void {
+    fn flushMemtable(self: *Engine) !bool {
         const start_ns = std.time.nanoTimestamp();
         var points_written: usize = 0;
         var segments_written: usize = 0;
@@ -379,6 +413,7 @@ pub const Engine = struct {
         self.tags.save(self.data_dir) catch |err| {
             std.log.warn("tag index save failed: {s}", .{@errorName(err)});
         };
+        return segments_written > 0;
     }
 
     fn hourBucket(ts: i64) i64 {
@@ -388,6 +423,18 @@ pub const Engine = struct {
 
     pub fn queryRange(self: *Engine, series_id: types.SeriesId, start_ts: i64, end_ts: i64, out: *std.array_list.Managed(types.Point)) !void {
         try segment_mod.queryRange(self.alloc, self.data_dir, &self.manifest, series_id, start_ts, end_ts, out);
+    }
+
+    pub fn registerSeries(self: *Engine, series: []const u8, tags: []const u8, series_id: types.SeriesId) !void {
+        try self.series_catalog.register(series, tags, series_id);
+    }
+
+    pub fn resolveUniqueSeriesName(self: *Engine, series: []const u8) series_catalog_mod.Match {
+        return self.series_catalog.resolveUniqueName(series);
+    }
+
+    pub fn resolveExactSeries(self: *Engine, series: []const u8, tags_json: []const u8) !series_catalog_mod.Match {
+        return self.series_catalog.resolveExact(series, tags_json);
     }
 
     pub fn noteTags(self: *Engine, series_id: types.SeriesId, tags: []const u8) void {
@@ -414,6 +461,19 @@ pub const Engine = struct {
         }
         try gop.value_ptr.*.append(.{ .ts = ts, .value = value });
         _ = self.mem.bytes.fetchAdd(@sizeOf(types.Point), .monotonic);
+    }
+
+    pub fn verifyCasState(self: *Engine) !void {
+        if (self.cas) |*cas| {
+            return try cas.verifyHeadMatchesLegacy(self.data_dir, &self.manifest, &self.tags);
+        }
+        return error.CasDisabled;
+    }
+
+    fn syncCasSnapshot(self: *Engine, reason: []const u8) !void {
+        if (self.cas) |*cas| {
+            _ = try cas.syncLegacySnapshot(self.data_dir, &self.manifest, &self.tags, reason);
+        }
     }
 
     fn recover(self: *Engine) !void {
@@ -445,7 +505,8 @@ pub const Engine = struct {
 
         try self.wal.replay(self.alloc, &ctx);
         if (self.mem.bytes.load(.monotonic) > 0) {
-            try flushMemtable(self);
+            const flushed = try flushMemtable(self);
+            if (flushed) try self.syncCasSnapshot("recovery-flush");
         }
     }
 };
@@ -490,6 +551,7 @@ test "engine ingests, flushes, and queries range" {
         .enable_influx = false,
         .enable_prom = false,
         .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
         .retention_ns = std.StringHashMap(u32).init(talloc),
     };
 
@@ -547,6 +609,7 @@ test "engine replays wal on startup" {
         .enable_influx = false,
         .enable_prom = false,
         .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .dual_write,
         .retention_ns = std.StringHashMap(u32).init(talloc),
     };
 
@@ -560,6 +623,7 @@ test "engine replays wal on startup" {
     try std.testing.expectEqual(@as(i64, 1_000), results.items[0].ts);
     try std.testing.expectApproxEqAbs(@as(f64, 42.0), results.items[0].value, 1e-9);
     try std.testing.expectEqual(@as(i64, 1_050), results.items[1].ts);
+    try engine.verifyCasState();
 }
 
 test "engine metrics track ingest and flush" {
@@ -581,6 +645,7 @@ test "engine metrics track ingest and flush" {
         .enable_influx = false,
         .enable_prom = false,
         .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
         .retention_ns = std.StringHashMap(u32).init(talloc),
     };
 
@@ -632,6 +697,7 @@ test "engine snapshotTo captures a restorable point-in-time copy" {
             .enable_influx = false,
             .enable_prom = false,
             .mem_limit_bytes = 1024 * 1024,
+            .cas_mode = .dual_write,
             .retention_ns = std.StringHashMap(u32).init(talloc),
         };
 
@@ -662,6 +728,7 @@ test "engine snapshotTo captures a restorable point-in-time copy" {
             .enable_influx = false,
             .enable_prom = false,
             .mem_limit_bytes = 1024 * 1024,
+            .cas_mode = .dual_write,
             .retention_ns = std.StringHashMap(u32).init(talloc),
         };
 
@@ -679,5 +746,56 @@ test "engine snapshotTo captures a restorable point-in-time copy" {
         const matches = restored.tags.get("host=snapshot");
         try std.testing.expectEqual(@as(usize, 1), matches.len);
         try std.testing.expectEqual(sid, matches[0]);
+        try restored.verifyCasState();
     }
+}
+
+test "engine dual-write creates a parent-linked CAS commit chain" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/data", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .dual_write,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    try engine.verifyCasState();
+
+    const initial_head = try engine.cas.?.refs.readHead(cas_mod.main_ref) orelse return error.MissingCasHead;
+    const sid = types.hash64("cas.chain");
+    try engine.ingest(.{ .series_id = sid, .ts = 1_000, .value = 10.0, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 1_005, .value = 11.0, .tags_json = "{}" });
+    engine.noteTags(sid, "{\"host\":\"cas\"}");
+
+    try waitForFlush(engine, 1, 1_000);
+    try engine.verifyCasState();
+
+    const next_head = try engine.cas.?.refs.readHead(cas_mod.main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(!initial_head.eql(next_head));
+
+    var reader = cas_mod.CommitReader{ .alloc = talloc, .store = &engine.cas.?.store, .refs = &engine.cas.?.refs };
+    var snapshot = try reader.loadHeadSnapshot();
+    defer snapshot.deinit(talloc);
+
+    try std.testing.expectEqual(@as(usize, 1), snapshot.commit.parents.len);
+    try std.testing.expect(snapshot.commit.parents[0].eql(initial_head));
+    try std.testing.expectEqual(@as(usize, 1), snapshot.segment_descriptors.len);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.tag_snapshot.entries.len);
 }

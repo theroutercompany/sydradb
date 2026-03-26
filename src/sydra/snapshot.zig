@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub fn snapshot(alloc: std.mem.Allocator, data_dir: std.fs.Dir, dst_path: []const u8) !void {
-    // Simple manifested copy: copy MANIFEST, wal/, segments/, tags.json
+    // Simple manifested copy: copy MANIFEST, wal/, segments/, tags.json, series catalog, objects/, refs/
     try std.fs.cwd().makePath(dst_path);
     var dst = try std.fs.cwd().openDir(dst_path, .{ .iterate = true });
     defer dst.close();
@@ -9,6 +9,9 @@ pub fn snapshot(alloc: std.mem.Allocator, data_dir: std.fs.Dir, dst_path: []cons
     try copyDirRecursive(alloc, data_dir, dst, "wal");
     try copyDirRecursive(alloc, data_dir, dst, "segments");
     try copyIfExists(data_dir, dst, "tags.json");
+    try copyIfExists(data_dir, dst, "series_catalog.jsonl");
+    try copyDirRecursive(alloc, data_dir, dst, "objects");
+    try copyDirRecursive(alloc, data_dir, dst, "refs");
 }
 
 pub fn restore(alloc: std.mem.Allocator, data_dir: std.fs.Dir, src_path: []const u8) !void {
@@ -18,6 +21,9 @@ pub fn restore(alloc: std.mem.Allocator, data_dir: std.fs.Dir, src_path: []const
     try copyDirRecursive(alloc, src, data_dir, "wal");
     try copyDirRecursive(alloc, src, data_dir, "segments");
     try copyIfExists(src, data_dir, "tags.json");
+    try copyIfExists(src, data_dir, "series_catalog.jsonl");
+    try copyDirRecursive(alloc, src, data_dir, "objects");
+    try copyDirRecursive(alloc, src, data_dir, "refs");
 }
 
 fn copyIfExists(from: std.fs.Dir, to: std.fs.Dir, name: []const u8) !void {
