@@ -270,7 +270,21 @@ pub const Engine = struct {
                 try cas_manager.?.exportHeadToLegacy(data_dir);
             }
         }
-        const wal = try wal_mod.WAL.open(alloc, data_dir, config.fsync);
+        var wal = try wal_mod.WAL.open(alloc, data_dir, config.fsync);
+        var manifest = try manifest_mod.Manifest.loadOrInit(alloc, data_dir);
+        errdefer manifest.deinit();
+        var tags = try tags_mod.TagIndex.loadOrInit(alloc, data_dir);
+        errdefer tags.deinit();
+        var series_catalog = try loadSeriesCatalogWithRepair(
+            alloc,
+            data_dir,
+            config.fsync,
+            &manifest,
+            &wal,
+            if (cas_manager) |*cas| cas else null,
+        );
+        errdefer series_catalog.deinit();
+
         var engine = try alloc.create(Engine);
         errdefer alloc.destroy(engine);
         engine.* = .{
@@ -279,9 +293,9 @@ pub const Engine = struct {
             .data_dir = data_dir,
             .wal = wal,
             .mem = MemTable.init(alloc),
-            .manifest = try manifest_mod.Manifest.loadOrInit(alloc, data_dir),
-            .tags = try tags_mod.TagIndex.loadOrInit(alloc, data_dir),
-            .series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(alloc, data_dir, config.fsync),
+            .manifest = manifest,
+            .tags = tags,
+            .series_catalog = series_catalog,
             .flush_timer_ms = config.flush_interval_ms,
             .metrics = Metrics.init(),
             .queue = undefined,
@@ -840,6 +854,124 @@ fn containsString(items: []const []u8, needle: []const u8) bool {
     return false;
 }
 
+fn loadSeriesCatalogWithRepair(
+    alloc: std.mem.Allocator,
+    data_dir: std.fs.Dir,
+    fsync: cfg.FsyncPolicy,
+    manifest: *const manifest_mod.Manifest,
+    wal: *wal_mod.WAL,
+    cas_manager: ?*cas_mod.CasManager,
+) !series_catalog_mod.SeriesCatalog {
+    return series_catalog_mod.SeriesCatalog.loadOrInit(alloc, data_dir, fsync) catch |err| switch (err) {
+        error.FileNotFound,
+        error.InvalidSeriesCatalog,
+        error.SeriesIdConflict,
+        error.InvalidCharacter,
+        error.InvalidNumber,
+        error.SyntaxError,
+        error.UnexpectedToken,
+        error.UnexpectedEndOfInput,
+        error.BufferUnderrun,
+        error.ValueTooLong,
+        error.LengthMismatch,
+        error.UnknownField,
+        error.MissingField,
+        error.DuplicateField,
+        => blk: {
+            try rebuildSeriesCatalogOnDisk(alloc, data_dir, fsync, manifest, wal, cas_manager);
+            break :blk try series_catalog_mod.SeriesCatalog.loadOrInit(alloc, data_dir, fsync);
+        },
+        else => return err,
+    };
+}
+
+fn rebuildSeriesCatalogOnDisk(
+    alloc: std.mem.Allocator,
+    data_dir: std.fs.Dir,
+    fsync: cfg.FsyncPolicy,
+    manifest: *const manifest_mod.Manifest,
+    wal: *wal_mod.WAL,
+    cas_manager: ?*cas_mod.CasManager,
+) !void {
+    var entries = std.array_list.Managed(series_catalog_mod.RebuildEntry).init(alloc);
+    defer {
+        for (entries.items) |entry| {
+            alloc.free(@constCast(entry.series));
+            alloc.free(@constCast(entry.canonical_tags));
+        }
+        entries.deinit();
+    }
+
+    var series_ids = std.AutoHashMap(types.SeriesId, usize).init(alloc);
+    defer series_ids.deinit();
+
+    if (cas_manager) |cas| {
+        var snapshot_index = cas.loadHeadIndex() catch |err| switch (err) {
+            error.CasHeadMissing => null,
+            else => return err,
+        };
+        if (snapshot_index) |*index| {
+            defer index.deinit();
+            for (index.snapshot.series_catalog_snapshot.entries) |entry| {
+                try appendRebuildEntry(alloc, &entries, &series_ids, entry.series, entry.canonical_tags, entry.series_id);
+            }
+            try series_catalog_mod.SeriesCatalog.rebuild(alloc, data_dir, fsync, entries.items);
+            return;
+        }
+    }
+
+    for (manifest.entries.items) |entry| {
+        var metadata = try segment_mod.inspectMetadata(alloc, data_dir, entry.path);
+        defer metadata.deinit(alloc);
+        if (metadata.selector) |selector| {
+            try appendRebuildEntry(alloc, &entries, &series_ids, selector.series, selector.canonical_tags, entry.series_id);
+        }
+    }
+
+    var ctx = struct {
+        alloc: std.mem.Allocator,
+        entries: *std.array_list.Managed(series_catalog_mod.RebuildEntry),
+        series_ids: *std.AutoHashMap(types.SeriesId, usize),
+
+        pub fn onSeriesRegistration(self: *@This(), series_id: types.SeriesId, series: []const u8, canonical_tags: []const u8) !void {
+            try appendRebuildEntry(self.alloc, self.entries, self.series_ids, series, canonical_tags, series_id);
+        }
+
+        pub fn onRecord(_: *@This(), _: types.SeriesId, _: i64, _: f64) !void {}
+    }{
+        .alloc = alloc,
+        .entries = &entries,
+        .series_ids = &series_ids,
+    };
+    try wal.replay(alloc, &ctx);
+
+    try series_catalog_mod.SeriesCatalog.rebuild(alloc, data_dir, fsync, entries.items);
+}
+
+fn appendRebuildEntry(
+    alloc: std.mem.Allocator,
+    entries: *std.array_list.Managed(series_catalog_mod.RebuildEntry),
+    series_ids: *std.AutoHashMap(types.SeriesId, usize),
+    series: []const u8,
+    canonical_tags: []const u8,
+    series_id: types.SeriesId,
+) !void {
+    if (series_ids.get(series_id)) |idx| {
+        const existing = entries.items[idx];
+        if (std.mem.eql(u8, existing.series, series) and std.mem.eql(u8, existing.canonical_tags, canonical_tags)) {
+            return;
+        }
+        return error.SeriesIdConflict;
+    }
+
+    try entries.append(.{
+        .series = try alloc.dupe(u8, series),
+        .canonical_tags = try alloc.dupe(u8, canonical_tags),
+        .series_id = series_id,
+    });
+    try series_ids.put(series_id, entries.items.len - 1);
+}
+
 fn legacyMetadataPresent(data_dir: std.fs.Dir) !bool {
     var manifest_file = data_dir.openFile("MANIFEST", .{}) catch |err| switch (err) {
         error.FileNotFound => return false,
@@ -1226,6 +1358,93 @@ test "engine resolveSelector surfaces metadata for by-id and exact lookups" {
     } });
     try std.testing.expectEqual(series_catalog_mod.ResolutionStatus.exact_match, exact.status);
     try std.testing.expectEqual(sid, exact.series_id.?);
+}
+
+test "engine rebuilds missing series catalog from segment metadata and wal registrations" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/repair-data", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    const flushed_tags = "{\"host\":\"a\"}";
+    const wal_tags = "{\"host\":\"b\"}";
+    const flushed_sid = types.seriesIdFrom("repair.flush", flushed_tags);
+    const wal_sid = types.seriesIdFrom("repair.live", wal_tags);
+
+    {
+        const config = cfg.Config{
+            .data_dir = try talloc.dupe(u8, data_path),
+            .http_port = 0,
+            .fsync = .none,
+            .flush_interval_ms = 5,
+            .memtable_max_bytes = 512,
+            .retention_days = 0,
+            .auth_token = try talloc.dupe(u8, ""),
+            .enable_influx = false,
+            .enable_prom = false,
+            .mem_limit_bytes = 1024 * 1024,
+            .cas_mode = .off,
+            .retention_ns = std.StringHashMap(u32).init(talloc),
+        };
+
+        var engine = try Engine.init(talloc, config);
+        defer engine.deinit();
+
+        try engine.registerSeries("repair.flush", flushed_tags, flushed_sid);
+        try engine.ingest(.{ .series_id = flushed_sid, .ts = 1_000, .value = 1.0, .tags_json = flushed_tags });
+        try waitForFlush(engine, 1, 1_000);
+
+        try engine.registerSeries("repair.live", wal_tags, wal_sid);
+        try engine.ingest(.{ .series_id = wal_sid, .ts = 2_000, .value = 2.0, .tags_json = wal_tags });
+        try waitForQueueEmpty(engine, 1_000);
+    }
+
+    {
+        var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+        defer data_dir.close();
+        try data_dir.deleteFile("series_catalog.jsonl");
+    }
+
+    {
+        const config = cfg.Config{
+            .data_dir = try talloc.dupe(u8, data_path),
+            .http_port = 0,
+            .fsync = .none,
+            .flush_interval_ms = 5,
+            .memtable_max_bytes = 512,
+            .retention_days = 0,
+            .auth_token = try talloc.dupe(u8, ""),
+            .enable_influx = false,
+            .enable_prom = false,
+            .mem_limit_bytes = 1024 * 1024,
+            .cas_mode = .off,
+            .retention_ns = std.StringHashMap(u32).init(talloc),
+        };
+
+        var engine = try Engine.init(talloc, config);
+        defer engine.deinit();
+
+        try std.testing.expectEqual(flushed_sid, switch (engine.resolveUniqueSeriesName("repair.flush")) {
+            .resolved => |sid| sid,
+            else => return error.TestUnexpectedResult,
+        });
+        try std.testing.expectEqual(wal_sid, switch (engine.resolveUniqueSeriesName("repair.live")) {
+            .resolved => |sid| sid,
+            else => return error.TestUnexpectedResult,
+        });
+
+        var flushed_points = std.array_list.Managed(types.Point).init(talloc);
+        defer flushed_points.deinit();
+        try engine.queryRange(flushed_sid, 0, 10_000, &flushed_points);
+        try std.testing.expectEqual(@as(usize, 1), flushed_points.items.len);
+
+        var wal_points = std.array_list.Managed(types.Point).init(talloc);
+        defer wal_points.deinit();
+        try engine.queryRange(wal_sid, 0, 10_000, &wal_points);
+        try std.testing.expectEqual(@as(usize, 1), wal_points.items.len);
+        try std.testing.expectApproxEqAbs(@as(f64, 2.0), wal_points.items[0].value, 1e-9);
+    }
 }
 
 test "engine dual-write creates a parent-linked CAS commit chain" {
