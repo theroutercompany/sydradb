@@ -1,8 +1,9 @@
 const std = @import("std");
 const cfg = @import("../config.zig");
 
-// WAL v0: record = [u32 len][u8 type][u64 series_id][i64 ts][f64 value][u32 crc32]
-// Type: 1 = Put
+// WAL v0:
+// Type 1 = Put: [u32 len][u8 type][u64 series_id][i64 ts][f64 value][u32 crc32]
+// Type 2 = SeriesRegistration: [u32 len][u8 type][u64 series_id][u32 series_len][u32 tags_len][series bytes][canonical tags bytes][u32 crc32]
 
 pub const WAL = struct {
     alloc: std.mem.Allocator,
@@ -55,6 +56,20 @@ pub const WAL = struct {
             .none => {},
         }
         return @intCast(total_bytes);
+    }
+
+    pub fn appendSeriesRegistration(self: *WAL, series_id: u64, series: []const u8, canonical_tags: []const u8) !u32 {
+        var payload = std.array_list.Managed(u8).init(self.alloc);
+        defer payload.deinit();
+
+        var writer = payload.writer();
+        try writer.writeByte(2);
+        try writer.writeInt(u64, series_id, .little);
+        try writer.writeInt(u32, @intCast(series.len), .little);
+        try writer.writeInt(u32, @intCast(canonical_tags.len), .little);
+        try writer.writeAll(series);
+        try writer.writeAll(canonical_tags);
+        return try appendPayload(self, payload.items);
     }
 
     pub fn rotateIfNeeded(self: *WAL) !void {
@@ -195,14 +210,54 @@ fn replayFile(alloc: std.mem.Allocator, wal_dir: std.fs.Dir, file_name: []const 
         crc.update(payload);
         if (crc.final() != expected_crc) return error.CorruptWal;
 
-        if (payload.len < 1 + 8 + 8 + 8) continue;
-        if (payload[0] != 1) continue;
-        const sid = std.mem.readInt(u64, payload[1 .. 1 + 8], .little);
-        const ts = std.mem.readInt(i64, payload[9 .. 9 + 8], .little);
-        const val_bits = std.mem.readInt(u64, payload[17 .. 17 + 8], .little);
-        const value: f64 = @bitCast(val_bits);
-        try ctx.onRecord(sid, ts, value);
+        switch (payload[0]) {
+            1 => {
+                if (payload.len < 1 + 8 + 8 + 8) continue;
+                const sid = std.mem.readInt(u64, payload[1 .. 1 + 8], .little);
+                const ts = std.mem.readInt(i64, payload[9 .. 9 + 8], .little);
+                const val_bits = std.mem.readInt(u64, payload[17 .. 17 + 8], .little);
+                const value: f64 = @bitCast(val_bits);
+                try ctx.onRecord(sid, ts, value);
+            },
+            2 => {
+                if (payload.len < 1 + 8 + 4 + 4) return error.CorruptWal;
+                const sid = std.mem.readInt(u64, payload[1 .. 1 + 8], .little);
+                const series_len = std.mem.readInt(u32, payload[9 .. 9 + 4], .little);
+                const tags_len = std.mem.readInt(u32, payload[13 .. 13 + 4], .little);
+                const expected_len = 1 + 8 + 4 + 4 + @as(usize, series_len) + @as(usize, tags_len);
+                if (payload.len != expected_len) return error.CorruptWal;
+                const series_start = 17;
+                const tags_start = series_start + series_len;
+                const series = payload[series_start..tags_start];
+                const tags = payload[tags_start .. tags_start + tags_len];
+                if (@hasDecl(@TypeOf(ctx.*), "onSeriesRegistration")) {
+                    try ctx.onSeriesRegistration(sid, series, tags);
+                }
+            },
+            else => continue,
+        }
     }
+}
+
+fn appendPayload(self: *WAL, payload: []const u8) !u32 {
+    var header: [4]u8 = undefined;
+    const plen: u32 = @intCast(payload.len);
+    std.mem.writeInt(u32, &header, plen, .little);
+    try self.file.writeAll(&header);
+    try self.file.writeAll(payload);
+    var crc = std.hash.Crc32.init();
+    crc.update(payload);
+    var crc_bytes: [4]u8 = undefined;
+    std.mem.writeInt(u32, &crc_bytes, crc.final(), .little);
+    try self.file.writeAll(&crc_bytes);
+    const total_bytes: usize = header.len + payload.len + 4;
+    self.bytes_written += total_bytes;
+    switch (self.fsync) {
+        .always => try self.file.sync(),
+        .interval => {},
+        .none => {},
+    }
+    return @intCast(total_bytes);
 }
 
 fn sortWalFiles(files: [][]u8) void {
@@ -224,4 +279,47 @@ fn readExact(reader: std.Io.AnyReader, buf: []u8) !void {
         if (n == 0) return error.CorruptWal;
         offset += n;
     }
+}
+
+test "wal replays series registrations before point records" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var wal = try WAL.open(alloc, tmp.dir, .none);
+    defer wal.close();
+
+    _ = try wal.appendSeriesRegistration(77, "weather.room4", "{\"host\":\"b\"}");
+    _ = try wal.append(77, 1_000, 3.5);
+
+    var ctx = struct {
+        registered: bool = false,
+        seen_series_id: ?u64 = null,
+        seen_series: ?[]const u8 = null,
+        seen_tags: ?[]const u8 = null,
+        point_count: usize = 0,
+
+        pub fn onSeriesRegistration(self: *@This(), series_id: u64, series: []const u8, canonical_tags: []const u8) !void {
+            self.registered = true;
+            self.seen_series_id = series_id;
+            self.seen_series = series;
+            self.seen_tags = canonical_tags;
+        }
+
+        pub fn onRecord(self: *@This(), series_id: u64, ts: i64, value: f64) !void {
+            try std.testing.expect(self.registered);
+            try std.testing.expectEqual(@as(u64, 77), series_id);
+            try std.testing.expectEqual(@as(i64, 1_000), ts);
+            try std.testing.expectApproxEqAbs(@as(f64, 3.5), value, 1e-9);
+            self.point_count += 1;
+        }
+    }{};
+
+    try wal.replay(alloc, &ctx);
+
+    try std.testing.expect(ctx.registered);
+    try std.testing.expectEqual(@as(u64, 77), ctx.seen_series_id.?);
+    try std.testing.expectEqualStrings("weather.room4", ctx.seen_series.?);
+    try std.testing.expectEqualStrings("{\"host\":\"b\"}", ctx.seen_tags.?);
+    try std.testing.expectEqual(@as(usize, 1), ctx.point_count);
 }

@@ -455,7 +455,15 @@ pub const Engine = struct {
                 while (end_idx < arr_ptr.*.items.len and hourBucket(arr_ptr.*.items[end_idx].ts) == hour) : (end_idx += 1) {}
                 const slice = arr_ptr.*.items[start_idx..end_idx];
                 // write segment
-                const seg_path = try segment_mod.writeSegment(self.alloc, self.data_dir, sid, hour, slice);
+                const selector_resolution = self.series_catalog.resolveBySeriesId(sid);
+                const selector_metadata = switch (selector_resolution.status) {
+                    .resolved, .exact_match => segment_mod.SelectorMetadataView{
+                        .series = selector_resolution.series.?,
+                        .canonical_tags = selector_resolution.canonical_tags.?,
+                    },
+                    .not_found, .ambiguous => null,
+                };
+                const seg_path = try segment_mod.writeSegmentWithMetadata(self.alloc, self.data_dir, sid, hour, slice, selector_metadata);
                 const c: u32 = @intCast(slice.len);
                 try self.manifest.add(self.data_dir, sid, hour, slice[0].ts, slice[slice.len - 1].ts, c, seg_path);
                 self.alloc.free(seg_path);
@@ -516,7 +524,7 @@ pub const Engine = struct {
     }
 
     pub fn registerSeries(self: *Engine, series: []const u8, tags: []const u8, series_id: types.SeriesId) !void {
-        _ = try self.series_catalog.register(series, tags, series_id);
+        try self.registerSeriesInternal(series, tags, series_id, true);
     }
 
     pub fn resolveSelector(self: *Engine, lookup: SelectorLookup) !series_catalog_mod.Resolution {
@@ -658,6 +666,9 @@ pub const Engine = struct {
         var ctx = struct {
             engine: *Engine,
             highwater: *std.AutoHashMap(types.SeriesId, i64),
+            pub fn onSeriesRegistration(self_ctx: *@This(), series_id: types.SeriesId, series: []const u8, canonical_tags: []const u8) !void {
+                try self_ctx.engine.registerSeriesInternal(series, canonical_tags, series_id, false);
+            }
             pub fn onRecord(self_ctx: *@This(), series_id: types.SeriesId, ts: i64, value: f64) !void {
                 if (self_ctx.highwater.getPtr(series_id)) |ptr| {
                     if (ts <= ptr.*) return;
@@ -681,6 +692,16 @@ pub const Engine = struct {
             const flushed = try flushMemtable(self);
             if (flushed) try self.syncCasSnapshot("recovery-flush");
         }
+    }
+
+    fn registerSeriesInternal(self: *Engine, series: []const u8, tags: []const u8, series_id: types.SeriesId, record_wal: bool) !void {
+        const inserted = try self.series_catalog.register(series, tags, series_id);
+        if (!inserted or !record_wal) return;
+
+        const resolution = self.series_catalog.resolveBySeriesId(series_id);
+        const series_name = resolution.series orelse series;
+        const canonical_tags = resolution.canonical_tags orelse tags;
+        _ = try self.wal.appendSeriesRegistration(series_id, series_name, canonical_tags);
     }
 
     fn collectSegmentHighwater(highwater: *std.AutoHashMap(types.SeriesId, i64), entries: anytype) !void {

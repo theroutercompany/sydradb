@@ -1006,7 +1006,8 @@ pub fn buildLegacySnapshot(
     }
 
     for (manifest.entries.items) |entry| {
-        const metadata = try segment_mod.inspectMetadata(data_dir, entry.path);
+        var metadata = try segment_mod.inspectMetadata(alloc, data_dir, entry.path);
+        defer metadata.deinit(alloc);
         if (metadata.series_id != entry.series_id or metadata.hour_bucket != entry.hour_bucket or metadata.start_ts != entry.start_ts or metadata.end_ts != entry.end_ts or metadata.count != entry.count) {
             return error.ManifestSegmentMismatch;
         }
