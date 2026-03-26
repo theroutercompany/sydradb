@@ -22,9 +22,7 @@ pub const ObjectId = struct {
     }
 
     pub fn toHex(self: ObjectId) [64]u8 {
-        var out: [64]u8 = undefined;
-        _ = std.fmt.bufPrint(&out, "{s}", .{std.fmt.fmtSliceHexLower(self.hash[0..])}) catch unreachable;
-        return out;
+        return std.fmt.bytesToHex(self.hash, .lower);
     }
 };
 
@@ -57,9 +55,8 @@ pub const ObjectStore = struct {
         var objects_dir = try self.root.openDir("objects", .{ .iterate = true });
         defer objects_dir.close();
 
-        const prefix_byte = id.hash[0];
-        var dir_buf: [2]u8 = undefined;
-        const dir_slice = try std.fmt.bufPrint(&dir_buf, "{02x}", .{prefix_byte});
+        const dir_buf = std.fmt.bytesToHex([_]u8{id.hash[0]}, .lower);
+        const dir_slice = dir_buf[0..];
 
         try objects_dir.makePath(dir_slice);
         var bucket_dir = try objects_dir.openDir(dir_slice, .{});
@@ -91,9 +88,8 @@ pub const ObjectStore = struct {
         var objects_dir = try self.root.openDir("objects", .{ .iterate = true });
         defer objects_dir.close();
 
-        const prefix_byte = id.hash[0];
-        var dir_buf: [2]u8 = undefined;
-        const dir_slice = try std.fmt.bufPrint(&dir_buf, "{02x}", .{prefix_byte});
+        const dir_buf = std.fmt.bytesToHex([_]u8{id.hash[0]}, .lower);
+        const dir_slice = dir_buf[0..];
 
         var bucket_dir = try objects_dir.openDir(dir_slice, .{});
         defer bucket_dir.close();
@@ -123,7 +119,7 @@ pub const ObjectStore = struct {
 };
 
 fn hash(obj_type: ObjectType, payload: []const u8) ObjectId {
-    var hasher = std.crypto.hash.blake3.Blake3.init(.{});
+    var hasher = std.crypto.hash.Blake3.init(.{});
     hasher.update(&[_]u8{@intFromEnum(obj_type)});
     hasher.update(payload);
     var out: [32]u8 = undefined;
@@ -135,7 +131,9 @@ test "object store write/read round-trip" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    var store = try ObjectStore.init(std.testing.allocator, tmp_dir.dir_path);
+    const store_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/object-store", .{tmp_dir.sub_path});
+    defer std.testing.allocator.free(store_path);
+    var store = try ObjectStore.init(std.testing.allocator, store_path);
     defer store.deinit();
 
     const payload = "hello world";

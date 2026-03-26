@@ -370,7 +370,7 @@ pub const CasManager = struct {
         tags: *const tags_mod.TagIndex,
     ) !object_store.ObjectId {
         if (try self.refs.readHead(main_ref)) |head| return head;
-        const writer = CommitWriter{ .alloc = self.alloc, .store = &self.store };
+        var writer = CommitWriter{ .alloc = self.alloc, .store = &self.store };
         const commit_id = try writer.writeSnapshot(data_dir, manifest, tags, null, "bootstrap");
         try self.refs.updateHeadAtomic(main_ref, commit_id);
         return commit_id;
@@ -384,7 +384,7 @@ pub const CasManager = struct {
         reason: []const u8,
     ) !object_store.ObjectId {
         const parent = try self.refs.readHead(main_ref);
-        const writer = CommitWriter{ .alloc = self.alloc, .store = &self.store };
+        var writer = CommitWriter{ .alloc = self.alloc, .store = &self.store };
         const commit_id = try writer.writeSnapshot(data_dir, manifest, tags, parent, reason);
         try self.refs.updateHeadAtomic(main_ref, commit_id);
         return commit_id;
@@ -511,7 +511,7 @@ fn hashFile(data_dir: std.fs.Dir, path: []const u8) ![32]u8 {
     defer file.close();
 
     var buf: [8192]u8 = undefined;
-    var hasher = std.crypto.hash.blake3.Blake3.init(.{});
+    var hasher = std.crypto.hash.Blake3.init(.{});
     while (true) {
         const bytes_read = try file.read(buf[0..]);
         if (bytes_read == 0) break;
@@ -799,7 +799,9 @@ test "cas codecs are deterministic for identical logical data" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    var store = try object_store.ObjectStore.init(std.testing.allocator, tmp_dir.dir_path);
+    const store_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/cas-store", .{tmp_dir.sub_path});
+    defer std.testing.allocator.free(store_path);
+    var store = try object_store.ObjectStore.init(std.testing.allocator, store_path);
     defer store.deinit();
 
     const id_a = try store.put(.blob, encoded_a);
