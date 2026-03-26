@@ -177,7 +177,19 @@ pub fn inspectMetadata(data_dir: std.fs.Dir, path: []const u8) !SegmentMetadata 
 }
 
 pub fn queryRange(alloc: std.mem.Allocator, data_dir: std.fs.Dir, manifest: *manifest_mod.Manifest, series_id: types.SeriesId, start_ts: i64, end_ts: i64, out: *std.array_list.Managed(types.Point)) !void {
-    for (manifest.entries.items) |e| {
+    try queryRangeEntries(alloc, data_dir, manifest.entries.items, series_id, start_ts, end_ts, out);
+}
+
+pub fn queryRangeEntries(
+    alloc: std.mem.Allocator,
+    data_dir: std.fs.Dir,
+    entries: anytype,
+    series_id: types.SeriesId,
+    start_ts: i64,
+    end_ts: i64,
+    out: *std.array_list.Managed(types.Point),
+) !void {
+    for (entries) |e| {
         if (e.series_id != series_id) continue;
         if (e.end_ts < start_ts or e.start_ts > end_ts) continue;
 

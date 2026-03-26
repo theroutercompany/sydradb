@@ -674,54 +674,7 @@ fn collectMatchingSeriesIds(
     tags_value: std.json.Value,
     op_and: bool,
 ) !std.array_list.Managed(types.SeriesId) {
-    var result = std.AutoHashMap(types.SeriesId, void).init(alloc);
-    defer result.deinit();
-
-    if (tags_value != .object) {
-        return std.array_list.Managed(types.SeriesId).init(alloc);
-    }
-
-    var saw_constraint = false;
-    var it = tags_value.object.iterator();
-    while (it.next()) |entry| {
-        if (entry.value_ptr.* != .string) continue;
-        const key = try std.fmt.allocPrint(alloc, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.string });
-        defer alloc.free(key);
-        const matches = eng.tags.get(key);
-        if (!saw_constraint) {
-            for (matches) |sid| try result.put(sid, {});
-            saw_constraint = true;
-            continue;
-        }
-        if (op_and) {
-            var result_it = result.iterator();
-            while (result_it.next()) |match| {
-                var found = false;
-                for (matches) |sid| {
-                    if (sid == match.key_ptr.*) {
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) _ = result.remove(match.key_ptr.*);
-            }
-        } else {
-            for (matches) |sid| try result.put(sid, {});
-        }
-    }
-
-    var ids = std.array_list.Managed(types.SeriesId).init(alloc);
-    errdefer ids.deinit();
-    var key_it = result.keyIterator();
-    while (key_it.next()) |sid| {
-        try ids.append(sid.*);
-    }
-    std.sort.block(types.SeriesId, ids.items, {}, struct {
-        fn lessThan(_: void, a: types.SeriesId, b: types.SeriesId) bool {
-            return a < b;
-        }
-    }.lessThan);
-    return ids;
+    return try eng.collectMatchingSeriesIds(alloc, tags_value, op_and);
 }
 
 fn handleIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {

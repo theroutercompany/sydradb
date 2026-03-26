@@ -32,6 +32,40 @@ pub const Engine = struct {
     stop_flag: bool = false,
     queue: *Queue,
     cas: ?cas_mod.CasManager = null,
+    cas_index: ?cas_mod.SnapshotIndex = null,
+
+    const MetadataView = union(enum) {
+        legacy: *Engine,
+        cas: *cas_mod.SnapshotIndex,
+
+        fn queryRange(self: @This(), alloc: std.mem.Allocator, data_dir: std.fs.Dir, series_id: types.SeriesId, start_ts: i64, end_ts: i64, out: *std.array_list.Managed(types.Point)) !void {
+            switch (self) {
+                .legacy => |engine| try segment_mod.queryRange(alloc, data_dir, &engine.manifest, series_id, start_ts, end_ts, out),
+                .cas => |index| try index.queryRange(alloc, data_dir, series_id, start_ts, end_ts, out),
+            }
+        }
+
+        fn tagMatches(self: @This(), key: []const u8) []const types.SeriesId {
+            return switch (self) {
+                .legacy => |engine| engine.tags.get(key),
+                .cas => |index| index.tagMatches(key),
+            };
+        }
+
+        fn resolveUniqueSeriesName(self: @This(), series: []const u8) series_catalog_mod.Match {
+            return switch (self) {
+                .legacy => |engine| engine.series_catalog.resolveUniqueName(series),
+                .cas => |index| index.resolveUniqueSeriesName(series),
+            };
+        }
+
+        fn resolveExactSeries(self: @This(), series: []const u8, tags_json: []const u8) !series_catalog_mod.Match {
+            return switch (self) {
+                .legacy => |engine| engine.series_catalog.resolveExact(series, tags_json),
+                .cas => |index| try index.resolveExactSeries(series, tags_json),
+            };
+        }
+    };
 
     pub const MemTable = struct {
         alloc: std.mem.Allocator,
@@ -196,11 +230,22 @@ pub const Engine = struct {
     };
 
     pub fn init(alloc: std.mem.Allocator, config: cfg.Config) !*Engine {
+        if (config.metadata_read_mode != .legacy and config.cas_mode == .off) {
+            return error.CasReadModeRequiresCas;
+        }
         std.fs.cwd().makePath(config.data_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
         const data_dir = try std.fs.cwd().openDir(config.data_dir, .{ .iterate = true });
+        var cas_manager: ?cas_mod.CasManager = null;
+        errdefer if (cas_manager) |*cas| cas.deinit();
+        if (config.cas_mode == .dual_write) {
+            cas_manager = try cas_mod.CasManager.init(alloc, config.data_dir, config.fsync);
+            if (config.metadata_read_mode == .primary and try cas_manager.?.refs.readHead(cas_mod.main_ref) != null and !try legacyMetadataPresent(data_dir)) {
+                try cas_manager.?.exportHeadToLegacy(data_dir);
+            }
+        }
         const wal = try wal_mod.WAL.open(alloc, data_dir, config.fsync);
         var engine = try alloc.create(Engine);
         errdefer alloc.destroy(engine);
@@ -216,7 +261,8 @@ pub const Engine = struct {
             .flush_timer_ms = config.flush_interval_ms,
             .metrics = Metrics.init(),
             .queue = undefined,
-            .cas = null,
+            .cas = cas_manager,
+            .cas_index = null,
         };
         errdefer {
             engine.mem.deinit();
@@ -225,6 +271,7 @@ pub const Engine = struct {
             engine.series_catalog.deinit();
             engine.wal.close();
             engine.data_dir.close();
+            if (engine.cas_index) |*index| index.deinit();
             engine.config.deinit(engine.alloc);
         }
         engine.queue = try Queue.init(alloc, &engine.metrics);
@@ -232,10 +279,9 @@ pub const Engine = struct {
             engine.queue.deinit();
             engine.alloc.destroy(engine.queue);
         }
-        if (engine.config.cas_mode == .dual_write) {
-            engine.cas = try cas_mod.CasManager.init(alloc, engine.config.data_dir);
-            errdefer if (engine.cas) |*cas| cas.deinit();
-            _ = try engine.cas.?.bootstrapIfMissing(engine.data_dir, &engine.manifest, &engine.tags);
+        if (engine.cas) |*cas| {
+            _ = try cas.bootstrapIfMissing(engine.data_dir, &engine.manifest, &engine.tags, &engine.series_catalog);
+            try engine.refreshCasIndex();
         }
         try engine.recover();
         engine.writer_thread = try std.Thread.spawn(.{}, writerLoop, .{engine});
@@ -252,6 +298,7 @@ pub const Engine = struct {
         self.series_catalog.deinit();
         self.wal.close();
         self.data_dir.close();
+        if (self.cas_index) |*index| index.deinit();
         self.queue.deinit();
         self.alloc.destroy(self.queue);
         if (self.cas) |*cas| cas.deinit();
@@ -422,7 +469,26 @@ pub const Engine = struct {
     }
 
     pub fn queryRange(self: *Engine, series_id: types.SeriesId, start_ts: i64, end_ts: i64, out: *std.array_list.Managed(types.Point)) !void {
-        try segment_mod.queryRange(self.alloc, self.data_dir, &self.manifest, series_id, start_ts, end_ts, out);
+        const legacy_view = self.legacyMetadataView();
+        switch (self.config.metadata_read_mode) {
+            .legacy => try legacy_view.queryRange(self.alloc, self.data_dir, series_id, start_ts, end_ts, out),
+            .shadow => {
+                try legacy_view.queryRange(self.alloc, self.data_dir, series_id, start_ts, end_ts, out);
+                if (self.casMetadataView()) |cas_view| {
+                    var cas_points = std.array_list.Managed(types.Point).init(self.alloc);
+                    defer cas_points.deinit();
+                    try cas_view.queryRange(self.alloc, self.data_dir, series_id, start_ts, end_ts, &cas_points);
+                    try verifyPointsMatch(out.items, cas_points.items);
+                }
+            },
+            .primary => {
+                if (self.casMetadataView()) |cas_view| {
+                    try cas_view.queryRange(self.alloc, self.data_dir, series_id, start_ts, end_ts, out);
+                } else {
+                    try legacy_view.queryRange(self.alloc, self.data_dir, series_id, start_ts, end_ts, out);
+                }
+            },
+        }
     }
 
     pub fn registerSeries(self: *Engine, series: []const u8, tags: []const u8, series_id: types.SeriesId) !void {
@@ -430,11 +496,60 @@ pub const Engine = struct {
     }
 
     pub fn resolveUniqueSeriesName(self: *Engine, series: []const u8) series_catalog_mod.Match {
-        return self.series_catalog.resolveUniqueName(series);
+        const legacy = self.legacyMetadataView().resolveUniqueSeriesName(series);
+        return switch (self.config.metadata_read_mode) {
+            .legacy => legacy,
+            .shadow => blk: {
+                if (self.casMetadataView()) |cas_view| {
+                    const cas_match = cas_view.resolveUniqueSeriesName(series);
+                    if (!matchesEqual(legacy, cas_match)) {
+                        std.debug.panic("cas shadow mismatch for series selector '{s}'", .{series});
+                    }
+                }
+                break :blk legacy;
+            },
+            .primary => if (self.casMetadataView()) |cas_view| cas_view.resolveUniqueSeriesName(series) else legacy,
+        };
     }
 
     pub fn resolveExactSeries(self: *Engine, series: []const u8, tags_json: []const u8) !series_catalog_mod.Match {
-        return self.series_catalog.resolveExact(series, tags_json);
+        const legacy_view = self.legacyMetadataView();
+        switch (self.config.metadata_read_mode) {
+            .legacy => return try legacy_view.resolveExactSeries(series, tags_json),
+            .shadow => {
+                const legacy = try legacy_view.resolveExactSeries(series, tags_json);
+                if (self.casMetadataView()) |cas_view| {
+                    const cas_match = try cas_view.resolveExactSeries(series, tags_json);
+                    if (!matchesEqual(legacy, cas_match)) return error.CasShadowMismatch;
+                }
+                return legacy;
+            },
+            .primary => {
+                if (self.casMetadataView()) |cas_view| return try cas_view.resolveExactSeries(series, tags_json);
+                return try legacy_view.resolveExactSeries(series, tags_json);
+            },
+        }
+    }
+
+    pub fn collectMatchingSeriesIds(self: *Engine, alloc: std.mem.Allocator, tags_value: std.json.Value, op_and: bool) !std.array_list.Managed(types.SeriesId) {
+        const legacy_view = self.legacyMetadataView();
+        switch (self.config.metadata_read_mode) {
+            .legacy => return try collectMatchingSeriesIdsFromView(alloc, legacy_view, tags_value, op_and),
+            .shadow => {
+                var legacy = try collectMatchingSeriesIdsFromView(alloc, legacy_view, tags_value, op_and);
+                errdefer legacy.deinit();
+                if (self.casMetadataView()) |cas_view| {
+                    var cas_ids = try collectMatchingSeriesIdsFromView(alloc, cas_view, tags_value, op_and);
+                    defer cas_ids.deinit();
+                    try verifySeriesIdsMatch(legacy.items, cas_ids.items);
+                }
+                return legacy;
+            },
+            .primary => {
+                if (self.casMetadataView()) |cas_view| return try collectMatchingSeriesIdsFromView(alloc, cas_view, tags_value, op_and);
+                return try collectMatchingSeriesIdsFromView(alloc, legacy_view, tags_value, op_and);
+            },
+        }
     }
 
     pub fn noteTags(self: *Engine, series_id: types.SeriesId, tags: []const u8) void {
@@ -465,14 +580,15 @@ pub const Engine = struct {
 
     pub fn verifyCasState(self: *Engine) !void {
         if (self.cas) |*cas| {
-            return try cas.verifyHeadMatchesLegacy(self.data_dir, &self.manifest, &self.tags);
+            return try cas.verifyHeadMatchesLegacy(self.data_dir, &self.manifest, &self.tags, &self.series_catalog);
         }
         return error.CasDisabled;
     }
 
     fn syncCasSnapshot(self: *Engine, reason: []const u8) !void {
         if (self.cas) |*cas| {
-            _ = try cas.syncLegacySnapshot(self.data_dir, &self.manifest, &self.tags, reason);
+            _ = try cas.syncLegacySnapshot(self.data_dir, &self.manifest, &self.tags, &self.series_catalog, reason);
+            try self.refreshCasIndex();
         }
     }
 
@@ -480,7 +596,8 @@ pub const Engine = struct {
         var highwater = std.AutoHashMap(types.SeriesId, i64).init(self.alloc);
         defer highwater.deinit();
 
-        for (self.manifest.entries.items) |entry| {
+        const segment_entries = if (self.cas_index) |*index| index.snapshot.segment_descriptors else self.manifest.entries.items;
+        for (segment_entries) |entry| {
             const gop = try highwater.getOrPut(entry.series_id);
             if (!gop.found_existing or entry.end_ts > gop.value_ptr.*) {
                 gop.value_ptr.* = entry.end_ts;
@@ -503,13 +620,160 @@ pub const Engine = struct {
             }
         }{ .engine = self, .highwater = &highwater };
 
-        try self.wal.replay(self.alloc, &ctx);
+        if (try self.recoveryWalFiles()) |files| {
+            defer wal_mod.freeWalFiles(self.alloc, files);
+            try self.wal.replayFiles(self.alloc, files, &ctx);
+        } else {
+            try self.wal.replay(self.alloc, &ctx);
+        }
         if (self.mem.bytes.load(.monotonic) > 0) {
             const flushed = try flushMemtable(self);
             if (flushed) try self.syncCasSnapshot("recovery-flush");
         }
     }
+
+    fn refreshCasIndex(self: *Engine) !void {
+        if (self.cas) |*cas| {
+            if (self.cas_index) |*index| index.deinit();
+            self.cas_index = try cas.loadHeadIndex();
+        }
+    }
+
+    fn recoveryWalFiles(self: *Engine) !?[][]u8 {
+        const index = if (self.cas_index) |*snapshot_index| snapshot_index else return null;
+        var files = std.array_list.Managed([]u8).init(self.alloc);
+        errdefer {
+            for (files.items) |name| self.alloc.free(name);
+            files.deinit();
+        }
+
+        for (index.snapshot.wal_index.entries) |entry| {
+            try files.append(try self.alloc.dupe(u8, entry.name));
+        }
+
+        const live = try wal_mod.listWalFiles(self.alloc, self.data_dir);
+        defer wal_mod.freeWalFiles(self.alloc, live);
+        for (live) |name| {
+            if (!containsString(files.items, name)) {
+                try files.append(try self.alloc.dupe(u8, name));
+            }
+        }
+        return try files.toOwnedSlice();
+    }
+
+    fn legacyMetadataView(self: *Engine) MetadataView {
+        return .{ .legacy = self };
+    }
+
+    fn casMetadataView(self: *Engine) ?MetadataView {
+        if (self.cas_index) |*index| return .{ .cas = index };
+        return null;
+    }
 };
+
+fn collectMatchingSeriesIdsFromView(
+    alloc: std.mem.Allocator,
+    view: Engine.MetadataView,
+    tags_value: std.json.Value,
+    op_and: bool,
+) !std.array_list.Managed(types.SeriesId) {
+    var result = std.AutoHashMap(types.SeriesId, void).init(alloc);
+    defer result.deinit();
+
+    if (tags_value != .object) {
+        return std.array_list.Managed(types.SeriesId).init(alloc);
+    }
+
+    var saw_constraint = false;
+    var it = tags_value.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .string) continue;
+        const key = try std.fmt.allocPrint(alloc, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.string });
+        defer alloc.free(key);
+        const matches = view.tagMatches(key);
+        if (!saw_constraint) {
+            for (matches) |sid| try result.put(sid, {});
+            saw_constraint = true;
+            continue;
+        }
+        if (op_and) {
+            var result_it = result.iterator();
+            while (result_it.next()) |match| {
+                var found = false;
+                for (matches) |sid| {
+                    if (sid == match.key_ptr.*) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) _ = result.remove(match.key_ptr.*);
+            }
+        } else {
+            for (matches) |sid| try result.put(sid, {});
+        }
+    }
+
+    var ids = std.array_list.Managed(types.SeriesId).init(alloc);
+    errdefer ids.deinit();
+    var key_it = result.keyIterator();
+    while (key_it.next()) |sid| {
+        try ids.append(sid.*);
+    }
+    std.sort.block(types.SeriesId, ids.items, {}, struct {
+        fn lessThan(_: void, a: types.SeriesId, b: types.SeriesId) bool {
+            return a < b;
+        }
+    }.lessThan);
+    return ids;
+}
+
+fn verifyPointsMatch(lhs: []const types.Point, rhs: []const types.Point) !void {
+    if (lhs.len != rhs.len) return error.CasShadowMismatch;
+    for (lhs, rhs) |left, right| {
+        if (left.ts != right.ts or left.value != right.value) return error.CasShadowMismatch;
+    }
+}
+
+fn verifySeriesIdsMatch(lhs: []const types.SeriesId, rhs: []const types.SeriesId) !void {
+    if (!std.mem.eql(types.SeriesId, lhs, rhs)) return error.CasShadowMismatch;
+}
+
+fn matchesEqual(lhs: series_catalog_mod.Match, rhs: series_catalog_mod.Match) bool {
+    return switch (lhs) {
+        .not_found => rhs == .not_found,
+        .ambiguous => rhs == .ambiguous,
+        .resolved => |sid| switch (rhs) {
+            .resolved => |other| sid == other,
+            else => false,
+        },
+    };
+}
+
+fn containsString(items: []const []u8, needle: []const u8) bool {
+    for (items) |item| {
+        if (std.mem.eql(u8, item, needle)) return true;
+    }
+    return false;
+}
+
+fn legacyMetadataPresent(data_dir: std.fs.Dir) !bool {
+    var manifest_file = data_dir.openFile("MANIFEST", .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    manifest_file.close();
+    var tags_file = data_dir.openFile("tags.json", .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    tags_file.close();
+    var catalog_file = data_dir.openFile("series_catalog.jsonl", .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    catalog_file.close();
+    return true;
+}
 
 const waitError = error{Timeout};
 
@@ -704,6 +968,7 @@ test "engine snapshotTo captures a restorable point-in-time copy" {
         var engine = try Engine.init(talloc, config);
         defer engine.deinit();
 
+        try engine.registerSeries("snapshot.series", "{}", sid);
         try engine.ingest(.{ .series_id = sid, .ts = 1_000, .value = 10.0, .tags_json = "{}" });
         try engine.ingest(.{ .series_id = sid, .ts = 1_005, .value = 11.0, .tags_json = "{}" });
         engine.noteTags(sid, "{\"host\":\"snapshot\"}");
@@ -746,6 +1011,10 @@ test "engine snapshotTo captures a restorable point-in-time copy" {
         const matches = restored.tags.get("host=snapshot");
         try std.testing.expectEqual(@as(usize, 1), matches.len);
         try std.testing.expectEqual(sid, matches[0]);
+        switch (restored.resolveUniqueSeriesName("snapshot.series")) {
+            .resolved => |resolved| try std.testing.expectEqual(sid, resolved),
+            else => return error.TestUnexpectedResult,
+        }
         try restored.verifyCasState();
     }
 }

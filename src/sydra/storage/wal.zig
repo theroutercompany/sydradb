@@ -70,42 +70,102 @@ pub const WAL = struct {
     }
 
     pub fn replay(self: *WAL, alloc: std.mem.Allocator, ctx: anytype) !void {
+        const files = try listWalFiles(alloc, self.dir);
+        defer freeWalFiles(alloc, files);
+        try self.replayFiles(alloc, files, ctx);
+    }
+
+    pub fn replayFiles(self: *WAL, alloc: std.mem.Allocator, files: []const []const u8, ctx: anytype) !void {
         var wal_dir = self.dir.openDir("wal", .{ .iterate = true }) catch |err| switch (err) {
             error.FileNotFound => return,
             else => return err,
         };
         defer wal_dir.close();
 
-        var files = try std.array_list.Managed([]u8).initCapacity(alloc, 0);
-        defer {
-            for (files.items) |name| alloc.free(name);
-            files.deinit();
-        }
-
-        var it = wal_dir.iterate();
-        while (try it.next()) |entry| {
-            if (entry.kind != .file) continue;
-            if (!std.mem.endsWith(u8, entry.name, ".wal")) continue;
-            const name = try alloc.dupe(u8, entry.name);
-            try files.append(name);
-        }
-
-        std.sort.block([]u8, files.items, {}, struct {
-            fn lessThan(_: void, a: []u8, b: []u8) bool {
-                const is_a_current = std.mem.eql(u8, a, "current.wal");
-                const is_b_current = std.mem.eql(u8, b, "current.wal");
-                if (is_a_current and !is_b_current) return false;
-                if (!is_a_current and is_b_current) return true;
-                return std.mem.lessThan(u8, a, b);
-            }
-        }.lessThan);
-
         const ctx_ptr = @constCast(ctx);
-        for (files.items) |name| {
+        for (files) |name| {
             try replayFile(alloc, wal_dir, name, ctx_ptr);
         }
     }
 };
+
+pub const WalFileInfo = struct {
+    name: []u8,
+    size: u64,
+    hash: [32]u8,
+};
+
+pub fn listWalFiles(alloc: std.mem.Allocator, data_dir: std.fs.Dir) ![][]u8 {
+    var wal_dir = data_dir.openDir("wal", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return try alloc.alloc([]u8, 0),
+        else => return err,
+    };
+    defer wal_dir.close();
+
+    var files = try std.array_list.Managed([]u8).initCapacity(alloc, 0);
+    errdefer {
+        for (files.items) |name| alloc.free(name);
+        files.deinit();
+    }
+
+    var it = wal_dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".wal")) continue;
+        try files.append(try alloc.dupe(u8, entry.name));
+    }
+
+    sortWalFiles(files.items);
+    return try files.toOwnedSlice();
+}
+
+pub fn freeWalFiles(alloc: std.mem.Allocator, files: [][]u8) void {
+    for (files) |name| alloc.free(name);
+    alloc.free(files);
+}
+
+pub fn freeWalFileInfos(alloc: std.mem.Allocator, files: []WalFileInfo) void {
+    for (files) |file| alloc.free(file.name);
+    alloc.free(files);
+}
+
+pub fn collectWalFileInfos(alloc: std.mem.Allocator, data_dir: std.fs.Dir) ![]WalFileInfo {
+    const files = try listWalFiles(alloc, data_dir);
+    defer freeWalFiles(alloc, files);
+
+    var infos = std.array_list.Managed(WalFileInfo).init(alloc);
+    errdefer {
+        for (infos.items) |info| alloc.free(info.name);
+        infos.deinit();
+    }
+
+    for (files) |name| {
+        const path = try std.fmt.allocPrint(alloc, "wal/{s}", .{name});
+        defer alloc.free(path);
+
+        var file = try data_dir.openFile(path, .{});
+        defer file.close();
+        const stat = try file.stat();
+
+        var buf: [8192]u8 = undefined;
+        var hasher = std.crypto.hash.Blake3.init(.{});
+        while (true) {
+            const bytes_read = try file.read(buf[0..]);
+            if (bytes_read == 0) break;
+            hasher.update(buf[0..bytes_read]);
+        }
+        var out: [32]u8 = undefined;
+        hasher.final(out[0..]);
+
+        try infos.append(.{
+            .name = try alloc.dupe(u8, name),
+            .size = stat.size,
+            .hash = out,
+        });
+    }
+
+    return try infos.toOwnedSlice();
+}
 
 fn replayFile(alloc: std.mem.Allocator, wal_dir: std.fs.Dir, file_name: []const u8, ctx: anytype) !void {
     var file = try wal_dir.openFile(file_name, .{});
@@ -143,6 +203,18 @@ fn replayFile(alloc: std.mem.Allocator, wal_dir: std.fs.Dir, file_name: []const 
         const value: f64 = @bitCast(val_bits);
         try ctx.onRecord(sid, ts, value);
     }
+}
+
+fn sortWalFiles(files: [][]u8) void {
+    std.sort.block([]u8, files, {}, struct {
+        fn lessThan(_: void, a: []u8, b: []u8) bool {
+            const is_a_current = std.mem.eql(u8, a, "current.wal");
+            const is_b_current = std.mem.eql(u8, b, "current.wal");
+            if (is_a_current and !is_b_current) return false;
+            if (!is_a_current and is_b_current) return true;
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lessThan);
 }
 
 fn readExact(reader: std.Io.AnyReader, buf: []u8) !void {

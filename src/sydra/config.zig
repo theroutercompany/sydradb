@@ -3,6 +3,7 @@ const std = @import("std");
 pub const FsyncPolicy = enum { always, interval, none };
 pub const CasMode = enum { off, dual_write };
 pub const QueryCompilerMode = enum { legacy, shadow, compiled };
+pub const MetadataReadMode = enum { legacy, shadow, primary };
 
 pub const Config = struct {
     data_dir: []const u8,
@@ -16,6 +17,7 @@ pub const Config = struct {
     enable_prom: bool,
     mem_limit_bytes: usize,
     cas_mode: CasMode,
+    metadata_read_mode: MetadataReadMode = .legacy,
     query_compiler_mode: QueryCompilerMode = .legacy,
     retention_ns: std.StringHashMap(u32),
 
@@ -49,6 +51,7 @@ fn parseToml(alloc: std.mem.Allocator, text: []const u8) !Config {
         .enable_prom = true,
         .mem_limit_bytes = 256 * 1024 * 1024,
         .cas_mode = .off,
+        .metadata_read_mode = .legacy,
         .query_compiler_mode = .legacy,
         .retention_ns = std.StringHashMap(u32).init(alloc),
     };
@@ -99,6 +102,18 @@ fn parseToml(alloc: std.mem.Allocator, text: []const u8) !Config {
                 cfg.cas_mode = .dual_write;
             } else {
                 return error.InvalidCasMode;
+            }
+        } else if (std.mem.eql(u8, key_raw, "metadata_read_mode")) {
+            var v2 = val_raw;
+            if (v2.len >= 2 and v2[0] == '"' and v2[v2.len - 1] == '"') v2 = v2[1 .. v2.len - 1];
+            if (std.mem.eql(u8, v2, "legacy")) {
+                cfg.metadata_read_mode = .legacy;
+            } else if (std.mem.eql(u8, v2, "shadow")) {
+                cfg.metadata_read_mode = .shadow;
+            } else if (std.mem.eql(u8, v2, "primary")) {
+                cfg.metadata_read_mode = .primary;
+            } else {
+                return error.InvalidMetadataReadMode;
             }
         } else if (std.mem.eql(u8, key_raw, "query_compiler_mode")) {
             var v2 = val_raw;

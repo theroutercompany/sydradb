@@ -30,6 +30,7 @@ pub fn run(handle: *alloc_mod.AllocatorHandle) !void {
     if (std.mem.eql(u8, cmd, "snapshot")) return cmdSnapshot(alloc, args);
     if (std.mem.eql(u8, cmd, "restore")) return cmdRestore(alloc, args);
     if (std.mem.eql(u8, cmd, "stats")) return cmdStats(handle, alloc, args);
+    if (std.mem.eql(u8, cmd, "cas")) return cmdCas(alloc, args);
 }
 
 fn loadConfigOrDefault(alloc: std.mem.Allocator) !config.Config {
@@ -45,6 +46,7 @@ fn loadConfigOrDefault(alloc: std.mem.Allocator) !config.Config {
         .enable_prom = true,
         .mem_limit_bytes = 256 * 1024 * 1024,
         .cas_mode = .off,
+        .metadata_read_mode = .legacy,
         .retention_ns = std.StringHashMap(u32).init(alloc),
     };
 }
@@ -141,17 +143,19 @@ fn cmdCompact(alloc: std.mem.Allocator, _: [][:0]u8) !void {
     defer manifest.deinit();
     var tags = try @import("storage/tags.zig").TagIndex.loadOrInit(alloc, data_dir);
     defer tags.deinit();
+    var series_catalog = try @import("storage/series_catalog.zig").SeriesCatalog.loadOrInit(alloc, data_dir, cfg.fsync);
+    defer series_catalog.deinit();
 
     var cas_manager: ?cas_mod.CasManager = null;
     defer if (cas_manager) |*cas| cas.deinit();
     if (cfg.cas_mode == .dual_write) {
-        cas_manager = try cas_mod.CasManager.init(alloc, cfg.data_dir);
-        _ = try cas_manager.?.bootstrapIfMissing(data_dir, &manifest, &tags);
+        cas_manager = try cas_mod.CasManager.init(alloc, cfg.data_dir, cfg.fsync);
+        _ = try cas_manager.?.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
     }
 
     const changed = try @import("storage/compact.zig").compactAllWithResult(alloc, data_dir, &manifest);
     if (changed and cas_manager != null) {
-        _ = try cas_manager.?.syncLegacySnapshot(data_dir, &manifest, &tags, "compaction");
+        _ = try cas_manager.?.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, "compaction");
     }
 }
 
@@ -224,4 +228,84 @@ fn cmdRestore(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     var data_dir = try std.fs.cwd().openDir(cfg.data_dir, .{ .iterate = true });
     defer data_dir.close();
     try @import("snapshot.zig").restore(alloc, data_dir, args[2]);
+}
+
+fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
+    if (args.len < 3) return error.Invalid;
+
+    var cfg = try loadConfigOrDefault(alloc);
+    defer cfg.deinit(alloc);
+
+    var data_dir = try std.fs.cwd().openDir(cfg.data_dir, .{ .iterate = true });
+    defer data_dir.close();
+
+    var cas = try cas_mod.CasManager.init(alloc, cfg.data_dir, cfg.fsync);
+    defer cas.deinit();
+
+    const sub = std.mem.sliceTo(args[2], 0);
+    if (std.mem.eql(u8, sub, "verify")) {
+        var manifest = try @import("storage/manifest.zig").Manifest.loadOrInit(alloc, data_dir);
+        defer manifest.deinit();
+        var tags = try @import("storage/tags.zig").TagIndex.loadOrInit(alloc, data_dir);
+        defer tags.deinit();
+        var series_catalog = try @import("storage/series_catalog.zig").SeriesCatalog.loadOrInit(alloc, data_dir, cfg.fsync);
+        defer series_catalog.deinit();
+        try cas.verifyHead(data_dir, &manifest, &tags, &series_catalog);
+        std.debug.print("cas verify ok\n", .{});
+        return;
+    }
+    if (std.mem.eql(u8, sub, "refs")) {
+        const refs = try cas.listRefs();
+        defer {
+            for (refs) |*entry| entry.deinit(alloc);
+            alloc.free(refs);
+        }
+        for (refs) |entry| {
+            const hex = entry.id.toHex();
+            std.debug.print("{s} {s}\n", .{ entry.name, hex });
+        }
+        return;
+    }
+    if (std.mem.eql(u8, sub, "log")) {
+        const spec = if (args.len >= 4) std.mem.sliceTo(args[3], 0) else cas_mod.main_ref;
+        const entries = try cas.loadLog(spec, 64);
+        defer {
+            for (entries) |*entry| entry.deinit(alloc);
+            alloc.free(entries);
+        }
+        for (entries) |entry| {
+            const hex = entry.commit_id.toHex();
+            std.debug.print("{s} parents={d} ts_ms={d} reason={s}\n", .{ hex, entry.parent_count, entry.created_at_ms, entry.reason });
+        }
+        return;
+    }
+    if (std.mem.eql(u8, sub, "branch")) {
+        if (args.len < 4) return error.Invalid;
+        const name = std.mem.sliceTo(args[3], 0);
+        const spec = if (args.len >= 5) std.mem.sliceTo(args[4], 0) else cas_mod.main_ref;
+        const ref_name = try std.fmt.allocPrint(alloc, "heads/{s}", .{name});
+        defer alloc.free(ref_name);
+        try cas.createRef(ref_name, spec);
+        return;
+    }
+    if (std.mem.eql(u8, sub, "tag")) {
+        if (args.len < 4) return error.Invalid;
+        const name = std.mem.sliceTo(args[3], 0);
+        const spec = if (args.len >= 5) std.mem.sliceTo(args[4], 0) else cas_mod.main_ref;
+        const ref_name = try std.fmt.allocPrint(alloc, "tags/{s}", .{name});
+        defer alloc.free(ref_name);
+        try cas.createRef(ref_name, spec);
+        return;
+    }
+    if (std.mem.eql(u8, sub, "gc")) {
+        const dry_run = !(args.len >= 4 and std.mem.eql(u8, std.mem.sliceTo(args[3], 0), "--apply"));
+        const result = try cas.gc(dry_run);
+        std.debug.print("cas gc dry_run={} reachable={d} unreachable={d} deleted={d}\n", .{ dry_run, result.reachable, result.unreachable_count, result.deleted });
+        return;
+    }
+    if (std.mem.eql(u8, sub, "export-legacy")) {
+        try cas.exportHeadToLegacy(data_dir);
+        return;
+    }
+    return error.Invalid;
 }
