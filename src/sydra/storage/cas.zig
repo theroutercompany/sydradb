@@ -1889,12 +1889,13 @@ test "gc prunes unreachable commits" {
 
     var cas_manager = try CasManager.init(talloc, data_path, .none);
     defer cas_manager.deinit();
-    _ = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
     const orphan = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, "orphan");
-    try cas_manager.refs.updateHeadAtomic(main_ref, orphan);
+    try std.testing.expect(!initial.eql(orphan));
+    try cas_manager.refs.updateHeadAtomic(main_ref, initial);
 
-    const branch_ref = "heads/branch";
-    try cas_manager.createRef(branch_ref, main_ref);
     const dry_run = try cas_manager.gc(true);
-    try std.testing.expectEqual(@as(usize, 0), dry_run.deleted);
+    try std.testing.expect(dry_run.unreachable_count > 0);
+    const applied = try cas_manager.gc(false);
+    try std.testing.expect(applied.deleted > 0);
 }

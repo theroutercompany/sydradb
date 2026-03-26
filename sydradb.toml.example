@@ -9,6 +9,7 @@ auth_token = ""  # set to enable auth on /api/*
 enable_influx = false
 enable_prom = true
 cas_mode = "off"  # off|dual_write
+metadata_read_mode = "legacy"  # legacy|shadow|primary
 
 # Per-namespace TTL (days)
 retention.default = 0

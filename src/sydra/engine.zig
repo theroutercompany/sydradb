@@ -1019,6 +1019,88 @@ test "engine snapshotTo captures a restorable point-in-time copy" {
     }
 }
 
+test "engine primary metadata mode boots from CAS metadata alone" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/primary-data", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    const sid = types.hash64("primary.series");
+
+    {
+        const config = cfg.Config{
+            .data_dir = try talloc.dupe(u8, data_path),
+            .http_port = 0,
+            .fsync = .none,
+            .flush_interval_ms = 5,
+            .memtable_max_bytes = 512,
+            .retention_days = 0,
+            .auth_token = try talloc.dupe(u8, ""),
+            .enable_influx = false,
+            .enable_prom = false,
+            .mem_limit_bytes = 1024 * 1024,
+            .cas_mode = .dual_write,
+            .retention_ns = std.StringHashMap(u32).init(talloc),
+        };
+
+        var engine = try Engine.init(talloc, config);
+        defer engine.deinit();
+
+        try engine.registerSeries("primary.series", "{}", sid);
+        try engine.ingest(.{ .series_id = sid, .ts = 1_000, .value = 5.0, .tags_json = "{}" });
+        engine.noteTags(sid, "{\"host\":\"primary\"}");
+        try waitForFlush(engine, 1, 1_000);
+        try engine.verifyCasState();
+    }
+
+    {
+        var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+        defer data_dir.close();
+        data_dir.deleteFile("MANIFEST") catch {};
+        data_dir.deleteFile("tags.json") catch {};
+        data_dir.deleteFile("series_catalog.jsonl") catch {};
+    }
+
+    {
+        const config = cfg.Config{
+            .data_dir = try talloc.dupe(u8, data_path),
+            .http_port = 0,
+            .fsync = .none,
+            .flush_interval_ms = 5,
+            .memtable_max_bytes = 512,
+            .retention_days = 0,
+            .auth_token = try talloc.dupe(u8, ""),
+            .enable_influx = false,
+            .enable_prom = false,
+            .mem_limit_bytes = 1024 * 1024,
+            .cas_mode = .dual_write,
+            .metadata_read_mode = .primary,
+            .retention_ns = std.StringHashMap(u32).init(talloc),
+        };
+
+        var engine = try Engine.init(talloc, config);
+        defer engine.deinit();
+
+        var results = std.array_list.Managed(types.Point).init(talloc);
+        defer results.deinit();
+        try engine.queryRange(sid, 0, 10_000, &results);
+        try std.testing.expectEqual(@as(usize, 1), results.items.len);
+        try std.testing.expectApproxEqAbs(@as(f64, 5.0), results.items[0].value, 1e-9);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, talloc, "{\"host\":\"primary\"}", .{});
+        defer parsed.deinit();
+        const matches = try engine.collectMatchingSeriesIds(talloc, parsed.value, true);
+        defer matches.deinit();
+        try std.testing.expectEqual(@as(usize, 1), matches.items.len);
+        try std.testing.expectEqual(sid, matches.items[0]);
+        switch (engine.resolveUniqueSeriesName("primary.series")) {
+            .resolved => |resolved| try std.testing.expectEqual(sid, resolved),
+            else => return error.TestUnexpectedResult,
+        }
+    }
+}
+
 test "engine dual-write creates a parent-linked CAS commit chain" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });

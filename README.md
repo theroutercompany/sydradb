@@ -98,6 +98,13 @@ Apache-2.0
 ./zig-out/bin/sydradb snapshot <dst_dir>
 ./zig-out/bin/sydradb restore  <src_dir>
 ./zig-out/bin/sydradb stats       # print simple counters
+./zig-out/bin/sydradb cas verify
+./zig-out/bin/sydradb cas refs
+./zig-out/bin/sydradb cas log [heads/main]
+./zig-out/bin/sydradb cas branch <name> [spec]
+./zig-out/bin/sydradb cas tag <name> [spec]
+./zig-out/bin/sydradb cas gc [--apply]
+./zig-out/bin/sydradb cas export-legacy
 ```
 
 Config: `sydradb.toml`
@@ -113,6 +120,7 @@ auth_token = ""  # set non-empty to require Bearer auth on /api/*
 enable_influx = false
 enable_prom = true
 cas_mode = "off"  # off|dual_write
+metadata_read_mode = "legacy"  # legacy|shadow|primary
 # Per-namespace TTL
 retention.weather = 30
 ```
@@ -121,6 +129,8 @@ Config notes:
 
 - `mem_limit_bytes` is parsed, but it is not currently enforced as a global runtime quota.
 - `cas_mode = "dual_write"` writes immutable metadata commits and `refs/heads/main` alongside the legacy storage path.
-- In this first ADR 0006 phase, query serving and WAL replay still use the legacy `MANIFEST`/`segments`/`wal` layout.
+- `metadata_read_mode = "shadow"` serves from legacy metadata and cross-checks answers against the CAS snapshot.
+- `metadata_read_mode = "primary"` serves metadata from CAS and can boot even if `MANIFEST`, `tags.json`, or `series_catalog.jsonl` are missing.
+- WAL recovery order is sourced from the CAS commit graph when CAS is enabled, with any uncaptured live WAL files appended as tail replay.
 - `enable_influx` and `enable_prom` remain parseable config flags, but they should be treated as placeholder or experimental toggles until real adapter surfaces land.
 - `auth_token` is the only built-in API auth mechanism today; if it is empty, `/api/*` is unauthenticated.

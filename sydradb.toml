@@ -6,3 +6,4 @@ flush_interval_ms = 2000
 memtable_max_bytes = 8388608  # 8 MiB
 retention_days = 0  # 0 means keep forever
 cas_mode = "off"  # off|dual_write
+metadata_read_mode = "legacy"  # legacy|shadow|primary
