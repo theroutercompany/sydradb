@@ -14,10 +14,38 @@ pub const Match = union(enum) {
     ambiguous,
 };
 
+pub const ResolutionStatus = enum {
+    not_found,
+    resolved,
+    ambiguous,
+    exact_match,
+};
+
+pub const Resolution = struct {
+    status: ResolutionStatus,
+    series_id: ?types.SeriesId = null,
+    series: ?[]const u8 = null,
+    canonical_tags: ?[]const u8 = null,
+
+    pub fn toMatch(self: @This()) Match {
+        return switch (self.status) {
+            .not_found => .not_found,
+            .resolved, .exact_match => .{ .resolved = self.series_id.? },
+            .ambiguous => .ambiguous,
+        };
+    }
+};
+
 pub const Entry = struct {
     series: []const u8,
     canonical_tags: []const u8,
     selector_key: []const u8,
+    series_id: types.SeriesId,
+};
+
+pub const RebuildEntry = struct {
+    series: []const u8,
+    canonical_tags: []const u8,
     series_id: types.SeriesId,
 };
 
@@ -29,6 +57,7 @@ pub const SeriesCatalog = struct {
     entries: std.ArrayListUnmanaged(Entry) = .{},
     selector_index: std.StringHashMap(SidList),
     name_index: std.StringHashMap(SidList),
+    series_id_index: std.AutoHashMap(types.SeriesId, usize),
 
     pub fn loadOrInit(alloc: std.mem.Allocator, data_dir: std.fs.Dir, fsync: cfg.FsyncPolicy) !SeriesCatalog {
         var catalog = SeriesCatalog{
@@ -37,6 +66,7 @@ pub const SeriesCatalog = struct {
             .file = undefined,
             .selector_index = std.StringHashMap(SidList).init(alloc),
             .name_index = std.StringHashMap(SidList).init(alloc),
+            .series_id_index = std.AutoHashMap(types.SeriesId, usize).init(alloc),
         };
         errdefer catalog.deinit();
 
@@ -68,6 +98,7 @@ pub const SeriesCatalog = struct {
         if (self.file) |*file| {
             file.close();
         }
+        self.series_id_index.deinit();
         var selector_it = self.selector_index.iterator();
         while (selector_it.next()) |entry| {
             entry.value_ptr.deinit(self.alloc);
@@ -89,7 +120,7 @@ pub const SeriesCatalog = struct {
         self.* = undefined;
     }
 
-    pub fn register(self: *SeriesCatalog, series: []const u8, tags_json: []const u8, series_id: types.SeriesId) !void {
+    pub fn register(self: *SeriesCatalog, series: []const u8, tags_json: []const u8, series_id: types.SeriesId) !bool {
         const owned_series = try self.alloc.dupe(u8, series);
         errdefer self.alloc.free(owned_series);
 
@@ -103,18 +134,27 @@ pub const SeriesCatalog = struct {
         defer self.mutex.unlock();
 
         const inserted = try self.insertOwned(owned_series, canonical_tags, selector_key, series_id);
-        if (!inserted) return;
+        if (!inserted) return false;
 
         try self.appendLine(owned_series, canonical_tags, series_id);
+        return true;
     }
 
     pub fn resolveUniqueName(self: *SeriesCatalog, series: []const u8) Match {
+        return self.resolveUniqueNameDetailed(series).toMatch();
+    }
+
+    pub fn resolveUniqueNameDetailed(self: *SeriesCatalog, series: []const u8) Resolution {
         self.mutex.lock();
         defer self.mutex.unlock();
-        return matchForList(self.name_index.get(series));
+        return self.resolutionForList(self.name_index.get(series), .resolved);
     }
 
     pub fn resolveExact(self: *SeriesCatalog, series: []const u8, tags_json: []const u8) !Match {
+        return (try self.resolveExactDetailed(series, tags_json)).toMatch();
+    }
+
+    pub fn resolveExactDetailed(self: *SeriesCatalog, series: []const u8, tags_json: []const u8) !Resolution {
         const canonical_tags = try canonicalizeTagsJson(self.alloc, tags_json);
         defer self.alloc.free(canonical_tags);
 
@@ -123,11 +163,52 @@ pub const SeriesCatalog = struct {
 
         self.mutex.lock();
         defer self.mutex.unlock();
-        return matchForList(self.selector_index.get(selector_key));
+        return self.resolutionForList(self.selector_index.get(selector_key), .exact_match);
+    }
+
+    pub fn resolveBySeriesId(self: *SeriesCatalog, series_id: types.SeriesId) Resolution {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return self.resolutionForSeriesId(series_id);
     }
 
     pub fn entryCount(self: *const SeriesCatalog) usize {
         return self.entries.items.len;
+    }
+
+    pub fn rebuild(
+        _: std.mem.Allocator,
+        data_dir: std.fs.Dir,
+        fsync: cfg.FsyncPolicy,
+        entries: []const RebuildEntry,
+    ) !void {
+        const temp_name = "series_catalog.jsonl.tmp";
+        var file = try data_dir.createFile(temp_name, .{ .truncate = true, .read = true });
+        defer file.close();
+        errdefer data_dir.deleteFile(temp_name) catch {};
+
+        var write_buf: [4096]u8 = undefined;
+        var writer_state = file.writer(&write_buf);
+        const writer = &writer_state.interface;
+
+        for (entries) |entry| {
+            var jw = std.json.Stringify{ .writer = writer };
+            try jw.beginObject();
+            try jw.objectField("series");
+            try jw.write(entry.series);
+            try jw.objectField("tags_json");
+            try jw.write(entry.canonical_tags);
+            try jw.objectField("series_id");
+            try jw.write(entry.series_id);
+            try jw.endObject();
+            try writer.writeByte('\n');
+        }
+        try writer_state.end();
+        switch (fsync) {
+            .always => try file.sync(),
+            .interval, .none => {},
+        }
+        try data_dir.rename(temp_name, catalog_file_name);
     }
 
     fn loadLine(self: *SeriesCatalog, line: []const u8) !void {
@@ -154,6 +235,17 @@ pub const SeriesCatalog = struct {
     }
 
     fn insertOwned(self: *SeriesCatalog, owned_series: []const u8, owned_tags: []const u8, selector_key: []const u8, series_id: types.SeriesId) !bool {
+        if (self.series_id_index.get(series_id)) |existing_idx| {
+            const existing = self.entries.items[existing_idx];
+            if (std.mem.eql(u8, existing.series, owned_series) and std.mem.eql(u8, existing.canonical_tags, owned_tags)) {
+                self.alloc.free(owned_series);
+                self.alloc.free(owned_tags);
+                self.alloc.free(selector_key);
+                return false;
+            }
+            return error.SeriesIdConflict;
+        }
+
         var selector_gop = try self.selector_index.getOrPut(selector_key);
         if (!selector_gop.found_existing) {
             selector_gop.value_ptr.* = .{};
@@ -174,12 +266,14 @@ pub const SeriesCatalog = struct {
             try name_gop.value_ptr.append(self.alloc, series_id);
         }
 
+        const next_index = self.entries.items.len;
         try self.entries.append(self.alloc, .{
             .series = owned_series,
             .canonical_tags = owned_tags,
             .selector_key = selector_key,
             .series_id = series_id,
         });
+        try self.series_id_index.put(series_id, next_index);
         return true;
     }
 
@@ -209,6 +303,31 @@ pub const SeriesCatalog = struct {
             .always => try self.file.?.sync(),
             .interval, .none => {},
         }
+    }
+
+    fn resolutionForList(self: *SeriesCatalog, maybe_list: ?SidList, success_status: ResolutionStatus) Resolution {
+        if (maybe_list) |list| {
+            if (list.items.len == 1) {
+                return self.resolutionForSeriesIdWithStatus(list.items[0], success_status);
+            }
+            if (list.items.len > 1) return .{ .status = .ambiguous };
+        }
+        return .{ .status = .not_found };
+    }
+
+    fn resolutionForSeriesId(self: *SeriesCatalog, series_id: types.SeriesId) Resolution {
+        return self.resolutionForSeriesIdWithStatus(series_id, .resolved);
+    }
+
+    fn resolutionForSeriesIdWithStatus(self: *SeriesCatalog, series_id: types.SeriesId, status: ResolutionStatus) Resolution {
+        const idx = self.series_id_index.get(series_id) orelse return .{ .status = .not_found };
+        const entry = self.entries.items[idx];
+        return .{
+            .status = status,
+            .series_id = series_id,
+            .series = entry.series,
+            .canonical_tags = entry.canonical_tags,
+        };
     }
 };
 
@@ -277,14 +396,6 @@ fn writeCanonicalValue(alloc: std.mem.Allocator, value: std.json.Value, jw: *std
     }
 }
 
-fn matchForList(maybe_list: ?SidList) Match {
-    if (maybe_list) |list| {
-        if (list.items.len == 1) return .{ .resolved = list.items[0] };
-        if (list.items.len > 1) return .ambiguous;
-    }
-    return .not_found;
-}
-
 fn containsSid(values: []const types.SeriesId, series_id: types.SeriesId) bool {
     for (values) |existing| {
         if (existing == series_id) return true;
@@ -312,9 +423,9 @@ test "series catalog resolves exact and unique names across restart" {
     var catalog = try SeriesCatalog.loadOrInit(alloc, tmp.dir, .always);
     defer catalog.deinit();
 
-    try catalog.register("metrics.cpu", "{\"host\":\"b\",\"env\":\"prod\"}", 11);
-    try catalog.register("metrics.cpu", "{\"env\":\"prod\",\"host\":\"b\"}", 13);
-    try catalog.register("metrics.mem", "{}", 21);
+    _ = try catalog.register("metrics.cpu", "{\"host\":\"b\",\"env\":\"prod\"}", 11);
+    _ = try catalog.register("metrics.cpu", "{\"env\":\"prod\",\"host\":\"b\"}", 13);
+    _ = try catalog.register("metrics.mem", "{}", 21);
 
     try std.testing.expectEqual(@as(usize, 3), catalog.entryCount());
     try std.testing.expect(catalog.resolveUniqueName("metrics.cpu") == .ambiguous);
@@ -333,7 +444,7 @@ test "series catalog reloads persisted mappings" {
     {
         var catalog = try SeriesCatalog.loadOrInit(alloc, tmp.dir, .always);
         defer catalog.deinit();
-        try catalog.register("weather.room1", "{}", 42);
+        _ = try catalog.register("weather.room1", "{}", 42);
     }
 
     var reopened = try SeriesCatalog.loadOrInit(alloc, tmp.dir, .always);
@@ -347,4 +458,31 @@ test "series catalog reloads persisted mappings" {
         .resolved => |sid| sid,
         else => unreachable,
     });
+}
+
+test "series catalog detailed resolutions expose canonical metadata" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var catalog = try SeriesCatalog.loadOrInit(alloc, tmp.dir, .always);
+    defer catalog.deinit();
+
+    try std.testing.expect(try catalog.register("weather.room2", "{\"zone\":\"lab\",\"host\":\"a\"}", 77));
+    try std.testing.expect(!(try catalog.register("weather.room2", "{\"host\":\"a\",\"zone\":\"lab\"}", 77)));
+
+    const unique = catalog.resolveUniqueNameDetailed("weather.room2");
+    try std.testing.expectEqual(ResolutionStatus.resolved, unique.status);
+    try std.testing.expectEqual(@as(types.SeriesId, 77), unique.series_id.?);
+    try std.testing.expectEqualStrings("weather.room2", unique.series.?);
+    try std.testing.expectEqualStrings("{\"host\":\"a\",\"zone\":\"lab\"}", unique.canonical_tags.?);
+
+    const exact = try catalog.resolveExactDetailed("weather.room2", "{\"host\":\"a\",\"zone\":\"lab\"}");
+    try std.testing.expectEqual(ResolutionStatus.exact_match, exact.status);
+    try std.testing.expectEqual(@as(types.SeriesId, 77), exact.series_id.?);
+    try std.testing.expectEqualStrings("{\"host\":\"a\",\"zone\":\"lab\"}", exact.canonical_tags.?);
+
+    const by_id = catalog.resolveBySeriesId(77);
+    try std.testing.expectEqual(ResolutionStatus.resolved, by_id.status);
+    try std.testing.expectEqualStrings("weather.room2", by_id.series.?);
 }

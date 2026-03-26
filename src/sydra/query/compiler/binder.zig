@@ -4,6 +4,7 @@ const ast = @import("../ast.zig");
 const common = @import("../common.zig");
 const diagnostics = @import("diagnostics.zig");
 const engine_mod = @import("../../engine.zig");
+const errors = @import("errors.zig");
 const ir = @import("ir.zig");
 
 pub const BindResult = struct {
@@ -16,7 +17,7 @@ pub fn bindSelector(
     allocator: std.mem.Allocator,
     engine: *engine_mod.Engine,
     selector: ?ast.Selector,
-) !BindResult {
+) errors.CompileError!BindResult {
     if (selector == null) {
         return .{
             .selector = null,
@@ -36,31 +37,43 @@ pub fn bindSelector(
     }
 
     return switch (selector.?.series) {
-        .by_id => |by_id| .{
-            .selector = ir.BoundSelector{
-                .source = .by_id,
-                .series_id = @intCast(by_id.value),
-                .name = null,
-                .canonical_tags = null,
-                .span = by_id.span,
-            },
-            .diagnostics = &.{},
-            .fallback_reason = null,
-        },
-        .name => |ident| switch (engine.resolveUniqueSeriesName(ident.value)) {
-            .resolved => |series_id| .{
+        .by_id => |by_id| {
+            const resolution = engine.resolveSelector(.{ .by_id = @intCast(by_id.value) }) catch |err| switch (err) {
+                error.CasShadowMismatch => return error.ShadowMismatch,
+                else => unreachable,
+            };
+            return .{
                 .selector = ir.BoundSelector{
-                    .source = .unique_name,
-                    .series_id = series_id,
-                    .name = ident.value,
-                    .canonical_tags = null,
-                    .span = ident.span,
+                    .source = .by_id,
+                    .series_id = @intCast(by_id.value),
+                    .name = resolution.series,
+                    .canonical_tags = resolution.canonical_tags,
+                    .span = by_id.span,
                 },
                 .diagnostics = &.{},
                 .fallback_reason = null,
-            },
-            .not_found => try fallback(allocator, .series_not_found, ident.span),
-            .ambiguous => try fallback(allocator, .ambiguous_selector, ident.span),
+            };
+        },
+        .name => |ident| {
+            const resolution = engine.resolveSelector(.{ .name = ident.value }) catch |err| switch (err) {
+                error.CasShadowMismatch => return error.ShadowMismatch,
+                else => unreachable,
+            };
+            return switch (resolution.status) {
+                .resolved, .exact_match => .{
+                    .selector = ir.BoundSelector{
+                        .source = if (resolution.status == .exact_match) .exact_match else .unique_name,
+                        .series_id = resolution.series_id.?,
+                        .name = resolution.series orelse ident.value,
+                        .canonical_tags = resolution.canonical_tags,
+                        .span = ident.span,
+                    },
+                    .diagnostics = &.{},
+                    .fallback_reason = null,
+                },
+                .not_found => try fallback(allocator, .series_not_found, ident.span),
+                .ambiguous => try fallback(allocator, .ambiguous_selector, ident.span),
+            };
         },
     };
 }

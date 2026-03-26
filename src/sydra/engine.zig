@@ -34,6 +34,15 @@ pub const Engine = struct {
     cas: ?cas_mod.CasManager = null,
     cas_index: ?cas_mod.SnapshotIndex = null,
 
+    pub const SelectorLookup = union(enum) {
+        by_id: types.SeriesId,
+        name: []const u8,
+        exact: struct {
+            series: []const u8,
+            tags_json: []const u8,
+        },
+    };
+
     const MetadataView = union(enum) {
         legacy: *Engine,
         cas: *cas_mod.SnapshotIndex,
@@ -53,16 +62,31 @@ pub const Engine = struct {
         }
 
         fn resolveUniqueSeriesName(self: @This(), series: []const u8) series_catalog_mod.Match {
+            return self.resolveUniqueSeriesNameDetailed(series).toMatch();
+        }
+
+        fn resolveUniqueSeriesNameDetailed(self: @This(), series: []const u8) series_catalog_mod.Resolution {
             return switch (self) {
-                .legacy => |engine| engine.series_catalog.resolveUniqueName(series),
-                .cas => |index| index.resolveUniqueSeriesName(series),
+                .legacy => |engine| engine.series_catalog.resolveUniqueNameDetailed(series),
+                .cas => |index| index.resolveUniqueSeriesNameDetailed(series),
             };
         }
 
         fn resolveExactSeries(self: @This(), series: []const u8, tags_json: []const u8) !series_catalog_mod.Match {
+            return (try self.resolveExactSeriesDetailed(series, tags_json)).toMatch();
+        }
+
+        fn resolveExactSeriesDetailed(self: @This(), series: []const u8, tags_json: []const u8) !series_catalog_mod.Resolution {
             return switch (self) {
-                .legacy => |engine| engine.series_catalog.resolveExact(series, tags_json),
-                .cas => |index| try index.resolveExactSeries(series, tags_json),
+                .legacy => |engine| try engine.series_catalog.resolveExactDetailed(series, tags_json),
+                .cas => |index| try index.resolveExactSeriesDetailed(series, tags_json),
+            };
+        }
+
+        fn resolveBySeriesId(self: @This(), series_id: types.SeriesId) series_catalog_mod.Resolution {
+            return switch (self) {
+                .legacy => |engine| engine.series_catalog.resolveBySeriesId(series_id),
+                .cas => |index| index.resolveBySeriesId(series_id),
             };
         }
     };
@@ -492,43 +516,72 @@ pub const Engine = struct {
     }
 
     pub fn registerSeries(self: *Engine, series: []const u8, tags: []const u8, series_id: types.SeriesId) !void {
-        try self.series_catalog.register(series, tags, series_id);
+        _ = try self.series_catalog.register(series, tags, series_id);
+    }
+
+    pub fn resolveSelector(self: *Engine, lookup: SelectorLookup) !series_catalog_mod.Resolution {
+        const legacy_view = self.legacyMetadataView();
+        switch (lookup) {
+            .by_id => |series_id| {
+                const legacy = legacy_view.resolveBySeriesId(series_id);
+                return switch (self.config.metadata_read_mode) {
+                    .legacy => legacy,
+                    .shadow => blk: {
+                        if (self.casMetadataView()) |cas_view| {
+                            const cas_resolution = cas_view.resolveBySeriesId(series_id);
+                            if (!resolutionsEqual(legacy, cas_resolution)) {
+                                return error.CasShadowMismatch;
+                            }
+                        }
+                        break :blk legacy;
+                    },
+                    .primary => if (self.casMetadataView()) |cas_view| cas_view.resolveBySeriesId(series_id) else legacy,
+                };
+            },
+            .name => |series| {
+                const legacy = legacy_view.resolveUniqueSeriesNameDetailed(series);
+                return switch (self.config.metadata_read_mode) {
+                    .legacy => legacy,
+                    .shadow => blk: {
+                        if (self.casMetadataView()) |cas_view| {
+                            const cas_resolution = cas_view.resolveUniqueSeriesNameDetailed(series);
+                            if (!resolutionsEqual(legacy, cas_resolution)) {
+                                return error.CasShadowMismatch;
+                            }
+                        }
+                        break :blk legacy;
+                    },
+                    .primary => if (self.casMetadataView()) |cas_view| cas_view.resolveUniqueSeriesNameDetailed(series) else legacy,
+                };
+            },
+            .exact => |exact| {
+                const legacy = try legacy_view.resolveExactSeriesDetailed(exact.series, exact.tags_json);
+                return switch (self.config.metadata_read_mode) {
+                    .legacy => legacy,
+                    .shadow => blk: {
+                        if (self.casMetadataView()) |cas_view| {
+                            const cas_resolution = try cas_view.resolveExactSeriesDetailed(exact.series, exact.tags_json);
+                            if (!resolutionsEqual(legacy, cas_resolution)) {
+                                return error.CasShadowMismatch;
+                            }
+                        }
+                        break :blk legacy;
+                    },
+                    .primary => if (self.casMetadataView()) |cas_view| try cas_view.resolveExactSeriesDetailed(exact.series, exact.tags_json) else legacy,
+                };
+            },
+        }
     }
 
     pub fn resolveUniqueSeriesName(self: *Engine, series: []const u8) series_catalog_mod.Match {
-        const legacy = self.legacyMetadataView().resolveUniqueSeriesName(series);
-        return switch (self.config.metadata_read_mode) {
-            .legacy => legacy,
-            .shadow => blk: {
-                if (self.casMetadataView()) |cas_view| {
-                    const cas_match = cas_view.resolveUniqueSeriesName(series);
-                    if (!matchesEqual(legacy, cas_match)) {
-                        std.debug.panic("cas shadow mismatch for series selector '{s}'", .{series});
-                    }
-                }
-                break :blk legacy;
-            },
-            .primary => if (self.casMetadataView()) |cas_view| cas_view.resolveUniqueSeriesName(series) else legacy,
-        };
+        return (self.resolveSelector(.{ .name = series }) catch |err| switch (err) {
+            error.CasShadowMismatch => std.debug.panic("cas shadow mismatch for series selector '{s}'", .{series}),
+            else => return .not_found,
+        }).toMatch();
     }
 
     pub fn resolveExactSeries(self: *Engine, series: []const u8, tags_json: []const u8) !series_catalog_mod.Match {
-        const legacy_view = self.legacyMetadataView();
-        switch (self.config.metadata_read_mode) {
-            .legacy => return try legacy_view.resolveExactSeries(series, tags_json),
-            .shadow => {
-                const legacy = try legacy_view.resolveExactSeries(series, tags_json);
-                if (self.casMetadataView()) |cas_view| {
-                    const cas_match = try cas_view.resolveExactSeries(series, tags_json);
-                    if (!matchesEqual(legacy, cas_match)) return error.CasShadowMismatch;
-                }
-                return legacy;
-            },
-            .primary => {
-                if (self.casMetadataView()) |cas_view| return try cas_view.resolveExactSeries(series, tags_json);
-                return try legacy_view.resolveExactSeries(series, tags_json);
-            },
-        }
+        return (try self.resolveSelector(.{ .exact = .{ .series = series, .tags_json = tags_json } })).toMatch();
     }
 
     pub fn collectMatchingSeriesIds(self: *Engine, alloc: std.mem.Allocator, tags_value: std.json.Value, op_and: bool) !std.array_list.Managed(types.SeriesId) {
@@ -745,15 +798,18 @@ fn verifySeriesIdsMatch(lhs: []const types.SeriesId, rhs: []const types.SeriesId
     if (!std.mem.eql(types.SeriesId, lhs, rhs)) return error.CasShadowMismatch;
 }
 
-fn matchesEqual(lhs: series_catalog_mod.Match, rhs: series_catalog_mod.Match) bool {
-    return switch (lhs) {
-        .not_found => rhs == .not_found,
-        .ambiguous => rhs == .ambiguous,
-        .resolved => |sid| switch (rhs) {
-            .resolved => |other| sid == other,
-            else => false,
-        },
-    };
+fn resolutionsEqual(lhs: series_catalog_mod.Resolution, rhs: series_catalog_mod.Resolution) bool {
+    if (lhs.status != rhs.status) return false;
+    if (lhs.series_id != rhs.series_id) return false;
+    if (!optionalStringsEqual(lhs.series, rhs.series)) return false;
+    if (!optionalStringsEqual(lhs.canonical_tags, rhs.canonical_tags)) return false;
+    return true;
+}
+
+fn optionalStringsEqual(lhs: ?[]const u8, rhs: ?[]const u8) bool {
+    if (lhs == null and rhs == null) return true;
+    if (lhs == null or rhs == null) return false;
+    return std.mem.eql(u8, lhs.?, rhs.?);
 }
 
 fn containsString(items: []const []u8, needle: []const u8) bool {
@@ -1106,6 +1162,49 @@ test "engine primary metadata mode boots from CAS metadata alone" {
             else => return error.TestUnexpectedResult,
         }
     }
+}
+
+test "engine resolveSelector surfaces metadata for by-id and exact lookups" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/selector-data", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    const sid = types.seriesIdFrom("selector.series", "{\"rack\":\"r1\",\"host\":\"a\"}");
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    try engine.registerSeries("selector.series", "{\"rack\":\"r1\",\"host\":\"a\"}", sid);
+
+    const by_id = try engine.resolveSelector(.{ .by_id = sid });
+    try std.testing.expectEqual(series_catalog_mod.ResolutionStatus.resolved, by_id.status);
+    try std.testing.expectEqual(sid, by_id.series_id.?);
+    try std.testing.expectEqualStrings("selector.series", by_id.series.?);
+    try std.testing.expectEqualStrings("{\"host\":\"a\",\"rack\":\"r1\"}", by_id.canonical_tags.?);
+
+    const exact = try engine.resolveSelector(.{ .exact = .{
+        .series = "selector.series",
+        .tags_json = "{\"host\":\"a\",\"rack\":\"r1\"}",
+    } });
+    try std.testing.expectEqual(series_catalog_mod.ResolutionStatus.exact_match, exact.status);
+    try std.testing.expectEqual(sid, exact.series_id.?);
 }
 
 test "engine dual-write creates a parent-linked CAS commit chain" {

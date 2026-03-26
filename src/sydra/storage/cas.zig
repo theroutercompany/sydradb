@@ -222,35 +222,70 @@ pub const SnapshotIndex = struct {
     }
 
     pub fn resolveUniqueSeriesName(self: *const SnapshotIndex, series: []const u8) series_catalog_mod.Match {
-        var resolved: ?types.SeriesId = null;
+        return self.resolveUniqueSeriesNameDetailed(series).toMatch();
+    }
+
+    pub fn resolveUniqueSeriesNameDetailed(self: *const SnapshotIndex, series: []const u8) series_catalog_mod.Resolution {
+        var resolved: ?SeriesCatalogSnapshotEntry = null;
         for (self.snapshot.series_catalog_snapshot.entries) |entry| {
             if (!std.mem.eql(u8, entry.series, series)) continue;
             if (resolved) |existing| {
-                if (existing != entry.series_id) return .ambiguous;
+                if (existing.series_id != entry.series_id) return .{ .status = .ambiguous };
             } else {
-                resolved = entry.series_id;
+                resolved = entry;
             }
         }
-        if (resolved) |sid| return .{ .resolved = sid };
-        return .not_found;
+        if (resolved) |entry| {
+            return .{
+                .status = .resolved,
+                .series_id = entry.series_id,
+                .series = entry.series,
+                .canonical_tags = entry.canonical_tags,
+            };
+        }
+        return .{ .status = .not_found };
     }
 
     pub fn resolveExactSeries(self: *const SnapshotIndex, series: []const u8, tags_json: []const u8) !series_catalog_mod.Match {
+        return (try self.resolveExactSeriesDetailed(series, tags_json)).toMatch();
+    }
+
+    pub fn resolveExactSeriesDetailed(self: *const SnapshotIndex, series: []const u8, tags_json: []const u8) !series_catalog_mod.Resolution {
         const canonical_tags = try series_catalog_mod.canonicalizeTagsJson(self.alloc, tags_json);
         defer self.alloc.free(canonical_tags);
 
-        var resolved: ?types.SeriesId = null;
+        var resolved: ?SeriesCatalogSnapshotEntry = null;
         for (self.snapshot.series_catalog_snapshot.entries) |entry| {
             if (!std.mem.eql(u8, entry.series, series)) continue;
             if (!std.mem.eql(u8, entry.canonical_tags, canonical_tags)) continue;
             if (resolved) |existing| {
-                if (existing != entry.series_id) return .ambiguous;
+                if (existing.series_id != entry.series_id) return .{ .status = .ambiguous };
             } else {
-                resolved = entry.series_id;
+                resolved = entry;
             }
         }
-        if (resolved) |sid| return .{ .resolved = sid };
-        return .not_found;
+        if (resolved) |entry| {
+            return .{
+                .status = .exact_match,
+                .series_id = entry.series_id,
+                .series = entry.series,
+                .canonical_tags = entry.canonical_tags,
+            };
+        }
+        return .{ .status = .not_found };
+    }
+
+    pub fn resolveBySeriesId(self: *const SnapshotIndex, series_id: types.SeriesId) series_catalog_mod.Resolution {
+        for (self.snapshot.series_catalog_snapshot.entries) |entry| {
+            if (entry.series_id != series_id) continue;
+            return .{
+                .status = .resolved,
+                .series_id = entry.series_id,
+                .series = entry.series,
+                .canonical_tags = entry.canonical_tags,
+            };
+        }
+        return .{ .status = .not_found };
     }
 };
 
@@ -1719,7 +1754,7 @@ test "cas bootstrap imports legacy metadata into a genesis commit" {
     try manifest.rewriteCheckpoint(data_dir);
     try tags.add("host=bootstrap", sid);
     try tags.save(data_dir);
-    try series_catalog.register("bootstrap.series", "{}", sid);
+    _ = try series_catalog.register("bootstrap.series", "{}", sid);
 
     var cas_manager = try CasManager.init(talloc, data_path, .none);
     defer cas_manager.deinit();
@@ -1769,7 +1804,7 @@ test "retention rewrites manifest and emits a CAS commit" {
         .{ .ts = now - 30, .value = 4.0 },
     };
 
-    try series_catalog.register("retention.series", "{}", sid);
+    _ = try series_catalog.register("retention.series", "{}", sid);
     const old_path = try segment_mod.writeSegment(talloc, data_dir, sid, old_points[0].ts - @mod(old_points[0].ts, 3600), old_points[0..]);
     defer talloc.free(old_path);
     try manifest.add(data_dir, sid, old_points[0].ts - @mod(old_points[0].ts, 3600), old_points[0].ts, old_points[old_points.len - 1].ts, @intCast(old_points.len), old_path);
@@ -1823,7 +1858,7 @@ test "compaction rewrites manifest and emits a CAS commit" {
         .{ .ts = 1_015, .value = 4.0 },
     };
 
-    try series_catalog.register("compact.series", "{}", sid);
+    _ = try series_catalog.register("compact.series", "{}", sid);
     const first_path = try segment_mod.writeSegment(talloc, data_dir, sid, 0, first_points[0..]);
     defer talloc.free(first_path);
     try manifest.add(data_dir, sid, 0, first_points[0].ts, first_points[first_points.len - 1].ts, @intCast(first_points.len), first_path);
@@ -1882,7 +1917,7 @@ test "gc prunes unreachable commits" {
     defer series_catalog.deinit();
 
     const sid = types.hash64("gc.series");
-    try series_catalog.register("gc.series", "{}", sid);
+    _ = try series_catalog.register("gc.series", "{}", sid);
     const points = [_]types.Point{.{ .ts = 1_000, .value = 1.0 }};
     const seg_path = try segment_mod.writeSegment(talloc, data_dir, sid, 0, points[0..]);
     defer talloc.free(seg_path);
