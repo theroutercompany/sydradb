@@ -1,6 +1,8 @@
 const std = @import("std");
+const builtin = @import("builtin");
 
 const compiler = @import("compiler.zig");
+const compiler_diagnostics = @import("compiler/diagnostics.zig");
 const parser = @import("parser.zig");
 const validator = @import("validator.zig");
 const plan_builder = @import("plan.zig");
@@ -73,8 +75,8 @@ pub fn executeWithMode(
             error.UnsupportedFunction,
             error.SeriesNotFound,
             error.AmbiguousSelector,
-            => try executeLegacy(prepared, .shadow, true, @errorName(err)),
-            else => try executeLegacy(prepared, .shadow, true, @errorName(err)),
+            => try executeLegacy(prepared, .shadow, true, fallbackReasonText(err)),
+            else => try executeLegacy(prepared, .shadow, true, fallbackReasonText(err)),
         },
     };
     arena_cleanup = false;
@@ -135,6 +137,7 @@ fn executeLegacy(
         legacy_fallback,
         fallback_reason,
         0,
+        0,
         durationMicros(logical_end - logical_start),
         durationMicros(optimize_end - logical_end),
         durationMicros(physical_end - optimize_end),
@@ -150,8 +153,9 @@ fn executeCompiled(
     mode: ExecutionMode,
 ) ExecuteError!executor.ExecutionCursor {
     const compile_start = std.time.microTimestamp();
-    const compiled = try compiler.compileSelect(prepared.arena_ptr.allocator(), prepared.engine, prepared.statement);
+    const detailed = try compiler.compileSelectDetailed(prepared.arena_ptr.allocator(), prepared.engine, prepared.statement);
     const compile_end = std.time.microTimestamp();
+    const compiled = detailed.compiled orelse return compiler.fallbackReasonToError(detailed.fallback_reason.?);
     const total_compile_us = durationMicros(compile_end - compile_start);
     const backend_us = compiled.backend.logical_us + compiled.backend.optimize_us + compiled.backend.physical_us;
     const frontend_compile_us = total_compile_us -| backend_us;
@@ -168,6 +172,7 @@ fn executeCompiled(
         mode,
         legacy_fallback,
         fallback_reason,
+        compiled.bind_us,
         frontend_compile_us,
         compiled.backend.logical_us,
         compiled.backend.optimize_us,
@@ -183,6 +188,7 @@ fn finalizeCursor(
     mode: ExecutionMode,
     legacy_fallback: bool,
     fallback_reason: []const u8,
+    bind_us: u64,
     compile_us: u64,
     logical_us: u64,
     optimize_us: u64,
@@ -193,7 +199,7 @@ fn finalizeCursor(
     cursor.stats = .{
         .parse_us = prepared.parse_us,
         .validate_us = prepared.validate_us,
-        .bind_us = 0,
+        .bind_us = bind_us,
         .compile_us = compile_us,
         .logical_us = logical_us,
         .optimize_us = optimize_us,
@@ -205,6 +211,38 @@ fn finalizeCursor(
         .fallback_reason = try dupeOptionalString(prepared.arena_ptr.allocator(), fallback_reason),
     };
     cursor.arena = prepared.arena_ptr;
+}
+
+pub fn shadowCompareSelect(
+    allocator: std.mem.Allocator,
+    engine: *engine_mod.Engine,
+    query: []const u8,
+) ExecuteError!compiler.ShadowCompareResult {
+    _ = builtin;
+    var compiled_cursor = try executeWithMode(allocator, engine, query, .compiled);
+    defer compiled_cursor.deinit();
+    var legacy_cursor = try executeWithMode(allocator, engine, query, .legacy);
+    defer legacy_cursor.deinit();
+
+    if (!columnsMatch(compiled_cursor.columns, legacy_cursor.columns)) {
+        return .{ .matched = false, .rows_compared = 0, .mismatch = .schema };
+    }
+
+    var rows_compared: usize = 0;
+    while (true) {
+        const compiled_row = try compiled_cursor.next();
+        const legacy_row = try legacy_cursor.next();
+        if (compiled_row == null and legacy_row == null) {
+            return .{ .matched = true, .rows_compared = rows_compared, .mismatch = null };
+        }
+        if (compiled_row == null or legacy_row == null) {
+            return .{ .matched = false, .rows_compared = rows_compared, .mismatch = .row_count };
+        }
+        if (!valuesMatch(compiled_row.?.values, legacy_row.?.values)) {
+            return .{ .matched = false, .rows_compared = rows_compared, .mismatch = .row_values };
+        }
+        rows_compared += 1;
+    }
 }
 
 fn dupeOptionalString(allocator: std.mem.Allocator, value: []const u8) ![]const u8 {
@@ -220,8 +258,31 @@ fn modeName(mode: ExecutionMode) []const u8 {
     };
 }
 
+fn fallbackReasonText(err: anyerror) []const u8 {
+    if (compiler_diagnostics.fromCompileError(err)) |reason| {
+        return @tagName(reason);
+    }
+    return @errorName(err);
+}
+
 fn durationMicros(value: i64) u64 {
     return @intCast(@max(value, 0));
+}
+
+fn columnsMatch(lhs: []const plan_builder.ColumnInfo, rhs: []const plan_builder.ColumnInfo) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        if (!std.ascii.eqlIgnoreCase(left.name, right.name)) return false;
+    }
+    return true;
+}
+
+fn valuesMatch(lhs: []const executor.Value, rhs: []const executor.Value) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        if (!executor.Value.equals(left, right)) return false;
+    }
+    return true;
 }
 
 test "execute supports select 1" {
@@ -373,12 +434,50 @@ test "executeWithMode shadow falls back to legacy for unsupported compiler proje
 
     try std.testing.expectEqualStrings("shadow", cursor.stats.execution_mode);
     try std.testing.expect(cursor.stats.legacy_fallback);
-    try std.testing.expectEqualStrings("UnsupportedFunction", cursor.stats.fallback_reason);
+    try std.testing.expectEqualStrings(@tagName(compiler_diagnostics.FallbackReason.unsupported_function), cursor.stats.fallback_reason);
 
     const first = try cursor.next();
     try std.testing.expect(first != null);
     try std.testing.expect(executor.Value.equals(first.?.values[0], executor.Value{ .float = 1.0 }));
     try std.testing.expect((try cursor.next()) == null);
+}
+
+test "shadowCompareSelect matches compiled and legacy rows for supported query" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/shadow-compare", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .shadow,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try engine_mod.Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const sid: u64 = 9001;
+    try engine.registerSeries("compare.room1", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 100, .value = 1.0, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 200, .value = 3.0, .tags_json = "{}" });
+    try waitForFlushForTest(engine, 1, 1_000);
+
+    const result = try shadowCompareSelect(talloc, engine, "select max(value) from compare.room1 where time >= 0");
+    try std.testing.expect(result.matched);
+    try std.testing.expect(result.rows_compared > 0);
 }
 
 fn waitForFlushForTest(engine: *engine_mod.Engine, min_flushes: u64, timeout_ms: u64) !void {
