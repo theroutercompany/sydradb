@@ -623,7 +623,7 @@ pub const CommitReader = struct {
         var commit = try decodeCommit(self.alloc, commit_loaded.payload);
         errdefer commit.deinit(self.alloc);
 
-        const root_tree = try self.loadTreeObject(commit.root);
+        var root_tree = try self.loadTreeObject(commit.root);
         defer root_tree.deinit(self.alloc);
 
         const metadata_tree_id = findTreeEntry(root_tree.entries, "metadata") orelse return error.MissingMetadataTree;
@@ -643,7 +643,7 @@ pub const CommitReader = struct {
         }
 
         {
-            const metadata_tree = try self.loadTreeObject(metadata_tree_id);
+            var metadata_tree = try self.loadTreeObject(metadata_tree_id);
             defer metadata_tree.deinit(self.alloc);
 
             if (findBlobEntry(metadata_tree.entries, "tags")) |tag_blob_id| {
@@ -668,7 +668,7 @@ pub const CommitReader = struct {
         }
 
         {
-            const wal_tree = try self.loadTreeObject(wal_tree_id);
+            var wal_tree = try self.loadTreeObject(wal_tree_id);
             defer wal_tree.deinit(self.alloc);
 
             if (findBlobEntry(wal_tree.entries, "index")) |wal_blob_id| {
@@ -719,7 +719,7 @@ pub const CommitReader = struct {
     }
 
     fn loadSegmentDescriptorsRecursive(self: *CommitReader, tree_id: object_store.ObjectId, descriptors: *std.array_list.Managed(SegmentDescriptor)) !void {
-        const tree = try self.loadTreeObject(tree_id);
+        var tree = try self.loadTreeObject(tree_id);
         defer tree.deinit(self.alloc);
 
         for (tree.entries) |entry| {
@@ -1366,7 +1366,7 @@ fn decodeTree(alloc: std.mem.Allocator, payload: []const u8) !Tree {
         errdefer alloc.free(name);
 
         const object_type = std.meta.intToEnum(object_store.ObjectType, try cursor.readByte()) catch return error.UnknownTreeObjectType;
-        const object_id = .{ .hash = try cursor.readHash() };
+        const object_id = object_store.ObjectId{ .hash = try cursor.readHash() };
         entries[i] = .{
             .name = name,
             .object_type = object_type,
@@ -1448,7 +1448,8 @@ const Cursor = struct {
     fn readInt(self: *Cursor, comptime T: type) !T {
         const size = @sizeOf(T);
         if (self.index + size > self.bytes.len) return error.TruncatedObject;
-        const value = std.mem.readInt(T, self.bytes[self.index .. self.index + size], .little);
+        const window = self.bytes[self.index .. self.index + size];
+        const value = std.mem.readInt(T, @ptrCast(window.ptr), .little);
         self.index += size;
         return value;
     }
@@ -1588,8 +1589,8 @@ fn writeTagsFile(alloc: std.mem.Allocator, data_dir: std.fs.Dir, tag_snapshot: T
 
     var write_buf: [4096]u8 = undefined;
     var writer_state = file.writer(&write_buf);
-    var writer = writer_state.interface();
-    var jw = std.json.Stringify{ .writer = &writer };
+    const writer = &writer_state.interface;
+    var jw = std.json.Stringify{ .writer = writer };
     try jw.beginObject();
     for (tag_snapshot.entries) |entry| {
         try jw.objectField(entry.key);
@@ -1614,10 +1615,10 @@ fn writeSeriesCatalogFile(alloc: std.mem.Allocator, data_dir: std.fs.Dir, series
 
     var write_buf: [4096]u8 = undefined;
     var writer_state = file.writer(&write_buf);
-    var writer = writer_state.interface();
+    const writer = &writer_state.interface;
 
     for (series_catalog_snapshot.entries) |entry| {
-        var jw = std.json.Stringify{ .writer = &writer };
+        var jw = std.json.Stringify{ .writer = writer };
         try jw.beginObject();
         try jw.objectField("series");
         try jw.write(entry.series);

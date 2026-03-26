@@ -596,12 +596,10 @@ pub const Engine = struct {
         var highwater = std.AutoHashMap(types.SeriesId, i64).init(self.alloc);
         defer highwater.deinit();
 
-        const segment_entries = if (self.cas_index) |*index| index.snapshot.segment_descriptors else self.manifest.entries.items;
-        for (segment_entries) |entry| {
-            const gop = try highwater.getOrPut(entry.series_id);
-            if (!gop.found_existing or entry.end_ts > gop.value_ptr.*) {
-                gop.value_ptr.* = entry.end_ts;
-            }
+        if (self.cas_index) |*index| {
+            try collectSegmentHighwater(&highwater, index.snapshot.segment_descriptors);
+        } else {
+            try collectSegmentHighwater(&highwater, self.manifest.entries.items);
         }
 
         var ctx = struct {
@@ -629,6 +627,15 @@ pub const Engine = struct {
         if (self.mem.bytes.load(.monotonic) > 0) {
             const flushed = try flushMemtable(self);
             if (flushed) try self.syncCasSnapshot("recovery-flush");
+        }
+    }
+
+    fn collectSegmentHighwater(highwater: *std.AutoHashMap(types.SeriesId, i64), entries: anytype) !void {
+        for (entries) |entry| {
+            const gop = try highwater.getOrPut(entry.series_id);
+            if (!gop.found_existing or entry.end_ts > gop.value_ptr.*) {
+                gop.value_ptr.* = entry.end_ts;
+            }
         }
     }
 
