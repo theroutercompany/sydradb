@@ -43,7 +43,7 @@ pub const VirtualMachine = struct {
 
     allocator: std.mem.Allocator,
     engine: *engine_mod.Engine,
-    program: *const bytecode.Program,
+    program: bytecode.Program,
     registers: []value_mod.Value,
     row_buffer: []value_mod.Value,
     series_cursors: []SeriesCursorState,
@@ -68,7 +68,7 @@ pub const VirtualMachine = struct {
         return .{
             .allocator = allocator,
             .engine = engine,
-            .program = program,
+            .program = program.*,
             .registers = registers,
             .row_buffer = row_buffer,
             .series_cursors = series_cursors,

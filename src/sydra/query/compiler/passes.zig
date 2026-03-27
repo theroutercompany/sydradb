@@ -224,7 +224,9 @@ pub fn pruneScanColumns(
     const plan = @import("../plan.zig");
     const need_time = needsIdentifier(typed_query, "time");
     const need_value = needsIdentifier(typed_query, "value");
-    const column_count: usize = @intFromBool(need_time) + @intFromBool(need_value);
+    const column_count: usize =
+        @as(usize, @intFromBool(need_time)) +
+        @as(usize, @intFromBool(need_value));
     const cols = try allocator.alloc(plan.ColumnInfo, column_count);
 
     var next_idx: usize = 0;

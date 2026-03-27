@@ -198,11 +198,13 @@ pub fn buildPipeline(allocator: std.mem.Allocator, engine: *engine_mod.Engine, n
         .one_row => |one_row| try createOneRowOperator(allocator, one_row.output),
         .filter => |filter| {
             const child = try buildPipeline(allocator, engine, filter.child);
+            errdefer child.destroy();
             return try createFilterOperator(allocator, child, filter.predicate, physical.nodeOutput(node));
         },
         .project => |project| try buildProjectOperator(allocator, engine, project),
         .aggregate => |aggregate| {
             const child = try buildPipeline(allocator, engine, aggregate.child);
+            errdefer child.destroy();
             return try createAggregateOperator(allocator, child, aggregate, physical.nodeOutput(node));
         },
         .sort => |sort| {
@@ -214,6 +216,7 @@ pub fn buildPipeline(allocator: std.mem.Allocator, engine: *engine_mod.Engine, n
                 return try createSortLimitOperator(allocator, engine, limit.child, limit, physical.nodeOutput(node));
             }
             const child = try buildPipeline(allocator, engine, limit.child);
+            errdefer child.destroy();
             return try createLimitOperator(allocator, child, physical.nodeOutput(node), limit.offset, limit.limit.limit);
         },
     };
@@ -242,6 +245,8 @@ fn createScanOperator(allocator: std.mem.Allocator, engine: *engine_mod.Engine, 
         .index = 0,
         .buffer = try allocator.alloc(Value, schema.len),
     };
+    errdefer payload.points.deinit();
+    errdefer allocator.free(payload.buffer);
 
     for (payload.buffer) |*slot| slot.* = Value.null;
 
@@ -249,7 +254,13 @@ fn createScanOperator(allocator: std.mem.Allocator, engine: *engine_mod.Engine, 
     switch (selector) {
         .ast => |ast_selector| switch (ast_selector.series) {
             .by_id => |id| payload.series_id = @as(types.SeriesId, @intCast(id.value)),
-            .name => return error.UnsupportedPlan,
+            .name => |ident| {
+                const resolution = engine.resolveSelector(.{ .name = ident.value }) catch return error.UnsupportedPlan;
+                switch (resolution.status) {
+                    .resolved, .exact_match => payload.series_id = resolution.series_id,
+                    .not_found, .ambiguous => return error.UnsupportedPlan,
+                }
+            },
         },
         .bound => |bound_selector| payload.series_id = bound_selector.series_id,
     }
@@ -333,11 +344,13 @@ fn buildProjectOperator(allocator: std.mem.Allocator, engine: *engine_mod.Engine
     if (node.reuse_child_schema or schemasEqual(child.schema, node.columns)) {
         return child;
     }
+    errdefer child.destroy();
     return try createProjectOperator(allocator, child, node.columns);
 }
 
 fn createProjectOperator(allocator: std.mem.Allocator, child: *Operator, columns: []const plan.ColumnInfo) ExecuteError!*Operator {
     const buffer = try allocator.alloc(Value, columns.len);
+    errdefer allocator.free(buffer);
     for (buffer) |*slot| slot.* = Value.null;
     const payload = Operator.Project{ .child = child, .buffer = buffer };
     return try createOperator(allocator, columns, "project", projectNext, projectDestroy, .{ .project = payload });

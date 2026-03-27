@@ -55,7 +55,7 @@ pub const Analyzer = struct {
     }
 
     fn validateSelect(self: *Analyzer, select: *const ast.Select, result: *AnalyzeResult) AnalyzeError!void {
-        const requires_time_predicate = select.selector != null;
+        const requires_time_predicate = selectRequiresTimePredicate(select);
         if (select.predicate) |pred| {
             const predicate_has_time = try self.visitExpression(pred, result);
             if (requires_time_predicate and !predicate_has_time) {
@@ -146,10 +146,69 @@ pub const Analyzer = struct {
     }
 };
 
+fn selectRequiresTimePredicate(select: *const ast.Select) bool {
+    if (select.selector == null) return false;
+    if (select.groupings.len != 0) return false;
+    if (!projectionsNeedTimePredicate(select.projections) and
+        !orderingNeedsTimePredicate(select.ordering) and
+        !predicateNeedsTimePredicate(select.predicate))
+    {
+        return false;
+    }
+    return true;
+}
+
+fn projectionsNeedTimePredicate(projections: []const ast.Projection) bool {
+    for (projections) |projection| {
+        if (!projectionIsMetadataOnly(projection.expr)) return true;
+    }
+    return false;
+}
+
+fn orderingNeedsTimePredicate(ordering: []const ast.OrderExpr) bool {
+    for (ordering) |order_expr| {
+        if (exprTouchesPointData(order_expr.expr)) return true;
+    }
+    return false;
+}
+
+fn predicateNeedsTimePredicate(predicate: ?*const ast.Expr) bool {
+    if (predicate) |expr| return exprTouchesPointData(expr);
+    return false;
+}
+
+fn projectionIsMetadataOnly(expr: *const ast.Expr) bool {
+    return switch (expr.*) {
+        .identifier => |ident| hasTagPrefix(ident.value),
+        else => false,
+    };
+}
+
+fn exprTouchesPointData(expr: *const ast.Expr) bool {
+    return switch (expr.*) {
+        .identifier => |ident| blk: {
+            const segment = trailingSegment(ident.value);
+            break :blk std.ascii.eqlIgnoreCase(segment, "time") or std.ascii.eqlIgnoreCase(segment, "value");
+        },
+        .literal => false,
+        .unary => |unary| exprTouchesPointData(unary.operand),
+        .binary => |binary| exprTouchesPointData(binary.left) or exprTouchesPointData(binary.right),
+        .call => |call| blk: {
+            for (call.args) |arg| {
+                if (exprTouchesPointData(arg)) break :blk true;
+            }
+            break :blk false;
+        },
+    };
+}
+
 fn identifierIsTime(ident: ast.Identifier) bool {
-    const slice = ident.value;
-    if (slice.len == 0) return false;
-    var start: usize = slice.len;
+    return std.ascii.eqlIgnoreCase(trailingSegment(ident.value), "time");
+}
+
+fn trailingSegment(slice: []const u8) []const u8 {
+    if (slice.len == 0) return slice;
+    var start: usize = 0;
     var idx = slice.len;
     while (idx > 0) {
         idx -= 1;
@@ -158,8 +217,12 @@ fn identifierIsTime(ident: ast.Identifier) bool {
             break;
         }
     }
-    const segment = slice[start..];
-    return std.ascii.eqlIgnoreCase(segment, "time");
+    return slice[start..];
+}
+
+fn hasTagPrefix(slice: []const u8) bool {
+    const dot = std.mem.indexOfScalar(u8, slice, '.') orelse return false;
+    return std.ascii.eqlIgnoreCase(slice[0..dot], "tag");
 }
 
 fn exprSpan(expr: *const ast.Expr) common.Span {

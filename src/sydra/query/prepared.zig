@@ -66,11 +66,13 @@ pub const PreparedStmt = struct {
 
     pub fn step(self: *PreparedStmt) StepError!StepResult {
         if (self.finalized) return error.Finalized;
-        var machine = &(self.machine orelse return error.NotImplemented);
-        return switch (try machine.step()) {
-            .row => |row| .{ .row = row },
-            .done => .done,
-        };
+        if (self.machine) |*machine| {
+            return switch (try machine.step()) {
+                .row => |row| .{ .row = row },
+                .done => .done,
+            };
+        }
+        return error.NotImplemented;
     }
 
     pub fn reset(self: *PreparedStmt) void {
@@ -305,6 +307,7 @@ test "prepared statement disassembles bytecode programs" {
 
     const instructions = try alloc.dupe(bytecode.Instruction, &.{
         .{ .opcode = .load_const, .p1 = 0, .p4 = .{ .constant = 0 } },
+        .{ .opcode = .result_row, .p1 = 0, .p2 = 1 },
         .{ .opcode = .halt },
     });
     var stmt = PreparedStmt{
@@ -328,7 +331,7 @@ test "prepared statement disassembles bytecode programs" {
     const lines = try stmt.explainBytecode(alloc);
     defer bytecode.freeDisassembly(alloc, lines);
 
-    try std.testing.expectEqual(@as(usize, 2), lines.len);
+    try std.testing.expectEqual(@as(usize, 3), lines.len);
     try std.testing.expectEqualStrings("load_const", lines[0].opcode);
     const first = try stmt.step();
     try std.testing.expect(first == .row);
@@ -373,8 +376,8 @@ test "prepareSydraQL compiles constant and scan statements to bytecode" {
 
     const sid = @import("../types.zig").seriesIdFrom("weather.room1", "{}");
     try engine.registerSeries("weather.room1", "{}", sid);
-    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 42.5, .tags_json = try alloc.dupe(u8, "{}") });
-    std.Thread.sleep(20 * std.time.ns_per_ms);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 42.5, .tags_json = "{}" });
+    try waitForQueryablePoints(alloc, engine, sid, 1, 1_000);
 
     var scan_stmt = try prepareSydraQL(alloc, engine, "select time, value from weather.room1 where time >= 0", .{});
     defer scan_stmt.finalize();
@@ -422,8 +425,8 @@ test "prepared bytecode snapshots stay stable for constant and scan plans" {
 
     const sid = @import("../types.zig").seriesIdFrom("weather.room1", "{}");
     try engine.registerSeries("weather.room1", "{}", sid);
-    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 42.5, .tags_json = try alloc.dupe(u8, "{}") });
-    std.Thread.sleep(20 * std.time.ns_per_ms);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 42.5, .tags_json = "{}" });
+    try waitForQueryablePoints(alloc, engine, sid, 1, 1_000);
 
     var scan_stmt = try prepareSydraQL(alloc, engine, "select time, value from weather.room1 where time >= 0", .{});
     defer scan_stmt.finalize();
@@ -466,9 +469,9 @@ test "prepared VM matches compiled executor on supported queries" {
 
     const sid = @import("../types.zig").seriesIdFrom("compare.room1", "{}");
     try engine.registerSeries("compare.room1", "{}", sid);
-    try engine.ingest(.{ .series_id = sid, .ts = 100, .value = 1.0, .tags_json = try alloc.dupe(u8, "{}") });
-    try engine.ingest(.{ .series_id = sid, .ts = 200, .value = 3.0, .tags_json = try alloc.dupe(u8, "{}") });
-    std.Thread.sleep(20 * std.time.ns_per_ms);
+    try engine.ingest(.{ .series_id = sid, .ts = 100, .value = 1.0, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 200, .value = 3.0, .tags_json = "{}" });
+    try waitForQueryablePoints(alloc, engine, sid, 2, 1_000);
 
     const scan_parity = try shadowCompareSydraQL(alloc, engine, "select time, value from compare.room1 where time >= 0");
     try std.testing.expect(scan_parity.columns_match);
@@ -512,8 +515,8 @@ test "prepareSqlCore translates SQL into prepared bytecode programs" {
 
     const sid = @import("../types.zig").seriesIdFrom("weather.room1", "{}");
     try engine.registerSeries("weather.room1", "{}", sid);
-    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 42.5, .tags_json = try alloc.dupe(u8, "{}") });
-    std.Thread.sleep(20 * std.time.ns_per_ms);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 42.5, .tags_json = "{}" });
+    try waitForQueryablePoints(alloc, engine, sid, 1, 1_000);
 
     var scan_stmt = try prepareSqlCore(alloc, engine, "SELECT time, value FROM weather.room1 WHERE time >= 0", .{});
     defer scan_stmt.finalize();
@@ -533,4 +536,23 @@ fn valuesEqual(lhs: []const value_mod.Value, rhs: []const value_mod.Value) bool 
         if (!value_mod.Value.equals(value, rhs[idx])) return false;
     }
     return true;
+}
+
+fn waitForQueryablePoints(
+    allocator: std.mem.Allocator,
+    engine: *engine_mod.Engine,
+    series_id: @import("../types.zig").SeriesId,
+    expected_count: usize,
+    timeout_ms: u64,
+) !void {
+    const deadline_ns = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ms)) * std.time.ns_per_ms;
+    while (std.time.nanoTimestamp() <= deadline_ns) {
+        var points = std.array_list.Managed(@import("../types.zig").Point).init(allocator);
+        defer points.deinit();
+
+        try engine.queryRange(series_id, std.math.minInt(i64), std.math.maxInt(i64), &points);
+        if (points.items.len >= expected_count) return;
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    return error.NotImplemented;
 }

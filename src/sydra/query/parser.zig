@@ -225,7 +225,10 @@ pub const Parser = struct {
 
     fn parseProjectionList(self: *Parser, list: *ProjectionList) ParseError!void {
         while (true) {
-            const expr = try self.parseExpression();
+            const expr = if ((try self.peek()).kind == .star)
+                try self.parseWildcardProjection()
+            else
+                try self.parseExpression();
             var alias: ?ast.Identifier = null;
             if (try self.matchKeyword(.as)) {
                 alias = try self.parseAliasIdentifier();
@@ -241,6 +244,16 @@ pub const Parser = struct {
                 break;
             }
         }
+    }
+
+    fn parseWildcardProjection(self: *Parser) ParseError!*const ast.Expr {
+        const token = try self.expectKind(.star);
+        const wildcard = ast.Identifier{
+            .value = try self.allocator.dupe(u8, token.lexeme),
+            .quoted = false,
+            .span = token.span,
+        };
+        return self.makeIdentifierExpr(wildcard);
     }
 
     fn parseAliasIdentifier(self: *Parser) ParseError!ast.Identifier {

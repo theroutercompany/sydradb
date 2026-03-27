@@ -133,9 +133,19 @@ test "load translator fixtures" {
     var list = try loadCases(alloc, "tests/translator/cases.jsonl");
     defer list.deinit();
     try std.testing.expect(list.cases.len >= 2);
-    const case0 = list.cases[0];
-    try std.testing.expectEqualStrings("select-constant", case0.name);
-    try std.testing.expect(case0.expect == .success);
-    const case1 = list.cases[1];
-    try std.testing.expect(case1.expect == .failure);
+
+    var saw_select_constant = false;
+    var saw_failure_case = false;
+    for (list.cases) |case| {
+        if (std.mem.eql(u8, case.name, "select-constant")) {
+            saw_select_constant = true;
+            try std.testing.expect(case.expect == .success);
+        }
+        if (std.mem.eql(u8, case.name, "update-basic")) {
+            saw_failure_case = true;
+            try std.testing.expect(case.expect == .failure);
+        }
+    }
+    try std.testing.expect(saw_select_constant);
+    try std.testing.expect(saw_failure_case);
 }
