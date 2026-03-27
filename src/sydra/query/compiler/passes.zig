@@ -312,13 +312,19 @@ fn ensureRawRowScalarSupported(expr: *const ast.Expr) errors.CompileError!void {
             try ensureRawRowScalarSupported(binary.right);
         },
         .call => |call| {
-            if (std.ascii.eqlIgnoreCase(call.callee.value, "abs")) {
+            if (std.ascii.eqlIgnoreCase(call.callee.value, "time_bucket")) {
+                try ensureTimeBucketSupported(expr);
+                return;
+            }
+            if (isSupportedUnaryRawRowFunction(call.callee.value)) {
                 if (call.args.len != 1) return error.UnsupportedFunction;
                 try ensureRawRowScalarSupported(call.args[0]);
                 return;
             }
-            if (std.ascii.eqlIgnoreCase(call.callee.value, "time_bucket")) {
-                try ensureTimeBucketSupported(expr);
+            if (std.ascii.eqlIgnoreCase(call.callee.value, "pow")) {
+                if (call.args.len != 2) return error.UnsupportedFunction;
+                try ensureRawRowScalarSupported(call.args[0]);
+                try ensureRawRowScalarSupported(call.args[1]);
                 return;
             }
             return error.UnsupportedFunction;
@@ -360,6 +366,15 @@ fn ensureBinaryOpSupported(op: ast.BinaryOp) errors.CompileError!void {
         => {},
         else => return error.UnsupportedExpression,
     }
+}
+
+fn isSupportedUnaryRawRowFunction(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "abs") or
+        std.ascii.eqlIgnoreCase(name, "ceil") or
+        std.ascii.eqlIgnoreCase(name, "floor") or
+        std.ascii.eqlIgnoreCase(name, "round") or
+        std.ascii.eqlIgnoreCase(name, "sqrt") or
+        std.ascii.eqlIgnoreCase(name, "ln");
 }
 
 fn ensureOrderIdentifier(
@@ -494,4 +509,34 @@ fn trailingSegment(slice: []const u8) []const u8 {
         if (slice[index] == '.') return slice[index + 1 ..];
     }
     return slice;
+}
+
+test "extractTimeRange merges bounded predicates" {
+    const parser = @import("../parser.zig");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser_inst = parser.Parser.init(arena.allocator(), "select value from metrics where time >= 10 and time < 20");
+    const statement = try parser_inst.parse();
+    const range = extractTimeRange(statement.select.predicate);
+
+    try std.testing.expectEqual(@as(i64, 10), range.start.?.value);
+    try std.testing.expect(range.start.?.inclusive);
+    try std.testing.expectEqual(@as(i64, 20), range.end.?.value);
+    try std.testing.expect(!range.end.?.inclusive);
+}
+
+test "raw row scalar support accepts pow and time_bucket origin" {
+    const parser = @import("../parser.zig");
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser_inst = parser.Parser.init(arena.allocator(), "select pow(value, 2), time_bucket(60, time, 5) from metrics");
+    const statement = try parser_inst.parse();
+    const select = statement.select;
+
+    try ensureRawRowScalarSupported(select.projections[0].expr);
+    try ensureRawRowScalarSupported(select.projections[1].expr);
 }

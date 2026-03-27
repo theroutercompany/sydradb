@@ -141,18 +141,55 @@ fn evaluateScalarCall(call: ast.Call, resolver: *const Resolver) EvalError!Value
         const arg = try evaluate(call.args[0], resolver);
         return Value{ .float = @abs(try arg.asFloat()) };
     }
+    if (std.ascii.eqlIgnoreCase(call.callee.value, "ceil")) {
+        return try evalUnaryFloatCall(call, resolver, .ceil);
+    }
+    if (std.ascii.eqlIgnoreCase(call.callee.value, "floor")) {
+        return try evalUnaryFloatCall(call, resolver, .floor);
+    }
+    if (std.ascii.eqlIgnoreCase(call.callee.value, "round")) {
+        return try evalUnaryFloatCall(call, resolver, .round);
+    }
+    if (std.ascii.eqlIgnoreCase(call.callee.value, "sqrt")) {
+        return try evalUnaryFloatCall(call, resolver, .sqrt);
+    }
+    if (std.ascii.eqlIgnoreCase(call.callee.value, "ln")) {
+        return try evalUnaryFloatCall(call, resolver, .ln);
+    }
+    if (std.ascii.eqlIgnoreCase(call.callee.value, "pow")) {
+        if (call.args.len != 2) return EvalError.UnsupportedExpression;
+        const lhs = try (try evaluate(call.args[0], resolver)).asFloat();
+        const rhs = try (try evaluate(call.args[1], resolver)).asFloat();
+        return Value{ .float = std.math.pow(f64, lhs, rhs) };
+    }
     return EvalError.UnsupportedExpression;
 }
 
 fn evalTimeBucket(call: ast.Call, resolver: *const Resolver) EvalError!Value {
-    if (call.args.len != 2) return EvalError.UnsupportedExpression;
+    if (call.args.len != 2 and call.args.len != 3) return EvalError.UnsupportedExpression;
     const bucket_val = try evaluate(call.args[0], resolver);
     const ts_val = try evaluate(call.args[1], resolver);
     const bucket_size = try bucket_val.asFloat();
     if (bucket_size == 0) return EvalError.DivisionByZero;
     const timestamp = try ts_val.asFloat();
-    const bucket = std.math.floor(timestamp / bucket_size) * bucket_size;
+    const origin = if (call.args.len == 3) try (try evaluate(call.args[2], resolver)).asFloat() else 0.0;
+    const bucket = std.math.floor((timestamp - origin) / bucket_size) * bucket_size + origin;
     return Value{ .integer = @intFromFloat(bucket) };
+}
+
+const UnaryMathOp = enum { ceil, floor, round, sqrt, ln };
+
+fn evalUnaryFloatCall(call: ast.Call, resolver: *const Resolver, comptime op: UnaryMathOp) EvalError!Value {
+    if (call.args.len != 1) return EvalError.UnsupportedExpression;
+    const arg = try evaluate(call.args[0], resolver);
+    const value = try arg.asFloat();
+    return Value{ .float = switch (op) {
+        .ceil => @ceil(value),
+        .floor => @floor(value),
+        .round => @round(value),
+        .sqrt => @sqrt(value),
+        .ln => @log(value),
+    } };
 }
 
 fn literalToValue(literal: ast.Literal) Value {
@@ -236,4 +273,93 @@ fn trailingSegment(name: []const u8) []const u8 {
         if (ch == '.') start = idx + 1;
     }
     return name[start..];
+}
+
+test "time_bucket supports explicit origin" {
+    const common = @import("common.zig");
+
+    const base_span = common.Span.init(0, 0);
+    const bucket_expr = try std.testing.allocator.create(ast.Expr);
+    defer std.testing.allocator.destroy(bucket_expr);
+    bucket_expr.* = .{ .literal = .{ .value = .{ .integer = 60 }, .span = base_span } };
+
+    const ts_expr = try std.testing.allocator.create(ast.Expr);
+    defer std.testing.allocator.destroy(ts_expr);
+    ts_expr.* = .{ .literal = .{ .value = .{ .integer = 125 }, .span = base_span } };
+
+    const origin_expr = try std.testing.allocator.create(ast.Expr);
+    defer std.testing.allocator.destroy(origin_expr);
+    origin_expr.* = .{ .literal = .{ .value = .{ .integer = 5 }, .span = base_span } };
+
+    const args = try std.testing.allocator.alloc(*const ast.Expr, 3);
+    defer std.testing.allocator.free(args);
+    args[0] = bucket_expr;
+    args[1] = ts_expr;
+    args[2] = origin_expr;
+
+    const expr = try std.testing.allocator.create(ast.Expr);
+    defer std.testing.allocator.destroy(expr);
+    expr.* = .{ .call = .{
+        .callee = .{ .value = "time_bucket", .quoted = false, .span = base_span },
+        .args = args,
+        .span = base_span,
+    } };
+
+    const ctx = RowContext{ .schema = &.{}, .values = &.{} };
+    const value = try evaluateRow(expr, &ctx);
+    try std.testing.expectEqual(@as(i64, 125), value.integer);
+}
+
+test "scalar math functions evaluate on row inputs" {
+    const common = @import("common.zig");
+
+    const alloc = std.testing.allocator;
+    const base_span = common.Span.init(0, 0);
+    const ident = try alloc.dupe(u8, "value");
+    defer alloc.free(ident);
+
+    const value_expr = try alloc.create(ast.Expr);
+    defer alloc.destroy(value_expr);
+    value_expr.* = .{ .identifier = .{ .value = ident, .quoted = false, .span = base_span } };
+
+    const pow_name = try alloc.dupe(u8, "pow");
+    defer alloc.free(pow_name);
+    const two_expr = try alloc.create(ast.Expr);
+    defer alloc.destroy(two_expr);
+    two_expr.* = .{ .literal = .{ .value = .{ .integer = 2 }, .span = base_span } };
+    const pow_args = try alloc.alloc(*const ast.Expr, 2);
+    defer alloc.free(pow_args);
+    pow_args[0] = value_expr;
+    pow_args[1] = two_expr;
+    const pow_expr = try alloc.create(ast.Expr);
+    defer alloc.destroy(pow_expr);
+    pow_expr.* = .{ .call = .{
+        .callee = .{ .value = pow_name, .quoted = false, .span = base_span },
+        .args = pow_args,
+        .span = base_span,
+    } };
+
+    const ceil_name = try alloc.dupe(u8, "ceil");
+    defer alloc.free(ceil_name);
+    const ceil_args = try alloc.alloc(*const ast.Expr, 1);
+    defer alloc.free(ceil_args);
+    ceil_args[0] = value_expr;
+    const ceil_expr = try alloc.create(ast.Expr);
+    defer alloc.destroy(ceil_expr);
+    ceil_expr.* = .{ .call = .{
+        .callee = .{ .value = ceil_name, .quoted = false, .span = base_span },
+        .args = ceil_args,
+        .span = base_span,
+    } };
+
+    const schema = [_]plan.ColumnInfo{
+        .{ .name = ident, .expr = value_expr },
+    };
+    const values = [_]Value{
+        .{ .float = 1.5 },
+    };
+    const ctx = RowContext{ .schema = schema[0..], .values = values[0..] };
+
+    try std.testing.expectApproxEqAbs(@as(f64, 2.25), (try evaluateRow(pow_expr, &ctx)).float, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), (try evaluateRow(ceil_expr, &ctx)).float, 1e-9);
 }

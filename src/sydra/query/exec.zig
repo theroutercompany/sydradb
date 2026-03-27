@@ -442,6 +442,55 @@ test "executeWithMode shadow falls back to legacy for unsupported compiler proje
     try std.testing.expect((try cursor.next()) == null);
 }
 
+test "executeWithMode compiled supports scalar alias ordering and first/last aggregates" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/compiled-stage4", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .compiled,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try engine_mod.Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const sid: u64 = 7007;
+    try engine.registerSeries("stage4.room1", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.5, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 20, .value = 2.0, .tags_json = "{}" });
+    try waitForFlushForTest(engine, 1, 1_000);
+
+    var scalar_cursor = try executeWithMode(talloc, engine, "select pow(value, 2) as squared from stage4.room1 where time >= 0 order by squared desc limit 1", .compiled);
+    defer scalar_cursor.deinit();
+
+    const scalar_row = (try scalar_cursor.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectApproxEqAbs(@as(f64, 4.0), try scalar_row.values[0].asFloat(), 1e-9);
+    try std.testing.expect((try scalar_cursor.next()) == null);
+
+    var aggregate_cursor = try executeWithMode(talloc, engine, "select first(value) as first_value, last(value) as last_value from stage4.room1 where time >= 0", .compiled);
+    defer aggregate_cursor.deinit();
+
+    const aggregate_row = (try aggregate_cursor.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), try aggregate_row.values[0].asFloat(), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), try aggregate_row.values[1].asFloat(), 1e-9);
+    try std.testing.expect((try aggregate_cursor.next()) == null);
+}
+
 test "shadowCompareSelect matches compiled and legacy rows for supported query" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });

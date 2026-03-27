@@ -127,7 +127,7 @@ pub const Operator = struct {
         remaining: usize,
     };
 
-    const AggregateKind = enum { avg, sum, count };
+    const AggregateKind = enum { avg, sum, count, min, max, first, last };
 
     const AggregateExpr = struct {
         expr: *const ast.Expr,
@@ -151,6 +151,15 @@ pub const Operator = struct {
         avg: AvgState,
         sum: f64,
         count: u64,
+        min: OptionalValue,
+        max: OptionalValue,
+        first: OptionalValue,
+        last: OptionalValue,
+    };
+
+    const OptionalValue = struct {
+        seen: bool = false,
+        value: Value = Value.null,
     };
 
     const GroupState = struct {
@@ -753,6 +762,10 @@ fn aggregateKindFor(name: []const u8) ?Operator.AggregateKind {
     if (std.ascii.eqlIgnoreCase(name, "avg")) return .avg;
     if (std.ascii.eqlIgnoreCase(name, "sum")) return .sum;
     if (std.ascii.eqlIgnoreCase(name, "count")) return .count;
+    if (std.ascii.eqlIgnoreCase(name, "min")) return .min;
+    if (std.ascii.eqlIgnoreCase(name, "max")) return .max;
+    if (std.ascii.eqlIgnoreCase(name, "first")) return .first;
+    if (std.ascii.eqlIgnoreCase(name, "last")) return .last;
     return null;
 }
 
@@ -761,6 +774,10 @@ fn initState(kind: Operator.AggregateKind) Operator.AggregateState {
         .avg => .{ .avg = .{ .total = 0, .count = 0 } },
         .sum => .{ .sum = 0 },
         .count => .{ .count = 0 },
+        .min => .{ .min = .{} },
+        .max => .{ .max = .{} },
+        .first => .{ .first = .{} },
+        .last => .{ .last = .{} },
     };
 }
 
@@ -807,6 +824,60 @@ fn updateState(state: *Operator.AggregateState, kind: Operator.AggregateKind, ma
                 }
             }
         },
+        .min => {
+            if (maybe_value) |value| {
+                if (!value.isNull()) {
+                    switch (state.*) {
+                        .min => |*min_state| {
+                            if (!min_state.seen or compareValuesForSort(value, min_state.value) == .lt) {
+                                min_state.* = .{ .seen = true, .value = value };
+                            }
+                        },
+                        else => unreachable,
+                    }
+                }
+            }
+        },
+        .max => {
+            if (maybe_value) |value| {
+                if (!value.isNull()) {
+                    switch (state.*) {
+                        .max => |*max_state| {
+                            if (!max_state.seen or compareValuesForSort(value, max_state.value) == .gt) {
+                                max_state.* = .{ .seen = true, .value = value };
+                            }
+                        },
+                        else => unreachable,
+                    }
+                }
+            }
+        },
+        .first => {
+            if (maybe_value) |value| {
+                if (!value.isNull()) {
+                    switch (state.*) {
+                        .first => |*first_state| {
+                            if (!first_state.seen) {
+                                first_state.* = .{ .seen = true, .value = value };
+                            }
+                        },
+                        else => unreachable,
+                    }
+                }
+            }
+        },
+        .last => {
+            if (maybe_value) |value| {
+                if (!value.isNull()) {
+                    switch (state.*) {
+                        .last => |*last_state| {
+                            last_state.* = .{ .seen = true, .value = value };
+                        },
+                        else => unreachable,
+                    }
+                }
+            }
+        },
     }
 }
 
@@ -822,6 +893,22 @@ fn finalizeState(state: Operator.AggregateState, kind: Operator.AggregateKind) V
         },
         .count => switch (state) {
             .count => |count_state| Value{ .integer = @as(i64, @intCast(count_state)) },
+            else => unreachable,
+        },
+        .min => switch (state) {
+            .min => |min_state| if (min_state.seen) min_state.value else Value.null,
+            else => unreachable,
+        },
+        .max => switch (state) {
+            .max => |max_state| if (max_state.seen) max_state.value else Value.null,
+            else => unreachable,
+        },
+        .first => switch (state) {
+            .first => |first_state| if (first_state.seen) first_state.value else Value.null,
+            else => unreachable,
+        },
+        .last => switch (state) {
+            .last => |last_state| if (last_state.seen) last_state.value else Value.null,
             else => unreachable,
         },
     };
@@ -961,6 +1048,113 @@ test "aggregate avg without grouping" {
     alloc.free(value_name);
     alloc.free(@constCast(avg_callee.value));
     alloc.free(agg_name);
+}
+
+test "aggregate min max first and last without grouping" {
+    const alloc = std.testing.allocator;
+    const common = @import("common.zig");
+
+    const time_name = try alloc.dupe(u8, "time");
+    const value_name = try alloc.dupe(u8, "value");
+    const base_span = common.Span.init(0, 0);
+
+    const time_expr = try alloc.create(ast.Expr);
+    defer alloc.destroy(time_expr);
+    time_expr.* = .{ .identifier = .{ .value = time_name, .quoted = false, .span = base_span } };
+
+    const value_expr = try alloc.create(ast.Expr);
+    defer alloc.destroy(value_expr);
+    value_expr.* = .{ .identifier = .{ .value = value_name, .quoted = false, .span = base_span } };
+
+    const child_columns = try alloc.alloc(plan.ColumnInfo, 2);
+    defer alloc.free(child_columns);
+    child_columns[0] = .{ .name = time_name, .expr = time_expr };
+    child_columns[1] = .{ .name = value_name, .expr = value_expr };
+
+    var row1 = try alloc.alloc(Value, 2);
+    defer alloc.free(row1);
+    row1[0] = Value{ .integer = 0 };
+    row1[1] = Value{ .float = 3.0 };
+    var row2 = try alloc.alloc(Value, 2);
+    defer alloc.free(row2);
+    row2[0] = Value{ .integer = 60 };
+    row2[1] = Value{ .float = 1.0 };
+    var row3 = try alloc.alloc(Value, 2);
+    defer alloc.free(row3);
+    row3[0] = Value{ .integer = 120 };
+    row3[1] = Value{ .float = 5.0 };
+
+    const data = try alloc.alloc([]Value, 3);
+    defer alloc.free(data);
+    data[0] = row1;
+    data[1] = row2;
+    data[2] = row3;
+
+    var child = try createTestSourceOperator(alloc, child_columns, data);
+    var child_owned = false;
+    defer if (!child_owned) child.destroy();
+
+    const function_names = [_][]const u8{ "min", "max", "first", "last" };
+    const output_names = [_][]const u8{ "min_value", "max_value", "first_value", "last_value" };
+    const agg_columns = try alloc.alloc(plan.ColumnInfo, function_names.len);
+    defer alloc.free(agg_columns);
+
+    var call_exprs = try alloc.alloc(*ast.Expr, function_names.len);
+    defer alloc.free(call_exprs);
+    var call_args = try alloc.alloc([]*const ast.Expr, function_names.len);
+    defer alloc.free(call_args);
+    var owned_name_storage = try alloc.alloc([]u8, function_names.len * 2);
+    defer {
+        for (owned_name_storage) |name| alloc.free(name);
+        alloc.free(owned_name_storage);
+    }
+
+    for (function_names, 0..) |fn_name, idx| {
+        owned_name_storage[idx] = try alloc.dupe(u8, fn_name);
+        owned_name_storage[function_names.len + idx] = try alloc.dupe(u8, output_names[idx]);
+
+        const args = try alloc.alloc(*const ast.Expr, 1);
+        args[0] = value_expr;
+        call_args[idx] = args;
+
+        const call_expr = try alloc.create(ast.Expr);
+        call_expr.* = .{ .call = .{
+            .callee = .{ .value = owned_name_storage[idx], .quoted = false, .span = base_span },
+            .args = args,
+            .span = base_span,
+        } };
+        call_exprs[idx] = call_expr;
+        agg_columns[idx] = .{ .name = owned_name_storage[function_names.len + idx], .expr = call_expr };
+    }
+    defer {
+        for (call_exprs) |expr| alloc.destroy(expr);
+        for (call_args) |args| alloc.free(args);
+    }
+
+    const aggregate_node = physical.Aggregate{
+        .groupings = &[_]ast.GroupExpr{},
+        .rollup_hint = null,
+        .output = agg_columns,
+        .child = undefined,
+        .requires_hash = false,
+        .has_fill_clause = false,
+    };
+
+    var agg_op = try createAggregateOperator(alloc, child, aggregate_node, agg_columns);
+    child_owned = true;
+    defer agg_op.destroy();
+
+    const maybe_row = try agg_op.next();
+    try std.testing.expect(maybe_row != null);
+    const row = maybe_row.?;
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), try row.values[0].asFloat(), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 5.0), try row.values[1].asFloat(), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), try row.values[2].asFloat(), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 5.0), try row.values[3].asFloat(), 1e-9);
+    try std.testing.expect((try agg_op.next()) == null);
+
+    alloc.free(time_name);
+    alloc.free(value_name);
 }
 
 test "operator stats track rows" {
