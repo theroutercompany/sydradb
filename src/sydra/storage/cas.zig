@@ -2872,7 +2872,10 @@ fn writeRepositoryFormat(alloc: std.mem.Allocator, root: std.fs.Dir, format: Rep
         },
         else => return err,
     };
-    if (fsync != .none) try syncDir(&root);
+    if (fsync != .none) {
+        var mutable_root = root;
+        try syncDir(&mutable_root);
+    }
 }
 
 fn writePackedObject(
