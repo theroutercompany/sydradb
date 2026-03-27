@@ -1290,35 +1290,18 @@ pub const CasManager = struct {
         var reachable = try self.collectReachable(refs);
         defer reachable.deinit();
 
-        const temp_dir_name = try std.fmt.allocPrint(self.alloc, ".objects-pack-{d}", .{std.time.nanoTimestamp()});
-        defer self.alloc.free(temp_dir_name);
-        try self.store.root.makePath(temp_dir_name);
-        errdefer self.store.root.deleteTree(temp_dir_name) catch {};
-
-        var rewritten: usize = 0;
+        var ids = std.array_list.Managed(object_store.ObjectId).init(self.alloc);
+        defer ids.deinit();
         var it = reachable.keyIterator();
         while (it.next()) |id_ptr| {
-            const loaded = try self.store.get(self.alloc, id_ptr.*);
-            defer self.alloc.free(loaded.payload);
-            try writePackedObject(self.alloc, self.store.root, temp_dir_name, id_ptr.*, loaded.obj_type, loaded.payload, self.store.fsync);
-            rewritten += 1;
+            try ids.append(id_ptr.*);
         }
-
-        const backup_name = try std.fmt.allocPrint(self.alloc, "objects.pre-pack-{d}", .{std.time.nanoTimestamp()});
-        defer self.alloc.free(backup_name);
-
-        try self.store.root.rename("objects", backup_name);
-        errdefer self.store.root.rename(backup_name, "objects") catch {};
-
-        const packed_objects = try std.fmt.allocPrint(self.alloc, "{s}/objects", .{temp_dir_name});
-        defer self.alloc.free(packed_objects);
-        try self.store.root.rename(packed_objects, "objects");
-        self.store.root.deleteTree(temp_dir_name) catch {};
-        self.store.root.deleteTree(backup_name) catch {};
+        var pack_write = try self.store.writePack(self.alloc, ids.items);
+        defer pack_write.deinit(self.alloc);
 
         return .{
             .reachable_objects = reachable.count(),
-            .rewritten_objects = rewritten,
+            .rewritten_objects = pack_write.object_count,
         };
     }
 

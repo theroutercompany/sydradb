@@ -33,6 +33,17 @@ pub const LoadedObject = struct {
     payload: []u8,
 };
 
+pub const PackWriteResult = struct {
+    pack_path: []u8,
+    idx_path: []u8,
+    object_count: usize,
+
+    pub fn deinit(self: *PackWriteResult, alloc: std.mem.Allocator) void {
+        alloc.free(self.pack_path);
+        alloc.free(self.idx_path);
+    }
+};
+
 pub const ObjectStore = struct {
     allocator: std.mem.Allocator,
     root: std.fs.Dir,
@@ -43,6 +54,8 @@ pub const ObjectStore = struct {
         try cwd.makePath(path);
         const root = try cwd.openDir(path, .{ .iterate = true });
         try root.makePath("objects");
+        try root.makePath("objects/packs");
+        try root.makePath("objects/info");
         try root.makePath("refs");
         return .{ .allocator = allocator, .root = root, .fsync = fsync };
     }
@@ -53,6 +66,7 @@ pub const ObjectStore = struct {
 
     pub fn put(self: *ObjectStore, obj_type: ObjectType, payload: []const u8) !ObjectId {
         const id = hash(obj_type, payload);
+        if (try self.containsId(id)) return id;
 
         var objects_dir = try self.root.openDir("objects", .{ .iterate = true });
         defer objects_dir.close();
@@ -65,14 +79,6 @@ pub const ObjectStore = struct {
         defer bucket_dir.close();
 
         const object_name = id.toHex();
-
-        if (bucket_dir.openFile(object_name[0..], .{ .mode = .read_only })) |existing| {
-            existing.close();
-            return id;
-        } else |err| switch (err) {
-            error.FileNotFound => {},
-            else => return err,
-        }
 
         const tmp_name = try std.fmt.allocPrint(self.allocator, "{s}.tmp-{d}", .{ object_name[0..], std.time.nanoTimestamp() });
         defer self.allocator.free(tmp_name);
@@ -103,13 +109,23 @@ pub const ObjectStore = struct {
     }
 
     pub fn get(self: *ObjectStore, allocator: std.mem.Allocator, id: ObjectId) !LoadedObject {
+        return self.getLoose(allocator, id) catch |err| switch (err) {
+            error.FileNotFound => try self.getPacked(allocator, id),
+            else => return err,
+        };
+    }
+
+    fn getLoose(self: *ObjectStore, allocator: std.mem.Allocator, id: ObjectId) !LoadedObject {
         var objects_dir = try self.root.openDir("objects", .{ .iterate = true });
         defer objects_dir.close();
 
         const dir_buf = std.fmt.bytesToHex([_]u8{id.hash[0]}, .lower);
         const dir_slice = dir_buf[0..];
 
-        var bucket_dir = try objects_dir.openDir(dir_slice, .{});
+        var bucket_dir = objects_dir.openDir(dir_slice, .{}) catch |err| switch (err) {
+            error.FileNotFound => return error.FileNotFound,
+            else => return err,
+        };
         defer bucket_dir.close();
 
         const object_name = id.toHex();
@@ -138,6 +154,9 @@ pub const ObjectStore = struct {
     }
 
     pub fn listIds(self: *ObjectStore, allocator: std.mem.Allocator) ![]ObjectId {
+        var seen = std.AutoHashMap(ObjectId, void).init(allocator);
+        defer seen.deinit();
+
         var ids = std.array_list.Managed(ObjectId).init(allocator);
         errdefer ids.deinit();
 
@@ -147,6 +166,7 @@ pub const ObjectStore = struct {
         var bucket_it = objects_dir.iterate();
         while (try bucket_it.next()) |bucket_entry| {
             if (bucket_entry.kind != .directory) continue;
+            if (bucket_entry.name.len != 2) continue;
             var bucket_dir = try objects_dir.openDir(bucket_entry.name, .{ .iterate = true });
             defer bucket_dir.close();
 
@@ -154,7 +174,20 @@ pub const ObjectStore = struct {
             while (try object_it.next()) |object_entry| {
                 if (object_entry.kind != .file) continue;
                 if (std.mem.indexOf(u8, object_entry.name, ".tmp-") != null) continue;
-                try ids.append(try ObjectId.fromHex(object_entry.name));
+                const id = try ObjectId.fromHex(object_entry.name);
+                if (!seen.contains(id)) {
+                    try seen.put(id, {});
+                    try ids.append(id);
+                }
+            }
+        }
+
+        const packed_ids = try self.listPackedIds(allocator);
+        defer allocator.free(packed_ids);
+        for (packed_ids) |id| {
+            if (!seen.contains(id)) {
+                try seen.put(id, {});
+                try ids.append(id);
             }
         }
 
@@ -168,13 +201,245 @@ pub const ObjectStore = struct {
         const dir_buf = std.fmt.bytesToHex([_]u8{id.hash[0]}, .lower);
         const dir_slice = dir_buf[0..];
 
-        var bucket_dir = try objects_dir.openDir(dir_slice, .{});
+        var bucket_dir = objects_dir.openDir(dir_slice, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                if (try self.findPackedLocation(id) != null) return error.ObjectStoredInPack;
+                return err;
+            },
+            else => return err,
+        };
         defer bucket_dir.close();
 
         const object_name = id.toHex();
-        try bucket_dir.deleteFile(object_name[0..]);
+        bucket_dir.deleteFile(object_name[0..]) catch |err| switch (err) {
+            error.FileNotFound => {
+                if (try self.findPackedLocation(id) != null) return error.ObjectStoredInPack;
+                return err;
+            },
+            else => return err,
+        };
         if (shouldSync(self.fsync)) {
             try syncDir(&bucket_dir);
+        }
+    }
+
+    pub fn writePack(self: *ObjectStore, allocator: std.mem.Allocator, ids: []const ObjectId) !PackWriteResult {
+        const sorted_ids = try allocator.dupe(ObjectId, ids);
+        defer allocator.free(sorted_ids);
+        std.sort.block(ObjectId, sorted_ids, {}, struct {
+            fn lessThan(_: void, lhs: ObjectId, rhs: ObjectId) bool {
+                return std.mem.lessThan(u8, lhs.hash[0..], rhs.hash[0..]);
+            }
+        }.lessThan);
+
+        const stamp = std.time.nanoTimestamp();
+        const pack_rel = try std.fmt.allocPrint(allocator, "objects/packs/pack-{d}.pack", .{stamp});
+        errdefer allocator.free(pack_rel);
+        const idx_rel = try std.fmt.allocPrint(allocator, "objects/packs/pack-{d}.idx", .{stamp});
+        errdefer allocator.free(idx_rel);
+
+        const tmp_pack_rel = try std.fmt.allocPrint(allocator, "{s}.tmp", .{pack_rel});
+        defer allocator.free(tmp_pack_rel);
+        const tmp_idx_rel = try std.fmt.allocPrint(allocator, "{s}.tmp", .{idx_rel});
+        defer allocator.free(tmp_idx_rel);
+
+        var offsets = try allocator.alloc(u64, sorted_ids.len);
+        defer allocator.free(offsets);
+
+        var pack_file = try self.root.createFile(tmp_pack_rel, .{ .truncate = true, .read = true });
+        defer pack_file.close();
+        errdefer self.root.deleteFile(tmp_pack_rel) catch {};
+
+        var pack_write_buf: [4096]u8 = undefined;
+        var pack_writer_state = pack_file.writer(&pack_write_buf);
+        const pack_writer = &pack_writer_state.interface;
+        try pack_writer.writeAll(packMagic[0..]);
+        try pack_writer.writeInt(u16, 1, .little);
+        try pack_writer.writeInt(u64, @intCast(sorted_ids.len), .little);
+
+        var current_offset: u64 = packMagic.len + @sizeOf(u16) + @sizeOf(u64);
+        for (sorted_ids, 0..) |id, idx| {
+            offsets[idx] = current_offset;
+            const loaded = try self.get(allocator, id);
+            defer allocator.free(loaded.payload);
+
+            try pack_writer.writeAll(id.hash[0..]);
+            try pack_writer.writeByte(@intFromEnum(loaded.obj_type));
+            try pack_writer.writeInt(u64, @intCast(loaded.payload.len), .little);
+            try pack_writer.writeAll(loaded.payload);
+
+            current_offset += 32 + 1 + @sizeOf(u64) + @as(u64, @intCast(loaded.payload.len));
+        }
+        try pack_writer_state.end();
+        if (shouldSync(self.fsync)) {
+            try pack_file.sync();
+        }
+
+        const pack_checksum = try hashRelativeFile(self.root, allocator, tmp_pack_rel);
+        const pack_stat = try pack_file.stat();
+
+        const idx_bytes = try encodePackIndex(allocator, sorted_ids, offsets, pack_stat.size, pack_checksum);
+        defer allocator.free(idx_bytes);
+
+        var idx_file = try self.root.createFile(tmp_idx_rel, .{ .truncate = true, .read = true });
+        defer idx_file.close();
+        errdefer self.root.deleteFile(tmp_idx_rel) catch {};
+        try idx_file.writeAll(idx_bytes);
+        if (shouldSync(self.fsync)) {
+            try idx_file.sync();
+        }
+
+        try self.root.rename(tmp_pack_rel, pack_rel);
+        try self.root.rename(tmp_idx_rel, idx_rel);
+        if (shouldSync(self.fsync)) {
+            try syncDir(&self.root);
+        }
+
+        try self.pruneOlderPackFiles(pack_rel, idx_rel);
+
+        for (sorted_ids) |id| {
+            self.delete(id) catch |err| switch (err) {
+                error.FileNotFound, error.ObjectStoredInPack => {},
+                else => return err,
+            };
+        }
+
+        return .{
+            .pack_path = pack_rel,
+            .idx_path = idx_rel,
+            .object_count = sorted_ids.len,
+        };
+    }
+
+    fn containsId(self: *ObjectStore, id: ObjectId) !bool {
+        if (self.getLoose(self.allocator, id)) |loaded| {
+            self.allocator.free(loaded.payload);
+            return true;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+        return (try self.findPackedLocation(id)) != null;
+    }
+
+    fn getPacked(self: *ObjectStore, allocator: std.mem.Allocator, id: ObjectId) !LoadedObject {
+        const location = try self.findPackedLocation(id) orelse return error.FileNotFound;
+        defer location.deinit(allocator);
+
+        var pack_file = try self.root.openFile(location.pack_path, .{ .mode = .read_only });
+        defer pack_file.close();
+        try pack_file.seekTo(location.offset);
+
+        var read_buf: [4096]u8 = undefined;
+        var reader_state = pack_file.reader(&read_buf);
+        const reader = std.Io.Reader.adaptToOldInterface(&reader_state.interface);
+        var id_buf: [32]u8 = undefined;
+        try reader.readNoEof(id_buf[0..]);
+        if (!std.mem.eql(u8, id_buf[0..], id.hash[0..])) return error.CorruptPack;
+
+        const obj_type = std.meta.intToEnum(ObjectType, try reader.readByte()) catch return error.UnknownObjectType;
+        var len_buf: [8]u8 = undefined;
+        try reader.readNoEof(len_buf[0..]);
+        const payload_len = std.mem.readInt(u64, &len_buf, .little);
+        const payload = try allocator.alloc(u8, @intCast(payload_len));
+        errdefer allocator.free(payload);
+        const bytes_read = try reader.readAll(payload);
+        if (bytes_read != payload.len) return error.CorruptPack;
+        if (!computeId(obj_type, payload).eql(id)) return error.ObjectHashMismatch;
+        return .{
+            .id = id,
+            .obj_type = obj_type,
+            .payload = payload,
+        };
+    }
+
+    fn findPackedLocation(self: *ObjectStore, id: ObjectId) !?PackLocation {
+        const idx_paths = try self.listPackIndexPaths(self.allocator);
+        defer freeOwnedStrings(self.allocator, idx_paths);
+
+        for (idx_paths) |idx_path| {
+            var index = try loadPackIndex(self.allocator, self.root, idx_path);
+            defer index.deinit(self.allocator);
+            if (index.lookup(id)) |offset| {
+                return .{
+                    .pack_path = try self.allocator.dupe(u8, index.pack_path),
+                    .offset = offset,
+                };
+            }
+        }
+        return null;
+    }
+
+    fn listPackedIds(self: *ObjectStore, allocator: std.mem.Allocator) ![]ObjectId {
+        const idx_paths = try self.listPackIndexPaths(allocator);
+        defer freeOwnedStrings(allocator, idx_paths);
+
+        var ids = std.array_list.Managed(ObjectId).init(allocator);
+        errdefer ids.deinit();
+        for (idx_paths) |idx_path| {
+            var index = try loadPackIndex(allocator, self.root, idx_path);
+            defer index.deinit(allocator);
+            try ids.appendSlice(index.object_ids);
+        }
+        return try ids.toOwnedSlice();
+    }
+
+    fn listPackIndexPaths(self: *ObjectStore, allocator: std.mem.Allocator) ![][]u8 {
+        var pack_dir = self.root.openDir("objects/packs", .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return try allocator.alloc([]u8, 0),
+            else => return err,
+        };
+        defer pack_dir.close();
+
+        var out = std.array_list.Managed([]u8).init(allocator);
+        errdefer {
+            for (out.items) |path| allocator.free(path);
+            out.deinit();
+        }
+
+        var it = pack_dir.iterate();
+        while (try it.next()) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".idx")) continue;
+            if (std.mem.endsWith(u8, entry.name, ".tmp")) continue;
+            try out.append(try std.fmt.allocPrint(allocator, "objects/packs/{s}", .{entry.name}));
+        }
+
+        std.sort.block([]u8, out.items, {}, struct {
+            fn lessThan(_: void, lhs: []u8, rhs: []u8) bool {
+                return std.mem.lessThan(u8, lhs, rhs);
+            }
+        }.lessThan);
+        return try out.toOwnedSlice();
+    }
+
+    fn pruneOlderPackFiles(self: *ObjectStore, keep_pack_rel: []const u8, keep_idx_rel: []const u8) !void {
+        var pack_dir = self.root.openDir("objects/packs", .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer pack_dir.close();
+
+        var stale = std.array_list.Managed([]u8).init(self.allocator);
+        defer {
+            for (stale.items) |path| self.allocator.free(path);
+            stale.deinit();
+        }
+
+        var it = pack_dir.iterate();
+        while (try it.next()) |entry| {
+            if (entry.kind != .file) continue;
+            if (std.mem.endsWith(u8, entry.name, ".tmp")) continue;
+            const rel = try std.fmt.allocPrint(self.allocator, "objects/packs/{s}", .{entry.name});
+            if (std.mem.eql(u8, rel, keep_pack_rel) or std.mem.eql(u8, rel, keep_idx_rel)) {
+                self.allocator.free(rel);
+                continue;
+            }
+            try stale.append(rel);
+        }
+
+        for (stale.items) |rel| {
+            self.root.deleteFile(rel) catch {};
         }
     }
 };
@@ -200,6 +465,177 @@ fn syncDir(dir: *std.fs.Dir) !void {
     if (@hasDecl(std.fs.Dir, "sync")) {
         try dir.sync();
     }
+}
+
+const packMagic = "SYDPACK1";
+const idxMagic = "SYDIDX1\x00";
+
+const PackLocation = struct {
+    pack_path: []u8,
+    offset: u64,
+
+    fn deinit(self: *PackLocation, alloc: std.mem.Allocator) void {
+        alloc.free(self.pack_path);
+    }
+};
+
+const PackIndex = struct {
+    pack_path: []u8,
+    pack_size: u64,
+    pack_checksum: [32]u8,
+    fanout: [256]u64,
+    object_ids: []ObjectId,
+    offsets: []u64,
+
+    fn deinit(self: *PackIndex, alloc: std.mem.Allocator) void {
+        alloc.free(self.pack_path);
+        alloc.free(self.object_ids);
+        alloc.free(self.offsets);
+    }
+
+    fn lookup(self: *const PackIndex, id: ObjectId) ?u64 {
+        const prefix = id.hash[0];
+        const start = if (prefix == 0) 0 else self.fanout[prefix - 1];
+        const end = self.fanout[prefix];
+        var lo: usize = @intCast(start);
+        var hi: usize = @intCast(end);
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const candidate = self.object_ids[mid];
+            if (candidate.eql(id)) return self.offsets[mid];
+            if (std.mem.lessThan(u8, candidate.hash[0..], id.hash[0..])) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        return null;
+    }
+};
+
+fn encodePackIndex(
+    alloc: std.mem.Allocator,
+    ids: []const ObjectId,
+    offsets: []const u64,
+    pack_size: u64,
+    pack_checksum: [32]u8,
+) ![]u8 {
+    var fanout: [256]u64 = [_]u64{0} ** 256;
+    for (ids) |id| {
+        fanout[id.hash[0]] += 1;
+    }
+    var i: usize = 1;
+    while (i < fanout.len) : (i += 1) {
+        fanout[i] += fanout[i - 1];
+    }
+
+    var bytes = std.array_list.Managed(u8).init(alloc);
+    errdefer bytes.deinit();
+
+    try bytes.appendSlice(idxMagic[0..]);
+    try appendInt(&bytes, u16, 1);
+    try appendInt(&bytes, u64, @intCast(ids.len));
+    for (fanout) |count| try appendInt(&bytes, u64, count);
+    try appendInt(&bytes, u64, pack_size);
+    try bytes.appendSlice(pack_checksum[0..]);
+    for (ids) |id| try bytes.appendSlice(id.hash[0..]);
+    for (offsets) |offset| try appendInt(&bytes, u64, offset);
+
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(bytes.items);
+    var checksum: [32]u8 = undefined;
+    hasher.final(checksum[0..]);
+    try bytes.appendSlice(checksum[0..]);
+    return try bytes.toOwnedSlice();
+}
+
+fn loadPackIndex(alloc: std.mem.Allocator, root: std.fs.Dir, idx_path: []const u8) !PackIndex {
+    const bytes = try root.readFileAlloc(alloc, idx_path, 256 * 1024 * 1024);
+    defer alloc.free(bytes);
+    if (bytes.len < idxMagic.len + @sizeOf(u16) + @sizeOf(u64) + (256 * @sizeOf(u64)) + @sizeOf(u64) + 32 + 32) {
+        return error.CorruptPackIndex;
+    }
+    if (!std.mem.eql(u8, bytes[0..idxMagic.len], idxMagic[0..])) return error.CorruptPackIndex;
+
+    const checksum_start = bytes.len - 32;
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(bytes[0..checksum_start]);
+    var expected_checksum: [32]u8 = undefined;
+    hasher.final(expected_checksum[0..]);
+    if (!std.mem.eql(u8, expected_checksum[0..], bytes[checksum_start..])) return error.CorruptPackIndex;
+
+    var cursor: usize = idxMagic.len;
+    const version = readIntAt(bytes, &cursor, u16);
+    if (version != 1) return error.UnsupportedPackIndexVersion;
+    const object_count = readIntAt(bytes, &cursor, u64);
+
+    var fanout: [256]u64 = undefined;
+    for (&fanout) |*entry| entry.* = readIntAt(bytes, &cursor, u64);
+    const pack_size = readIntAt(bytes, &cursor, u64);
+    var pack_checksum: [32]u8 = undefined;
+    @memcpy(pack_checksum[0..], bytes[cursor .. cursor + 32]);
+    cursor += 32;
+
+    const object_ids = try alloc.alloc(ObjectId, @intCast(object_count));
+    errdefer alloc.free(object_ids);
+    for (object_ids) |*id| {
+        @memcpy(id.hash[0..], bytes[cursor .. cursor + 32]);
+        cursor += 32;
+    }
+
+    const offsets = try alloc.alloc(u64, @intCast(object_count));
+    errdefer alloc.free(offsets);
+    for (offsets) |*offset| {
+        offset.* = readIntAt(bytes, &cursor, u64);
+    }
+
+    const pack_path = try packPathForIndex(alloc, idx_path);
+    return .{
+        .pack_path = pack_path,
+        .pack_size = pack_size,
+        .pack_checksum = pack_checksum,
+        .fanout = fanout,
+        .object_ids = object_ids,
+        .offsets = offsets,
+    };
+}
+
+fn packPathForIndex(alloc: std.mem.Allocator, idx_path: []const u8) ![]u8 {
+    if (!std.mem.endsWith(u8, idx_path, ".idx")) return error.InvalidPackIndexPath;
+    return try std.fmt.allocPrint(alloc, "{s}.pack", .{idx_path[0 .. idx_path.len - 4]});
+}
+
+fn appendInt(bytes: *std.array_list.Managed(u8), comptime T: type, value: T) !void {
+    var raw: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, raw[0..], value, .little);
+    try bytes.appendSlice(raw[0..]);
+}
+
+fn readIntAt(bytes: []const u8, cursor: *usize, comptime T: type) T {
+    defer cursor.* += @sizeOf(T);
+    return std.mem.readInt(T, bytes[cursor.* .. cursor.* + @sizeOf(T)], .little);
+}
+
+fn hashRelativeFile(root: std.fs.Dir, alloc: std.mem.Allocator, path: []const u8) ![32]u8 {
+    _ = alloc;
+    var file = try root.openFile(path, .{ .mode = .read_only });
+    defer file.close();
+
+    var buf: [8192]u8 = undefined;
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    while (true) {
+        const read_len = try file.read(buf[0..]);
+        if (read_len == 0) break;
+        hasher.update(buf[0..read_len]);
+    }
+    var out: [32]u8 = undefined;
+    hasher.final(out[0..]);
+    return out;
+}
+
+fn freeOwnedStrings(alloc: std.mem.Allocator, items: [][]u8) void {
+    for (items) |item| alloc.free(item);
+    alloc.free(items);
 }
 
 test "object store write/read round-trip" {
@@ -253,4 +689,56 @@ test "object store detects hash mismatches" {
     try file.writeAll("x");
 
     try std.testing.expectError(error.ObjectHashMismatch, store.get(std.testing.allocator, id));
+}
+
+test "object store can read packed objects after loose copies are pruned" {
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    const store_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/object-store-pack", .{tmp_dir.sub_path});
+    defer std.testing.allocator.free(store_path);
+    var store = try ObjectStore.init(std.testing.allocator, store_path, .none);
+    defer store.deinit();
+
+    const blob_id = try store.put(.blob, "packed blob");
+    const tree_id = try store.put(.tree, "packed tree");
+    const ids = [_]ObjectId{ blob_id, tree_id };
+
+    var pack_write = try store.writePack(std.testing.allocator, ids[0..]);
+    defer pack_write.deinit(std.testing.allocator);
+
+    const loaded_blob = try store.get(std.testing.allocator, blob_id);
+    defer std.testing.allocator.free(loaded_blob.payload);
+    try std.testing.expectEqual(ObjectType.blob, loaded_blob.obj_type);
+    try std.testing.expectEqualStrings("packed blob", loaded_blob.payload);
+
+    const loaded_tree = try store.get(std.testing.allocator, tree_id);
+    defer std.testing.allocator.free(loaded_tree.payload);
+    try std.testing.expectEqual(ObjectType.tree, loaded_tree.obj_type);
+    try std.testing.expectEqualStrings("packed tree", loaded_tree.payload);
+
+    const all_ids = try store.listIds(std.testing.allocator);
+    defer std.testing.allocator.free(all_ids);
+    try std.testing.expectEqual(@as(usize, 2), all_ids.len);
+}
+
+test "object store rejects corrupt pack indexes" {
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    const store_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/object-store-pack-corrupt", .{tmp_dir.sub_path});
+    defer std.testing.allocator.free(store_path);
+    var store = try ObjectStore.init(std.testing.allocator, store_path, .none);
+    defer store.deinit();
+
+    const id = try store.put(.blob, "corrupt pack blob");
+    var pack_write = try store.writePack(std.testing.allocator, &[_]ObjectId{id});
+    defer pack_write.deinit(std.testing.allocator);
+
+    var idx_file = try store.root.openFile(pack_write.idx_path, .{ .mode = .read_write });
+    defer idx_file.close();
+    try idx_file.seekTo(0);
+    try idx_file.writeAll("BROKEN!!");
+
+    try std.testing.expectError(error.CorruptPackIndex, store.get(std.testing.allocator, id));
 }

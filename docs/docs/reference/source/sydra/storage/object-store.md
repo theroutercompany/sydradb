@@ -10,7 +10,8 @@ title: src/sydra/storage/object_store.zig
 Implements a content-addressed object store (Git-inspired):
 
 - Objects are addressed by a BLAKE3 hash of `(type, payload)`.
-- Objects are stored under `objects/<prefix>/<hex>` in a directory.
+- Loose objects are stored under `objects/<prefix>/<hex>`.
+- Packed objects are stored under `objects/packs/*.pack` with `objects/packs/*.idx` fanout indexes.
 
 ## Public types
 
@@ -50,13 +51,14 @@ Fields:
 
 - `allocator: std.mem.Allocator`
 - `root: std.fs.Dir`
+- `fsync: cfg.FsyncPolicy`
 
 ## Public API
 
-### `pub fn init(allocator, path: []const u8) !ObjectStore`
+### `pub fn init(allocator, path: []const u8, fsync) !ObjectStore`
 
 - Ensures `path/` exists.
-- Creates `objects/` and `refs/` under `path/`.
+- Creates `objects/`, `objects/packs/`, `objects/info/`, and `refs/` under `path/`.
 
 ### `pub fn put(self, obj_type: ObjectType, payload: []const u8) !ObjectId`
 
@@ -77,8 +79,9 @@ try file.writeAll(payload);
 
 ### `pub fn get(self, allocator, id: ObjectId) !LoadedObject`
 
-- Loads the object file into an allocated buffer.
+- Resolves loose objects first, then packed objects through any matching `.idx` file in `objects/packs/`.
 - Validates the header and payload length.
+- For packed objects, validates the record id and recomputes the object hash from `(type, payload)`.
 - Returns a `LoadedObject` with `payload` as a slice into that buffer.
 
 Callers must free `loaded.payload` using the same allocator passed to `get`.
@@ -98,6 +101,22 @@ if (payload_len > buffer[5..].len) return error.CorruptObject;
 const payload = buffer[5 .. 5 + payload_len];
 ```
 
+### `pub fn writePack(self, allocator, ids: []const ObjectId) !PackWriteResult`
+
+- Writes a whole-object pack for the provided ids.
+- Sorts object ids lexicographically by BLAKE3 hash.
+- Emits:
+  - `objects/packs/pack-<timestamp>.pack`
+  - `objects/packs/pack-<timestamp>.idx`
+- The `.idx` file contains:
+  - a 256-entry cumulative fanout table by first hash byte
+  - sorted object ids
+  - 64-bit record offsets into the `.pack`
+  - the packed file size
+  - a BLAKE3 checksum of the pack file
+  - a trailing BLAKE3 checksum of the index contents
+- After the new pack lands, older pack files are pruned and redundant loose copies for the packed ids are removed.
+
 ```zig title="ObjectId hashing (excerpt)"
 fn hash(obj_type: ObjectType, payload: []const u8) ObjectId {
     var hasher = std.crypto.hash.blake3.Blake3.init(.{});
@@ -112,3 +131,5 @@ fn hash(obj_type: ObjectType, payload: []const u8) ObjectId {
 ## Tests
 
 - `test "object store write/read round-trip"`
+- `test "object store can read packed objects after loose copies are pruned"`
+- `test "object store rejects corrupt pack indexes"`
