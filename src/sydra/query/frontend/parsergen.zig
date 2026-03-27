@@ -142,6 +142,19 @@ pub const ParseRuntimeError = std.mem.Allocator.Error || error{
     DisabledRule,
 };
 
+pub const FailureReason = enum {
+    unexpected_token,
+    disabled_rule,
+};
+
+pub const FailureInfo = struct {
+    reason: FailureReason,
+    token_index: usize,
+    state: u16,
+    lookahead_terminal: u16,
+    rule_index: ?u16 = null,
+};
+
 pub const GeneratedParser = struct {
     allocator: std.mem.Allocator,
     tables: *const ParserTables,
@@ -149,6 +162,7 @@ pub const GeneratedParser = struct {
     stack: std.array_list.Managed(u16),
     reductions: std.array_list.Managed(u16),
     fallback_count: usize,
+    last_failure: ?FailureInfo,
 
     pub fn init(allocator: std.mem.Allocator, tables: *const ParserTables, hooks: RuntimeHooks) !GeneratedParser {
         var parser = GeneratedParser{
@@ -158,6 +172,7 @@ pub const GeneratedParser = struct {
             .stack = std.array_list.Managed(u16).init(allocator),
             .reductions = std.array_list.Managed(u16).init(allocator),
             .fallback_count = 0,
+            .last_failure = null,
         };
         errdefer {
             parser.stack.deinit();
@@ -176,7 +191,12 @@ pub const GeneratedParser = struct {
         self.stack.clearRetainingCapacity();
         self.reductions.clearRetainingCapacity();
         self.fallback_count = 0;
+        self.last_failure = null;
         try self.stack.append(0);
+    }
+
+    pub fn failureInfo(self: @This()) ?FailureInfo {
+        return self.last_failure;
     }
 
     pub fn parse(self: *@This(), terminals: []const u16) ParseRuntimeError!ParseResult {
@@ -200,7 +220,15 @@ pub const GeneratedParser = struct {
                 }
             }
 
-            switch (action orelse return error.ParseError) {
+            switch (action orelse {
+                self.last_failure = .{
+                    .reason = .unexpected_token,
+                    .token_index = cursor,
+                    .state = state,
+                    .lookahead_terminal = lookahead,
+                };
+                return error.ParseError;
+            }) {
                 .shift => |next_state| {
                     if (cursor >= terminals.len) return error.ParseError;
                     try self.stack.append(next_state);
@@ -208,7 +236,16 @@ pub const GeneratedParser = struct {
                     self.emitCoverage(state, .{ .shift = next_state });
                 },
                 .reduce => |rule_index| {
-                    if (!self.ruleEnabled(rule_index)) return error.DisabledRule;
+                    if (!self.ruleEnabled(rule_index)) {
+                        self.last_failure = .{
+                            .reason = .disabled_rule,
+                            .token_index = cursor,
+                            .state = state,
+                            .lookahead_terminal = lookahead,
+                            .rule_index = rule_index,
+                        };
+                        return error.DisabledRule;
+                    }
                     const rule = self.tables.rules[rule_index];
                     if (self.stack.items.len <= rule.rhs_len) return error.ParseError;
                     self.stack.items.len -= rule.rhs_len;
@@ -1010,4 +1047,96 @@ test "generated parser runtime accepts SQL core select" {
 
     try std.testing.expect(result.accepted);
     try std.testing.expect(tables.states.len > 1);
+}
+
+test "generated parser runtime records parse failure location" {
+    const alloc = std.testing.allocator;
+    const sql_core = @import("grammars/sql_core_ts.zig").spec;
+    var gen = ParserGenerator.init(alloc);
+    var tables = try gen.buildTables(sql_core);
+    defer tables.deinit(alloc);
+
+    var parser = try GeneratedParser.init(alloc, &tables, .{});
+    defer parser.deinit();
+
+    const terminals = [_]u16{
+        tables.terminalId("select") orelse return error.InvalidCharacter,
+        tables.terminalId("from") orelse return error.InvalidCharacter,
+        tables.terminalId("identifier") orelse return error.InvalidCharacter,
+        tables.terminalId("eof") orelse return error.InvalidCharacter,
+    };
+    try std.testing.expectError(error.ParseError, parser.parse(terminals[0..]));
+    const failure = parser.failureInfo() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(FailureReason.unexpected_token, failure.reason);
+    try std.testing.expectEqual(@as(usize, 1), failure.token_index);
+}
+
+test "generated parser runtime honors conditional rules and emits coverage events" {
+    const alloc = std.testing.allocator;
+    const test_spec = grammar.GrammarSpec{
+        .name = "conditional_test",
+        .parser_name = "ConditionalParser",
+        .start_symbol = "stmt",
+        .tokens = &.{
+            .{ .name = "select" },
+            .{ .name = "number" },
+            .{ .name = "eof" },
+        },
+        .nonterminals = &.{
+            "stmt",
+        },
+        .rules = &.{
+            .{ .lhs = "stmt", .rhs = &.{ "select", "number" }, .action = "emitSelect()", .condition = "allow_select", .destructor = "destroySelect()" },
+        },
+    };
+
+    var gen = ParserGenerator.init(alloc);
+    var tables = try gen.buildTables(test_spec);
+    defer tables.deinit(alloc);
+
+    try std.testing.expectEqualStrings("destroySelect()", tables.rules[1].destructor.?);
+
+    const HooksCtx = struct {
+        allow_rule: bool,
+        coverage_events: usize = 0,
+
+        fn ruleEnabled(ctx: ?*anyopaque, _: usize, condition: ?[]const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            if (condition == null) return true;
+            return self.allow_rule;
+        }
+
+        fn coverage(ctx: ?*anyopaque, _: u16, _: CoverageEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.coverage_events += 1;
+        }
+    };
+
+    const terminals = [_]u16{
+        tables.terminalId("select") orelse return error.InvalidCharacter,
+        tables.terminalId("number") orelse return error.InvalidCharacter,
+    };
+
+    var blocked_ctx = HooksCtx{ .allow_rule = false };
+    var blocked = try GeneratedParser.init(alloc, &tables, .{
+        .context = &blocked_ctx,
+        .rule_enabled = HooksCtx.ruleEnabled,
+        .coverage = HooksCtx.coverage,
+    });
+    defer blocked.deinit();
+    try std.testing.expectError(error.DisabledRule, blocked.parse(terminals[0..]));
+    const blocked_failure = blocked.failureInfo() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(FailureReason.disabled_rule, blocked_failure.reason);
+
+    var allowed_ctx = HooksCtx{ .allow_rule = true };
+    var allowed = try GeneratedParser.init(alloc, &tables, .{
+        .context = &allowed_ctx,
+        .rule_enabled = HooksCtx.ruleEnabled,
+        .coverage = HooksCtx.coverage,
+    });
+    defer allowed.deinit();
+    var result = try allowed.parse(terminals[0..]);
+    defer result.deinit(alloc);
+    try std.testing.expect(result.accepted);
+    try std.testing.expect(allowed_ctx.coverage_events > 0);
 }

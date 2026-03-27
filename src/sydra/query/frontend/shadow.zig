@@ -127,10 +127,11 @@ fn parseWithGeneratedRuntime(
 
     var result = generated.parse(terminal_ids.?) catch |err| switch (err) {
         error.ParseError, error.DisabledRule => {
+            const failure = generated.failureInfo();
             try list.append(.{
                 .code = .parser_mismatch,
                 .message = "generated sydraql parser runtime could not accept the shared token stream",
-                .span = if (tokens.len == 0) null else tokens[0].span,
+                .span = failureSpan(tokens, failure),
                 .phase = .parse,
             });
             return null;
@@ -141,6 +142,13 @@ fn parseWithGeneratedRuntime(
 
     if (!result.accepted) return null;
     return generatedStatementKind(tables.*, result.reductions);
+}
+
+fn failureSpan(tokens: []const lexer.Token, failure: ?parsergen.FailureInfo) ?@import("../common.zig").Span {
+    if (failure) |info| {
+        if (info.token_index < tokens.len) return tokens[info.token_index].span;
+    }
+    return if (tokens.len == 0) null else tokens[0].span;
 }
 
 fn collectGeneratedTerminalIds(

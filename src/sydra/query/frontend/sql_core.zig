@@ -47,10 +47,11 @@ pub fn parseSqlCoreSkeleton(
 
         var result = generated.parse(ids) catch |err| switch (err) {
             error.ParseError, error.DisabledRule => {
+                const failure = generated.failureInfo();
                 try diags.append(.{
                     .code = .unexpected_token,
                     .message = "generated sql_core_ts parser could not accept the covered token stream",
-                    .span = firstMeaningfulSpan(tokens),
+                    .span = failureSpan(tokens, failure),
                     .phase = .parse,
                 });
                 return .{
@@ -157,7 +158,10 @@ fn classify(tokens: []const lexer.Token) StatementKind {
     };
 }
 
-fn firstMeaningfulSpan(tokens: []const lexer.Token) ?@import("../common.zig").Span {
+fn failureSpan(tokens: []const lexer.Token, failure: ?parsergen.FailureInfo) ?@import("../common.zig").Span {
+    if (failure) |info| {
+        if (info.token_index < tokens.len) return tokens[info.token_index].span;
+    }
     for (tokens) |token| {
         if (token.kind != .eof) return token.span;
     }
