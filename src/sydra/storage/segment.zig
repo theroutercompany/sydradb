@@ -122,6 +122,19 @@ pub fn readAll(alloc: std.mem.Allocator, data_dir: std.fs.Dir, path: []const u8)
 
 pub fn readAllDescriptor(alloc: std.mem.Allocator, data_dir: std.fs.Dir, store: *object_store.ObjectStore, descriptor: anytype) ![]types.Point {
     const Descriptor = @TypeOf(descriptor);
+    if (@hasField(Descriptor, "content")) {
+        if (descriptor.content) |content| {
+            switch (content) {
+                .blob => |content_id| {
+                    const loaded = try store.get(alloc, content_id);
+                    defer alloc.free(loaded.payload);
+                    if (loaded.obj_type != .blob) return error.InvalidSegmentContentObject;
+                    return try readAllFromBytes(alloc, loaded.payload);
+                },
+                .extent_tree => return error.ExtentTreeUnsupported,
+            }
+        }
+    }
     if (@hasField(Descriptor, "content_id")) {
         if (descriptor.content_id) |content_id| {
             const loaded = try store.get(alloc, content_id);

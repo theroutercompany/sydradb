@@ -12,10 +12,64 @@ const wal_mod = @import("wal.zig");
 
 pub const current_format_version: u16 = 1;
 pub const main_ref = "heads/main";
+pub const current_repository_format_version: u16 = 1;
+pub const default_extent_chunk_bytes: u32 = 64 * 1024;
+const store_format_path = "objects/info/store-format";
+const store_format_magic = "SYDSTORE1";
+
+pub const RefBackend = enum(u8) {
+    loose = 1,
+    reftable = 2,
+};
+
+pub const RepositoryFormat = struct {
+    version: u16 = current_repository_format_version,
+    ref_backend: RefBackend = .loose,
+    extent_chunk_bytes: u32 = default_extent_chunk_bytes,
+};
+
+pub const ExtentTreeRef = struct {
+    root_id: object_store.ObjectId,
+    size_bytes: u64,
+    chunk_bytes: u32,
+
+    pub fn eql(self: ExtentTreeRef, other: ExtentTreeRef) bool {
+        return self.root_id.eql(other.root_id) and
+            self.size_bytes == other.size_bytes and
+            self.chunk_bytes == other.chunk_bytes;
+    }
+};
+
+pub const ContentRef = union(enum) {
+    blob: object_store.ObjectId,
+    extent_tree: ExtentTreeRef,
+
+    pub fn eql(self: ContentRef, other: ContentRef) bool {
+        return switch (self) {
+            .blob => |lhs| switch (other) {
+                .blob => |rhs| lhs.eql(rhs),
+                .extent_tree => false,
+            },
+            .extent_tree => |lhs| switch (other) {
+                .blob => false,
+                .extent_tree => |rhs| lhs.eql(rhs),
+            },
+        };
+    }
+
+    pub fn rootObjectId(self: ContentRef) object_store.ObjectId {
+        return switch (self) {
+            .blob => |id| id,
+            .extent_tree => |tree| tree.root_id,
+        };
+    }
+};
 
 pub const SegmentDescriptor = struct {
     path: []u8,
+    mirror_path: []u8 = &[_]u8{},
     content_id: ?object_store.ObjectId = null,
+    content: ?ContentRef = null,
     file_hash: [32]u8,
     file_size: u64,
     series_id: types.SeriesId,
@@ -30,9 +84,19 @@ pub const SegmentDescriptor = struct {
         alloc.free(self.path);
     }
 
+    pub fn contentRef(self: SegmentDescriptor) ?ContentRef {
+        if (self.content) |content| return content;
+        if (self.content_id) |content_id| return .{ .blob = content_id };
+        return null;
+    }
+
+    pub fn mirrorPath(self: SegmentDescriptor) []const u8 {
+        return if (self.mirror_path.len != 0) self.mirror_path else self.path;
+    }
+
     pub fn eql(self: SegmentDescriptor, other: SegmentDescriptor) bool {
-        return std.mem.eql(u8, self.path, other.path) and
-            optionalObjectIdEql(self.content_id, other.content_id) and
+        return std.mem.eql(u8, self.mirrorPath(), other.mirrorPath()) and
+            optionalContentRefEql(self.contentRef(), other.contentRef()) and
             std.mem.eql(u8, self.file_hash[0..], other.file_hash[0..]) and
             self.file_size == other.file_size and
             self.series_id == other.series_id and
@@ -104,7 +168,9 @@ pub const SeriesCatalogSnapshot = struct {
 
 pub const WalChunkDescriptor = struct {
     name: []u8,
+    mirror_name: []u8 = &[_]u8{},
     content_id: ?object_store.ObjectId = null,
+    content: ?ContentRef = null,
     file_size: u64,
     file_hash: [32]u8,
     mutable: bool,
@@ -114,9 +180,19 @@ pub const WalChunkDescriptor = struct {
         alloc.free(self.name);
     }
 
+    pub fn contentRef(self: WalChunkDescriptor) ?ContentRef {
+        if (self.content) |content| return content;
+        if (self.content_id) |content_id| return .{ .blob = content_id };
+        return null;
+    }
+
+    pub fn mirrorName(self: WalChunkDescriptor) []const u8 {
+        return if (self.mirror_name.len != 0) self.mirror_name else self.name;
+    }
+
     pub fn eql(self: WalChunkDescriptor, other: WalChunkDescriptor) bool {
-        return std.mem.eql(u8, self.name, other.name) and
-            optionalObjectIdEql(self.content_id, other.content_id) and
+        return std.mem.eql(u8, self.mirrorName(), other.mirrorName()) and
+            optionalContentRefEql(self.contentRef(), other.contentRef()) and
             self.file_size == other.file_size and
             std.mem.eql(u8, self.file_hash[0..], other.file_hash[0..]) and
             self.mutable == other.mutable and
@@ -600,15 +676,19 @@ pub const CommitWriter = struct {
             .object_id = wal_blob_id,
         });
         for (snapshot.wal_index.entries) |entry| {
-            const content_id = entry.content_id orelse continue;
-            const gop = try wal_chunk_ids.getOrPut(content_id);
+            const content = entry.contentRef() orelse continue;
+            const content_root_id = content.rootObjectId();
+            const gop = try wal_chunk_ids.getOrPut(content_root_id);
             if (gop.found_existing) continue;
 
-            const chunk_hex = content_id.toHex();
+            const chunk_hex = content_root_id.toHex();
             try wal_entries.append(.{
                 .name = try std.fmt.allocPrint(self.alloc, "chunk-{s}", .{chunk_hex[0..]}),
-                .object_type = .blob,
-                .object_id = content_id,
+                .object_type = switch (content) {
+                    .blob => .blob,
+                    .extent_tree => .tree,
+                },
+                .object_id = content_root_id,
             });
         }
         const wal_tree_id = try self.putTree(wal_entries.items);
@@ -728,7 +808,7 @@ pub const CommitWriter = struct {
             }
 
             try hour_group.?.entries.append(.{
-                .name = try self.alloc.dupe(u8, std.fs.path.basename(descriptor.path)),
+                .name = try self.alloc.dupe(u8, std.fs.path.basename(descriptor.mirrorPath())),
                 .object_type = .blob,
                 .object_id = descriptor_id,
             });
@@ -1087,12 +1167,17 @@ pub const CasManager = struct {
     alloc: std.mem.Allocator,
     store: object_store.ObjectStore,
     refs: RefStore,
+    format: RepositoryFormat,
 
     pub fn init(alloc: std.mem.Allocator, path: []const u8, fsync: cfg.FsyncPolicy) !CasManager {
+        var store = try object_store.ObjectStore.init(alloc, path, fsync);
+        errdefer store.deinit();
+        const format = try loadOrInitRepositoryFormat(alloc, store.root, fsync);
         return .{
             .alloc = alloc,
-            .store = try object_store.ObjectStore.init(alloc, path, fsync),
+            .store = store,
             .refs = try RefStore.init(alloc, path, fsync),
+            .format = format,
         };
     }
 
@@ -1710,9 +1795,9 @@ fn appendSegmentDescriptorBlob(
     var idx: usize = 0;
     const version = payload[idx];
     idx += 1;
-    if (version != 1 and version != 2 and version != 3) return false;
+    if (version != 1 and version != 2 and version != 3 and version != 4) return false;
 
-    var content_id: ?object_store.ObjectId = null;
+    var content_root: ?object_store.ObjectId = null;
     switch (version) {
         1 => {},
         2 => {
@@ -1721,12 +1806,25 @@ fn appendSegmentDescriptorBlob(
             idx += 1;
             switch (flag) {
                 0 => {},
-                1 => content_id = .{ .hash = try readHashAt(payload, &idx) },
+                1 => content_root = .{ .hash = try readHashAt(payload, &idx) },
                 else => return false,
             }
         },
         3 => {
-            content_id = .{ .hash = try readHashAt(payload, &idx) };
+            content_root = .{ .hash = try readHashAt(payload, &idx) };
+        },
+        4 => {
+            const kind = try readByteAt(payload, &idx);
+            switch (kind) {
+                0 => {},
+                1 => content_root = .{ .hash = try readHashAt(payload, &idx) },
+                2 => {
+                    content_root = .{ .hash = try readHashAt(payload, &idx) };
+                    _ = try readIntAt(payload, &idx, u64);
+                    _ = try readIntAt(payload, &idx, u32);
+                },
+                else => return false,
+            }
         },
         else => unreachable,
     }
@@ -1741,7 +1839,7 @@ fn appendSegmentDescriptorBlob(
     _ = try readIntAt(payload, &idx, u32); // count
     if (idx + 2 != payload.len) return false;
 
-    if (content_id) |id| try stack.append(id);
+    if (content_root) |id| try stack.append(id);
     return true;
 }
 
@@ -1757,7 +1855,7 @@ fn appendWalIndexBlob(
     var idx: usize = 0;
     const version = payload[idx];
     idx += 1;
-    if (version != 1 and version != 2 and version != 3) return false;
+    if (version != 1 and version != 2 and version != 3 and version != 4) return false;
 
     const entry_count = try readIntAt(payload, &idx, u32);
     var entry_idx: u32 = 0;
@@ -1777,6 +1875,19 @@ fn appendWalIndexBlob(
                 }
             },
             3 => try stack.append(.{ .hash = try readHashAt(payload, &idx) }),
+            4 => {
+                const kind = try readByteAt(payload, &idx);
+                switch (kind) {
+                    0 => {},
+                    1 => try stack.append(.{ .hash = try readHashAt(payload, &idx) }),
+                    2 => {
+                        try stack.append(.{ .hash = try readHashAt(payload, &idx) });
+                        _ = try readIntAt(payload, &idx, u64);
+                        _ = try readIntAt(payload, &idx, u32);
+                    },
+                    else => return false,
+                }
+            },
             else => unreachable,
         }
 
@@ -1796,6 +1907,13 @@ fn readIntAt(payload: []const u8, idx: *usize, comptime T: type) !T {
     const value = std.mem.readInt(T, @as(*const [size]u8, @ptrCast(payload[idx.* .. idx.* + size].ptr)), .little);
     idx.* += size;
     return value;
+}
+
+fn readByteAt(payload: []const u8, idx: *usize) !u8 {
+    if (idx.* >= payload.len) return error.TruncatedObject;
+    const byte = payload[idx.*];
+    idx.* += 1;
+    return byte;
 }
 
 fn readHashAt(payload: []const u8, idx: *usize) ![32]u8 {
@@ -2682,6 +2800,58 @@ fn loadCommitGraph(alloc: std.mem.Allocator, root: std.fs.Dir) !CommitGraph {
     };
 }
 
+fn loadOrInitRepositoryFormat(alloc: std.mem.Allocator, root: std.fs.Dir, fsync: cfg.FsyncPolicy) !RepositoryFormat {
+    return loadRepositoryFormat(root) catch |err| switch (err) {
+        error.FileNotFound => blk: {
+            const format = RepositoryFormat{};
+            try writeRepositoryFormat(alloc, root, format, fsync);
+            break :blk format;
+        },
+        else => return err,
+    };
+}
+
+fn loadRepositoryFormat(root: std.fs.Dir) !RepositoryFormat {
+    const bytes = try root.readFileAlloc(std.heap.page_allocator, store_format_path, 1024);
+    defer std.heap.page_allocator.free(bytes);
+    if (bytes.len < store_format_magic.len + @sizeOf(u16) + 1 + @sizeOf(u32)) return error.CorruptStoreFormat;
+    if (!std.mem.eql(u8, bytes[0..store_format_magic.len], store_format_magic)) return error.CorruptStoreFormat;
+    var cursor = Cursor{ .bytes = bytes, .index = store_format_magic.len };
+    const version = try cursor.readInt(u16);
+    const ref_backend = std.meta.intToEnum(RefBackend, try cursor.readByte()) catch return error.UnsupportedRefBackend;
+    const extent_chunk_bytes = try cursor.readInt(u32);
+    try cursor.finish();
+    return .{
+        .version = version,
+        .ref_backend = ref_backend,
+        .extent_chunk_bytes = extent_chunk_bytes,
+    };
+}
+
+fn writeRepositoryFormat(alloc: std.mem.Allocator, root: std.fs.Dir, format: RepositoryFormat, fsync: cfg.FsyncPolicy) !void {
+    var bytes = std.array_list.Managed(u8).init(alloc);
+    defer bytes.deinit();
+    try bytes.appendSlice(store_format_magic);
+    try appendInt(&bytes, u16, format.version);
+    try bytes.append(@intFromEnum(format.ref_backend));
+    try appendInt(&bytes, u32, format.extent_chunk_bytes);
+
+    const temp_path = store_format_path ++ ".tmp";
+    var file = try root.createFile(temp_path, .{ .truncate = true, .read = true });
+    defer file.close();
+    errdefer root.deleteFile(temp_path) catch {};
+    try file.writeAll(bytes.items);
+    if (fsync != .none) try file.sync();
+    root.rename(temp_path, store_format_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            root.deleteFile(store_format_path) catch {};
+            try root.rename(temp_path, store_format_path);
+        },
+        else => return err,
+    };
+    if (fsync != .none) try syncDir(&root);
+}
+
 fn writePackedObject(
     alloc: std.mem.Allocator,
     root: std.fs.Dir,
@@ -2735,7 +2905,9 @@ pub fn buildLegacySnapshot(
         const content_id = try ensureBlobForFile(alloc, store, data_dir, entry.path);
         try descriptors.append(.{
             .path = try alloc.dupe(u8, entry.path),
+            .mirror_path = &[_]u8{},
             .content_id = content_id,
+            .content = if (content_id) |id| .{ .blob = id } else null,
             .file_hash = try hashFile(data_dir, entry.path),
             .file_size = metadata.file_size,
             .series_id = entry.series_id,
@@ -2848,7 +3020,9 @@ fn buildWalIndex(alloc: std.mem.Allocator, data_dir: std.fs.Dir, store: ?*object
         const content_id = try ensureBlobForWalFile(alloc, store, data_dir, info.name);
         try entries.append(.{
             .name = try alloc.dupe(u8, info.name),
+            .mirror_name = &[_]u8{},
             .content_id = content_id,
+            .content = if (content_id) |id| .{ .blob = id } else null,
             .file_size = info.size,
             .file_hash = info.hash,
             .mutable = std.mem.eql(u8, info.name, "current.wal"),
@@ -2941,11 +3115,11 @@ fn encodeSegmentDescriptor(alloc: std.mem.Allocator, descriptor: SegmentDescript
     var bytes = std.array_list.Managed(u8).init(alloc);
     errdefer bytes.deinit();
 
-    const content_id = descriptor.content_id orelse return error.MissingSegmentContentId;
+    const content = descriptor.contentRef() orelse return error.MissingSegmentContentId;
 
-    try bytes.append(3);
-    try bytes.appendSlice(content_id.hash[0..]);
-    try appendString(&bytes, descriptor.path);
+    try bytes.append(4);
+    try encodeContentRef(&bytes, content);
+    try appendString(&bytes, descriptor.mirrorPath());
     try bytes.appendSlice(descriptor.file_hash[0..]);
     try appendInt(&bytes, u64, descriptor.file_size);
     try appendInt(&bytes, u64, descriptor.series_id);
@@ -2961,14 +3135,16 @@ fn encodeSegmentDescriptor(alloc: std.mem.Allocator, descriptor: SegmentDescript
 fn decodeSegmentDescriptor(alloc: std.mem.Allocator, payload: []const u8) !SegmentDescriptor {
     var cursor = Cursor{ .bytes = payload };
     const version = try cursor.readByte();
-    if (version != 1 and version != 2 and version != 3) return error.UnsupportedSegmentDescriptorVersion;
+    if (version != 1 and version != 2 and version != 3 and version != 4) return error.UnsupportedSegmentDescriptorVersion;
 
-    const content_id = if (version == 1)
+    const content = if (version == 4)
+        try decodeContentRef(&cursor)
+    else if (version == 1)
         null
     else if (version == 2)
-        try cursor.readOptionalObjectId()
+        if (try cursor.readOptionalObjectId()) |id| ContentRef{ .blob = id } else null
     else
-        object_store.ObjectId{ .hash = try cursor.readHash() };
+        ContentRef{ .blob = .{ .hash = try cursor.readHash() } };
     const path = try cursor.readOwnedString(alloc);
     errdefer alloc.free(path);
 
@@ -2985,7 +3161,12 @@ fn decodeSegmentDescriptor(alloc: std.mem.Allocator, payload: []const u8) !Segme
 
     return .{
         .path = path,
-        .content_id = content_id,
+        .mirror_path = &[_]u8{},
+        .content_id = if (content) |ref| switch (ref) {
+            .blob => |id| id,
+            .extent_tree => null,
+        } else null,
+        .content = content,
         .file_hash = file_hash,
         .file_size = file_size,
         .series_id = series_id,
@@ -3097,12 +3278,12 @@ fn encodeWalIndex(alloc: std.mem.Allocator, wal_index: WalIndex) ![]u8 {
     var bytes = std.array_list.Managed(u8).init(alloc);
     errdefer bytes.deinit();
 
-    try bytes.append(3);
+    try bytes.append(4);
     try appendInt(&bytes, u32, @intCast(wal_index.entries.len));
     for (wal_index.entries) |entry| {
-        const content_id = entry.content_id orelse return error.MissingWalContentId;
-        try appendString(&bytes, entry.name);
-        try bytes.appendSlice(content_id.hash[0..]);
+        const content = entry.contentRef() orelse return error.MissingWalContentId;
+        try appendString(&bytes, entry.mirrorName());
+        try encodeContentRef(&bytes, content);
         try appendInt(&bytes, u64, entry.file_size);
         try bytes.appendSlice(entry.file_hash[0..]);
         try bytes.append(if (entry.mutable) 1 else 0);
@@ -3114,7 +3295,7 @@ fn encodeWalIndex(alloc: std.mem.Allocator, wal_index: WalIndex) ![]u8 {
 fn decodeWalIndex(alloc: std.mem.Allocator, payload: []const u8) !WalIndex {
     var cursor = Cursor{ .bytes = payload };
     const version = try cursor.readByte();
-    if (version != 1 and version != 2 and version != 3) return error.UnsupportedWalIndexVersion;
+    if (version != 1 and version != 2 and version != 3 and version != 4) return error.UnsupportedWalIndexVersion;
 
     const entry_count = try cursor.readInt(u32);
     var entries = try alloc.alloc(WalChunkDescriptor, entry_count);
@@ -3127,19 +3308,26 @@ fn decodeWalIndex(alloc: std.mem.Allocator, payload: []const u8) !WalIndex {
     while (i < entry_count) : (i += 1) {
         const name = try cursor.readOwnedString(alloc);
         errdefer alloc.free(name);
-        const content_id = if (version == 1)
+        const content = if (version == 4)
+            try decodeContentRef(&cursor)
+        else if (version == 1)
             null
         else if (version == 2)
-            try cursor.readOptionalObjectId()
+            if (try cursor.readOptionalObjectId()) |id| ContentRef{ .blob = id } else null
         else
-            object_store.ObjectId{ .hash = try cursor.readHash() };
+            ContentRef{ .blob = .{ .hash = try cursor.readHash() } };
         const file_size = try cursor.readInt(u64);
         const file_hash = try cursor.readHash();
         const mutable = (try cursor.readByte()) != 0;
         const captured_bytes = if (version >= 3) try cursor.readInt(u64) else file_size;
         entries[i] = .{
             .name = name,
-            .content_id = content_id,
+            .mirror_name = &[_]u8{},
+            .content_id = if (content) |ref| switch (ref) {
+                .blob => |id| id,
+                .extent_tree => null,
+            } else null,
+            .content = content,
             .file_size = file_size,
             .file_hash = file_hash,
             .mutable = mutable,
@@ -3244,6 +3432,21 @@ fn appendString(bytes: *std.array_list.Managed(u8), value: []const u8) !void {
     try bytes.appendSlice(value);
 }
 
+fn encodeContentRef(bytes: *std.array_list.Managed(u8), content: ContentRef) !void {
+    switch (content) {
+        .blob => |id| {
+            try bytes.append(1);
+            try bytes.appendSlice(id.hash[0..]);
+        },
+        .extent_tree => |tree| {
+            try bytes.append(2);
+            try bytes.appendSlice(tree.root_id.hash[0..]);
+            try appendInt(bytes, u64, tree.size_bytes);
+            try appendInt(bytes, u32, tree.chunk_bytes);
+        },
+    }
+}
+
 fn appendOptionalObjectId(bytes: *std.array_list.Managed(u8), maybe_id: ?object_store.ObjectId) !void {
     try bytes.append(if (maybe_id != null) 1 else 0);
     if (maybe_id) |id| {
@@ -3307,7 +3510,26 @@ const Cursor = struct {
     }
 };
 
+fn decodeContentRef(cursor: *Cursor) !?ContentRef {
+    return switch (try cursor.readByte()) {
+        0 => null,
+        1 => ContentRef{ .blob = .{ .hash = try cursor.readHash() } },
+        2 => ContentRef{ .extent_tree = .{
+            .root_id = .{ .hash = try cursor.readHash() },
+            .size_bytes = try cursor.readInt(u64),
+            .chunk_bytes = try cursor.readInt(u32),
+        } },
+        else => error.UnsupportedContentRefVersion,
+    };
+}
+
 fn optionalObjectIdEql(lhs: ?object_store.ObjectId, rhs: ?object_store.ObjectId) bool {
+    if (lhs == null and rhs == null) return true;
+    if (lhs == null or rhs == null) return false;
+    return lhs.?.eql(rhs.?);
+}
+
+fn optionalContentRefEql(lhs: ?ContentRef, rhs: ?ContentRef) bool {
     if (lhs == null and rhs == null) return true;
     if (lhs == null or rhs == null) return false;
     return lhs.?.eql(rhs.?);
@@ -3389,7 +3611,7 @@ fn sortDescriptors(descriptors: []SegmentDescriptor) void {
             if (lhs.series_id != rhs.series_id) return lhs.series_id < rhs.series_id;
             if (lhs.hour_bucket != rhs.hour_bucket) return lhs.hour_bucket < rhs.hour_bucket;
             if (lhs.start_ts != rhs.start_ts) return lhs.start_ts < rhs.start_ts;
-            return std.mem.lessThan(u8, lhs.path, rhs.path);
+            return std.mem.lessThan(u8, lhs.mirrorPath(), rhs.mirrorPath());
         }
     }.lessThan);
 }
@@ -3476,13 +3698,15 @@ fn writeManifestFile(alloc: std.mem.Allocator, data_dir: std.fs.Dir, descriptors
     defer manifest.deinit();
 
     for (descriptors) |descriptor| {
+        const mirror_path = descriptor.mirrorPath();
+        if (mirror_path.len == 0) continue;
         try manifest.entries.append(alloc, .{
             .series_id = descriptor.series_id,
             .hour_bucket = descriptor.hour_bucket,
             .start_ts = descriptor.start_ts,
             .end_ts = descriptor.end_ts,
             .count = descriptor.count,
-            .path = try alloc.dupe(u8, descriptor.path),
+            .path = try alloc.dupe(u8, mirror_path),
         });
     }
     try manifest.rewriteCheckpoint(data_dir);
@@ -3598,6 +3822,72 @@ test "cas codecs are deterministic for identical logical data" {
     const id_a = try store.put(.blob, encoded_a);
     const id_b = try store.put(.blob, encoded_b);
     try std.testing.expect(id_a.eql(id_b));
+}
+
+test "cas manager initializes a repository format marker" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repo-format", .{tmp_dir.sub_path});
+    defer alloc.free(data_path);
+
+    var cas_manager = try CasManager.init(alloc, data_path, .none);
+    defer cas_manager.deinit();
+
+    try std.testing.expectEqual(current_repository_format_version, cas_manager.format.version);
+    try std.testing.expectEqual(RefBackend.loose, cas_manager.format.ref_backend);
+    try std.testing.expectEqual(default_extent_chunk_bytes, cas_manager.format.extent_chunk_bytes);
+
+    const loaded = try loadRepositoryFormat(cas_manager.store.root);
+    try std.testing.expectEqual(cas_manager.format.version, loaded.version);
+    try std.testing.expectEqual(cas_manager.format.ref_backend, loaded.ref_backend);
+    try std.testing.expectEqual(cas_manager.format.extent_chunk_bytes, loaded.extent_chunk_bytes);
+}
+
+test "legacy descriptor decoders normalize blob content refs" {
+    const alloc = std.testing.allocator;
+    const content_id = object_store.computeId(.blob, "legacy-blob");
+
+    var legacy_segment = std.array_list.Managed(u8).init(alloc);
+    defer legacy_segment.deinit();
+    try legacy_segment.append(3);
+    try legacy_segment.appendSlice(content_id.hash[0..]);
+    try appendString(&legacy_segment, "segments/legacy.seg");
+    try legacy_segment.appendSlice(([_]u8{0x42} ** 32)[0..]);
+    try appendInt(&legacy_segment, u64, 123);
+    try appendInt(&legacy_segment, u64, 77);
+    try appendInt(&legacy_segment, i64, 3600);
+    try appendInt(&legacy_segment, i64, 10);
+    try appendInt(&legacy_segment, i64, 20);
+    try appendInt(&legacy_segment, u32, 2);
+    try legacy_segment.append(1);
+    try legacy_segment.append(1);
+
+    var decoded_segment = try decodeSegmentDescriptor(alloc, legacy_segment.items);
+    defer decoded_segment.deinit(alloc);
+    try std.testing.expect(decoded_segment.contentRef() != null);
+    try std.testing.expect(decoded_segment.contentRef().?.eql(.{ .blob = content_id }));
+    try std.testing.expectEqualStrings("segments/legacy.seg", decoded_segment.mirrorPath());
+
+    var legacy_wal = std.array_list.Managed(u8).init(alloc);
+    defer legacy_wal.deinit();
+    try legacy_wal.append(3);
+    try appendInt(&legacy_wal, u32, 1);
+    try appendString(&legacy_wal, "current.wal");
+    try legacy_wal.appendSlice(content_id.hash[0..]);
+    try appendInt(&legacy_wal, u64, 256);
+    try legacy_wal.appendSlice(([_]u8{0x24} ** 32)[0..]);
+    try legacy_wal.append(1);
+    try appendInt(&legacy_wal, u64, 128);
+
+    var decoded_wal = try decodeWalIndex(alloc, legacy_wal.items);
+    defer decoded_wal.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), decoded_wal.entries.len);
+    try std.testing.expect(decoded_wal.entries[0].contentRef() != null);
+    try std.testing.expect(decoded_wal.entries[0].contentRef().?.eql(.{ .blob = content_id }));
+    try std.testing.expectEqualStrings("current.wal", decoded_wal.entries[0].mirrorName());
+    try std.testing.expectEqual(@as(u64, 128), decoded_wal.entries[0].captured_bytes);
 }
 
 test "cas bootstrap imports legacy metadata into a genesis commit" {

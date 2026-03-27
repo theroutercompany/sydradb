@@ -862,14 +862,19 @@ pub const Engine = struct {
         const cas = if (self.cas) |*cas_manager| cas_manager else return false;
 
         for (index.snapshot.wal_index.entries) |entry| {
-            if (entry.content_id) |content_id| {
-                const loaded = try cas.store.get(self.alloc, content_id);
-                defer self.alloc.free(loaded.payload);
-                if (loaded.obj_type != .blob) return error.InvalidWalChunkObject;
-                const captured_len = @min(loaded.payload.len, @as(usize, @intCast(entry.captured_bytes)));
-                try wal_mod.replayBytes(self.alloc, loaded.payload[0..captured_len], ctx);
-            } else if (entry.name.len != 0) {
-                const single = [_][]const u8{entry.name};
+            if (entry.contentRef()) |content| {
+                switch (content) {
+                    .blob => |content_id| {
+                        const loaded = try cas.store.get(self.alloc, content_id);
+                        defer self.alloc.free(loaded.payload);
+                        if (loaded.obj_type != .blob) return error.InvalidWalChunkObject;
+                        const captured_len = @min(loaded.payload.len, @as(usize, @intCast(entry.captured_bytes)));
+                        try wal_mod.replayBytes(self.alloc, loaded.payload[0..captured_len], ctx);
+                    },
+                    .extent_tree => return error.ExtentTreeUnsupported,
+                }
+            } else if (entry.mirrorName().len != 0) {
+                const single = [_][]const u8{entry.mirrorName()};
                 try self.wal.replayFiles(self.alloc, single[0..], ctx);
             }
         }
@@ -887,18 +892,23 @@ pub const Engine = struct {
                     else => return err,
                 };
 
-                if (entry.content_id) |content_id| {
-                    const loaded = try cas.store.get(self.alloc, content_id);
-                    defer self.alloc.free(loaded.payload);
-                    if (loaded.obj_type != .blob) return error.InvalidWalChunkObject;
+                if (entry.contentRef()) |content| {
+                    switch (content) {
+                        .blob => |content_id| {
+                            const loaded = try cas.store.get(self.alloc, content_id);
+                            defer self.alloc.free(loaded.payload);
+                            if (loaded.obj_type != .blob) return error.InvalidWalChunkObject;
 
-                    if (stat.size > entry.captured_bytes and try wal_mod.filePrefixMatches(self.data_dir, path, loaded.payload)) {
-                        try self.wal.replayFileFromOffset(self.alloc, name, entry.captured_bytes, ctx);
-                        continue;
-                    }
+                            if (stat.size > entry.captured_bytes and try wal_mod.filePrefixMatches(self.data_dir, path, loaded.payload)) {
+                                try self.wal.replayFileFromOffset(self.alloc, name, entry.captured_bytes, ctx);
+                                continue;
+                            }
 
-                    if (stat.size == entry.captured_bytes and try wal_mod.filePrefixMatches(self.data_dir, path, loaded.payload)) {
-                        continue;
+                            if (stat.size == entry.captured_bytes and try wal_mod.filePrefixMatches(self.data_dir, path, loaded.payload)) {
+                                continue;
+                            }
+                        },
+                        .extent_tree => return error.ExtentTreeUnsupported,
                     }
                 }
             } else if (!std.mem.eql(u8, name, "current.wal") and containsWalName(index.snapshot.wal_index.entries, name)) {
@@ -919,7 +929,7 @@ pub const Engine = struct {
         }
 
         for (index.snapshot.wal_index.entries) |entry| {
-            try files.append(try self.alloc.dupe(u8, entry.name));
+            try files.append(try self.alloc.dupe(u8, entry.mirrorName()));
         }
 
         const live = try wal_mod.listWalFiles(self.alloc, self.data_dir);
@@ -935,14 +945,14 @@ pub const Engine = struct {
 
 fn containsWalName(entries: []const cas_mod.WalChunkDescriptor, needle: []const u8) bool {
     for (entries) |entry| {
-        if (std.mem.eql(u8, entry.name, needle)) return true;
+        if (std.mem.eql(u8, entry.mirrorName(), needle)) return true;
     }
     return false;
 }
 
 fn findWalEntry(entries: []const cas_mod.WalChunkDescriptor, needle: []const u8) ?cas_mod.WalChunkDescriptor {
     for (entries) |entry| {
-        if (std.mem.eql(u8, entry.name, needle)) return entry;
+        if (std.mem.eql(u8, entry.mirrorName(), needle)) return entry;
     }
     return null;
 }
@@ -1113,7 +1123,7 @@ fn findMatchingDescriptorIndex(
         if (descriptor.start_ts != entry.start_ts) continue;
         if (descriptor.end_ts != entry.end_ts) continue;
         if (descriptor.count != entry.count) continue;
-        if (!std.mem.eql(u8, descriptor.path, entry.path)) continue;
+        if (!std.mem.eql(u8, descriptor.mirrorPath(), entry.path)) continue;
         return descriptor_index;
     }
     return null;
@@ -1124,13 +1134,15 @@ fn manifestFromSnapshot(alloc: std.mem.Allocator, descriptors: []const cas_mod.S
     errdefer manifest.deinit();
 
     for (descriptors) |descriptor| {
+        const mirror_path = descriptor.mirrorPath();
+        if (mirror_path.len == 0) continue;
         try manifest.entries.append(alloc, .{
             .series_id = descriptor.series_id,
             .hour_bucket = descriptor.hour_bucket,
             .start_ts = descriptor.start_ts,
             .end_ts = descriptor.end_ts,
             .count = descriptor.count,
-            .path = try alloc.dupe(u8, descriptor.path),
+            .path = try alloc.dupe(u8, mirror_path),
         });
     }
     return manifest;

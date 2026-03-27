@@ -31,6 +31,7 @@ Under `data_dir`, the engine uses:
 - `objects/<prefix>/<hex>` – loose content-addressed objects
 - `objects/packs/*.pack` – immutable packed object containers
 - `objects/packs/*.idx` – fanout-based pack indexes for packed objects
+- `objects/info/store-format` – repository-wide storage format marker and feature defaults
 - `objects/info/commit-graph` – optional commit ancestry side index written by CAS maintenance
 - `objects/cruft/<timestamp>/...` – quarantined unreachable CAS content retained until the GC grace window expires
 - `refs/` – mutable plaintext refs and reflogs for the CAS head/branches/tags/checkpoints
@@ -106,10 +107,10 @@ The CAS layer stores immutable objects addressed by a BLAKE3 hash of `(type, pay
 
 Current typed metadata payloads include:
 
-- segment descriptors with required content ids for sealed segment blobs
+- segment descriptors with a canonical `ContentRef` plus optional mirror paths for exported `.seg` files
 - tag snapshots
 - series catalog snapshots
-- WAL indexes with captured byte counts for mutable `current.wal`
+- WAL indexes with a canonical `ContentRef`, optional mirror names, and captured byte counts for mutable `current.wal`
 - tree objects and commit objects that link the metadata DAG together
 
 See [`src/sydra/storage/manifest.zig`](./source/sydra/storage/manifest.md) for the in-memory model and load/save behavior.
