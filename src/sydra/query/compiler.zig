@@ -272,4 +272,5 @@ fn testConfig(alloc: std.mem.Allocator, data_path: []const u8) !cfg_mod.Config {
 
 test {
     _ = @import("frontend/shadow.zig");
+    _ = @import("frontend/sql_core.zig");
 }
