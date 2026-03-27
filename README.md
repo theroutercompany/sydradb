@@ -103,8 +103,13 @@ Apache-2.0
 ./zig-out/bin/sydradb cas log [heads/main]
 ./zig-out/bin/sydradb cas branch <name> [spec]
 ./zig-out/bin/sydradb cas tag <name> [spec]
+./zig-out/bin/sydradb cas diff <lhs> <rhs>
+./zig-out/bin/sydradb cas rollback <spec>
 ./zig-out/bin/sydradb cas gc [--apply]
-./zig-out/bin/sydradb cas export-legacy
+./zig-out/bin/sydradb cas fsck
+./zig-out/bin/sydradb cas pack
+./zig-out/bin/sydradb cas checkout <spec>
+./zig-out/bin/sydradb cas export-legacy [spec]
 ```
 
 Config: `sydradb.toml`

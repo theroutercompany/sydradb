@@ -924,6 +924,25 @@ pub const GcResult = struct {
     mirror_deleted: usize,
 };
 
+pub const FsckReport = struct {
+    refs: usize,
+    reachable_objects: usize,
+    commit_objects: usize,
+    tree_objects: usize,
+    blob_objects: usize,
+    segment_contents_checked: usize,
+    wal_contents_checked: usize,
+    missing_segment_mirrors: usize,
+    missing_wal_mirrors: usize,
+    reflog_files_checked: usize,
+    stale_reflog_files: usize,
+};
+
+pub const PackResult = struct {
+    reachable_objects: usize,
+    rewritten_objects: usize,
+};
+
 pub const CasManager = struct {
     alloc: std.mem.Allocator,
     store: object_store.ObjectStore,
@@ -1158,6 +1177,142 @@ pub const CasManager = struct {
         };
     }
 
+    pub fn fsck(self: *CasManager, data_dir: std.fs.Dir) !FsckReport {
+        const refs = try self.refs.listRefs(self.alloc);
+        defer {
+            for (refs) |*entry| entry.deinit(self.alloc);
+            self.alloc.free(refs);
+        }
+
+        var reachable = try self.collectReachable(refs);
+        defer reachable.deinit();
+
+        var report = FsckReport{
+            .refs = refs.len,
+            .reachable_objects = reachable.count(),
+            .commit_objects = 0,
+            .tree_objects = 0,
+            .blob_objects = 0,
+            .segment_contents_checked = 0,
+            .wal_contents_checked = 0,
+            .missing_segment_mirrors = 0,
+            .missing_wal_mirrors = 0,
+            .reflog_files_checked = 0,
+            .stale_reflog_files = 0,
+        };
+
+        var it = reachable.keyIterator();
+        while (it.next()) |id_ptr| {
+            const loaded = try self.store.get(self.alloc, id_ptr.*);
+            defer self.alloc.free(loaded.payload);
+            switch (loaded.obj_type) {
+                .commit => report.commit_objects += 1,
+                .tree => report.tree_objects += 1,
+                .blob => report.blob_objects += 1,
+                else => return error.UnsupportedCasObjectType,
+            }
+        }
+
+        if (try self.refs.readHead(main_ref) != null) {
+            var snapshot = try self.loadHeadIndex();
+            defer snapshot.deinit();
+
+            for (snapshot.snapshot.segment_descriptors) |descriptor| {
+                if (descriptor.content_id) |content_id| {
+                    const loaded = try self.store.get(self.alloc, content_id);
+                    defer self.alloc.free(loaded.payload);
+                    if (loaded.obj_type != .blob) return error.InvalidSegmentContentObject;
+                    const points = try segment_mod.readAllFromBytes(self.alloc, loaded.payload);
+                    self.alloc.free(points);
+                    report.segment_contents_checked += 1;
+                }
+                if (descriptor.path.len != 0) {
+                    data_dir.statFile(descriptor.path) catch |err| switch (err) {
+                        error.FileNotFound => report.missing_segment_mirrors += 1,
+                        else => return err,
+                    };
+                }
+            }
+
+            for (snapshot.snapshot.wal_index.entries) |entry| {
+                if (entry.content_id) |content_id| {
+                    const loaded = try self.store.get(self.alloc, content_id);
+                    defer self.alloc.free(loaded.payload);
+                    if (loaded.obj_type != .blob) return error.InvalidWalChunkObject;
+
+                    var noop_ctx = struct {
+                        pub fn onSeriesRegistration(_: *@This(), _: types.SeriesId, _: []const u8, _: []const u8) !void {}
+                        pub fn onRecord(_: *@This(), _: types.SeriesId, _: i64, _: f64) !void {}
+                    }{};
+                    try wal_mod.replayBytes(self.alloc, loaded.payload, &noop_ctx);
+                    report.wal_contents_checked += 1;
+                }
+
+                const path = try std.fmt.allocPrint(self.alloc, "wal/{s}", .{entry.name});
+                defer self.alloc.free(path);
+                data_dir.statFile(path) catch |err| switch (err) {
+                    error.FileNotFound => report.missing_wal_mirrors += 1,
+                    else => return err,
+                };
+            }
+        }
+
+        const reflog_files = try listFilesRecursive(self.alloc, self.store.root, "logs/refs");
+        defer freeOwnedStrings(self.alloc, reflog_files);
+        for (reflog_files) |path| {
+            try validateReflogFile(self.alloc, self.store.root, path);
+            report.reflog_files_checked += 1;
+            const ref_name = path["logs/refs/".len..];
+            if (!containsRef(refs, ref_name)) {
+                report.stale_reflog_files += 1;
+            }
+        }
+
+        return report;
+    }
+
+    pub fn pack(self: *CasManager) !PackResult {
+        const refs = try self.refs.listRefs(self.alloc);
+        defer {
+            for (refs) |*entry| entry.deinit(self.alloc);
+            self.alloc.free(refs);
+        }
+
+        var reachable = try self.collectReachable(refs);
+        defer reachable.deinit();
+
+        const temp_dir_name = try std.fmt.allocPrint(self.alloc, ".objects-pack-{d}", .{std.time.nanoTimestamp()});
+        defer self.alloc.free(temp_dir_name);
+        try self.store.root.makePath(temp_dir_name);
+        errdefer self.store.root.deleteTree(temp_dir_name) catch {};
+
+        var rewritten: usize = 0;
+        var it = reachable.keyIterator();
+        while (it.next()) |id_ptr| {
+            const loaded = try self.store.get(self.alloc, id_ptr.*);
+            defer self.alloc.free(loaded.payload);
+            try writePackedObject(self.alloc, self.store.root, temp_dir_name, id_ptr.*, loaded.obj_type, loaded.payload, self.store.fsync);
+            rewritten += 1;
+        }
+
+        const backup_name = try std.fmt.allocPrint(self.alloc, "objects.pre-pack-{d}", .{std.time.nanoTimestamp()});
+        defer self.alloc.free(backup_name);
+
+        try self.store.root.rename("objects", backup_name);
+        errdefer self.store.root.rename(backup_name, "objects") catch {};
+
+        const packed_objects = try std.fmt.allocPrint(self.alloc, "{s}/objects", .{temp_dir_name});
+        defer self.alloc.free(packed_objects);
+        try self.store.root.rename(packed_objects, "objects");
+        self.store.root.deleteTree(temp_dir_name) catch {};
+        self.store.root.deleteTree(backup_name) catch {};
+
+        return .{
+            .reachable_objects = reachable.count(),
+            .rewritten_objects = rewritten,
+        };
+    }
+
     fn collectReachable(self: *CasManager, refs: []const RefEntry) !std.AutoHashMap(object_store.ObjectId, void) {
         var seen = std.AutoHashMap(object_store.ObjectId, void).init(self.alloc);
         errdefer seen.deinit();
@@ -1316,6 +1471,60 @@ fn objectSize(store: *object_store.ObjectStore, id: object_store.ObjectId) !u64 
     const object_name = id.toHex();
     const stat = try bucket_dir.statFile(object_name[0..]);
     return stat.size;
+}
+
+fn containsRef(refs: []const RefEntry, needle: []const u8) bool {
+    for (refs) |entry| {
+        if (std.mem.eql(u8, entry.name, needle)) return true;
+    }
+    return false;
+}
+
+fn validateReflogFile(alloc: std.mem.Allocator, dir: std.fs.Dir, path: []const u8) !void {
+    const body = try dir.readFileAlloc(alloc, path, 1024 * 1024);
+    defer alloc.free(body);
+
+    var line_it = std.mem.tokenizeScalar(u8, body, '\n');
+    while (line_it.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len == 0) continue;
+        var field_it = std.mem.tokenizeScalar(u8, line, ' ');
+        _ = field_it.next() orelse return error.InvalidReflog;
+        const old_hex = field_it.next() orelse return error.InvalidReflog;
+        const new_hex = field_it.next() orelse return error.InvalidReflog;
+        _ = try object_store.ObjectId.fromHex(old_hex);
+        _ = try object_store.ObjectId.fromHex(new_hex);
+    }
+}
+
+fn writePackedObject(
+    alloc: std.mem.Allocator,
+    root: std.fs.Dir,
+    temp_dir_name: []const u8,
+    id: object_store.ObjectId,
+    obj_type: object_store.ObjectType,
+    payload: []const u8,
+    fsync: cfg.FsyncPolicy,
+) !void {
+    const dir_name = std.fmt.bytesToHex([_]u8{id.hash[0]}, .lower);
+    const bucket_path = try std.fmt.allocPrint(alloc, "{s}/objects/{s}", .{ temp_dir_name, dir_name[0..] });
+    defer alloc.free(bucket_path);
+    try root.makePath(bucket_path);
+
+    const object_hex = id.toHex();
+    const object_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ bucket_path, object_hex[0..] });
+    defer alloc.free(object_path);
+
+    var file = try root.createFile(object_path, .{ .truncate = true, .read = true });
+    defer file.close();
+
+    var header = [_]u8{ @intFromEnum(obj_type), 0, 0, 0, 0 };
+    std.mem.writeInt(u32, header[1..5], @intCast(payload.len), .little);
+    try file.writeAll(&header);
+    try file.writeAll(payload);
+    if (fsync != .none) {
+        try file.sync();
+    }
 }
 
 pub fn buildLegacySnapshot(
@@ -1959,6 +2168,13 @@ fn containsSeriesEntry(entries: []const SeriesCatalogSnapshotEntry, needle: Seri
     return false;
 }
 
+fn containsObjectId(entries: []const object_store.ObjectId, needle: object_store.ObjectId) bool {
+    for (entries) |entry| {
+        if (entry.eql(needle)) return true;
+    }
+    return false;
+}
+
 fn sortDescriptors(descriptors: []SegmentDescriptor) void {
     std.sort.block(SegmentDescriptor, descriptors, {}, struct {
         fn lessThan(_: void, lhs: SegmentDescriptor, rhs: SegmentDescriptor) bool {
@@ -2492,4 +2708,52 @@ test "gc prunes unreachable commits" {
     try std.testing.expect(applied.mirror_deleted > 0);
     try std.testing.expectError(error.FileNotFound, data_dir.statFile("segments/stale.seg"));
     try std.testing.expectError(error.FileNotFound, data_dir.statFile("wal/stale.wal"));
+}
+
+test "fsck and pack preserve the reachable CAS head" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/pack", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    try std.fs.cwd().makePath(data_path);
+
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
+    defer series_catalog.deinit();
+
+    const sid = types.hash64("pack.series");
+    _ = try series_catalog.register("pack.series", "{}", sid);
+    const points = [_]types.Point{.{ .ts = 1_000, .value = 4.0 }};
+    const seg_path = try segment_mod.writeSegment(talloc, data_dir, sid, 0, points[0..]);
+    defer talloc.free(seg_path);
+    try manifest.add(data_dir, sid, 0, 1_000, 1_000, 1, seg_path);
+
+    var cas_manager = try CasManager.init(talloc, data_path, .none);
+    defer cas_manager.deinit();
+
+    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    const orphan = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, "orphan-pack");
+    try std.testing.expect(!initial.eql(orphan));
+    try cas_manager.refs.updateHeadAtomic(main_ref, initial);
+
+    const fsck = try cas_manager.fsck(data_dir);
+    try std.testing.expect(fsck.reachable_objects > 0);
+    try std.testing.expect(fsck.commit_objects > 0);
+
+    const pack_result = try cas_manager.pack();
+    try std.testing.expectEqual(fsck.reachable_objects, pack_result.reachable_objects);
+
+    const all_ids = try cas_manager.store.listIds(talloc);
+    defer talloc.free(all_ids);
+    try std.testing.expectEqual(fsck.reachable_objects, all_ids.len);
+    try std.testing.expect(containsObjectId(all_ids, initial));
+    try std.testing.expect(!containsObjectId(all_ids, orphan));
 }

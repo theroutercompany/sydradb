@@ -326,6 +326,31 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         );
         return;
     }
+    if (std.mem.eql(u8, sub, "fsck")) {
+        const report = try cas.fsck(data_dir);
+        std.debug.print(
+            "cas fsck refs={d} reachable={d} commits={d} trees={d} blobs={d} segment_contents_checked={d} wal_contents_checked={d} missing_segment_mirrors={d} missing_wal_mirrors={d} reflog_files_checked={d} stale_reflog_files={d}\n",
+            .{
+                report.refs,
+                report.reachable_objects,
+                report.commit_objects,
+                report.tree_objects,
+                report.blob_objects,
+                report.segment_contents_checked,
+                report.wal_contents_checked,
+                report.missing_segment_mirrors,
+                report.missing_wal_mirrors,
+                report.reflog_files_checked,
+                report.stale_reflog_files,
+            },
+        );
+        return;
+    }
+    if (std.mem.eql(u8, sub, "pack")) {
+        const result = try cas.pack();
+        std.debug.print("cas pack reachable={d} rewritten={d}\n", .{ result.reachable_objects, result.rewritten_objects });
+        return;
+    }
     if (std.mem.eql(u8, sub, "checkout")) {
         if (args.len < 4) return error.Invalid;
         try cas.exportSpecToLegacy(std.mem.sliceTo(args[3], 0), data_dir);
