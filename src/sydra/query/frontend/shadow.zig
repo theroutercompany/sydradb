@@ -34,7 +34,10 @@ pub const ShadowParseResult = struct {
     }
 };
 
-pub fn parseSydraqlShadow(allocator: std.mem.Allocator, source: []const u8) !ShadowParseResult {
+pub fn parseSydraqlShadow(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+) (std.mem.Allocator.Error || lexer.LexError || legacy_parser.ParseError || error{ InvalidTrace, InvalidCharacter })!ShadowParseResult {
     var lex = lexer.Lexer.init(allocator, source);
     const tokens = try lex.collectAll(allocator);
     defer allocator.free(tokens);
@@ -134,7 +137,7 @@ fn parseWithGeneratedRuntime(
     list: *std.array_list.Managed(diagnostics.Diagnostic),
     tokens: []const lexer.Token,
     tables: *const parsergen.ParserTables,
-) !?stmt_mod.FrontendStmt {
+) std.mem.Allocator.Error!?stmt_mod.FrontendStmt {
     const terminal_ids = try collectGeneratedTerminalIds(allocator, tokens, tables);
     if (terminal_ids == null) return null;
     defer allocator.free(terminal_ids.?);
@@ -156,7 +159,19 @@ fn parseWithGeneratedRuntime(
         return null;
     }
 
-    var semantic = try sydraql_semantics.buildStmt(allocator, arena, tokens, tables, artifact);
+    var semantic = sydraql_semantics.buildStmt(allocator, arena, tokens, tables, artifact) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            defer artifact.deinit(allocator);
+            try list.append(.{
+                .code = .parser_mismatch,
+                .message = "generated sydraql semantic replay could not build a frontend statement",
+                .span = failureSpan(tokens, null),
+                .phase = .parse,
+            });
+            return null;
+        },
+    };
     defer semantic.parse.deinit(allocator);
     return semantic.stmt;
 }

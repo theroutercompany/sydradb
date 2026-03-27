@@ -7,6 +7,7 @@ const compiler = @import("compiler.zig");
 const engine_mod = @import("../engine.zig");
 const exec = @import("exec.zig");
 const frontend = @import("frontend.zig");
+const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const plan = @import("plan.zig");
 const translator = @import("translator.zig");
@@ -25,15 +26,29 @@ pub const PrepareFlags = packed struct(u8) {
     reserved: u6 = 0,
 };
 
-pub const NormalizedStmt = union(enum) {
-    ast_statement: *const ast.Statement,
-    typed_query: compiler.TypedQuery,
-};
+pub const ParameterSlot = frontend.normalize.ParameterSlot;
+pub const ParameterBinding = frontend.normalize.ParameterBinding;
+pub const NamedParameterBinding = frontend.normalize.NamedParameterBinding;
+pub const NormalizedStmt = frontend.normalize.NormalizedStmt;
 
 pub const BindingContext = struct {
     language: QueryLanguage,
     source_text: []const u8,
     diagnostics: []const frontend.diagnostics.Diagnostic = &.{},
+    parameters: []const ParameterBinding = &.{},
+    named_parameters: []const NamedParameterBinding = &.{},
+    translation_fallback: bool = false,
+
+    pub fn parameterCount(self: @This()) usize {
+        return self.parameters.len;
+    }
+
+    pub fn slotForNamed(self: @This(), name: []const u8) ?ParameterSlot {
+        for (self.named_parameters) |binding| {
+            if (std.mem.eql(u8, binding.name, name)) return binding.slot;
+        }
+        return null;
+    }
 };
 
 pub const StepResult = union(enum) {
@@ -64,13 +79,12 @@ pub const PreparedStmt = struct {
     language: QueryLanguage,
     source_text: []const u8,
     flags: PrepareFlags,
+    binding: BindingContext,
     program: bytecode.Program,
     columns: []const plan.ColumnInfo = &.{},
     normalized: NormalizedStmt,
-    diagnostics: []const frontend.diagnostics.Diagnostic = &.{},
-    owned_source_text: bool = false,
+    typed_query: ?compiler.TypedQuery = null,
     owned_columns: bool = false,
-    owned_statement: ?*const ast.Statement = null,
     arena_ptr: ?*std.heap.ArenaAllocator = null,
     machine: ?vm.VirtualMachine = null,
     finalized: bool = false,
@@ -94,20 +108,14 @@ pub const PreparedStmt = struct {
         if (self.finalized) return;
         if (self.machine) |*machine| machine.deinit();
         self.program.deinit();
-        if (self.owned_source_text) {
-            self.allocator.free(self.source_text);
-        }
         if (self.owned_columns and self.columns.len != 0) {
             self.allocator.free(self.columns);
-        }
-        if (self.owned_statement) |stmt| {
-            self.allocator.destroy(@constCast(stmt));
         }
         if (self.arena_ptr) |arena_ptr| {
             arena_ptr.deinit();
             self.allocator.destroy(arena_ptr);
         }
-        if (self.diagnostics.len != 0) self.allocator.free(self.diagnostics);
+        if (self.binding.diagnostics.len != 0) self.allocator.free(self.binding.diagnostics);
         self.finalized = true;
     }
 
@@ -120,24 +128,25 @@ pub const PreparedStmt = struct {
         errdefer for (uses.items) |use| allocator.free(use.name);
         defer uses.deinit();
 
-        switch (self.normalized) {
-            .typed_query => |typed_query| {
-                if (typed_query.bound_selector) |selector| {
-                    try appendBoundSelectorTableUse(allocator, &uses, selector);
-                } else if (typed_query.select.selector) |selector| {
-                    try appendSelectorTableUse(allocator, &uses, selector);
-                }
-            },
-            .ast_statement => |statement| try appendStatementTableUses(allocator, &uses, statement),
+        if (self.typed_query) |typed_query| {
+            if (typed_query.bound_selector) |selector| {
+                try appendBoundSelectorTableUse(allocator, &uses, selector);
+            } else if (typed_query.select.selector) |selector| {
+                try appendAstSelectorTableUse(allocator, &uses, selector);
+            }
+        } else {
+            try appendFrontendStatementTableUses(allocator, &uses, self.normalized.statement);
         }
 
         return try uses.toOwnedSlice();
     }
 };
 
-pub const PrepareError = std.mem.Allocator.Error || parser.ParseError || compiler.CompileError || frontend.normalize.NormalizeError || error{
+pub const PrepareError = std.mem.Allocator.Error || lexer.LexError || parser.ParseError || compiler.CompileError || frontend.normalize.NormalizeError || error{
+    InvalidCharacter,
     SqlTranslationFailed,
     NotImplemented,
+    InvalidTrace,
 } || codegen.CodegenError;
 
 pub const StepError = vm.VmError || error{
@@ -158,25 +167,31 @@ pub fn prepareSydraQL(
     text: []const u8,
     flags: PrepareFlags,
 ) PrepareError!PreparedStmt {
-    var arena_ptr = try allocator.create(std.heap.ArenaAllocator);
-    arena_ptr.* = std.heap.ArenaAllocator.init(allocator);
-    errdefer {
-        arena_ptr.deinit();
-        allocator.destroy(arena_ptr);
-    }
+    var shadow = try frontend.shadow.parseSydraqlShadow(allocator, text);
+    errdefer shadow.deinit();
 
-    var parser_inst = parser.Parser.init(arena_ptr.allocator(), text);
-    var statement = try parser_inst.parse();
-    return try prepareParsedStatement(
+    const normalized = if (shadow.generated_stmt) |generated_stmt|
+        try frontend.normalize.normalizeFrontendStmt(shadow.arena_ptr.allocator(), generated_stmt)
+    else
+        try frontend.normalize.normalizeAstStatement(shadow.arena_ptr.allocator(), &shadow.statement);
+
+    allocator.free(shadow.emitted.emitted_source);
+    shadow.emitted.emitted_source = &.{};
+
+    return try prepareNormalizedStatement(
         allocator,
         engine,
-        .sydraql,
-        text,
-        false,
+        .{
+            .language = .sydraql,
+            .source_text = text,
+            .diagnostics = shadow.diagnostics,
+            .parameters = normalized.parameters,
+            .named_parameters = normalized.named_parameters,
+            .translation_fallback = false,
+        },
         flags,
-        &statement,
-        arena_ptr,
-        &.{},
+        normalized,
+        shadow.arena_ptr,
     );
 }
 
@@ -187,35 +202,30 @@ pub fn prepareSqlCore(
     flags: PrepareFlags,
 ) PrepareError!PreparedStmt {
     var skeleton = try frontend.sql_core.parseSqlCoreSkeleton(allocator, text);
-    defer skeleton.deinit();
-
-    const diagnostics = skeleton.diagnostics;
-    skeleton.diagnostics = &.{};
+    errdefer skeleton.deinit();
 
     if (skeleton.stmt) |stmt| {
-        var arena_ptr = try allocator.create(std.heap.ArenaAllocator);
-        arena_ptr.* = std.heap.ArenaAllocator.init(allocator);
-        errdefer {
-            arena_ptr.deinit();
-            allocator.destroy(arena_ptr);
-        }
-
-        var statement = try frontend.normalize.toAstStatement(arena_ptr.allocator(), stmt);
-        return try prepareParsedStatement(
+        const arena_ptr = skeleton.arena_ptr orelse return error.NotImplemented;
+        const normalized = try frontend.normalize.normalizeFrontendStmt(arena_ptr.allocator(), stmt);
+        return try prepareNormalizedStatement(
             allocator,
             engine,
-            .sql_core,
-            text,
-            false,
+            .{
+                .language = .sql_core,
+                .source_text = text,
+                .diagnostics = skeleton.diagnostics,
+                .parameters = normalized.parameters,
+                .named_parameters = normalized.named_parameters,
+                .translation_fallback = false,
+            },
             flags,
-            &statement,
+            normalized,
             arena_ptr,
-            diagnostics,
         );
     }
 
     const translation = try translateSqlToSydraql(allocator, text);
-    errdefer allocator.free(translation);
+    defer allocator.free(translation);
 
     var arena_ptr = try allocator.create(std.heap.ArenaAllocator);
     arena_ptr.* = std.heap.ArenaAllocator.init(allocator);
@@ -226,16 +236,21 @@ pub fn prepareSqlCore(
 
     var parser_inst = parser.Parser.init(arena_ptr.allocator(), translation);
     var statement = try parser_inst.parse();
-    return try prepareParsedStatement(
+    const normalized = try frontend.normalize.normalizeAstStatement(arena_ptr.allocator(), &statement);
+    return try prepareNormalizedStatement(
         allocator,
         engine,
-        .sql_core,
-        translation,
-        true,
+        .{
+            .language = .sql_core,
+            .source_text = text,
+            .diagnostics = skeleton.diagnostics,
+            .parameters = normalized.parameters,
+            .named_parameters = normalized.named_parameters,
+            .translation_fallback = true,
+        },
         flags,
-        &statement,
+        normalized,
         arena_ptr,
-        diagnostics,
     );
 }
 
@@ -305,18 +320,16 @@ fn translateSqlToSydraql(allocator: std.mem.Allocator, text: []const u8) Prepare
     };
 }
 
-fn prepareParsedStatement(
+fn prepareNormalizedStatement(
     allocator: std.mem.Allocator,
     engine: *engine_mod.Engine,
-    language: QueryLanguage,
-    source_text: []const u8,
-    owned_source_text: bool,
+    binding: BindingContext,
     flags: PrepareFlags,
-    statement: *const ast.Statement,
+    normalized: NormalizedStmt,
     arena_ptr: *std.heap.ArenaAllocator,
-    diagnostics: []const frontend.diagnostics.Diagnostic,
 ) PrepareError!PreparedStmt {
-    const compiled = try compiler.compileSelect(arena_ptr.allocator(), engine, statement);
+    var statement = try frontend.normalize.toAstStatement(arena_ptr.allocator(), normalized);
+    const compiled = try compiler.compileSelect(arena_ptr.allocator(), engine, &statement);
     var lowered = try codegen.buildProgram(allocator, compiled);
     errdefer lowered.program.deinit();
     errdefer if (lowered.columns.len != 0) allocator.free(lowered.columns);
@@ -324,14 +337,14 @@ fn prepareParsedStatement(
     var stmt = PreparedStmt{
         .allocator = allocator,
         .engine = engine,
-        .language = language,
-        .source_text = source_text,
+        .language = binding.language,
+        .source_text = binding.source_text,
         .flags = flags,
+        .binding = binding,
         .program = lowered.program,
         .columns = lowered.columns,
-        .normalized = .{ .typed_query = compiled.typed_query },
-        .diagnostics = diagnostics,
-        .owned_source_text = owned_source_text,
+        .normalized = normalized,
+        .typed_query = compiled.typed_query,
         .owned_columns = true,
         .arena_ptr = arena_ptr,
     };
@@ -339,25 +352,24 @@ fn prepareParsedStatement(
     return stmt;
 }
 
-fn appendStatementTableUses(
+fn appendFrontendStatementTableUses(
     allocator: std.mem.Allocator,
     uses: *std.array_list.Managed(TableUse),
-    statement: *const ast.Statement,
+    statement: frontend.stmt.FrontendStmt,
 ) !void {
-    switch (statement.*) {
+    switch (statement) {
         .select => |select| {
             if (select.selector) |selector| {
-                try appendSelectorTableUse(allocator, uses, selector);
+                try appendFrontendSelectorTableUse(allocator, uses, selector);
             }
         },
         .insert => |insert| {
-            try appendTableUse(allocator, uses, .series, insert.series.value, null);
+            try appendTableUse(allocator, uses, .series, insert.target.value, null);
         },
         .delete => |delete| {
-            try appendSelectorTableUse(allocator, uses, delete.selector);
+            try appendTableUse(allocator, uses, .series, delete.target.value, null);
         },
-        .explain => |explain| try appendStatementTableUses(allocator, uses, explain.target),
-        .invalid => {},
+        .explain => |explain| try appendFrontendStatementTableUses(allocator, uses, explain.target.*),
     }
 }
 
@@ -382,7 +394,28 @@ fn appendBoundSelectorTableUse(
     try appendOwnedTableUse(uses, .series, rendered, selector.series_id);
 }
 
-fn appendSelectorTableUse(
+fn appendFrontendSelectorTableUse(
+    allocator: std.mem.Allocator,
+    uses: *std.array_list.Managed(TableUse),
+    selector: frontend.stmt.Selector,
+) !void {
+    switch (selector.series) {
+        .name => |name| try appendTableUse(allocator, uses, .series, name.value, null),
+        .by_id => |by_id| {
+            const rendered = try std.fmt.allocPrint(allocator, "series_id:{d}", .{by_id.value});
+            errdefer allocator.free(rendered);
+            for (uses.items) |existing| {
+                if (existing.kind == .series and existing.series_id == @as(types.SeriesId, @intCast(by_id.value)) and std.mem.eql(u8, existing.name, rendered)) {
+                    allocator.free(rendered);
+                    return;
+                }
+            }
+            try appendOwnedTableUse(uses, .series, rendered, @intCast(by_id.value));
+        },
+    }
+}
+
+fn appendAstSelectorTableUse(
     allocator: std.mem.Allocator,
     uses: *std.array_list.Managed(TableUse),
     selector: ast.Selector,
@@ -458,8 +491,6 @@ test "prepared statement disassembles bytecode programs" {
     };
     var engine = try engine_mod.Engine.init(alloc, config);
     defer engine.deinit();
-    const placeholder_stmt = try alloc.create(ast.Statement);
-    placeholder_stmt.* = ast.placeholderStatement(.{ .start = 0, .end = 0 });
 
     const instructions = try alloc.dupe(bytecode.Instruction, &.{
         .{ .opcode = .load_const, .p1 = 0, .p4 = .{ .constant = 0 } },
@@ -478,8 +509,18 @@ test "prepared statement disassembles bytecode programs" {
             .constants = try alloc.dupe(value_mod.Value, &.{value_mod.Value{ .integer = 1 }}),
             .source_name = "unit",
         },
-        .normalized = .{ .ast_statement = placeholder_stmt },
-        .owned_statement = placeholder_stmt,
+        .binding = .{
+            .language = .sydraql,
+            .source_text = "select 1",
+        },
+        .normalized = .{
+            .statement = .{
+                .select = .{
+                    .projections = &.{},
+                    .span = .{ .start = 0, .end = 8 },
+                },
+            },
+        },
     };
     stmt.machine = try vm.VirtualMachine.init(alloc, engine, &stmt.program);
     defer stmt.finalize();
@@ -707,7 +748,8 @@ test "prepareSqlCore translates SQL into prepared bytecode programs" {
     var constant_stmt = try prepareSqlCore(alloc, engine, "SELECT 1", .{});
     defer constant_stmt.finalize();
     try std.testing.expectEqual(QueryLanguage.sql_core, constant_stmt.language);
-    try std.testing.expectEqual(@as(usize, 0), constant_stmt.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 0), constant_stmt.binding.diagnostics.len);
+    try std.testing.expectEqual(@as(usize, 0), constant_stmt.binding.parameterCount());
     const constant_row = try constant_stmt.step();
     try std.testing.expect(constant_row == .row);
     try std.testing.expectEqual(@as(i64, 1), constant_row.row[0].integer);
@@ -727,6 +769,34 @@ test "prepareSqlCore translates SQL into prepared bytecode programs" {
     const scan_row = try scan_stmt.step();
     try std.testing.expect(scan_row == .row);
     try std.testing.expectEqual(@as(i64, 10), scan_row.row[0].integer);
+}
+
+test "binding context tracks named parameter slots" {
+    const binding: BindingContext = .{
+        .language = .sql_core,
+        .source_text = "SELECT value FROM weather.room1 WHERE time >= $1 AND value <= :cap",
+        .parameters = &.{
+            .{
+                .slot = 1,
+                .raw = "$1",
+                .kind = .positional,
+                .explicit_index = 1,
+                .span = .{ .start = 41, .end = 43 },
+            },
+            .{
+                .slot = 2,
+                .raw = ":cap",
+                .kind = .named,
+                .name = "cap",
+                .span = .{ .start = 57, .end = 61 },
+            },
+        },
+        .named_parameters = &.{.{ .name = "cap", .slot = 2 }},
+    };
+
+    try std.testing.expectEqual(@as(usize, 2), binding.parameterCount());
+    try std.testing.expectEqual(@as(?ParameterSlot, 2), binding.slotForNamed("cap"));
+    try std.testing.expectEqual(@as(?ParameterSlot, null), binding.slotForNamed("missing"));
 }
 
 fn valuesEqual(lhs: []const value_mod.Value, rhs: []const value_mod.Value) bool {
