@@ -37,6 +37,8 @@ pub fn parseSydraqlShadow(allocator: std.mem.Allocator, source: []const u8) !Sha
     defer allocator.free(tokens);
 
     var gen = parsergen.ParserGenerator.init(allocator);
+    var tables = try gen.buildTables(sydraql_core.spec);
+    defer tables.deinit(allocator);
     const emitted = try gen.emit(sydraql_core.spec);
     errdefer allocator.free(emitted.emitted_source);
 
@@ -54,7 +56,8 @@ pub fn parseSydraqlShadow(allocator: std.mem.Allocator, source: []const u8) !Sha
     errdefer diags.deinit();
 
     try validateTokens(&diags, tokens, sydraql_core.spec);
-    try validateStatementShape(&diags, tokens, statement);
+    const generated_kind = try parseWithGeneratedRuntime(allocator, &diags, tokens, &tables);
+    try validateStatementShape(&diags, tokens, statement, generated_kind);
 
     return .{
         .allocator = allocator,
@@ -89,19 +92,15 @@ fn validateTokens(list: *std.array_list.Managed(diagnostics.Diagnostic), tokens:
     }
 }
 
-fn validateStatementShape(list: *std.array_list.Managed(diagnostics.Diagnostic), tokens: []const lexer.Token, statement: ast.Statement) !void {
+fn validateStatementShape(
+    list: *std.array_list.Managed(diagnostics.Diagnostic),
+    tokens: []const lexer.Token,
+    statement: ast.Statement,
+    generated_kind: ?std.meta.Tag(ast.Statement),
+) !void {
     if (tokens.len == 0) return;
     const first = tokens[0];
-    const expected_tag = switch (first.kind) {
-        .keyword => switch (first.keyword.?) {
-            .select => std.meta.Tag(ast.Statement).select,
-            .insert => std.meta.Tag(ast.Statement).insert,
-            .delete => std.meta.Tag(ast.Statement).delete,
-            .explain => std.meta.Tag(ast.Statement).explain,
-            else => std.meta.Tag(ast.Statement).invalid,
-        },
-        else => std.meta.Tag(ast.Statement).invalid,
-    };
+    const expected_tag = generated_kind orelse classifyByFirstToken(first);
 
     if (std.meta.activeTag(statement) != expected_tag) {
         try list.append(.{
@@ -111,6 +110,127 @@ fn validateStatementShape(list: *std.array_list.Managed(diagnostics.Diagnostic),
             .phase = .parse,
         });
     }
+}
+
+fn parseWithGeneratedRuntime(
+    allocator: std.mem.Allocator,
+    list: *std.array_list.Managed(diagnostics.Diagnostic),
+    tokens: []const lexer.Token,
+    tables: *const parsergen.ParserTables,
+) !?std.meta.Tag(ast.Statement) {
+    const terminal_ids = try collectGeneratedTerminalIds(allocator, tokens, tables);
+    if (terminal_ids == null) return null;
+    defer allocator.free(terminal_ids.?);
+
+    var generated = try parsergen.GeneratedParser.init(allocator, tables, .{});
+    defer generated.deinit();
+
+    var result = generated.parse(terminal_ids.?) catch |err| switch (err) {
+        error.ParseError, error.DisabledRule => {
+            try list.append(.{
+                .code = .parser_mismatch,
+                .message = "generated sydraql parser runtime could not accept the shared token stream",
+                .span = if (tokens.len == 0) null else tokens[0].span,
+                .phase = .parse,
+            });
+            return null;
+        },
+        else => return err,
+    };
+    defer result.deinit(allocator);
+
+    if (!result.accepted) return null;
+    return generatedStatementKind(tables.*, result.reductions);
+}
+
+fn collectGeneratedTerminalIds(
+    allocator: std.mem.Allocator,
+    tokens: []const lexer.Token,
+    tables: *const parsergen.ParserTables,
+) !?[]u16 {
+    var ids = std.array_list.Managed(u16).init(allocator);
+    defer ids.deinit();
+
+    for (tokens) |token| {
+        const terminal = runtimeTerminalNameForToken(token);
+        if (terminal.len == 0) return null;
+        const terminal_id = tables.terminalId(terminal) orelse return null;
+        try ids.append(terminal_id);
+    }
+
+    return try ids.toOwnedSlice();
+}
+
+fn generatedStatementKind(
+    tables: parsergen.ParserTables,
+    reductions: []const u16,
+) ?std.meta.Tag(ast.Statement) {
+    var idx = reductions.len;
+    while (idx > 0) {
+        idx -= 1;
+        const rule_index = reductions[idx];
+        const rule = tables.rules[rule_index];
+        if (rule.lhs_nonterminal >= tables.nonterminals.len) continue;
+        if (!std.mem.eql(u8, tables.nonterminals[rule.lhs_nonterminal], "stmt")) continue;
+
+        const rhs = tables.rhs_symbols[rule.rhs_start .. rule.rhs_start + rule.rhs_len];
+        if (rhs.len == 1 and rhs[0].kind == .nonterminal and rhs[0].index < tables.nonterminals.len) {
+            if (std.mem.eql(u8, tables.nonterminals[rhs[0].index], "select_stmt")) return .select;
+        }
+
+        if (rhs.len == 0 or rhs[0].kind != .terminal) continue;
+        const terminal = tables.terminalName(rhs[0].index);
+        if (std.mem.eql(u8, terminal, "insert")) return .insert;
+        if (std.mem.eql(u8, terminal, "delete")) return .delete;
+        if (std.mem.eql(u8, terminal, "explain")) return .explain;
+    }
+    return null;
+}
+
+fn runtimeTerminalNameForToken(token: lexer.Token) []const u8 {
+    return switch (token.kind) {
+        .identifier, .quoted_identifier => "identifier",
+        .number => "number",
+        .string => "string",
+        .duration => "number",
+        .timestamp => "string",
+        .keyword => switch (token.keyword.?) {
+            .select => "select",
+            .insert => "insert",
+            .delete => "delete",
+            .explain => "explain",
+            .bytecode => "bytecode",
+            .from => "from",
+            .where => "where",
+            .group => "group",
+            .by => "by",
+            .fill => "fill",
+            .order => "order",
+            .limit => "limit",
+            .offset => "offset",
+            .time => "time",
+            .tag => "tag",
+            else => "",
+        },
+        .comma => "comma",
+        .l_paren => "l_paren",
+        .r_paren => "r_paren",
+        .eof => "eof",
+        else => "",
+    };
+}
+
+fn classifyByFirstToken(token: lexer.Token) std.meta.Tag(ast.Statement) {
+    return switch (token.kind) {
+        .keyword => switch (token.keyword.?) {
+            .select => .select,
+            .insert => .insert,
+            .delete => .delete,
+            .explain => .explain,
+            else => .invalid,
+        },
+        else => .invalid,
+    };
 }
 
 fn terminalNameForToken(token: lexer.Token) []const u8 {
@@ -196,5 +316,17 @@ test "shadow sydraql parser covers explain bytecode" {
     }
 
     try std.testing.expect(result.statement == .explain);
+    try std.testing.expect(!result.hasMismatch());
+}
+
+test "shadow sydraql parser uses generated runtime on covered selects" {
+    const alloc = std.testing.allocator;
+    const result = try parseSydraqlShadow(alloc, "select 1");
+    defer {
+        var owned = result;
+        owned.deinit();
+    }
+
+    try std.testing.expect(result.statement == .select);
     try std.testing.expect(!result.hasMismatch());
 }
