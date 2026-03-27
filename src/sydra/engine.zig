@@ -1417,6 +1417,78 @@ test "engine primary metadata mode boots from CAS metadata alone" {
     }
 }
 
+test "engine primary mode can query from CAS-owned segment content without mirrors" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/cas-segment-data", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    const sid = types.hash64("cas.segment.series");
+
+    {
+        const config = cfg.Config{
+            .data_dir = try talloc.dupe(u8, data_path),
+            .http_port = 0,
+            .fsync = .none,
+            .flush_interval_ms = 5,
+            .memtable_max_bytes = 512,
+            .retention_days = 0,
+            .auth_token = try talloc.dupe(u8, ""),
+            .enable_influx = false,
+            .enable_prom = false,
+            .mem_limit_bytes = 1024 * 1024,
+            .cas_mode = .dual_write,
+            .retention_ns = std.StringHashMap(u32).init(talloc),
+        };
+
+        var engine = try Engine.init(talloc, config);
+        defer engine.deinit();
+
+        try engine.registerSeries("cas.segment.series", "{}", sid);
+        try engine.ingest(.{ .series_id = sid, .ts = 2_000, .value = 9.5, .tags_json = "{}" });
+        try waitForFlush(engine, 1, 1_000);
+        try engine.verifyCasState();
+    }
+
+    {
+        var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+        defer data_dir.close();
+        data_dir.deleteTree("segments") catch {};
+        data_dir.deleteFile("MANIFEST") catch {};
+        data_dir.deleteFile("tags.json") catch {};
+        data_dir.deleteFile("series_catalog.jsonl") catch {};
+    }
+
+    {
+        const config = cfg.Config{
+            .data_dir = try talloc.dupe(u8, data_path),
+            .http_port = 0,
+            .fsync = .none,
+            .flush_interval_ms = 5,
+            .memtable_max_bytes = 512,
+            .retention_days = 0,
+            .auth_token = try talloc.dupe(u8, ""),
+            .enable_influx = false,
+            .enable_prom = false,
+            .mem_limit_bytes = 1024 * 1024,
+            .cas_mode = .dual_write,
+            .metadata_read_mode = .primary,
+            .retention_ns = std.StringHashMap(u32).init(talloc),
+        };
+
+        var engine = try Engine.init(talloc, config);
+        defer engine.deinit();
+
+        var results = std.array_list.Managed(types.Point).init(talloc);
+        defer results.deinit();
+        try engine.queryRange(sid, 0, 10_000, &results);
+        try std.testing.expectEqual(@as(usize, 1), results.items.len);
+        try std.testing.expectEqual(@as(i64, 2_000), results.items[0].ts);
+        try std.testing.expectApproxEqAbs(@as(f64, 9.5), results.items[0].value, 1e-9);
+    }
+}
+
 test "engine resolveSelector surfaces metadata for by-id and exact lookups" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });

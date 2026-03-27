@@ -189,7 +189,15 @@ fn replayFile(alloc: std.mem.Allocator, wal_dir: std.fs.Dir, file_name: []const 
     var read_buf: [4096]u8 = undefined;
     var reader_state = file.reader(&read_buf);
     const reader = std.Io.Reader.adaptToOldInterface(&reader_state.interface);
+    try replayReader(alloc, reader, ctx);
+}
 
+pub fn replayBytes(alloc: std.mem.Allocator, bytes: []const u8, ctx: anytype) !void {
+    var stream = std.io.fixedBufferStream(bytes);
+    try replayReader(alloc, stream.reader().any(), ctx);
+}
+
+fn replayReader(alloc: std.mem.Allocator, reader: anytype, ctx: anytype) !void {
     while (true) {
         var len_buf: [4]u8 = undefined;
         const len_read = try reader.read(&len_buf);

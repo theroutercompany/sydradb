@@ -179,13 +179,17 @@ pub const ObjectStore = struct {
     }
 };
 
-fn hash(obj_type: ObjectType, payload: []const u8) ObjectId {
+pub fn computeId(obj_type: ObjectType, payload: []const u8) ObjectId {
     var hasher = std.crypto.hash.Blake3.init(.{});
     hasher.update(&[_]u8{@intFromEnum(obj_type)});
     hasher.update(payload);
     var out: [32]u8 = undefined;
     hasher.final(out[0..]);
     return .{ .hash = out };
+}
+
+fn hash(obj_type: ObjectType, payload: []const u8) ObjectId {
+    return computeId(obj_type, payload);
 }
 
 fn shouldSync(policy: cfg.FsyncPolicy) bool {

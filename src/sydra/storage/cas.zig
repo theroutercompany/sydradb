@@ -15,6 +15,7 @@ pub const main_ref = "heads/main";
 
 pub const SegmentDescriptor = struct {
     path: []u8,
+    content_id: ?object_store.ObjectId = null,
     file_hash: [32]u8,
     file_size: u64,
     series_id: types.SeriesId,
@@ -31,6 +32,7 @@ pub const SegmentDescriptor = struct {
 
     pub fn eql(self: SegmentDescriptor, other: SegmentDescriptor) bool {
         return std.mem.eql(u8, self.path, other.path) and
+            optionalObjectIdEql(self.content_id, other.content_id) and
             std.mem.eql(u8, self.file_hash[0..], other.file_hash[0..]) and
             self.file_size == other.file_size and
             self.series_id == other.series_id and
@@ -102,6 +104,7 @@ pub const SeriesCatalogSnapshot = struct {
 
 pub const WalChunkDescriptor = struct {
     name: []u8,
+    content_id: ?object_store.ObjectId = null,
     file_size: u64,
     file_hash: [32]u8,
     mutable: bool,
@@ -112,6 +115,7 @@ pub const WalChunkDescriptor = struct {
 
     pub fn eql(self: WalChunkDescriptor, other: WalChunkDescriptor) bool {
         return std.mem.eql(u8, self.name, other.name) and
+            optionalObjectIdEql(self.content_id, other.content_id) and
             self.file_size == other.file_size and
             std.mem.eql(u8, self.file_hash[0..], other.file_hash[0..]) and
             self.mutable == other.mutable;
@@ -199,11 +203,13 @@ pub const Snapshot = struct {
 
 pub const SnapshotIndex = struct {
     alloc: std.mem.Allocator,
+    store: *object_store.ObjectStore,
     snapshot: Snapshot,
 
-    pub fn init(alloc: std.mem.Allocator, snapshot: Snapshot) SnapshotIndex {
+    pub fn init(alloc: std.mem.Allocator, store: *object_store.ObjectStore, snapshot: Snapshot) SnapshotIndex {
         return .{
             .alloc = alloc,
+            .store = store,
             .snapshot = snapshot,
         };
     }
@@ -213,7 +219,7 @@ pub const SnapshotIndex = struct {
     }
 
     pub fn queryRange(self: *const SnapshotIndex, alloc: std.mem.Allocator, data_dir: std.fs.Dir, series_id: types.SeriesId, start_ts: i64, end_ts: i64, out: *std.array_list.Managed(types.Point)) !void {
-        try segment_mod.queryRangeEntries(alloc, data_dir, self.snapshot.segment_descriptors, series_id, start_ts, end_ts, out);
+        try segment_mod.queryRangeDescriptorEntries(alloc, data_dir, self.store, self.snapshot.segment_descriptors, series_id, start_ts, end_ts, out);
     }
 
     pub fn tagMatches(self: *const SnapshotIndex, key: []const u8) []const types.SeriesId {
@@ -409,7 +415,7 @@ pub const CommitWriter = struct {
         parent: ?object_store.ObjectId,
         reason: []const u8,
     ) !object_store.ObjectId {
-        var snapshot = try buildLegacySnapshot(self.alloc, data_dir, manifest, tags, series_catalog);
+        var snapshot = try buildLegacySnapshot(self.alloc, data_dir, manifest, tags, series_catalog, self.store);
         defer snapshot.deinit(self.alloc);
         return try self.writePreparedSnapshot(&snapshot, parent, reason);
     }
@@ -736,7 +742,7 @@ pub const CommitReader = struct {
         tags: *const tags_mod.TagIndex,
         series_catalog: *const series_catalog_mod.SeriesCatalog,
     ) !void {
-        var live = try buildLegacySnapshot(self.alloc, data_dir, manifest, tags, series_catalog);
+        var live = try buildLegacySnapshot(self.alloc, data_dir, manifest, tags, series_catalog, self.store);
         defer live.deinit(self.alloc);
 
         var stored = try self.loadHeadSnapshot();
@@ -849,7 +855,7 @@ pub const CasManager = struct {
 
     pub fn loadHeadIndex(self: *CasManager) !SnapshotIndex {
         var reader = CommitReader{ .alloc = self.alloc, .store = &self.store, .refs = &self.refs };
-        return SnapshotIndex.init(self.alloc, try reader.loadHeadSnapshot());
+        return SnapshotIndex.init(self.alloc, &self.store, try reader.loadHeadSnapshot());
     }
 
     pub fn verifyHead(self: *CasManager, data_dir: std.fs.Dir, manifest: *const manifest_mod.Manifest, tags: *const tags_mod.TagIndex, series_catalog: *const series_catalog_mod.SeriesCatalog) !void {
@@ -998,6 +1004,7 @@ pub fn buildLegacySnapshot(
     manifest: *const manifest_mod.Manifest,
     tags: *const tags_mod.TagIndex,
     series_catalog: *const series_catalog_mod.SeriesCatalog,
+    store: ?*object_store.ObjectStore,
 ) !LegacySnapshot {
     var descriptors = std.array_list.Managed(SegmentDescriptor).init(alloc);
     errdefer {
@@ -1011,8 +1018,10 @@ pub fn buildLegacySnapshot(
         if (metadata.series_id != entry.series_id or metadata.hour_bucket != entry.hour_bucket or metadata.start_ts != entry.start_ts or metadata.end_ts != entry.end_ts or metadata.count != entry.count) {
             return error.ManifestSegmentMismatch;
         }
+        const content_id = try ensureBlobForFile(alloc, store, data_dir, entry.path);
         try descriptors.append(.{
             .path = try alloc.dupe(u8, entry.path),
+            .content_id = content_id,
             .file_hash = try hashFile(data_dir, entry.path),
             .file_size = metadata.file_size,
             .series_id = entry.series_id,
@@ -1031,7 +1040,7 @@ pub fn buildLegacySnapshot(
         .segment_descriptors = try descriptors.toOwnedSlice(),
         .tag_snapshot = try buildTagSnapshot(alloc, tags),
         .series_catalog_snapshot = try buildSeriesCatalogSnapshot(alloc, series_catalog),
-        .wal_index = try buildWalIndex(alloc, data_dir),
+        .wal_index = try buildWalIndex(alloc, data_dir, store),
     };
 }
 
@@ -1111,7 +1120,7 @@ fn buildSeriesCatalogSnapshot(alloc: std.mem.Allocator, series_catalog: *const s
     return .{ .entries = try entries.toOwnedSlice() };
 }
 
-fn buildWalIndex(alloc: std.mem.Allocator, data_dir: std.fs.Dir) !WalIndex {
+fn buildWalIndex(alloc: std.mem.Allocator, data_dir: std.fs.Dir, store: ?*object_store.ObjectStore) !WalIndex {
     const infos = try wal_mod.collectWalFileInfos(alloc, data_dir);
     defer wal_mod.freeWalFileInfos(alloc, infos);
 
@@ -1122,8 +1131,13 @@ fn buildWalIndex(alloc: std.mem.Allocator, data_dir: std.fs.Dir) !WalIndex {
     }
 
     for (infos) |info| {
+        const content_id = if (std.mem.eql(u8, info.name, "current.wal"))
+            null
+        else
+            try ensureBlobForWalFile(alloc, store, data_dir, info.name);
         try entries.append(.{
             .name = try alloc.dupe(u8, info.name),
+            .content_id = content_id,
             .file_size = info.size,
             .file_hash = info.hash,
             .mutable = std.mem.eql(u8, info.name, "current.wal"),
@@ -1178,11 +1192,39 @@ fn hashFile(data_dir: std.fs.Dir, path: []const u8) ![32]u8 {
     return out;
 }
 
+fn ensureBlobForFile(
+    alloc: std.mem.Allocator,
+    store: ?*object_store.ObjectStore,
+    data_dir: std.fs.Dir,
+    path: []const u8,
+) !?object_store.ObjectId {
+    const bytes = try data_dir.readFileAlloc(alloc, path, 128 * 1024 * 1024);
+    defer alloc.free(bytes);
+    const id = object_store.computeId(.blob, bytes);
+    if (store) |object_store_ref| {
+        const stored = try object_store_ref.put(.blob, bytes);
+        if (!stored.eql(id)) return error.UnexpectedObjectId;
+    }
+    return id;
+}
+
+fn ensureBlobForWalFile(
+    alloc: std.mem.Allocator,
+    store: ?*object_store.ObjectStore,
+    data_dir: std.fs.Dir,
+    wal_name: []const u8,
+) !?object_store.ObjectId {
+    const path = try std.fmt.allocPrint(alloc, "wal/{s}", .{wal_name});
+    defer alloc.free(path);
+    return try ensureBlobForFile(alloc, store, data_dir, path);
+}
+
 fn encodeSegmentDescriptor(alloc: std.mem.Allocator, descriptor: SegmentDescriptor) ![]u8 {
     var bytes = std.array_list.Managed(u8).init(alloc);
     errdefer bytes.deinit();
 
-    try bytes.append(1);
+    try bytes.append(2);
+    try appendOptionalObjectId(&bytes, descriptor.content_id);
     try appendString(&bytes, descriptor.path);
     try bytes.appendSlice(descriptor.file_hash[0..]);
     try appendInt(&bytes, u64, descriptor.file_size);
@@ -1199,8 +1241,9 @@ fn encodeSegmentDescriptor(alloc: std.mem.Allocator, descriptor: SegmentDescript
 fn decodeSegmentDescriptor(alloc: std.mem.Allocator, payload: []const u8) !SegmentDescriptor {
     var cursor = Cursor{ .bytes = payload };
     const version = try cursor.readByte();
-    if (version != 1) return error.UnsupportedSegmentDescriptorVersion;
+    if (version != 1 and version != 2) return error.UnsupportedSegmentDescriptorVersion;
 
+    const content_id = if (version >= 2) try cursor.readOptionalObjectId() else null;
     const path = try cursor.readOwnedString(alloc);
     errdefer alloc.free(path);
 
@@ -1217,6 +1260,7 @@ fn decodeSegmentDescriptor(alloc: std.mem.Allocator, payload: []const u8) !Segme
 
     return .{
         .path = path,
+        .content_id = content_id,
         .file_hash = file_hash,
         .file_size = file_size,
         .series_id = series_id,
@@ -1328,10 +1372,11 @@ fn encodeWalIndex(alloc: std.mem.Allocator, wal_index: WalIndex) ![]u8 {
     var bytes = std.array_list.Managed(u8).init(alloc);
     errdefer bytes.deinit();
 
-    try bytes.append(1);
+    try bytes.append(2);
     try appendInt(&bytes, u32, @intCast(wal_index.entries.len));
     for (wal_index.entries) |entry| {
         try appendString(&bytes, entry.name);
+        try appendOptionalObjectId(&bytes, entry.content_id);
         try appendInt(&bytes, u64, entry.file_size);
         try bytes.appendSlice(entry.file_hash[0..]);
         try bytes.append(if (entry.mutable) 1 else 0);
@@ -1342,7 +1387,7 @@ fn encodeWalIndex(alloc: std.mem.Allocator, wal_index: WalIndex) ![]u8 {
 fn decodeWalIndex(alloc: std.mem.Allocator, payload: []const u8) !WalIndex {
     var cursor = Cursor{ .bytes = payload };
     const version = try cursor.readByte();
-    if (version != 1) return error.UnsupportedWalIndexVersion;
+    if (version != 1 and version != 2) return error.UnsupportedWalIndexVersion;
 
     const entry_count = try cursor.readInt(u32);
     var entries = try alloc.alloc(WalChunkDescriptor, entry_count);
@@ -1355,11 +1400,13 @@ fn decodeWalIndex(alloc: std.mem.Allocator, payload: []const u8) !WalIndex {
     while (i < entry_count) : (i += 1) {
         const name = try cursor.readOwnedString(alloc);
         errdefer alloc.free(name);
+        const content_id = if (version >= 2) try cursor.readOptionalObjectId() else null;
         const file_size = try cursor.readInt(u64);
         const file_hash = try cursor.readHash();
         const mutable = (try cursor.readByte()) != 0;
         entries[i] = .{
             .name = name,
+            .content_id = content_id,
             .file_size = file_size,
             .file_hash = file_hash,
             .mutable = mutable,
@@ -1463,6 +1510,13 @@ fn appendString(bytes: *std.array_list.Managed(u8), value: []const u8) !void {
     try bytes.appendSlice(value);
 }
 
+fn appendOptionalObjectId(bytes: *std.array_list.Managed(u8), maybe_id: ?object_store.ObjectId) !void {
+    try bytes.append(if (maybe_id != null) 1 else 0);
+    if (maybe_id) |id| {
+        try bytes.appendSlice(id.hash[0..]);
+    }
+}
+
 fn appendInt(bytes: *std.array_list.Managed(u8), comptime T: type, value: T) !void {
     var tmp: [@sizeOf(T)]u8 = undefined;
     std.mem.writeInt(T, tmp[0..], value, .little);
@@ -1506,10 +1560,24 @@ const Cursor = struct {
         return out;
     }
 
+    fn readOptionalObjectId(self: *Cursor) !?object_store.ObjectId {
+        return switch (try self.readByte()) {
+            0 => null,
+            1 => .{ .hash = try self.readHash() },
+            else => error.InvalidOptionalObjectIdFlag,
+        };
+    }
+
     fn finish(self: *Cursor) !void {
         if (self.index != self.bytes.len) return error.ExtraObjectBytes;
     }
 };
+
+fn optionalObjectIdEql(lhs: ?object_store.ObjectId, rhs: ?object_store.ObjectId) bool {
+    if (lhs == null and rhs == null) return true;
+    if (lhs == null or rhs == null) return false;
+    return lhs.?.eql(rhs.?);
+}
 
 fn sortDescriptors(descriptors: []SegmentDescriptor) void {
     std.sort.block(SegmentDescriptor, descriptors, {}, struct {

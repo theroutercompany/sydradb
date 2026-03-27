@@ -1,5 +1,6 @@
 const std = @import("std");
 const types = @import("../types.zig");
+const object_store = @import("object_store.zig");
 const manifest_mod = @import("manifest.zig");
 
 // Segment format v2 (SYSEG3):
@@ -111,9 +112,35 @@ pub fn readAll(alloc: std.mem.Allocator, data_dir: std.fs.Dir, path: []const u8)
     var f = try data_dir.openFile(path, .{});
     defer f.close();
 
+    const stat = try f.stat();
+    const bytes = try alloc.alloc(u8, @intCast(stat.size));
+    defer alloc.free(bytes);
+    const read_len = try f.readAll(bytes);
+    if (read_len != bytes.len) return error.CorruptSegment;
+    return try readAllFromBytes(alloc, bytes);
+}
+
+pub fn readAllDescriptor(alloc: std.mem.Allocator, data_dir: std.fs.Dir, store: *object_store.ObjectStore, descriptor: anytype) ![]types.Point {
+    const Descriptor = @TypeOf(descriptor);
+    if (@hasField(Descriptor, "content_id")) {
+        if (descriptor.content_id) |content_id| {
+            const loaded = try store.get(alloc, content_id);
+            defer alloc.free(loaded.payload);
+            if (loaded.obj_type != .blob) return error.InvalidSegmentContentObject;
+            return try readAllFromBytes(alloc, loaded.payload);
+        }
+    }
+    if (@hasField(Descriptor, "path") and descriptor.path.len != 0) {
+        return try readAll(alloc, data_dir, descriptor.path);
+    }
+    return error.MissingSegmentContent;
+}
+
+pub fn readAllFromBytes(alloc: std.mem.Allocator, bytes: []const u8) ![]types.Point {
+    var stream = std.io.fixedBufferStream(bytes);
+    const reader = stream.reader().any();
     var read_buf: [4096]u8 = undefined;
-    var reader_state = f.reader(&read_buf);
-    const reader = std.Io.Reader.adaptToOldInterface(&reader_state.interface);
+    _ = &read_buf;
 
     var hdr: [6]u8 = undefined;
     try reader.readNoEof(&hdr);
@@ -295,6 +322,29 @@ pub fn queryRangeEntries(
         while (k < count) : (k += 1) {
             const ts = ts_list[k];
             if (ts >= start_ts and ts <= end_ts) try out.append(.{ .ts = ts, .value = vals[k] });
+        }
+    }
+}
+
+pub fn queryRangeDescriptorEntries(
+    alloc: std.mem.Allocator,
+    data_dir: std.fs.Dir,
+    store: *object_store.ObjectStore,
+    descriptors: anytype,
+    series_id: types.SeriesId,
+    start_ts: i64,
+    end_ts: i64,
+    out: *std.array_list.Managed(types.Point),
+) !void {
+    for (descriptors) |descriptor| {
+        if (descriptor.series_id != series_id) continue;
+        if (descriptor.end_ts < start_ts or descriptor.start_ts > end_ts) continue;
+
+        const points = try readAllDescriptor(alloc, data_dir, store, descriptor);
+        defer alloc.free(points);
+        for (points) |point| {
+            if (point.ts < start_ts or point.ts > end_ts) continue;
+            try out.append(point);
         }
     }
 }
