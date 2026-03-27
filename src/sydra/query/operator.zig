@@ -83,7 +83,6 @@ pub const Operator = struct {
 
     const Scan = struct {
         engine: *engine_mod.Engine,
-        selector: ?ast.Selector,
         series_id: ?types.SeriesId,
         points: std.array_list.Managed(types.Point),
         index: usize,
@@ -238,7 +237,6 @@ fn createScanOperator(allocator: std.mem.Allocator, engine: *engine_mod.Engine, 
 
     var payload = Operator.Scan{
         .engine = engine,
-        .selector = node.selector,
         .series_id = null,
         .points = std.array_list.Managed(types.Point).init(allocator),
         .index = 0,
@@ -248,9 +246,12 @@ fn createScanOperator(allocator: std.mem.Allocator, engine: *engine_mod.Engine, 
     for (payload.buffer) |*slot| slot.* = Value.null;
 
     const selector = node.selector.?;
-    switch (selector.series) {
-        .by_id => |id| payload.series_id = @as(types.SeriesId, @intCast(id.value)),
-        .name => return error.UnsupportedPlan,
+    switch (selector) {
+        .ast => |ast_selector| switch (ast_selector.series) {
+            .by_id => |id| payload.series_id = @as(types.SeriesId, @intCast(id.value)),
+            .name => return error.UnsupportedPlan,
+        },
+        .bound => |bound_selector| payload.series_id = bound_selector.series_id,
     }
 
     if (payload.series_id) |sid| {

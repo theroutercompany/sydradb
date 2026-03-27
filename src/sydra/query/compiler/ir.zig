@@ -110,11 +110,11 @@ pub const TypedQuery = struct {
 };
 
 pub const BackendLoweringResult = struct {
-    logical_plan: *plan.Node,
-    optimized_plan: *plan.Node,
+    logical_plan: ?*plan.Node = null,
+    optimized_plan: ?*plan.Node = null,
     physical_plan: physical.PhysicalPlan,
-    logical_us: u64,
-    optimize_us: u64,
+    logical_us: u64 = 0,
+    optimize_us: u64 = 0,
     physical_us: u64,
 };
 

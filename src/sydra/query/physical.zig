@@ -1,6 +1,8 @@
 const std = @import("std");
 const plan = @import("plan.zig");
 const ast = @import("ast.zig");
+const common = @import("common.zig");
+const types = @import("../types.zig");
 const meta = std.meta;
 
 pub const BuildError = std.mem.Allocator.Error;
@@ -20,10 +22,29 @@ pub const Node = union(enum) {
 };
 
 pub const Scan = struct {
-    selector: ?ast.Selector,
+    selector: ?ScanSelector,
     output: []const plan.ColumnInfo,
     rollup_hint: ?plan.RollupHint,
     time_bounds: TimeBounds,
+};
+
+pub const BoundSelectorSource = enum {
+    by_id,
+    unique_name,
+    exact_match,
+};
+
+pub const BoundSelector = struct {
+    source: BoundSelectorSource,
+    series_id: types.SeriesId,
+    name: ?[]const u8 = null,
+    canonical_tags: ?[]const u8 = null,
+    span: common.Span,
+};
+
+pub const ScanSelector = union(enum) {
+    ast: ast.Selector,
+    bound: BoundSelector,
 };
 
 pub const OneRow = struct {
@@ -99,7 +120,12 @@ fn buildNode(allocator: std.mem.Allocator, logical: *plan.Node, ctx: Context) Bu
     const node = try allocator.create(Node);
     switch (logical.*) {
         .scan => |scan| {
-            node.* = .{ .scan = .{ .selector = scan.selector, .output = scan.output, .rollup_hint = detectScanRollup(scan), .time_bounds = ctx.time_bounds } };
+            node.* = .{ .scan = .{
+                .selector = if (scan.selector) |selector| ScanSelector{ .ast = selector } else null,
+                .output = scan.output,
+                .rollup_hint = detectScanRollup(scan),
+                .time_bounds = ctx.time_bounds,
+            } };
         },
         .one_row => |one_row| {
             node.* = .{ .one_row = .{ .output = one_row.output } };
