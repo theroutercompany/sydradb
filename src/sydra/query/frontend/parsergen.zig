@@ -271,7 +271,7 @@ pub const GeneratedParser = struct {
         };
     }
 
-    pub fn parseArtifact(self: *@This(), terminals: []const u16) ParseRuntimeError!ParseArtifact {
+    pub fn parseArtifact(self: *@This(), terminals: []const u16) std.mem.Allocator.Error!ParseArtifact {
         try self.reset();
 
         var cursor: usize = 0;

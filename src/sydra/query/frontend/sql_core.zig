@@ -4,6 +4,8 @@ const diagnostics = @import("diagnostics.zig");
 const grammar = @import("grammar.zig");
 const lexer = @import("../lexer.zig");
 const parsergen = @import("parsergen.zig");
+const sql_semantics = @import("sql_semantics.zig");
+const stmt_mod = @import("stmt.zig");
 const sql_core_ts = @import("grammars/sql_core_ts.zig");
 
 pub const StatementKind = enum {
@@ -15,10 +17,21 @@ pub const StatementKind = enum {
 };
 
 pub const SkeletonResult = struct {
+    allocator: std.mem.Allocator,
     kind: StatementKind,
+    stmt: ?stmt_mod.FrontendStmt = null,
     diagnostics: []const diagnostics.Diagnostic,
     token_count: usize,
     used_generated_runtime: bool,
+    arena_ptr: ?*std.heap.ArenaAllocator = null,
+
+    pub fn deinit(self: *@This()) void {
+        self.allocator.free(self.diagnostics);
+        if (self.arena_ptr) |arena_ptr| {
+            arena_ptr.deinit();
+            self.allocator.destroy(arena_ptr);
+        }
+    }
 };
 
 pub fn parseSqlCoreSkeleton(
@@ -41,40 +54,97 @@ pub fn parseSqlCoreSkeleton(
     defer if (terminal_ids) |ids| allocator.free(ids);
 
     var kind = classify(tokens);
+    var stmt: ?stmt_mod.FrontendStmt = null;
+    var arena_ptr: ?*std.heap.ArenaAllocator = null;
     if (terminal_ids) |ids| {
         var generated = try parsergen.GeneratedParser.init(allocator, &tables, .{});
         defer generated.deinit();
 
-        var result = generated.parse(ids) catch |err| switch (err) {
-            error.ParseError, error.DisabledRule => {
-                const failure = generated.failureInfo();
+        var artifact = try generated.parseArtifact(ids);
+
+        if (!artifact.accepted) {
+            defer artifact.deinit(allocator);
+            try diags.append(.{
+                .code = .unexpected_token,
+                .message = "generated sql_core_ts parser could not accept the covered token stream",
+                .span = failureSpan(tokens, artifact.failure),
+                .phase = .parse,
+            });
+            return .{
+                .allocator = allocator,
+                .kind = kind,
+                .diagnostics = try diags.toOwnedSlice(),
+                .token_count = tokens.len,
+                .used_generated_runtime = true,
+            };
+        }
+
+        arena_ptr = try allocator.create(std.heap.ArenaAllocator);
+        arena_ptr.?.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer {
+            arena_ptr.?.deinit();
+            allocator.destroy(arena_ptr.?);
+        }
+
+        var semantic = sql_semantics.buildStmt(allocator, arena_ptr.?.allocator(), tokens, &tables, artifact) catch |err| switch (err) {
+            error.OutOfMemory => {
+                artifact.deinit(allocator);
+                return error.OutOfMemory;
+            },
+            error.InvalidTrace => {
+                artifact.deinit(allocator);
                 try diags.append(.{
-                    .code = .unexpected_token,
-                    .message = "generated sql_core_ts parser could not accept the covered token stream",
-                    .span = failureSpan(tokens, failure),
+                    .code = .parser_mismatch,
+                    .message = "generated sql_core_ts semantic replay could not build a frontend statement",
+                    .span = failureSpan(tokens, null),
                     .phase = .parse,
                 });
                 return .{
+                    .allocator = allocator,
                     .kind = kind,
                     .diagnostics = try diags.toOwnedSlice(),
                     .token_count = tokens.len,
                     .used_generated_runtime = true,
+                    .arena_ptr = arena_ptr,
                 };
             },
-            error.OutOfMemory => return error.OutOfMemory,
+            else => {
+                artifact.deinit(allocator);
+                try diags.append(.{
+                    .code = .parser_mismatch,
+                    .message = "generated sql_core_ts semantic replay hit an unsupported semantic action",
+                    .span = failureSpan(tokens, null),
+                    .phase = .parse,
+                });
+                return .{
+                    .allocator = allocator,
+                    .kind = kind,
+                    .diagnostics = try diags.toOwnedSlice(),
+                    .token_count = tokens.len,
+                    .used_generated_runtime = true,
+                    .arena_ptr = arena_ptr,
+                };
+            },
         };
-        defer result.deinit(allocator);
+        defer semantic.parse.deinit(allocator);
 
-        if (generatedStatementKind(tables, result.reductions)) |generated_kind| {
-            kind = generated_kind;
-        }
+        stmt = semantic.stmt;
+        kind = switch (stmt.?.kind()) {
+            .select => .select,
+            .insert => .insert,
+            .delete => .delete,
+            .explain => .explain,
+        };
     }
 
     return .{
+        .allocator = allocator,
         .kind = kind,
+        .stmt = stmt,
         .diagnostics = try diags.toOwnedSlice(),
         .token_count = tokens.len,
         .used_generated_runtime = used_generated_runtime,
+        .arena_ptr = arena_ptr,
     };
 }
 
@@ -116,33 +186,6 @@ fn collectGeneratedTerminalIds(
 
     if (!fully_covered) return null;
     return try ids.toOwnedSlice();
-}
-
-fn generatedStatementKind(
-    tables: parsergen.ParserTables,
-    reductions: []const u16,
-) ?StatementKind {
-    var idx = reductions.len;
-    while (idx > 0) {
-        idx -= 1;
-        const rule_index = reductions[idx];
-        const rule = tables.rules[rule_index];
-        if (rule.lhs_nonterminal >= tables.nonterminals.len) continue;
-        if (!std.mem.eql(u8, tables.nonterminals[rule.lhs_nonterminal], "stmt")) continue;
-
-        const rhs = tables.rhs_symbols[rule.rhs_start .. rule.rhs_start + rule.rhs_len];
-        if (rhs.len == 1 and rhs[0].kind == .nonterminal and rhs[0].index < tables.nonterminals.len) {
-            const child = tables.nonterminals[rhs[0].index];
-            if (std.mem.eql(u8, child, "select_stmt")) return .select;
-            if (std.mem.eql(u8, child, "insert_stmt")) return .insert;
-            if (std.mem.eql(u8, child, "delete_stmt")) return .delete;
-        }
-
-        if (rhs.len == 0 or rhs[0].kind != .terminal) continue;
-        const terminal = tables.terminalName(rhs[0].index);
-        if (std.mem.eql(u8, terminal, "explain")) return .explain;
-    }
-    return null;
 }
 
 fn classify(tokens: []const lexer.Token) StatementKind {
@@ -230,21 +273,22 @@ test "sql core parser skeleton matches golden cases" {
         const kind_text = fields.next() orelse return error.InvalidCharacter;
         const sql = fields.next() orelse return error.InvalidCharacter;
 
-        const result = try parseSqlCoreSkeleton(alloc, sql);
-        defer alloc.free(result.diagnostics);
+        var result = try parseSqlCoreSkeleton(alloc, sql);
+        defer result.deinit();
 
         const expected = std.meta.stringToEnum(StatementKind, kind_text) orelse return error.InvalidCharacter;
         try std.testing.expectEqual(expected, result.kind);
         try std.testing.expectEqual(@as(usize, 0), result.diagnostics.len);
         try std.testing.expect(result.used_generated_runtime);
         try std.testing.expect(result.token_count >= 2);
+        try std.testing.expect(result.stmt != null);
     }
 }
 
 test "sql core parser skeleton reports grammar coverage gaps" {
     const alloc = std.testing.allocator;
-    const result = try parseSqlCoreSkeleton(alloc, "select value from metrics where value =~ 'hot'");
-    defer alloc.free(result.diagnostics);
+    var result = try parseSqlCoreSkeleton(alloc, "select value from metrics where value =~ 'hot'");
+    defer result.deinit();
 
     try std.testing.expectEqual(StatementKind.select, result.kind);
     try std.testing.expectEqual(@as(usize, 1), result.diagnostics.len);
@@ -254,8 +298,8 @@ test "sql core parser skeleton reports grammar coverage gaps" {
 
 test "sql core parser skeleton reports parse errors for covered invalid syntax" {
     const alloc = std.testing.allocator;
-    const result = try parseSqlCoreSkeleton(alloc, "select from metrics");
-    defer alloc.free(result.diagnostics);
+    var result = try parseSqlCoreSkeleton(alloc, "select from metrics");
+    defer result.deinit();
 
     try std.testing.expectEqual(StatementKind.select, result.kind);
     try std.testing.expectEqual(@as(usize, 1), result.diagnostics.len);
@@ -276,8 +320,8 @@ test "sql core parser skeleton matches error fixture cases" {
         const generated_text = fields.next() orelse return error.InvalidCharacter;
         const sql = fields.next() orelse return error.InvalidCharacter;
 
-        const result = try parseSqlCoreSkeleton(alloc, sql);
-        defer alloc.free(result.diagnostics);
+        var result = try parseSqlCoreSkeleton(alloc, sql);
+        defer result.deinit();
 
         const expected_code = std.meta.stringToEnum(diagnostics.DiagnosticCode, code_text) orelse return error.InvalidCharacter;
         const expected_generated = std.mem.eql(u8, generated_text, "true");

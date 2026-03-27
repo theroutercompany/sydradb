@@ -1,8 +1,10 @@
 pub const diagnostics = @import("frontend/diagnostics.zig");
 pub const grammar = @import("frontend/grammar.zig");
+pub const normalize = @import("frontend/normalize.zig");
 pub const parsergen = @import("frontend/parsergen.zig");
 pub const shadow = @import("frontend/shadow.zig");
 pub const sql_core = @import("frontend/sql_core.zig");
+pub const sql_semantics = @import("frontend/sql_semantics.zig");
 pub const stmt = @import("frontend/stmt.zig");
 pub const sydraql_semantics = @import("frontend/sydraql_semantics.zig");
 pub const sydraql_core = @import("frontend/grammars/sydraql_core.zig");

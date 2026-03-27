@@ -168,11 +168,12 @@ const Dispatcher = struct {
     }
 
     fn emitByIdSelector(_: *@This(), rhs: []const SemanticValue) !SemanticValue {
-        const number = try integerLiteralFromValue(rhs[2]);
+        const token = try tokenFromValue(rhs[2]);
+        const value = try std.fmt.parseInt(i64, token.lexeme, 10);
         return .{ .selector = .{
             .series = .{ .by_id = .{
-                .value = @intCast(@max(number.value, 0)),
-                .span = number.span,
+                .value = @intCast(@max(value, 0)),
+                .span = token.span,
             } },
             .span = combinedSpan(rhs),
         } };
@@ -272,9 +273,10 @@ const Dispatcher = struct {
     }
 
     fn emitLimit(_: *@This(), rhs: []const SemanticValue) !SemanticValue {
-        const number = try integerLiteralFromValue(rhs[1]);
+        const token = try tokenFromValue(rhs[1]);
+        const value = try std.fmt.parseInt(i64, token.lexeme, 10);
         return .{ .limit = .{
-            .limit = @intCast(@max(number.value, 0)),
+            .limit = @intCast(@max(value, 0)),
             .span = combinedSpan(rhs),
         } };
     }

@@ -55,11 +55,14 @@ pub const Select = struct {
 
 pub const Insert = struct {
     target: Identifier,
+    columns: []const *const Expr = &.{},
+    values: []const *const Expr = &.{},
     span: common.Span,
 };
 
 pub const Delete = struct {
     target: Identifier,
+    predicate: ?*const Expr = null,
     span: common.Span,
 };
 
@@ -115,6 +118,8 @@ pub const Expr = union(enum) {
     identifier: Identifier,
     integer: IntegerLiteral,
     string: StringLiteral,
+    parameter: Parameter,
+    comparison: Comparison,
     call: Call,
 
     pub fn span(self: @This()) common.Span {
@@ -122,6 +127,8 @@ pub const Expr = union(enum) {
             .identifier => |identifier| identifier.span,
             .integer => |literal| literal.span,
             .string => |literal| literal.span,
+            .parameter => |parameter| parameter.span,
+            .comparison => |comparison| comparison.span,
             .call => |call| call.span,
         };
     }
@@ -135,6 +142,33 @@ pub const IntegerLiteral = struct {
 
 pub const StringLiteral = struct {
     value: []const u8,
+    span: common.Span,
+};
+
+pub const ParameterKind = enum {
+    positional,
+    named,
+};
+
+pub const Parameter = struct {
+    raw: []const u8,
+    kind: ParameterKind,
+    span: common.Span,
+};
+
+pub const ComparisonOp = enum {
+    equal,
+    not_equal,
+    less,
+    less_equal,
+    greater,
+    greater_equal,
+};
+
+pub const Comparison = struct {
+    op: ComparisonOp,
+    left: *const Expr,
+    right: *const Expr,
     span: common.Span,
 };
 

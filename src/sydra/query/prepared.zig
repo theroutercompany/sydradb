@@ -105,7 +105,7 @@ pub const PreparedStmt = struct {
     }
 };
 
-pub const PrepareError = std.mem.Allocator.Error || parser.ParseError || compiler.CompileError || error{
+pub const PrepareError = std.mem.Allocator.Error || parser.ParseError || compiler.CompileError || frontend.normalize.NormalizeError || error{
     SqlTranslationFailed,
     NotImplemented,
 } || codegen.CodegenError;
@@ -149,8 +149,33 @@ pub fn prepareSqlCore(
     text: []const u8,
     flags: PrepareFlags,
 ) PrepareError!PreparedStmt {
-    const skeleton = try frontend.sql_core.parseSqlCoreSkeleton(allocator, text);
-    errdefer allocator.free(skeleton.diagnostics);
+    var skeleton = try frontend.sql_core.parseSqlCoreSkeleton(allocator, text);
+    defer skeleton.deinit();
+
+    const diagnostics = skeleton.diagnostics;
+    skeleton.diagnostics = &.{};
+
+    if (skeleton.stmt) |stmt| {
+        var arena_ptr = try allocator.create(std.heap.ArenaAllocator);
+        arena_ptr.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer {
+            arena_ptr.deinit();
+            allocator.destroy(arena_ptr);
+        }
+
+        var statement = try frontend.normalize.toAstStatement(arena_ptr.allocator(), stmt);
+        return try prepareParsedStatement(
+            allocator,
+            engine,
+            .sql_core,
+            text,
+            false,
+            flags,
+            &statement,
+            arena_ptr,
+            diagnostics,
+        );
+    }
 
     const translation = try translateSqlToSydraql(allocator, text);
     errdefer allocator.free(translation);
@@ -173,7 +198,7 @@ pub fn prepareSqlCore(
         flags,
         &statement,
         arena_ptr,
-        skeleton.diagnostics,
+        diagnostics,
     );
 }
 
