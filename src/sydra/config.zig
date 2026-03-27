@@ -18,7 +18,7 @@ pub const Config = struct {
     mem_limit_bytes: usize,
     cas_mode: CasMode,
     metadata_read_mode: MetadataReadMode = .legacy,
-    query_compiler_mode: QueryCompilerMode = .legacy,
+    query_compiler_mode: QueryCompilerMode = .compiled,
     retention_ns: std.StringHashMap(u32),
 
     pub fn deinit(self: *Config, alloc: std.mem.Allocator) void {
@@ -52,7 +52,7 @@ fn parseToml(alloc: std.mem.Allocator, text: []const u8) !Config {
         .mem_limit_bytes = 256 * 1024 * 1024,
         .cas_mode = .off,
         .metadata_read_mode = .legacy,
-        .query_compiler_mode = .legacy,
+        .query_compiler_mode = .compiled,
         .retention_ns = std.StringHashMap(u32).init(alloc),
     };
     var it = std.mem.tokenizeAny(u8, text, "\n\r");

@@ -469,6 +469,13 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     const flush_ns_total = eng.metrics.flush_ns_total.load(.monotonic);
     const flush_points_total = eng.metrics.flush_points_total.load(.monotonic);
     const wal_bytes_total = eng.metrics.wal_bytes_total.load(.monotonic);
+    const query_compile_attempts_total = eng.metrics.query_compile_attempts_total.load(.monotonic);
+    const query_compile_success_total = eng.metrics.query_compile_success_total.load(.monotonic);
+    const query_compile_fallback_total = eng.metrics.query_compile_fallback_total.load(.monotonic);
+    const query_compile_unsupported_total = eng.metrics.query_compile_unsupported_total.load(.monotonic);
+    const query_compile_series_not_found_total = eng.metrics.query_compile_series_not_found_total.load(.monotonic);
+    const query_compile_ambiguous_selector_total = eng.metrics.query_compile_ambiguous_selector_total.load(.monotonic);
+    const query_compile_shadow_mismatch_total = eng.metrics.query_compile_shadow_mismatch_total.load(.monotonic);
     const queue_depth = eng.queue.len();
     const memtable_bytes = eng.mem.bytes.load(.monotonic);
     const flush_seconds_total = @as(f64, @floatFromInt(flush_ns_total)) / 1_000_000_000.0;
@@ -483,6 +490,13 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     try writer.print("# HELP sydradb_flush_seconds_total Aggregate flush duration in seconds\n# TYPE sydradb_flush_seconds_total counter\nsydradb_flush_seconds_total {d:.6}\n", .{flush_seconds_total});
     try writer.print("# HELP sydradb_flush_points_total Total points flushed to disk\n# TYPE sydradb_flush_points_total counter\nsydradb_flush_points_total {d}\n", .{flush_points_total});
     try writer.print("# HELP sydradb_wal_bytes_total Total bytes written to WAL\n# TYPE sydradb_wal_bytes_total counter\nsydradb_wal_bytes_total {d}\n", .{wal_bytes_total});
+    try writer.print("# HELP sydradb_query_compile_attempts_total Total compiled query attempts\n# TYPE sydradb_query_compile_attempts_total counter\nsydradb_query_compile_attempts_total {d}\n", .{query_compile_attempts_total});
+    try writer.print("# HELP sydradb_query_compile_success_total Total compiled query lowerings that succeeded\n# TYPE sydradb_query_compile_success_total counter\nsydradb_query_compile_success_total {d}\n", .{query_compile_success_total});
+    try writer.print("# HELP sydradb_query_compile_fallback_total Total query compiler fallbacks\n# TYPE sydradb_query_compile_fallback_total counter\nsydradb_query_compile_fallback_total {d}\n", .{query_compile_fallback_total});
+    try writer.print("# HELP sydradb_query_compile_unsupported_total Total query compiler fallbacks caused by unsupported shapes\n# TYPE sydradb_query_compile_unsupported_total counter\nsydradb_query_compile_unsupported_total {d}\n", .{query_compile_unsupported_total});
+    try writer.print("# HELP sydradb_query_compile_series_not_found_total Total query compiler fallbacks caused by unresolved selectors\n# TYPE sydradb_query_compile_series_not_found_total counter\nsydradb_query_compile_series_not_found_total {d}\n", .{query_compile_series_not_found_total});
+    try writer.print("# HELP sydradb_query_compile_ambiguous_selector_total Total query compiler fallbacks caused by ambiguous selectors\n# TYPE sydradb_query_compile_ambiguous_selector_total counter\nsydradb_query_compile_ambiguous_selector_total {d}\n", .{query_compile_ambiguous_selector_total});
+    try writer.print("# HELP sydradb_query_compile_shadow_mismatch_total Total query compiler fallbacks caused by shadow mismatches\n# TYPE sydradb_query_compile_shadow_mismatch_total counter\nsydradb_query_compile_shadow_mismatch_total {d}\n", .{query_compile_shadow_mismatch_total});
     try writer.print("# HELP sydradb_queue_depth Current ingest queue depth\n# TYPE sydradb_queue_depth gauge\nsydradb_queue_depth {d}\n", .{queue_depth});
     try writer.print("# HELP sydradb_memtable_bytes Current memtable size in bytes\n# TYPE sydradb_memtable_bytes gauge\nsydradb_memtable_bytes {d}\n", .{memtable_bytes});
 

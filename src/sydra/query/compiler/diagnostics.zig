@@ -71,6 +71,7 @@ pub fn fromCompileError(err: anyerror) ?FallbackReason {
         error.UnsupportedFunction => .unsupported_function,
         error.SeriesNotFound => .series_not_found,
         error.AmbiguousSelector => .ambiguous_selector,
+        error.ShadowMismatch => .shadow_mismatch,
         else => null,
     };
 }

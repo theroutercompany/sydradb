@@ -61,23 +61,8 @@ pub fn executeWithMode(
 
     const result = switch (mode) {
         .legacy => try executeLegacy(prepared, .legacy, false, ""),
-        .compiled => try executeCompiled(prepared, false, "", .compiled),
-        .shadow => executeCompiled(prepared, false, "", .shadow) catch |err| switch (err) {
-            error.UnsupportedStatement,
-            error.UnsupportedFill,
-            error.UnsupportedTagFilter,
-            error.UnsupportedGrouping,
-            error.UnsupportedAggregate,
-            error.UnsupportedProjection,
-            error.UnsupportedOrdering,
-            error.UnsupportedPredicate,
-            error.UnsupportedExpression,
-            error.UnsupportedFunction,
-            error.SeriesNotFound,
-            error.AmbiguousSelector,
-            => try executeLegacy(prepared, .shadow, true, fallbackReasonText(err)),
-            else => try executeLegacy(prepared, .shadow, true, fallbackReasonText(err)),
-        },
+        .compiled => try executeCompiledPreferred(prepared, .compiled),
+        .shadow => try executeCompiledPreferred(prepared, .shadow),
     };
     arena_cleanup = false;
     return result;
@@ -148,14 +133,14 @@ fn executeLegacy(
 
 fn executeCompiled(
     prepared: Prepared,
-    legacy_fallback: bool,
-    fallback_reason: []const u8,
     mode: ExecutionMode,
 ) ExecuteError!executor.ExecutionCursor {
     const compile_start = std.time.microTimestamp();
+    recordCompileAttempt(prepared.engine);
     const detailed = try compiler.compileSelectDetailed(prepared.arena_ptr.allocator(), prepared.engine, prepared.statement);
     const compile_end = std.time.microTimestamp();
     const compiled = detailed.compiled orelse return compiler.fallbackReasonToError(detailed.fallback_reason.?);
+    recordCompileSuccess(prepared.engine);
     const total_compile_us = durationMicros(compile_end - compile_start);
     const backend_us = compiled.backend.logical_us + compiled.backend.optimize_us + compiled.backend.physical_us;
     const frontend_compile_us = total_compile_us -| backend_us;
@@ -170,8 +155,8 @@ fn executeCompiled(
         prepared,
         &cursor,
         mode,
-        legacy_fallback,
-        fallback_reason,
+        false,
+        "",
         compiled.bind_us,
         frontend_compile_us,
         compiled.backend.logical_us,
@@ -180,6 +165,19 @@ fn executeCompiled(
         durationMicros(pipeline_end - pipeline_start),
     );
     return cursor;
+}
+
+fn executeCompiledPreferred(
+    prepared: Prepared,
+    mode: ExecutionMode,
+) ExecuteError!executor.ExecutionCursor {
+    return executeCompiled(prepared, mode) catch |err| {
+        if (compiler_diagnostics.fromCompileError(err)) |reason| {
+            recordCompileFallback(prepared.engine, reason);
+            return executeLegacy(prepared, mode, true, compiler_diagnostics.reasonName(reason));
+        }
+        return err;
+    };
 }
 
 fn finalizeCursor(
@@ -258,11 +256,22 @@ fn modeName(mode: ExecutionMode) []const u8 {
     };
 }
 
-fn fallbackReasonText(err: anyerror) []const u8 {
-    if (compiler_diagnostics.fromCompileError(err)) |reason| {
-        return @tagName(reason);
+fn recordCompileAttempt(engine: *engine_mod.Engine) void {
+    _ = engine.metrics.query_compile_attempts_total.fetchAdd(1, .monotonic);
+}
+
+fn recordCompileSuccess(engine: *engine_mod.Engine) void {
+    _ = engine.metrics.query_compile_success_total.fetchAdd(1, .monotonic);
+}
+
+fn recordCompileFallback(engine: *engine_mod.Engine, reason: compiler.FallbackReason) void {
+    _ = engine.metrics.query_compile_fallback_total.fetchAdd(1, .monotonic);
+    switch (reason) {
+        .series_not_found => _ = engine.metrics.query_compile_series_not_found_total.fetchAdd(1, .monotonic),
+        .ambiguous_selector => _ = engine.metrics.query_compile_ambiguous_selector_total.fetchAdd(1, .monotonic),
+        .shadow_mismatch => _ = engine.metrics.query_compile_shadow_mismatch_total.fetchAdd(1, .monotonic),
+        else => _ = engine.metrics.query_compile_unsupported_total.fetchAdd(1, .monotonic),
     }
-    return @errorName(err);
 }
 
 fn durationMicros(value: i64) u64 {
@@ -314,6 +323,8 @@ test "execute supports select 1" {
     var cursor = try execute(talloc, engine, "select 1");
     defer cursor.deinit();
 
+    try std.testing.expectEqualStrings("compiled", cursor.stats.execution_mode);
+    try std.testing.expect(!cursor.stats.legacy_fallback);
     try std.testing.expectEqual(@as(usize, 1), cursor.columns.len);
 
     const first = try cursor.next();
@@ -435,6 +446,50 @@ test "executeWithMode shadow falls back to legacy for unsupported compiler proje
     try std.testing.expectEqualStrings("shadow", cursor.stats.execution_mode);
     try std.testing.expect(cursor.stats.legacy_fallback);
     try std.testing.expectEqualStrings(@tagName(compiler_diagnostics.FallbackReason.unsupported_function), cursor.stats.fallback_reason);
+
+    const first = try cursor.next();
+    try std.testing.expect(first != null);
+    try std.testing.expect(executor.Value.equals(first.?.values[0], executor.Value{ .float = 1.0 }));
+    try std.testing.expect((try cursor.next()) == null);
+}
+
+test "executeWithMode compiled falls back to legacy and records metrics" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/compiled-legacy-fallback", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .compiled,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try engine_mod.Engine.init(talloc, config);
+    defer engine.deinit();
+
+    var cursor = try executeWithMode(talloc, engine, "select abs(-1)", .compiled);
+    defer cursor.deinit();
+
+    try std.testing.expectEqualStrings("compiled", cursor.stats.execution_mode);
+    try std.testing.expect(cursor.stats.legacy_fallback);
+    try std.testing.expectEqualStrings(@tagName(compiler_diagnostics.FallbackReason.unsupported_function), cursor.stats.fallback_reason);
+    try std.testing.expectEqual(@as(u64, 1), engine.metrics.query_compile_attempts_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), engine.metrics.query_compile_success_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), engine.metrics.query_compile_fallback_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), engine.metrics.query_compile_unsupported_total.load(.monotonic));
 
     const first = try cursor.next();
     try std.testing.expect(first != null);
