@@ -58,6 +58,7 @@ pub const PreparedStmt = struct {
     normalized: NormalizedStmt,
     diagnostics: []const frontend.diagnostics.Diagnostic = &.{},
     owned_source_text: bool = false,
+    owned_columns: bool = false,
     owned_statement: ?*const ast.Statement = null,
     arena_ptr: ?*std.heap.ArenaAllocator = null,
     machine: ?vm.VirtualMachine = null,
@@ -83,6 +84,9 @@ pub const PreparedStmt = struct {
         if (self.owned_source_text) {
             self.allocator.free(self.source_text);
         }
+        if (self.owned_columns and self.columns.len != 0) {
+            self.allocator.free(self.columns);
+        }
         if (self.owned_statement) |stmt| {
             self.allocator.destroy(@constCast(stmt));
         }
@@ -102,7 +106,7 @@ pub const PreparedStmt = struct {
 pub const PrepareError = std.mem.Allocator.Error || parser.ParseError || compiler.CompileError || error{
     SqlTranslationFailed,
     NotImplemented,
-};
+} || codegen.CodegenError;
 
 pub const StepError = vm.VmError || error{
     NotImplemented,
@@ -124,22 +128,17 @@ pub fn prepareSydraQL(
 
     var parser_inst = parser.Parser.init(arena_ptr.allocator(), text);
     var statement = try parser_inst.parse();
-    const compiled = try compiler.compileSelect(arena_ptr.allocator(), engine, &statement);
-    const lowered = try codegen.buildProgram(allocator, compiled);
-
-    var stmt = PreparedStmt{
-        .allocator = allocator,
-        .engine = engine,
-        .language = .sydraql,
-        .source_text = text,
-        .flags = flags,
-        .program = lowered.program,
-        .columns = lowered.columns,
-        .normalized = .{ .typed_query = compiled.typed_query },
-        .arena_ptr = arena_ptr,
-    };
-    stmt.machine = try vm.VirtualMachine.init(allocator, engine, &stmt.program);
-    return stmt;
+    return try prepareParsedStatement(
+        allocator,
+        engine,
+        .sydraql,
+        text,
+        false,
+        flags,
+        &statement,
+        arena_ptr,
+        &.{},
+    );
 }
 
 pub fn prepareSqlCore(
@@ -148,26 +147,32 @@ pub fn prepareSqlCore(
     text: []const u8,
     flags: PrepareFlags,
 ) PrepareError!PreparedStmt {
+    const skeleton = try frontend.sql_core.parseSqlCoreSkeleton(allocator, text);
+    errdefer allocator.free(skeleton.diagnostics);
+
     const translation = try translateSqlToSydraql(allocator, text);
     errdefer allocator.free(translation);
-    const stmt = try allocator.create(ast.Statement);
-    errdefer allocator.destroy(stmt);
-    stmt.* = ast.placeholderStatement(.{ .start = 0, .end = 0 });
-    return PreparedStmt{
-        .allocator = allocator,
-        .engine = engine,
-        .language = .sql_core,
-        .source_text = translation,
-        .flags = flags,
-        .program = .{
-            .allocator = allocator,
-            .instructions = try allocator.alloc(bytecode.Instruction, 0),
-            .source_name = "sql_core",
-        },
-        .normalized = .{ .ast_statement = stmt },
-        .owned_source_text = true,
-        .owned_statement = stmt,
-    };
+
+    var arena_ptr = try allocator.create(std.heap.ArenaAllocator);
+    arena_ptr.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer {
+        arena_ptr.deinit();
+        allocator.destroy(arena_ptr);
+    }
+
+    var parser_inst = parser.Parser.init(arena_ptr.allocator(), translation);
+    var statement = try parser_inst.parse();
+    return try prepareParsedStatement(
+        allocator,
+        engine,
+        .sql_core,
+        translation,
+        true,
+        flags,
+        &statement,
+        arena_ptr,
+        skeleton.diagnostics,
+    );
 }
 
 pub fn shadowCompareSydraQL(
@@ -236,6 +241,40 @@ fn translateSqlToSydraql(allocator: std.mem.Allocator, text: []const u8) Prepare
     };
 }
 
+fn prepareParsedStatement(
+    allocator: std.mem.Allocator,
+    engine: *engine_mod.Engine,
+    language: QueryLanguage,
+    source_text: []const u8,
+    owned_source_text: bool,
+    flags: PrepareFlags,
+    statement: *const ast.Statement,
+    arena_ptr: *std.heap.ArenaAllocator,
+    diagnostics: []const frontend.diagnostics.Diagnostic,
+) PrepareError!PreparedStmt {
+    const compiled = try compiler.compileSelect(arena_ptr.allocator(), engine, statement);
+    const lowered = try codegen.buildProgram(allocator, compiled);
+    errdefer lowered.program.deinit();
+    errdefer if (lowered.columns.len != 0) allocator.free(lowered.columns);
+
+    var stmt = PreparedStmt{
+        .allocator = allocator,
+        .engine = engine,
+        .language = language,
+        .source_text = source_text,
+        .flags = flags,
+        .program = lowered.program,
+        .columns = lowered.columns,
+        .normalized = .{ .typed_query = compiled.typed_query },
+        .diagnostics = diagnostics,
+        .owned_source_text = owned_source_text,
+        .owned_columns = true,
+        .arena_ptr = arena_ptr,
+    };
+    stmt.machine = try vm.VirtualMachine.init(allocator, engine, &stmt.program);
+    return stmt;
+}
+
 test "prepared statement disassembles bytecode programs" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -270,7 +309,7 @@ test "prepared statement disassembles bytecode programs" {
     });
     var stmt = PreparedStmt{
         .allocator = alloc,
-        .engine = &engine,
+        .engine = engine,
         .language = .sydraql,
         .source_text = "select 1",
         .flags = .{},
@@ -283,7 +322,7 @@ test "prepared statement disassembles bytecode programs" {
         .normalized = .{ .ast_statement = placeholder_stmt },
         .owned_statement = placeholder_stmt,
     };
-    stmt.machine = try vm.VirtualMachine.init(alloc, &engine, &stmt.program);
+    stmt.machine = try vm.VirtualMachine.init(alloc, engine, &stmt.program);
     defer stmt.finalize();
 
     const lines = try stmt.explainBytecode(alloc);
@@ -326,7 +365,7 @@ test "prepareSydraQL compiles constant and scan statements to bytecode" {
     var engine = try engine_mod.Engine.init(alloc, config);
     defer engine.deinit();
 
-    var constant_stmt = try prepareSydraQL(alloc, &engine, "select 1", .{});
+    var constant_stmt = try prepareSydraQL(alloc, engine, "select 1", .{});
     defer constant_stmt.finalize();
     const constant_row = try constant_stmt.step();
     try std.testing.expect(constant_row == .row);
@@ -337,7 +376,7 @@ test "prepareSydraQL compiles constant and scan statements to bytecode" {
     try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 42.5, .tags_json = try alloc.dupe(u8, "{}") });
     std.time.sleep(20 * std.time.ns_per_ms);
 
-    var scan_stmt = try prepareSydraQL(alloc, &engine, "select time, value from weather.room1 where time >= 0", .{});
+    var scan_stmt = try prepareSydraQL(alloc, engine, "select time, value from weather.room1 where time >= 0", .{});
     defer scan_stmt.finalize();
     const first = try scan_stmt.step();
     try std.testing.expect(first == .row);
@@ -370,7 +409,7 @@ test "prepared bytecode snapshots stay stable for constant and scan plans" {
     var engine = try engine_mod.Engine.init(alloc, config);
     defer engine.deinit();
 
-    var constant_stmt = try prepareSydraQL(alloc, &engine, "select 1", .{});
+    var constant_stmt = try prepareSydraQL(alloc, engine, "select 1", .{});
     defer constant_stmt.finalize();
     const constant_snapshot = try formatBytecodeSnapshot(alloc, &constant_stmt);
     defer alloc.free(constant_snapshot);
@@ -386,7 +425,7 @@ test "prepared bytecode snapshots stay stable for constant and scan plans" {
     try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 42.5, .tags_json = try alloc.dupe(u8, "{}") });
     std.time.sleep(20 * std.time.ns_per_ms);
 
-    var scan_stmt = try prepareSydraQL(alloc, &engine, "select time, value from weather.room1 where time >= 0", .{});
+    var scan_stmt = try prepareSydraQL(alloc, engine, "select time, value from weather.room1 where time >= 0", .{});
     defer scan_stmt.finalize();
     const scan_snapshot = try formatBytecodeSnapshot(alloc, &scan_stmt);
     defer alloc.free(scan_snapshot);
@@ -421,7 +460,7 @@ test "prepared VM matches compiled executor on supported queries" {
     var engine = try engine_mod.Engine.init(alloc, config);
     defer engine.deinit();
 
-    const constant_parity = try shadowCompareSydraQL(alloc, &engine, "select 1");
+    const constant_parity = try shadowCompareSydraQL(alloc, engine, "select 1");
     try std.testing.expect(constant_parity.columns_match);
     try std.testing.expect(constant_parity.rows_match);
 
@@ -431,10 +470,61 @@ test "prepared VM matches compiled executor on supported queries" {
     try engine.ingest(.{ .series_id = sid, .ts = 200, .value = 3.0, .tags_json = try alloc.dupe(u8, "{}") });
     std.time.sleep(20 * std.time.ns_per_ms);
 
-    const scan_parity = try shadowCompareSydraQL(alloc, &engine, "select time, value from compare.room1 where time >= 0");
+    const scan_parity = try shadowCompareSydraQL(alloc, engine, "select time, value from compare.room1 where time >= 0");
     try std.testing.expect(scan_parity.columns_match);
     try std.testing.expect(scan_parity.rows_match);
     try std.testing.expectEqual(@as(usize, 2), scan_parity.row_count);
+}
+
+test "prepareSqlCore translates SQL into prepared bytecode programs" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-sql-core", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .legacy,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    var constant_stmt = try prepareSqlCore(alloc, engine, "SELECT 1", .{});
+    defer constant_stmt.finalize();
+    try std.testing.expectEqual(QueryLanguage.sql_core, constant_stmt.language);
+    try std.testing.expectEqual(@as(usize, 0), constant_stmt.diagnostics.len);
+    const constant_row = try constant_stmt.step();
+    try std.testing.expect(constant_row == .row);
+    try std.testing.expectEqual(@as(i64, 1), constant_row.row[0].integer);
+
+    const sid = @import("../types.zig").seriesIdFrom("weather.room1", "{}");
+    try engine.registerSeries("weather.room1", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 42.5, .tags_json = try alloc.dupe(u8, "{}") });
+    std.time.sleep(20 * std.time.ns_per_ms);
+
+    var scan_stmt = try prepareSqlCore(alloc, engine, "SELECT time, value FROM weather.room1 WHERE time >= 0", .{});
+    defer scan_stmt.finalize();
+    const lines = try scan_stmt.explainBytecode(alloc);
+    defer bytecode.freeDisassembly(alloc, lines);
+    try std.testing.expect(lines.len >= 4);
+    try std.testing.expectEqualStrings("open_series", lines[0].opcode);
+
+    const scan_row = try scan_stmt.step();
+    try std.testing.expect(scan_row == .row);
+    try std.testing.expectEqual(@as(i64, 10), scan_row.row[0].integer);
 }
 
 fn valuesEqual(lhs: []const value_mod.Value, rhs: []const value_mod.Value) bool {
