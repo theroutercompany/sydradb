@@ -1131,10 +1131,7 @@ fn buildWalIndex(alloc: std.mem.Allocator, data_dir: std.fs.Dir, store: ?*object
     }
 
     for (infos) |info| {
-        const content_id = if (std.mem.eql(u8, info.name, "current.wal"))
-            null
-        else
-            try ensureBlobForWalFile(alloc, store, data_dir, info.name);
+        const content_id = try ensureBlobForWalFile(alloc, store, data_dir, info.name);
         try entries.append(.{
             .name = try alloc.dupe(u8, info.name),
             .content_id = content_id,
@@ -1950,6 +1947,31 @@ test "compaction rewrites manifest and emits a CAS commit" {
     const next_head = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, "compaction");
     try std.testing.expect(!initial_head.eql(next_head));
     try cas_manager.verifyHeadMatchesLegacy(data_dir, &manifest, &tags, &series_catalog);
+}
+
+test "wal index captures CAS content ids for mutable current wal" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/wal-index", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    try std.fs.cwd().makePath(data_path);
+
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var wal = try wal_mod.WAL.open(talloc, data_dir, .none);
+    defer wal.close();
+    _ = try wal.append(77, 1_000, 3.25);
+
+    var index = try buildWalIndex(talloc, data_dir, null);
+    defer index.deinit(talloc);
+
+    try std.testing.expectEqual(@as(usize, 1), index.entries.len);
+    try std.testing.expect(std.mem.eql(u8, index.entries[0].name, "current.wal"));
+    try std.testing.expect(index.entries[0].content_id != null);
+    try std.testing.expect(index.entries[0].mutable);
 }
 
 test "ref store rejects torn ref contents" {

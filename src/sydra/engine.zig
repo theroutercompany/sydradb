@@ -775,7 +775,9 @@ pub const Engine = struct {
             }
         }{ .engine = self, .highwater = &highwater };
 
-        if (try self.recoveryWalFiles()) |files| {
+        if (try self.replayRecoveryWalFromCas(&ctx)) {
+            // CAS snapshot replay handled above, including any explicit live WAL tail.
+        } else if (try self.recoveryWalFiles()) |files| {
             defer wal_mod.freeWalFiles(self.alloc, files);
             try self.wal.replayFiles(self.alloc, files, &ctx);
         } else {
@@ -806,6 +808,32 @@ pub const Engine = struct {
         }
     }
 
+    fn replayRecoveryWalFromCas(self: *Engine, ctx: anytype) !bool {
+        const index = if (self.metadata.cas_index) |*snapshot_index| snapshot_index else return false;
+        const cas = if (self.cas) |*cas_manager| cas_manager else return false;
+
+        for (index.snapshot.wal_index.entries) |entry| {
+            if (entry.content_id) |content_id| {
+                const loaded = try cas.store.get(self.alloc, content_id);
+                defer self.alloc.free(loaded.payload);
+                if (loaded.obj_type != .blob) return error.InvalidWalChunkObject;
+                try wal_mod.replayBytes(self.alloc, loaded.payload, ctx);
+            } else if (entry.name.len != 0) {
+                const single = [_][]const u8{entry.name};
+                try self.wal.replayFiles(self.alloc, single[0..], ctx);
+            }
+        }
+
+        const live = try wal_mod.listWalFiles(self.alloc, self.data_dir);
+        defer wal_mod.freeWalFiles(self.alloc, live);
+        for (live) |name| {
+            if (!std.mem.eql(u8, name, "current.wal") and containsWalName(index.snapshot.wal_index.entries, name)) continue;
+            const single = [_][]const u8{name};
+            try self.wal.replayFiles(self.alloc, single[0..], ctx);
+        }
+        return true;
+    }
+
     fn recoveryWalFiles(self: *Engine) !?[][]u8 {
         const index = if (self.metadata.cas_index) |*snapshot_index| snapshot_index else return null;
         var files = std.array_list.Managed([]u8).init(self.alloc);
@@ -828,6 +856,13 @@ pub const Engine = struct {
         return try files.toOwnedSlice();
     }
 };
+
+fn containsWalName(entries: []const cas_mod.WalChunkDescriptor, needle: []const u8) bool {
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.name, needle)) return true;
+    }
+    return false;
+}
 
 fn manifestFromSnapshot(alloc: std.mem.Allocator, descriptors: []const cas_mod.SegmentDescriptor) !manifest_mod.Manifest {
     var manifest = manifest_mod.Manifest{ .alloc = alloc, .entries = .{} };
