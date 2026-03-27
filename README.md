@@ -144,6 +144,7 @@ Config notes:
 - `snapshot`/`restore` now operate on CAS bundles. A restored bundle only materializes `objects/` and `refs/`; use `metadata_read_mode = "primary"` for mirrorless startup, or run `cas checkout` / `cas export-legacy` if you need compatibility files regenerated.
 - Sealed segment and WAL payloads are chunked into CAS extent trees; `cas checkout` / `cas export-legacy` materialize mirror files by walking those trees rather than depending on legacy blobs.
 - `cas pack` now maintains a pack set instead of collapsing to one active pack; `objects/info/multi-pack-index` accelerates mixed-pack lookups while loose objects remain the write path.
+- `objects/info/reachability-bitmap` caches the reachable object-id set for the current ref snapshot, and `objects/info/commit-graph` now carries logical changed-path Bloom filters alongside generation numbers.
 - `cas gc` is reflog-aware by default. `--apply` first quarantines unreachable content under `objects/cruft/<timestamp>/` and only prunes older cruft after the configured grace window; use `--no-reflogs` when you want rollback history to stop protecting old commits.
 - `cas fsck` defaults to full content and mirror validation. `--connectivity-only` limits it to graph/reflog/reachability checks, and `--lost-found` writes dangling commit/blob/tree ids under `lost-found/`.
 - `enable_influx` and `enable_prom` remain parseable config flags, but they should be treated as placeholder or experimental toggles until real adapter surfaces land.

@@ -794,8 +794,9 @@ fn readMultiPackIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !MultiPackInde
     for (&fanout) |*entry| entry.* = readIntAt(bytes, &cursor, u64);
 
     const pack_paths = try alloc.alloc([]u8, @intCast(pack_count));
+    var pack_paths_loaded: usize = 0;
     errdefer {
-        for (pack_paths) |path| alloc.free(path);
+        for (pack_paths[0..pack_paths_loaded]) |path| alloc.free(path);
         alloc.free(pack_paths);
     }
     for (pack_paths) |*pack_path| {
@@ -803,6 +804,7 @@ fn readMultiPackIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !MultiPackInde
         if (cursor + path_len > checksum_start) return error.CorruptMultiPackIndex;
         pack_path.* = try alloc.dupe(u8, bytes[cursor .. cursor + path_len]);
         cursor += path_len;
+        pack_paths_loaded += 1;
     }
 
     const records = try alloc.alloc(MultiPackRecord, @intCast(object_count));

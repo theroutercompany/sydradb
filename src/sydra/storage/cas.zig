@@ -1079,6 +1079,9 @@ pub const PackResult = struct {
 
 const commit_graph_path = "objects/info/commit-graph";
 const commit_graph_magic = "SYDCGR1\x00";
+const reachability_bitmap_path = "objects/info/reachability-bitmap";
+const reachability_bitmap_magic = "SYDRBIT1";
+const changed_path_bloom_bytes: usize = 128;
 
 const CommitGraph = struct {
     object_ids: []object_store.ObjectId,
@@ -1089,6 +1092,8 @@ const CommitGraph = struct {
     parent_positions: []u64,
     reason_offsets: []u64,
     reasons: []u8,
+    changed_path_bloom_bytes: u16,
+    changed_path_blooms: []u8,
 
     fn deinit(self: *CommitGraph, alloc: std.mem.Allocator) void {
         alloc.free(self.object_ids);
@@ -1099,6 +1104,7 @@ const CommitGraph = struct {
         alloc.free(self.parent_positions);
         alloc.free(self.reason_offsets);
         alloc.free(self.reasons);
+        alloc.free(self.changed_path_blooms);
     }
 
     fn lookup(self: *const CommitGraph, id: object_store.ObjectId) ?usize {
@@ -1128,6 +1134,33 @@ const CommitGraph = struct {
         return self.roots[idx];
     }
 
+    fn changedPathMayMatch(self: *const CommitGraph, id: object_store.ObjectId, path: []const u8) bool {
+        const idx = self.lookup(id) orelse return true;
+        return self.changedPathMayMatchByIndex(idx, path);
+    }
+
+    fn changedPathMayMatchByIndex(self: *const CommitGraph, idx: usize, path: []const u8) bool {
+        const bloom = self.changedPathBloom(idx);
+        if (bloom.len == 0) return true;
+        var seed: u64 = 0x9e3779b97f4a7c15;
+        var iter: usize = 0;
+        while (iter < 4) : (iter += 1) {
+            const hash_value = std.hash.Wyhash.hash(seed, path);
+            const bit_count = bloom.len * 8;
+            const bit_index: usize = @intCast(hash_value % bit_count);
+            if ((bloom[bit_index / 8] & (@as(u8, 1) << @intCast(bit_index % 8))) == 0) return false;
+            seed +%= 0x517cc1b727220a95;
+        }
+        return true;
+    }
+
+    fn changedPathBloom(self: *const CommitGraph, idx: usize) []const u8 {
+        if (self.changed_path_bloom_bytes == 0) return &.{};
+        const width: usize = self.changed_path_bloom_bytes;
+        const start = idx * width;
+        return self.changed_path_blooms[start .. start + width];
+    }
+
     fn toLogEntries(self: *const CommitGraph, alloc: std.mem.Allocator, start_id: object_store.ObjectId, max_entries: usize) ![]LogEntry {
         const start_idx = self.lookup(start_id) orelse return error.CommitGraphMissingCommit;
         var out = std.array_list.Managed(LogEntry).init(alloc);
@@ -1151,6 +1184,17 @@ const CommitGraph = struct {
                 @as(usize, @intCast(self.parent_positions[@intCast(self.parent_offsets[idx])]));
         }
         return try out.toOwnedSlice();
+    }
+};
+
+const ReachabilityBitmap = struct {
+    refs: []RefEntry,
+    reachable_ids: []object_store.ObjectId,
+
+    fn deinit(self: *ReachabilityBitmap, alloc: std.mem.Allocator) void {
+        for (self.refs) |*entry| entry.deinit(alloc);
+        alloc.free(self.refs);
+        alloc.free(self.reachable_ids);
     }
 };
 
@@ -1531,6 +1575,18 @@ pub const CasManager = struct {
             .lost_found_objects = 0,
         };
 
+        if (loadReachabilityBitmap(self.alloc, self.store.root)) |bitmap| {
+            defer bitmap.deinit(self.alloc);
+            if (!refEntriesEql(bitmap.refs, inputs.refs)) return error.CorruptReachabilityBitmap;
+            if (bitmap.reachable_ids.len != direct_reachable.count()) return error.CorruptReachabilityBitmap;
+            for (bitmap.reachable_ids) |id| {
+                if (!direct_reachable.contains(id)) return error.CorruptReachabilityBitmap;
+            }
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+
         var it = direct_reachable.keyIterator();
         while (it.next()) |id_ptr| {
             const loaded = try self.store.get(self.alloc, id_ptr.*);
@@ -1562,6 +1618,25 @@ pub const CasManager = struct {
                 for (commit.parents, parent_start..) |parent, graph_parent_idx| {
                     const parent_pos: usize = @intCast(graph.parent_positions[graph_parent_idx]);
                     if (!graph.object_ids[parent_pos].eql(parent)) return error.CorruptCommitGraph;
+                }
+                if (graph.changed_path_bloom_bytes > 0) {
+                    const expected_bloom = try self.alloc.alloc(u8, graph.changed_path_bloom_bytes);
+                    defer self.alloc.free(expected_bloom);
+                    @memset(expected_bloom, 0);
+                    if (commit.parents.len == 0) {
+                        try collectChangedPathsForTree(self.alloc, &self.store, commit.root, "", expected_bloom);
+                    } else {
+                        const first_parent_pos: usize = @intCast(graph.parent_positions[parent_start]);
+                        try diffChangedPathsForTrees(
+                            self.alloc,
+                            &self.store,
+                            graph.roots[first_parent_pos],
+                            commit.root,
+                            "",
+                            expected_bloom,
+                        );
+                    }
+                    if (!std.mem.eql(u8, expected_bloom, graph.changedPathBloom(idx))) return error.CorruptCommitGraph;
                 }
                 report.commit_graph_entries_checked += 1;
             }
@@ -1710,6 +1785,15 @@ pub const CasManager = struct {
         var graph = try buildCommitGraph(self.alloc, &self.store, refs);
         defer graph.deinit(self.alloc);
         try writeCommitGraph(self.alloc, self.store.root, graph, self.store.fsync);
+
+        var starts = std.array_list.Managed(object_store.ObjectId).init(self.alloc);
+        defer starts.deinit();
+        for (refs) |entry| try starts.append(entry.id);
+        var reachable = try self.collectReachableFromIds(starts.items);
+        defer reachable.deinit();
+        const reachable_ids = try reachableMapToSortedIds(self.alloc, &reachable);
+        defer self.alloc.free(reachable_ids);
+        try writeReachabilityBitmap(self.alloc, self.store.root, refs, reachable_ids, self.store.fsync);
     }
 
     fn collectReachabilityInputs(self: *CasManager, include_reflogs: bool) !ReachabilityInputs {
@@ -1732,6 +1816,9 @@ pub const CasManager = struct {
     }
 
     fn collectReachableFromInputs(self: *CasManager, inputs: ReachabilityInputs) !std.AutoHashMap(object_store.ObjectId, void) {
+        if (inputs.reflog_ids.len == 0) {
+            return try self.collectReachable(inputs.refs);
+        }
         var starts = std.array_list.Managed(object_store.ObjectId).init(self.alloc);
         defer starts.deinit();
         for (inputs.refs) |entry| try starts.append(entry.id);
@@ -1740,10 +1827,28 @@ pub const CasManager = struct {
     }
 
     fn collectReachable(self: *CasManager, refs: []const RefEntry) !std.AutoHashMap(object_store.ObjectId, void) {
+        if (loadReachabilityBitmap(self.alloc, self.store.root)) |bitmap| {
+            defer bitmap.deinit(self.alloc);
+            if (refEntriesEql(bitmap.refs, refs)) {
+                var reachable = std.AutoHashMap(object_store.ObjectId, void).init(self.alloc);
+                errdefer reachable.deinit();
+                for (bitmap.reachable_ids) |id| try reachable.put(id, {});
+                return reachable;
+            }
+        } else |err| switch (err) {
+            error.FileNotFound, error.CorruptReachabilityBitmap, error.UnsupportedReachabilityBitmapVersion => {},
+            else => return err,
+        }
+
         var starts = std.array_list.Managed(object_store.ObjectId).init(self.alloc);
         defer starts.deinit();
         for (refs) |entry| try starts.append(entry.id);
-        return try self.collectReachableFromIds(starts.items);
+        var reachable = try self.collectReachableFromIds(starts.items);
+        errdefer reachable.deinit();
+        const reachable_ids = try reachableMapToSortedIds(self.alloc, &reachable);
+        defer self.alloc.free(reachable_ids);
+        try writeReachabilityBitmap(self.alloc, self.store.root, refs, reachable_ids, self.store.fsync);
+        return reachable;
     }
 
     fn collectReachableFromIds(self: *CasManager, starts: []const object_store.ObjectId) !std.AutoHashMap(object_store.ObjectId, void) {
@@ -1788,6 +1893,34 @@ pub const CasManager = struct {
         return seen;
     }
 };
+
+fn refEntriesEql(lhs: []const RefEntry, rhs: []const RefEntry) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |lhs_entry, rhs_entry| {
+        if (!std.mem.eql(u8, lhs_entry.name, rhs_entry.name)) return false;
+        if (!lhs_entry.id.eql(rhs_entry.id)) return false;
+    }
+    return true;
+}
+
+fn reachableMapToSortedIds(
+    alloc: std.mem.Allocator,
+    reachable: *const std.AutoHashMap(object_store.ObjectId, void),
+) ![]object_store.ObjectId {
+    const ids = try alloc.alloc(object_store.ObjectId, reachable.count());
+    var idx: usize = 0;
+    var it = reachable.keyIterator();
+    while (it.next()) |id_ptr| {
+        ids[idx] = id_ptr.*;
+        idx += 1;
+    }
+    std.sort.block(object_store.ObjectId, ids, {}, struct {
+        fn lessThan(_: void, lhs: object_store.ObjectId, rhs: object_store.ObjectId) bool {
+            return std.mem.lessThan(u8, lhs.hash[0..], rhs.hash[0..]);
+        }
+    }.lessThan);
+    return ids;
+}
 
 fn appendReferencedBlobObjects(
     stack: *std.array_list.Managed(object_store.ObjectId),
@@ -2663,6 +2796,9 @@ fn buildCommitGraph(
     errdefer alloc.free(parent_offsets);
     const reason_offsets = try alloc.alloc(u64, entries.items.len + 1);
     errdefer alloc.free(reason_offsets);
+    const changed_path_blooms = try alloc.alloc(u8, entries.items.len * changed_path_bloom_bytes);
+    errdefer alloc.free(changed_path_blooms);
+    @memset(changed_path_blooms, 0);
 
     var positions = std.AutoHashMap(object_store.ObjectId, usize).init(alloc);
     defer positions.deinit();
@@ -2691,6 +2827,21 @@ fn buildCommitGraph(
     var idx: usize = 0;
     while (idx < entries.items.len) : (idx += 1) {
         generations[idx] = try computeCommitGeneration(idx, parent_offsets, parent_positions.items, generations);
+        const bloom = changed_path_blooms[idx * changed_path_bloom_bytes .. (idx + 1) * changed_path_bloom_bytes];
+        if (entries.items[idx].parents.len == 0) {
+            try collectChangedPathsForTree(alloc, store, entries.items[idx].root, "", bloom);
+            continue;
+        }
+
+        const parent_idx = positions.get(entries.items[idx].parents[0]) orelse return error.CorruptCommitGraph;
+        try diffChangedPathsForTrees(
+            alloc,
+            store,
+            entries.items[parent_idx].root,
+            entries.items[idx].root,
+            "",
+            bloom,
+        );
     }
 
     return .{
@@ -2702,6 +2853,8 @@ fn buildCommitGraph(
         .parent_positions = try parent_positions.toOwnedSlice(),
         .reason_offsets = reason_offsets,
         .reasons = try reasons.toOwnedSlice(),
+        .changed_path_bloom_bytes = changed_path_bloom_bytes,
+        .changed_path_blooms = changed_path_blooms,
     };
 }
 
@@ -2729,12 +2882,155 @@ fn computeCommitGeneration(
     return generations[idx];
 }
 
+fn insertChangedPath(bloom: []u8, path: []const u8) void {
+    if (bloom.len == 0 or path.len == 0) return;
+    var seed: u64 = 0x9e3779b97f4a7c15;
+    var iter: usize = 0;
+    while (iter < 4) : (iter += 1) {
+        const hash_value = std.hash.Wyhash.hash(seed, path);
+        const bit_count = bloom.len * 8;
+        const bit_index: usize = @intCast(hash_value % bit_count);
+        bloom[bit_index / 8] |= (@as(u8, 1) << @intCast(bit_index % 8));
+        seed +%= 0x517cc1b727220a95;
+    }
+}
+
+fn shouldRecurseChangedPath(path: []const u8) bool {
+    if (path.len == 0) return true;
+    if (std.mem.eql(u8, path, "metadata")) return true;
+    if (std.mem.eql(u8, path, "metadata/segments")) return true;
+    if (std.mem.eql(u8, path, "wal")) return true;
+    if (!std.mem.startsWith(u8, path, "metadata/segments/")) return false;
+
+    var slash_count: usize = 0;
+    for (path) |ch| {
+        if (ch == '/') slash_count += 1;
+    }
+    return slash_count < 4;
+}
+
+fn joinChangedPath(alloc: std.mem.Allocator, prefix: []const u8, name: []const u8) ![]u8 {
+    if (prefix.len == 0) return try alloc.dupe(u8, name);
+    return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ prefix, name });
+}
+
+fn loadTreeObjectFromStore(alloc: std.mem.Allocator, store: *object_store.ObjectStore, tree_id: object_store.ObjectId) !Tree {
+    const loaded = try store.get(alloc, tree_id);
+    defer alloc.free(loaded.payload);
+    if (loaded.obj_type != .tree) return error.InvalidTreeObject;
+    return try decodeTree(alloc, loaded.payload);
+}
+
+fn collectChangedPathsForTree(
+    alloc: std.mem.Allocator,
+    store: *object_store.ObjectStore,
+    tree_id: object_store.ObjectId,
+    prefix: []const u8,
+    bloom: []u8,
+) !void {
+    var tree = try loadTreeObjectFromStore(alloc, store, tree_id);
+    defer tree.deinit(alloc);
+    for (tree.entries) |entry| {
+        const path = try joinChangedPath(alloc, prefix, entry.name);
+        defer alloc.free(path);
+        insertChangedPath(bloom, path);
+        if (entry.object_type == .tree and shouldRecurseChangedPath(path)) {
+            try collectChangedPathsForTree(alloc, store, entry.object_id, path, bloom);
+        }
+    }
+}
+
+fn diffChangedPathsForTrees(
+    alloc: std.mem.Allocator,
+    store: *object_store.ObjectStore,
+    lhs_tree_id: object_store.ObjectId,
+    rhs_tree_id: object_store.ObjectId,
+    prefix: []const u8,
+    bloom: []u8,
+) !void {
+    var lhs_tree = try loadTreeObjectFromStore(alloc, store, lhs_tree_id);
+    defer lhs_tree.deinit(alloc);
+    var rhs_tree = try loadTreeObjectFromStore(alloc, store, rhs_tree_id);
+    defer rhs_tree.deinit(alloc);
+
+    var lhs_idx: usize = 0;
+    var rhs_idx: usize = 0;
+    while (lhs_idx < lhs_tree.entries.len or rhs_idx < rhs_tree.entries.len) {
+        if (lhs_idx >= lhs_tree.entries.len) {
+            const rhs_entry = rhs_tree.entries[rhs_idx];
+            rhs_idx += 1;
+            const rhs_path = try joinChangedPath(alloc, prefix, rhs_entry.name);
+            defer alloc.free(rhs_path);
+            insertChangedPath(bloom, rhs_path);
+            if (rhs_entry.object_type == .tree and shouldRecurseChangedPath(rhs_path)) {
+                try collectChangedPathsForTree(alloc, store, rhs_entry.object_id, rhs_path, bloom);
+            }
+            continue;
+        }
+        if (rhs_idx >= rhs_tree.entries.len) {
+            const lhs_entry = lhs_tree.entries[lhs_idx];
+            lhs_idx += 1;
+            const lhs_path = try joinChangedPath(alloc, prefix, lhs_entry.name);
+            defer alloc.free(lhs_path);
+            insertChangedPath(bloom, lhs_path);
+            if (lhs_entry.object_type == .tree and shouldRecurseChangedPath(lhs_path)) {
+                try collectChangedPathsForTree(alloc, store, lhs_entry.object_id, lhs_path, bloom);
+            }
+            continue;
+        }
+
+        const lhs_entry = lhs_tree.entries[lhs_idx];
+        const rhs_entry = rhs_tree.entries[rhs_idx];
+        const ordering = std.mem.order(u8, lhs_entry.name, rhs_entry.name);
+        switch (ordering) {
+            .lt => {
+                lhs_idx += 1;
+                const lhs_path = try joinChangedPath(alloc, prefix, lhs_entry.name);
+                defer alloc.free(lhs_path);
+                insertChangedPath(bloom, lhs_path);
+                if (lhs_entry.object_type == .tree and shouldRecurseChangedPath(lhs_path)) {
+                    try collectChangedPathsForTree(alloc, store, lhs_entry.object_id, lhs_path, bloom);
+                }
+            },
+            .gt => {
+                rhs_idx += 1;
+                const rhs_path = try joinChangedPath(alloc, prefix, rhs_entry.name);
+                defer alloc.free(rhs_path);
+                insertChangedPath(bloom, rhs_path);
+                if (rhs_entry.object_type == .tree and shouldRecurseChangedPath(rhs_path)) {
+                    try collectChangedPathsForTree(alloc, store, rhs_entry.object_id, rhs_path, bloom);
+                }
+            },
+            .eq => {
+                lhs_idx += 1;
+                rhs_idx += 1;
+                if (lhs_entry.object_type == rhs_entry.object_type and lhs_entry.object_id.eql(rhs_entry.object_id)) {
+                    continue;
+                }
+                const path = try joinChangedPath(alloc, prefix, lhs_entry.name);
+                defer alloc.free(path);
+                insertChangedPath(bloom, path);
+                if (lhs_entry.object_type == .tree and rhs_entry.object_type == .tree and shouldRecurseChangedPath(path)) {
+                    try diffChangedPathsForTrees(alloc, store, lhs_entry.object_id, rhs_entry.object_id, path, bloom);
+                } else {
+                    if (lhs_entry.object_type == .tree and shouldRecurseChangedPath(path)) {
+                        try collectChangedPathsForTree(alloc, store, lhs_entry.object_id, path, bloom);
+                    }
+                    if (rhs_entry.object_type == .tree and shouldRecurseChangedPath(path)) {
+                        try collectChangedPathsForTree(alloc, store, rhs_entry.object_id, path, bloom);
+                    }
+                }
+            },
+        }
+    }
+}
+
 fn writeCommitGraph(alloc: std.mem.Allocator, root: std.fs.Dir, graph: CommitGraph, fsync: cfg.FsyncPolicy) !void {
     var bytes = std.array_list.Managed(u8).init(alloc);
     defer bytes.deinit();
 
     try bytes.appendSlice(commit_graph_magic[0..]);
-    try appendInt(&bytes, u16, 1);
+    try appendInt(&bytes, u16, 2);
     try appendInt(&bytes, u64, @intCast(graph.object_ids.len));
     for (graph.object_ids) |id| try bytes.appendSlice(id.hash[0..]);
     for (graph.roots) |root_id| try bytes.appendSlice(root_id.hash[0..]);
@@ -2744,6 +3040,8 @@ fn writeCommitGraph(alloc: std.mem.Allocator, root: std.fs.Dir, graph: CommitGra
     for (graph.parent_positions) |position| try appendInt(&bytes, u64, position);
     for (graph.reason_offsets) |offset| try appendInt(&bytes, u64, offset);
     try bytes.appendSlice(graph.reasons);
+    try appendInt(&bytes, u16, graph.changed_path_bloom_bytes);
+    try bytes.appendSlice(graph.changed_path_blooms);
 
     const temp_path = "objects/info/commit-graph.tmp";
     var file = try root.createFile(temp_path, .{ .truncate = true, .read = true });
@@ -2770,7 +3068,7 @@ fn loadCommitGraph(alloc: std.mem.Allocator, root: std.fs.Dir) !CommitGraph {
 
     var cursor = Cursor{ .bytes = bytes, .index = commit_graph_magic.len };
     const version = try cursor.readInt(u16);
-    if (version != 1) return error.UnsupportedCommitGraphVersion;
+    if (version != 1 and version != 2) return error.UnsupportedCommitGraphVersion;
     const commit_count = try cursor.readInt(u64);
 
     const object_ids = try alloc.alloc(object_store.ObjectId, @intCast(commit_count));
@@ -2807,6 +3105,21 @@ fn loadCommitGraph(alloc: std.mem.Allocator, root: std.fs.Dir) !CommitGraph {
     errdefer alloc.free(reasons);
     @memcpy(reasons, cursor.bytes[cursor.index .. cursor.index + reasons.len]);
     cursor.index += reasons.len;
+
+    var bloom_width: u16 = 0;
+    var changed_path_blooms: []u8 = &.{};
+    if (version >= 2) {
+        bloom_width = try cursor.readInt(u16);
+        const bloom_len = @as(usize, @intCast(commit_count)) * @as(usize, bloom_width);
+        changed_path_blooms = try alloc.alloc(u8, bloom_len);
+        errdefer alloc.free(changed_path_blooms);
+        if (cursor.index + bloom_len > cursor.bytes.len) return error.CorruptCommitGraph;
+        @memcpy(changed_path_blooms, cursor.bytes[cursor.index .. cursor.index + bloom_len]);
+        cursor.index += bloom_len;
+    } else {
+        changed_path_blooms = try alloc.alloc(u8, 0);
+        errdefer alloc.free(changed_path_blooms);
+    }
     try cursor.finish();
 
     return .{
@@ -2818,6 +3131,102 @@ fn loadCommitGraph(alloc: std.mem.Allocator, root: std.fs.Dir) !CommitGraph {
         .parent_positions = parent_positions,
         .reason_offsets = reason_offsets,
         .reasons = reasons,
+        .changed_path_bloom_bytes = bloom_width,
+        .changed_path_blooms = changed_path_blooms,
+    };
+}
+
+fn writeReachabilityBitmap(
+    alloc: std.mem.Allocator,
+    root: std.fs.Dir,
+    refs: []const RefEntry,
+    reachable_ids: []const object_store.ObjectId,
+    fsync: cfg.FsyncPolicy,
+) !void {
+    var bytes = std.array_list.Managed(u8).init(alloc);
+    defer bytes.deinit();
+
+    try bytes.appendSlice(reachability_bitmap_magic[0..]);
+    try appendInt(&bytes, u16, 1);
+    try appendInt(&bytes, u64, @intCast(refs.len));
+    try appendInt(&bytes, u64, @intCast(reachable_ids.len));
+    for (refs) |entry| {
+        try appendInt(&bytes, u16, @intCast(entry.name.len));
+        try bytes.appendSlice(entry.name);
+        try bytes.appendSlice(entry.id.hash[0..]);
+    }
+    for (reachable_ids) |id| try bytes.appendSlice(id.hash[0..]);
+
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(bytes.items);
+    var checksum: [32]u8 = undefined;
+    hasher.final(checksum[0..]);
+    try bytes.appendSlice(checksum[0..]);
+
+    const temp_path = reachability_bitmap_path ++ ".tmp";
+    var file = try root.createFile(temp_path, .{ .truncate = true, .read = true });
+    defer file.close();
+    errdefer root.deleteFile(temp_path) catch {};
+    try file.writeAll(bytes.items);
+    if (fsync != .none) {
+        try file.sync();
+    }
+    root.rename(temp_path, reachability_bitmap_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            root.deleteFile(reachability_bitmap_path) catch {};
+            try root.rename(temp_path, reachability_bitmap_path);
+        },
+        else => return err,
+    };
+    if (fsync != .none) {
+        try syncDir(&root);
+    }
+}
+
+fn loadReachabilityBitmap(alloc: std.mem.Allocator, root: std.fs.Dir) !ReachabilityBitmap {
+    const bytes = try root.readFileAlloc(alloc, reachability_bitmap_path, 256 * 1024 * 1024);
+    defer alloc.free(bytes);
+    if (bytes.len < reachability_bitmap_magic.len + @sizeOf(u16) + @sizeOf(u64) * 2 + 32) return error.CorruptReachabilityBitmap;
+    if (!std.mem.eql(u8, bytes[0..reachability_bitmap_magic.len], reachability_bitmap_magic[0..])) return error.CorruptReachabilityBitmap;
+
+    const checksum_start = bytes.len - 32;
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(bytes[0..checksum_start]);
+    var expected_checksum: [32]u8 = undefined;
+    hasher.final(expected_checksum[0..]);
+    if (!std.mem.eql(u8, expected_checksum[0..], bytes[checksum_start..])) return error.CorruptReachabilityBitmap;
+
+    var cursor = Cursor{ .bytes = bytes, .index = reachability_bitmap_magic.len };
+    const version = try cursor.readInt(u16);
+    if (version != 1) return error.UnsupportedReachabilityBitmapVersion;
+    const ref_count = try cursor.readInt(u64);
+    const object_count = try cursor.readInt(u64);
+
+    const refs = try alloc.alloc(RefEntry, @intCast(ref_count));
+    var refs_loaded: usize = 0;
+    errdefer {
+        for (refs[0..refs_loaded]) |*entry| entry.deinit(alloc);
+        alloc.free(refs);
+    }
+    for (refs) |*entry| {
+        const name_len = try cursor.readInt(u16);
+        const name = try cursor.readBytes(alloc, name_len);
+        errdefer alloc.free(name);
+        entry.* = .{
+            .name = name,
+            .id = .{ .hash = try cursor.readHash() },
+        };
+        refs_loaded += 1;
+    }
+
+    const reachable_ids = try alloc.alloc(object_store.ObjectId, @intCast(object_count));
+    errdefer alloc.free(reachable_ids);
+    for (reachable_ids) |*id| id.* = .{ .hash = try cursor.readHash() };
+    try cursor.finish();
+
+    return .{
+        .refs = refs,
+        .reachable_ids = reachable_ids,
     };
 }
 
@@ -4318,12 +4727,14 @@ test "commit graph indexes reachable commit ancestry" {
     var graph = try loadCommitGraph(talloc, cas_manager.store.root);
     defer graph.deinit(talloc);
     try std.testing.expectEqual(@as(usize, 2), graph.object_ids.len);
+    try std.testing.expectEqual(@as(u16, changed_path_bloom_bytes), graph.changed_path_bloom_bytes);
 
     const advanced_idx = graph.lookup(advanced) orelse return error.CommitGraphMissingCommit;
     const initial_idx = graph.lookup(initial) orelse return error.CommitGraphMissingCommit;
     try std.testing.expect(graph.generations[advanced_idx] > graph.generations[initial_idx]);
     try std.testing.expectEqual(@as(usize, 1), @as(usize, @intCast(graph.parent_offsets[advanced_idx + 1] - graph.parent_offsets[advanced_idx])));
     try std.testing.expect(graph.object_ids[@intCast(graph.parent_positions[@intCast(graph.parent_offsets[advanced_idx])])].eql(initial));
+    try std.testing.expect(graph.changedPathMayMatch(advanced, "metadata/segments"));
 
     const log_entries = try cas_manager.loadLog(main_ref, 8);
     defer {
@@ -4333,6 +4744,52 @@ test "commit graph indexes reachable commit ancestry" {
     try std.testing.expectEqual(@as(usize, 2), log_entries.len);
     try std.testing.expect(log_entries[0].commit_id.eql(advanced));
     try std.testing.expectEqualStrings("advance", log_entries[0].reason);
+}
+
+test "reachability bitmap falls back to graph walks when corrupt" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/reachability-bitmap", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    try std.fs.cwd().makePath(data_path);
+
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
+    defer series_catalog.deinit();
+
+    const sid = types.hash64("bitmap.series");
+    _ = try series_catalog.register("bitmap.series", "{}", sid);
+    const points = [_]types.Point{.{ .ts = 1_000, .value = 5.0 }};
+    const seg_path = try segment_mod.writeSegment(talloc, data_dir, sid, 0, points[0..]);
+    defer talloc.free(seg_path);
+    try manifest.add(data_dir, sid, 0, 1_000, 1_000, 1, seg_path);
+
+    var cas_manager = try CasManager.init(talloc, data_path, .none);
+    defer cas_manager.deinit();
+
+    _ = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    var bitmap = try loadReachabilityBitmap(talloc, cas_manager.store.root);
+    bitmap.deinit(talloc);
+
+    var file = try cas_manager.store.root.openFile(reachability_bitmap_path, .{ .mode = .read_write });
+    defer file.close();
+    try file.seekTo(0);
+    try file.writeAll("BROKEN!!");
+
+    const result = try cas_manager.pack();
+    try std.testing.expect(result.reachable_objects > 0);
+
+    bitmap = try loadReachabilityBitmap(talloc, cas_manager.store.root);
+    defer bitmap.deinit(talloc);
+    try std.testing.expect(bitmap.reachable_ids.len >= result.reachable_objects);
 }
 
 test "gc prunes unreachable commits" {

@@ -33,7 +33,8 @@ Under `data_dir`, the engine uses:
 - `objects/packs/*.idx` – fanout-based pack indexes for packed objects
 - `objects/info/store-format` – repository-wide storage format marker and feature defaults
 - `objects/info/multi-pack-index` – optional pack-set fanout index across all active packs
-- `objects/info/commit-graph` – optional commit ancestry side index written by CAS maintenance
+- `objects/info/commit-graph` – optional commit ancestry side index with generation numbers and logical changed-path Bloom filters
+- `objects/info/reachability-bitmap` – optional ref-keyed reachable-object side index for CAS maintenance fast paths
 - `objects/cruft/<timestamp>/...` – quarantined unreachable CAS content retained until the GC grace window expires
 - `refs/` – mutable plaintext refs and reflogs for the CAS head/branches/tags/checkpoints
 - `lost-found/` – optional fsck output for dangling commit/blob/tree ids
@@ -103,6 +104,7 @@ The CAS layer stores immutable objects addressed by a BLAKE3 hash of `(type, pay
 - Loose objects live under `objects/<prefix>/<hex>`.
 - Packed objects live in `objects/packs/*.pack` and are indexed by `objects/packs/*.idx`.
 - `objects/info/multi-pack-index` provides an optional cross-pack fanout table so lookups can resolve mixed pack sets without scanning every individual `.idx` file first.
+- `objects/info/reachability-bitmap` caches the exact reachable object-id set for the current sorted ref snapshot, so `cas pack`, bundle selection, and non-reflog reachability checks can fall back to a side index instead of walking the full DAG every time.
 - The current implementation stores whole objects in packs; it does not use delta compression.
 - `cas pack` writes an additional pack/index pair for the currently reachable loose object set, refreshes `objects/info/multi-pack-index`, and removes redundant loose copies for the newly packed objects without pruning older active packs.
 - `cas gc --apply` preserves unreachable content by first copying active pack files and moving loose unreachable objects into `objects/cruft/<timestamp>/`, then pruning older cruft directories after the configured grace window.
@@ -143,6 +145,7 @@ Operational notes:
 ## Integrity and cleanup
 
 - `cas fsck` is reflog-aware by default, so commits only referenced by reflogs are still considered reachable.
+- `objects/info/commit-graph` version 2 stores fixed-width Bloom filters for logical metadata paths such as `metadata/segments`, `metadata/tags`, `metadata/series_catalog`, and `wal/*`.
 - `cas fsck --connectivity-only` limits validation to refs, reflogs, reachable objects, commit-graph consistency, and dangling detection.
 - `cas fsck --lost-found` writes dangling commit/blob/tree ids into `lost-found/`.
 - `cas gc --no-reflogs` ignores reflog protection when deciding what is unreachable.
