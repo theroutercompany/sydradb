@@ -7,7 +7,7 @@ const frontend = @import("frontend.zig");
 const ManagedArrayList = std.array_list.Managed;
 
 inline fn tokenHasKeyword(token: lexer.Token, keyword: lexer.Keyword) bool {
-    return token.kind == .keyword and token.keyword != null and token.keyword.? == keyword;
+    return token.matchesKeyword(keyword);
 }
 
 inline fn tokenKeyword(token: lexer.Token) ?lexer.Keyword {
@@ -243,30 +243,16 @@ pub const Parser = struct {
             _ = try self.advance();
             return .{ .value = token.lexeme, .quoted = true, .span = token.span };
         }
-        if (token.kind == .identifier) {
+        if (token.isIdentifierLike()) {
             _ = try self.advance();
-            return .{ .value = token.lexeme, .quoted = false, .span = token.span };
-        }
-        if (token.kind == .keyword) {
-            if (token.keyword) |kw| {
-                switch (kw) {
-                    .time, .tag => {
-                        _ = try self.advance();
-                        return .{ .value = token.lexeme, .quoted = false, .span = token.span };
-                    },
-                    else => {},
-                }
-            }
+            return .{ .value = token.lexeme, .quoted = token.kind == .quoted_identifier, .span = token.span };
         }
         return ParseError.UnexpectedToken;
     }
 
     fn isAliasCandidate(self: *Parser, token: lexer.Token) bool {
         _ = self;
-        return switch (token.kind) {
-            .identifier, .quoted_identifier => true,
-            else => false,
-        };
+        return token.isIdentifierLike();
     }
 
     fn parseGroupings(self: *Parser, list: *GroupList) ParseError!void {
@@ -766,14 +752,7 @@ fn isFloatLiteral(text: []const u8) bool {
 }
 
 fn isIdentifierToken(token: lexer.Token) bool {
-    if (token.kind == .identifier or token.kind == .quoted_identifier) return true;
-    if (token.kind == .keyword and token.keyword != null) {
-        return switch (token.keyword.?) {
-            .tag, .time, .now, .previous, .linear => true,
-            else => false,
-        };
-    }
-    return false;
+    return token.isIdentifierLike();
 }
 
 fn exprStart(expr: *const ast.Expr) usize {

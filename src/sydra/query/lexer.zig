@@ -1,5 +1,6 @@
 const std = @import("std");
 const common = @import("common.zig");
+const frontend_diagnostics = @import("frontend/diagnostics.zig");
 
 /// TokenKind enumerates lexical categories. Operators and symbols remain
 /// granular so the parser can reason about precedence without string compares.
@@ -8,6 +9,9 @@ pub const TokenKind = enum {
     quoted_identifier,
     number,
     string,
+    duration,
+    timestamp,
+    parameter,
     keyword,
     comma,
     period,
@@ -73,6 +77,23 @@ pub const Keyword = enum {
     null_literal,
 };
 
+pub const ParameterKind = enum {
+    positional,
+    named,
+};
+
+pub const Parameter = struct {
+    kind: ParameterKind,
+    index: ?u32 = null,
+    name: ?[]const u8 = null,
+};
+
+pub const LiteralClass = enum {
+    plain,
+    duration,
+    timestamp,
+};
+
 /// Token captures the raw slice for a lexeme alongside its kind and span. For
 /// keywords we also surface the resolved enum via `keyword`.
 pub const Token = struct {
@@ -80,6 +101,21 @@ pub const Token = struct {
     lexeme: []const u8,
     span: common.Span,
     keyword: ?Keyword = null,
+    fallback_kind: ?TokenKind = null,
+    parameter: ?Parameter = null,
+    literal_class: LiteralClass = .plain,
+
+    pub fn canFallbackToIdentifier(self: Token) bool {
+        return self.fallback_kind == .identifier;
+    }
+
+    pub fn isIdentifierLike(self: Token) bool {
+        return self.kind == .identifier or self.kind == .quoted_identifier or self.canFallbackToIdentifier();
+    }
+
+    pub fn matchesKeyword(self: Token, keyword: Keyword) bool {
+        return self.kind == .keyword and self.keyword != null and self.keyword.? == keyword;
+    }
 };
 
 /// Lexer errors are returned for malformed literals (e.g. unterminated strings).
@@ -124,7 +160,12 @@ pub const Lexer = struct {
             ',' => return self.makeSimpleToken(TokenKind.comma, start, 1),
             '.' => return self.makeSimpleToken(TokenKind.period, start, 1),
             ';' => return self.makeSimpleToken(TokenKind.semicolon, start, 1),
-            ':' => return self.makeSimpleToken(TokenKind.colon, start, 1),
+            ':' => {
+                if (self.index + 1 < self.source.len and isIdentifierStart(self.source[self.index + 1])) {
+                    return self.scanParameter(start, .named);
+                }
+                return self.makeSimpleToken(TokenKind.colon, start, 1);
+            },
             '(' => return self.makeSimpleToken(TokenKind.l_paren, start, 1),
             ')' => return self.makeSimpleToken(TokenKind.r_paren, start, 1),
             '[' => return self.makeSimpleToken(TokenKind.l_bracket, start, 1),
@@ -141,6 +182,12 @@ pub const Lexer = struct {
             '*' => return self.makeSimpleToken(TokenKind.star, start, 1),
             '/' => return self.makeSimpleToken(TokenKind.slash, start, 1),
             '%' => return self.makeSimpleToken(TokenKind.percent, start, 1),
+            '$' => {
+                if (self.index + 1 < self.source.len and (isIdentifierStart(self.source[self.index + 1]) or isDigit(self.source[self.index + 1]))) {
+                    return self.scanParameter(start, if (isDigit(self.source[self.index + 1])) .positional else .named);
+                }
+                return self.makeSimpleToken(TokenKind.unknown, start, 1);
+            },
             '^' => return self.makeSimpleToken(TokenKind.caret, start, 1),
             '=' => {
                 if (self.matchChar('~')) {
@@ -207,6 +254,18 @@ pub const Lexer = struct {
         self.index = 0;
     }
 
+    pub fn collectAll(self: *Lexer, allocator: std.mem.Allocator) LexError![]Token {
+        var tokens = std.array_list.Managed(Token).init(allocator);
+        errdefer tokens.deinit();
+
+        while (true) {
+            const token = try self.next();
+            try tokens.append(token);
+            if (token.kind == .eof) break;
+        }
+        return try tokens.toOwnedSlice();
+    }
+
     fn skipWhitespaceAndComments(self: *Lexer) void {
         while (self.index < self.source.len) {
             const ch = self.source[self.index];
@@ -263,6 +322,7 @@ pub const Lexer = struct {
                 .lexeme = slice,
                 .span = common.Span.init(start, self.index),
                 .keyword = kw,
+                .fallback_kind = keywordFallbackKind(kw),
             };
         }
         return Token{
@@ -298,6 +358,9 @@ pub const Lexer = struct {
         while (self.index < self.source.len and isDigit(self.source[self.index])) {
             self.index += 1;
         }
+        if (looksLikeTimestamp(self.source, self.index)) {
+            return self.scanTimestamp(start);
+        }
         if (self.index < self.source.len and self.source[self.index] == '.') {
             self.index += 1;
             while (self.index < self.source.len and isDigit(self.source[self.index])) {
@@ -314,12 +377,57 @@ pub const Lexer = struct {
                 self.index = exp_start;
             }
         }
+        if (matchDurationUnit(self.source[self.index..])) |unit_len| {
+            self.index += unit_len;
+            const duration_slice = self.source[start..self.index];
+            return Token{
+                .kind = TokenKind.duration,
+                .lexeme = duration_slice,
+                .span = common.Span.init(start, self.index),
+                .literal_class = .duration,
+            };
+        }
         const slice = self.source[start..self.index];
         return Token{
             .kind = TokenKind.number,
             .lexeme = slice,
             .span = common.Span.init(start, self.index),
             .keyword = null,
+        };
+    }
+
+    fn scanTimestamp(self: *Lexer, start: usize) LexError!Token {
+        while (self.index < self.source.len and isTimestampBody(self.source[self.index])) {
+            self.index += 1;
+        }
+        return Token{
+            .kind = TokenKind.timestamp,
+            .lexeme = self.source[start..self.index],
+            .span = common.Span.init(start, self.index),
+            .literal_class = .timestamp,
+        };
+    }
+
+    fn scanParameter(self: *Lexer, start: usize, kind: ParameterKind) LexError!Token {
+        self.index += 1;
+        const payload_start = self.index;
+        while (self.index < self.source.len and isParameterBody(self.source[self.index])) {
+            self.index += 1;
+        }
+        const payload = self.source[payload_start..self.index];
+        if (payload.len == 0) return LexError.InvalidLiteral;
+
+        var parameter = Parameter{ .kind = kind };
+        switch (kind) {
+            .positional => parameter.index = std.fmt.parseUnsigned(u32, payload, 10) catch return LexError.InvalidLiteral,
+            .named => parameter.name = payload,
+        }
+
+        return Token{
+            .kind = TokenKind.parameter,
+            .lexeme = self.source[start..self.index],
+            .span = common.Span.init(start, self.index),
+            .parameter = parameter,
         };
     }
 
@@ -357,6 +465,23 @@ pub const Lexer = struct {
     }
 };
 
+pub fn diagnosticForError(err: LexError, span: ?common.Span) frontend_diagnostics.Diagnostic {
+    return switch (err) {
+        error.InvalidLiteral => .{
+            .code = .invalid_literal,
+            .message = "invalid literal",
+            .span = span,
+            .phase = .lex,
+        },
+        error.UnterminatedString => .{
+            .code = .unexpected_eof,
+            .message = "unterminated string literal",
+            .span = span,
+            .phase = .lex,
+        },
+    };
+}
+
 fn eofToken(index: usize) Token {
     return Token{
         .kind = TokenKind.eof,
@@ -376,6 +501,34 @@ fn isIdentifierBody(ch: u8) bool {
 
 fn isDigit(ch: u8) bool {
     return ch >= '0' and ch <= '9';
+}
+
+fn isParameterBody(ch: u8) bool {
+    return isIdentifierBody(ch);
+}
+
+fn isTimestampBody(ch: u8) bool {
+    return isDigit(ch) or ch == '-' or ch == ':' or ch == 'T' or ch == 't' or ch == 'Z' or ch == 'z' or ch == '.' or ch == '+';
+}
+
+fn looksLikeTimestamp(source: []const u8, index: usize) bool {
+    return index + 1 < source.len and source[index] == '-' and isDigit(source[index + 1]);
+}
+
+fn matchDurationUnit(rest: []const u8) ?usize {
+    const units = [_][]const u8{ "ns", "us", "ms", "s", "m", "h", "d", "w" };
+    for (units) |unit| {
+        if (rest.len < unit.len) continue;
+        if (std.ascii.eqlIgnoreCase(rest[0..unit.len], unit)) return unit.len;
+    }
+    return null;
+}
+
+fn keywordFallbackKind(keyword: Keyword) ?TokenKind {
+    return switch (keyword) {
+        .tag, .time, .now, .previous, .linear => .identifier,
+        else => null,
+    };
 }
 
 fn keywordFromSlice(slice: []const u8) ?Keyword {
@@ -456,6 +609,64 @@ test "numbers and strings lex" {
     tok = try lexer.next();
     try std.testing.expectEqual(TokenKind.string, tok.kind);
     try std.testing.expectEqualStrings("'value'", tok.lexeme);
+}
+
+test "lexer recognizes parameter, duration, and timestamp tokens" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(!gpa.deinit());
+    const alloc = gpa.allocator();
+
+    var lexer = Lexer.init(alloc, "$1 :name 5m 2026-03-27T10:15:00Z");
+    var tok = try lexer.next();
+    try std.testing.expectEqual(TokenKind.parameter, tok.kind);
+    try std.testing.expectEqual(@as(u32, 1), tok.parameter.?.index.?);
+
+    tok = try lexer.next();
+    try std.testing.expectEqual(TokenKind.parameter, tok.kind);
+    try std.testing.expectEqualStrings("name", tok.parameter.?.name.?);
+
+    tok = try lexer.next();
+    try std.testing.expectEqual(TokenKind.duration, tok.kind);
+    try std.testing.expectEqual(LiteralClass.duration, tok.literal_class);
+
+    tok = try lexer.next();
+    try std.testing.expectEqual(TokenKind.timestamp, tok.kind);
+    try std.testing.expectEqual(LiteralClass.timestamp, tok.literal_class);
+}
+
+test "keyword fallback preserves identifier-like tokens" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(!gpa.deinit());
+    const alloc = gpa.allocator();
+
+    var lexer = Lexer.init(alloc, "time tag previous linear");
+    var tok = try lexer.next();
+    try std.testing.expect(tok.canFallbackToIdentifier());
+    try std.testing.expect(tok.isIdentifierLike());
+
+    tok = try lexer.next();
+    try std.testing.expect(tok.canFallbackToIdentifier());
+
+    tok = try lexer.next();
+    try std.testing.expect(tok.canFallbackToIdentifier());
+
+    tok = try lexer.next();
+    try std.testing.expect(tok.canFallbackToIdentifier());
+}
+
+test "collectAll returns a full token stream" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(!gpa.deinit());
+    const alloc = gpa.allocator();
+
+    var lexer = Lexer.init(alloc, "select $1");
+    const tokens = try lexer.collectAll(alloc);
+    defer alloc.free(tokens);
+
+    try std.testing.expectEqual(@as(usize, 3), tokens.len);
+    try std.testing.expectEqual(TokenKind.keyword, tokens[0].kind);
+    try std.testing.expectEqual(TokenKind.parameter, tokens[1].kind);
+    try std.testing.expectEqual(TokenKind.eof, tokens[2].kind);
 }
 
 test "lexer skips comments" {
