@@ -32,7 +32,9 @@ Under `data_dir`, the engine uses:
 - `objects/packs/*.pack` – immutable packed object containers
 - `objects/packs/*.idx` – fanout-based pack indexes for packed objects
 - `objects/info/commit-graph` – optional commit ancestry side index written by CAS maintenance
+- `objects/cruft/<timestamp>/...` – quarantined unreachable CAS content retained until the GC grace window expires
 - `refs/` – mutable plaintext refs and reflogs for the CAS head/branches/tags/checkpoints
+- `lost-found/` – optional fsck output for dangling commit/blob/tree ids
 
 ## WAL format (v0)
 
@@ -100,6 +102,7 @@ The CAS layer stores immutable objects addressed by a BLAKE3 hash of `(type, pay
 - Packed objects live in `objects/packs/*.pack` and are indexed by `objects/packs/*.idx`.
 - The current implementation stores whole objects in packs; it does not use delta compression.
 - `cas pack` writes a new pack/index pair, prunes older pack files, and removes redundant loose copies for the packed reachable set.
+- `cas gc --apply` preserves unreachable content by first copying active pack files and moving loose unreachable objects into `objects/cruft/<timestamp>/`, then pruning older cruft directories after the configured grace window.
 
 Current typed metadata payloads include:
 
@@ -128,6 +131,13 @@ Operational notes:
 - `restore` is a thin wrapper over `cas bundle apply <src_dir>`.
 - Applying a bundle restores `objects/` and `refs/` only; it does not recreate `MANIFEST`, `tags.json`, or `series_catalog.jsonl` unless an explicit CAS export command is run afterward.
 - Incremental bundles list prerequisite commits in `bundle.manifest`; `cas bundle apply` rejects them unless the destination store already contains those prerequisite objects.
+
+## Integrity and cleanup
+
+- `cas fsck` is reflog-aware by default, so commits only referenced by reflogs are still considered reachable.
+- `cas fsck --connectivity-only` limits validation to refs, reflogs, reachable objects, commit-graph consistency, and dangling detection.
+- `cas fsck --lost-found` writes dangling commit/blob/tree ids into `lost-found/`.
+- `cas gc --no-reflogs` ignores reflog protection when deciding what is unreachable.
 
 See also:
 

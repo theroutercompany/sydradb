@@ -925,6 +925,11 @@ pub const GcResult = struct {
     reachable: usize,
     unreachable_count: usize,
     unreachable_bytes: u64,
+    reflog_protected: usize,
+    quarantined_count: usize,
+    quarantined_bytes: u64,
+    pruned_count: usize,
+    pruned_bytes: u64,
     deleted: usize,
     stale_segment_files: usize,
     stale_segment_bytes: u64,
@@ -933,9 +938,27 @@ pub const GcResult = struct {
     mirror_deleted: usize,
 };
 
+pub const FsckMode = enum {
+    connectivity_only,
+    full,
+};
+
+pub const GcOptions = struct {
+    dry_run: bool = true,
+    include_reflogs: bool = true,
+    grace_period_ms: i64 = 24 * 60 * 60 * 1000,
+};
+
+pub const FsckOptions = struct {
+    mode: FsckMode = .full,
+    include_reflogs: bool = true,
+    write_lost_found: bool = false,
+};
+
 pub const FsckReport = struct {
     refs: usize,
     reachable_objects: usize,
+    reflog_heads: usize,
     commit_objects: usize,
     tree_objects: usize,
     blob_objects: usize,
@@ -946,6 +969,8 @@ pub const FsckReport = struct {
     missing_wal_mirrors: usize,
     reflog_files_checked: usize,
     stale_reflog_files: usize,
+    dangling_objects: usize,
+    lost_found_objects: usize,
 };
 
 pub const PackResult = struct {
@@ -1027,6 +1052,17 @@ const CommitGraph = struct {
                 @as(usize, @intCast(self.parent_positions[@intCast(self.parent_offsets[idx])]));
         }
         return try out.toOwnedSlice();
+    }
+};
+
+const ReachabilityInputs = struct {
+    refs: []RefEntry,
+    reflog_ids: []object_store.ObjectId,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.refs) |*entry| entry.deinit(alloc);
+        alloc.free(self.refs);
+        alloc.free(self.reflog_ids);
     }
 };
 
@@ -1252,29 +1288,75 @@ pub const CasManager = struct {
         try writeSeriesCatalogFile(self.alloc, data_dir, snapshot.series_catalog_snapshot);
     }
 
-    pub fn gc(self: *CasManager, dry_run: bool) !GcResult {
-        const refs = try self.refs.listRefs(self.alloc);
-        defer {
-            for (refs) |*entry| entry.deinit(self.alloc);
-            self.alloc.free(refs);
-        }
+    pub fn gc(self: *CasManager, options: GcOptions) !GcResult {
+        var inputs = try self.collectReachabilityInputs(options.include_reflogs);
+        defer inputs.deinit(self.alloc);
 
-        var reachable = try self.collectReachable(refs);
+        var reachable = try self.collectReachableFromInputs(inputs);
         defer reachable.deinit();
+
+        var direct_reachable = try self.collectReachable(inputs.refs);
+        defer direct_reachable.deinit();
 
         const all = try self.store.listIds(self.alloc);
         defer self.alloc.free(all);
 
-        var unreachable_count: usize = 0;
+        var unreachable_ids = std.array_list.Managed(object_store.ObjectId).init(self.alloc);
+        defer unreachable_ids.deinit();
+
         var unreachable_bytes: u64 = 0;
-        var deleted: usize = 0;
         for (all) |id| {
             if (reachable.contains(id)) continue;
-            unreachable_count += 1;
-            unreachable_bytes += try objectSize(&self.store, id);
-            if (!dry_run) {
-                try self.store.delete(id);
-                deleted += 1;
+            try unreachable_ids.append(id);
+            unreachable_bytes += try objectSize(self.alloc, &self.store, id);
+        }
+
+        const now_ms = std.time.milliTimestamp();
+        const existing_pack_paths = try listFilesRecursive(self.alloc, self.store.root, "objects/packs");
+        defer freeOwnedStrings(self.alloc, existing_pack_paths);
+
+        var deleted: usize = 0;
+        var quarantined_count: usize = 0;
+        var quarantined_bytes: u64 = 0;
+        if (!options.dry_run and unreachable_ids.items.len > 0) {
+            const stamp_ms = now_ms;
+            if (existing_pack_paths.len > 0) {
+                try quarantinePackFiles(self.alloc, self.store.root, existing_pack_paths, stamp_ms);
+                if (reachable.count() > 0) {
+                    var reachable_ids = std.array_list.Managed(object_store.ObjectId).init(self.alloc);
+                    defer reachable_ids.deinit();
+                    var it = reachable.keyIterator();
+                    while (it.next()) |id_ptr| try reachable_ids.append(id_ptr.*);
+                    var pack_write = try self.store.writePack(self.alloc, reachable_ids.items);
+                    defer pack_write.deinit(self.alloc);
+                } else {
+                    try deleteActivePackFiles(self.store.root, existing_pack_paths);
+                }
+            }
+
+            for (unreachable_ids.items) |id| {
+                _ = try moveLooseObjectToCruft(self.alloc, self.store.root, id, stamp_ms);
+            }
+            quarantined_count = unreachable_ids.items.len;
+            quarantined_bytes = unreachable_bytes;
+            deleted = unreachable_ids.items.len;
+        }
+
+        const prunable = try scanExpiredCruft(self.alloc, self.store.root, now_ms, options.grace_period_ms);
+        defer prunable.deinit(self.alloc);
+
+        var pruned_count: usize = 0;
+        var pruned_bytes: u64 = 0;
+        if (!options.dry_run) {
+            for (prunable.entries) |entry| {
+                try self.store.root.deleteTree(entry.path);
+                pruned_count += entry.file_count;
+                pruned_bytes += entry.bytes;
+            }
+        } else {
+            for (prunable.entries) |entry| {
+                pruned_count += entry.file_count;
+                pruned_bytes += entry.bytes;
             }
         }
 
@@ -1288,7 +1370,7 @@ pub const CasManager = struct {
             var head = try self.loadHeadIndex();
             defer head.deinit();
 
-            const mirror_result = try cleanupStaleMirrors(self.alloc, self.store.root, head.snapshot, dry_run);
+            const mirror_result = try cleanupStaleMirrors(self.alloc, self.store.root, head.snapshot, options.dry_run);
             stale_segment_files = mirror_result.stale_segment_files;
             stale_segment_bytes = mirror_result.stale_segment_bytes;
             stale_wal_files = mirror_result.stale_wal_files;
@@ -1298,8 +1380,13 @@ pub const CasManager = struct {
 
         return .{
             .reachable = reachable.count(),
-            .unreachable_count = unreachable_count,
+            .unreachable_count = unreachable_ids.items.len,
             .unreachable_bytes = unreachable_bytes,
+            .reflog_protected = countProtectedObjects(&reachable, &direct_reachable),
+            .quarantined_count = quarantined_count,
+            .quarantined_bytes = quarantined_bytes,
+            .pruned_count = pruned_count,
+            .pruned_bytes = pruned_bytes,
             .deleted = deleted,
             .stale_segment_files = stale_segment_files,
             .stale_segment_bytes = stale_segment_bytes,
@@ -1309,19 +1396,17 @@ pub const CasManager = struct {
         };
     }
 
-    pub fn fsck(self: *CasManager, data_dir: std.fs.Dir) !FsckReport {
-        const refs = try self.refs.listRefs(self.alloc);
-        defer {
-            for (refs) |*entry| entry.deinit(self.alloc);
-            self.alloc.free(refs);
-        }
+    pub fn fsck(self: *CasManager, data_dir: std.fs.Dir, options: FsckOptions) !FsckReport {
+        var inputs = try self.collectReachabilityInputs(options.include_reflogs);
+        defer inputs.deinit(self.alloc);
 
-        var reachable = try self.collectReachable(refs);
+        var reachable = try self.collectReachableFromInputs(inputs);
         defer reachable.deinit();
 
         var report = FsckReport{
-            .refs = refs.len,
+            .refs = inputs.refs.len,
             .reachable_objects = reachable.count(),
+            .reflog_heads = inputs.reflog_ids.len,
             .commit_objects = 0,
             .tree_objects = 0,
             .blob_objects = 0,
@@ -1332,6 +1417,8 @@ pub const CasManager = struct {
             .missing_wal_mirrors = 0,
             .reflog_files_checked = 0,
             .stale_reflog_files = 0,
+            .dangling_objects = 0,
+            .lost_found_objects = 0,
         };
 
         var it = reachable.keyIterator();
@@ -1348,9 +1435,9 @@ pub const CasManager = struct {
 
         if (loadCommitGraph(self.alloc, self.store.root)) |graph| {
             defer graph.deinit(self.alloc);
-            if (graph.object_ids.len != report.commit_objects) return error.CorruptCommitGraph;
+            if (graph.object_ids.len < report.commit_objects) return error.CorruptCommitGraph;
             for (graph.object_ids, 0..) |commit_id, idx| {
-                if (!reachable.contains(commit_id)) return error.CorruptCommitGraph;
+                if (!reachable.contains(commit_id)) continue;
                 const loaded = try self.store.get(self.alloc, commit_id);
                 defer self.alloc.free(loaded.payload);
                 if (loaded.obj_type != .commit) return error.InvalidCommitObject;
@@ -1372,7 +1459,7 @@ pub const CasManager = struct {
             else => return err,
         }
 
-        if (try self.refs.readHead(main_ref) != null) {
+        if (options.mode == .full and try self.refs.readHead(main_ref) != null) {
             var snapshot = try self.loadHeadIndex();
             defer snapshot.deinit();
 
@@ -1422,9 +1509,21 @@ pub const CasManager = struct {
             try validateReflogFile(self.alloc, self.store.root, path);
             report.reflog_files_checked += 1;
             const ref_name = path["logs/refs/".len..];
-            if (!containsRef(refs, ref_name)) {
+            if (!containsRef(inputs.refs, ref_name)) {
                 report.stale_reflog_files += 1;
             }
+        }
+
+        const all = try self.store.listIds(self.alloc);
+        defer self.alloc.free(all);
+        var dangling = std.array_list.Managed(object_store.ObjectId).init(self.alloc);
+        defer dangling.deinit();
+        for (all) |id| {
+            if (!reachable.contains(id)) try dangling.append(id);
+        }
+        report.dangling_objects = dangling.items.len;
+        if (options.write_lost_found) {
+            report.lost_found_objects = try writeLostFoundEntries(self.alloc, self.store.root, &self.store, dangling.items);
         }
 
         return report;
@@ -1464,6 +1563,33 @@ pub const CasManager = struct {
         var graph = try buildCommitGraph(self.alloc, &self.store, refs);
         defer graph.deinit(self.alloc);
         try writeCommitGraph(self.alloc, self.store.root, graph, self.store.fsync);
+    }
+
+    fn collectReachabilityInputs(self: *CasManager, include_reflogs: bool) !ReachabilityInputs {
+        const refs = try self.refs.listRefs(self.alloc);
+        errdefer {
+            for (refs) |*entry| entry.deinit(self.alloc);
+            self.alloc.free(refs);
+        }
+
+        const reflog_ids = if (include_reflogs)
+            try collectReflogObjectIds(self.alloc, self.store.root)
+        else
+            try self.alloc.alloc(object_store.ObjectId, 0);
+        errdefer self.alloc.free(reflog_ids);
+
+        return .{
+            .refs = refs,
+            .reflog_ids = reflog_ids,
+        };
+    }
+
+    fn collectReachableFromInputs(self: *CasManager, inputs: ReachabilityInputs) !std.AutoHashMap(object_store.ObjectId, void) {
+        var starts = std.array_list.Managed(object_store.ObjectId).init(self.alloc);
+        defer starts.deinit();
+        for (inputs.refs) |entry| try starts.append(entry.id);
+        try starts.appendSlice(inputs.reflog_ids);
+        return try self.collectReachableFromIds(starts.items);
     }
 
     fn collectReachable(self: *CasManager, refs: []const RefEntry) !std.AutoHashMap(object_store.ObjectId, void) {
@@ -1857,6 +1983,25 @@ fn cleanupStaleMirrors(alloc: std.mem.Allocator, data_dir: std.fs.Dir, snapshot:
     };
 }
 
+const CruftDirInfo = struct {
+    path: []u8,
+    bytes: u64,
+    file_count: usize,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.path);
+    }
+};
+
+const CruftScan = struct {
+    entries: []CruftDirInfo,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.entries) |*entry| entry.deinit(alloc);
+        alloc.free(self.entries);
+    }
+};
+
 fn walPathReferenced(entries: []const WalChunkDescriptor, path: []const u8) bool {
     for (entries) |entry| {
         var buf: [256]u8 = undefined;
@@ -1904,17 +2049,29 @@ fn freeOwnedStrings(alloc: std.mem.Allocator, values: [][]u8) void {
     alloc.free(values);
 }
 
-fn objectSize(store: *object_store.ObjectStore, id: object_store.ObjectId) !u64 {
+fn objectSize(alloc: std.mem.Allocator, store: *object_store.ObjectStore, id: object_store.ObjectId) !u64 {
     var objects_dir = try store.root.openDir("objects", .{ .iterate = true });
     defer objects_dir.close();
 
     const bucket_name = std.fmt.bytesToHex([_]u8{id.hash[0]}, .lower);
-    var bucket_dir = try objects_dir.openDir(bucket_name[0..], .{});
+    var bucket_dir = objects_dir.openDir(bucket_name[0..], .{}) catch |err| switch (err) {
+        error.FileNotFound => return packedObjectSize(alloc, store, id),
+        else => return err,
+    };
     defer bucket_dir.close();
 
     const object_name = id.toHex();
-    const stat = try bucket_dir.statFile(object_name[0..]);
+    const stat = bucket_dir.statFile(object_name[0..]) catch |err| switch (err) {
+        error.FileNotFound => return packedObjectSize(alloc, store, id),
+        else => return err,
+    };
     return stat.size;
+}
+
+fn packedObjectSize(alloc: std.mem.Allocator, store: *object_store.ObjectStore, id: object_store.ObjectId) !u64 {
+    const loaded = try store.get(alloc, id);
+    defer alloc.free(loaded.payload);
+    return 32 + 1 + @sizeOf(u64) + @as(u64, @intCast(loaded.payload.len));
 }
 
 fn containsRef(refs: []const RefEntry, needle: []const u8) bool {
@@ -1932,13 +2089,194 @@ fn validateReflogFile(alloc: std.mem.Allocator, dir: std.fs.Dir, path: []const u
     while (line_it.next()) |line_raw| {
         const line = std.mem.trim(u8, line_raw, " \t\r\n");
         if (line.len == 0) continue;
-        var field_it = std.mem.tokenizeScalar(u8, line, ' ');
-        _ = field_it.next() orelse return error.InvalidReflog;
-        const old_hex = field_it.next() orelse return error.InvalidReflog;
-        const new_hex = field_it.next() orelse return error.InvalidReflog;
-        _ = try object_store.ObjectId.fromHex(old_hex);
-        _ = try object_store.ObjectId.fromHex(new_hex);
+        _ = try parseReflogLine(line);
     }
+}
+
+fn parseReflogLine(line: []const u8) !struct {
+    old_id: ?object_store.ObjectId,
+    new_id: object_store.ObjectId,
+} {
+    var field_it = std.mem.tokenizeScalar(u8, line, ' ');
+    _ = field_it.next() orelse return error.InvalidReflog;
+    const old_hex = field_it.next() orelse return error.InvalidReflog;
+    const new_hex = field_it.next() orelse return error.InvalidReflog;
+    const old_id = if (isZeroHex(old_hex)) null else try object_store.ObjectId.fromHex(old_hex);
+    return .{
+        .old_id = old_id,
+        .new_id = try object_store.ObjectId.fromHex(new_hex),
+    };
+}
+
+fn isZeroHex(hex: []const u8) bool {
+    if (hex.len != 64) return false;
+    for (hex) |ch| {
+        if (ch != '0') return false;
+    }
+    return true;
+}
+
+fn collectReflogObjectIds(alloc: std.mem.Allocator, root: std.fs.Dir) ![]object_store.ObjectId {
+    const reflog_files = try listFilesRecursive(alloc, root, "logs/refs");
+    defer freeOwnedStrings(alloc, reflog_files);
+
+    var ids = std.array_list.Managed(object_store.ObjectId).init(alloc);
+    defer ids.deinit();
+    var seen = std.AutoHashMap(object_store.ObjectId, void).init(alloc);
+    defer seen.deinit();
+
+    for (reflog_files) |path| {
+        const body = try root.readFileAlloc(alloc, path, 1024 * 1024);
+        defer alloc.free(body);
+        var line_it = std.mem.tokenizeScalar(u8, body, '\n');
+        while (line_it.next()) |line_raw| {
+            const line = std.mem.trim(u8, line_raw, " \t\r\n");
+            if (line.len == 0) continue;
+            const parsed = try parseReflogLine(line);
+            if (parsed.old_id) |old_id| {
+                if (!seen.contains(old_id)) {
+                    try seen.put(old_id, {});
+                    try ids.append(old_id);
+                }
+            }
+            if (!seen.contains(parsed.new_id)) {
+                try seen.put(parsed.new_id, {});
+                try ids.append(parsed.new_id);
+            }
+        }
+    }
+    return try ids.toOwnedSlice();
+}
+
+fn countProtectedObjects(reachable: *const std.AutoHashMap(object_store.ObjectId, void), direct: *const std.AutoHashMap(object_store.ObjectId, void)) usize {
+    var protected: usize = 0;
+    var it = reachable.keyIterator();
+    while (it.next()) |id_ptr| {
+        if (!direct.contains(id_ptr.*)) protected += 1;
+    }
+    return protected;
+}
+
+fn quarantinePackFiles(alloc: std.mem.Allocator, root: std.fs.Dir, pack_paths: [][]u8, stamp_ms: i64) !void {
+    const dst_dir = try std.fmt.allocPrint(alloc, "objects/cruft/{d}/packs", .{stamp_ms});
+    defer alloc.free(dst_dir);
+    try root.makePath(dst_dir);
+
+    for (pack_paths) |path| {
+        const base = std.fs.path.basename(path);
+        const dst_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dst_dir, base });
+        defer alloc.free(dst_path);
+        root.copyFile(path, root, dst_path, .{}) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+}
+
+fn deleteActivePackFiles(root: std.fs.Dir, pack_paths: [][]u8) !void {
+    for (pack_paths) |path| {
+        root.deleteFile(path) catch {};
+    }
+}
+
+fn moveLooseObjectToCruft(alloc: std.mem.Allocator, root: std.fs.Dir, id: object_store.ObjectId, stamp_ms: i64) !bool {
+    const hex = id.toHex();
+    const src_path = try std.fmt.allocPrint(alloc, "objects/{s}/{s}", .{ hex[0..2], hex[0..] });
+    defer alloc.free(src_path);
+
+    const dst_dir = try std.fmt.allocPrint(alloc, "objects/cruft/{d}/loose", .{stamp_ms});
+    defer alloc.free(dst_dir);
+    try root.makePath(dst_dir);
+
+    const dst_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dst_dir, hex[0..] });
+    defer alloc.free(dst_path);
+
+    root.rename(src_path, dst_path) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        error.PathAlreadyExists => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn scanExpiredCruft(alloc: std.mem.Allocator, root: std.fs.Dir, now_ms: i64, grace_period_ms: i64) !CruftScan {
+    var cruft_dir = root.openDir("objects/cruft", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return .{ .entries = try alloc.alloc(CruftDirInfo, 0) },
+        else => return err,
+    };
+    defer cruft_dir.close();
+
+    const cutoff = now_ms - grace_period_ms;
+    var entries = std.array_list.Managed(CruftDirInfo).init(alloc);
+    errdefer {
+        for (entries.items) |*entry| entry.deinit(alloc);
+        entries.deinit();
+    }
+
+    var it = cruft_dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .directory) continue;
+        const stamp_ms = std.fmt.parseInt(i64, entry.name, 10) catch continue;
+        if (stamp_ms >= cutoff) continue;
+
+        const rel_path = try std.fmt.allocPrint(alloc, "objects/cruft/{s}", .{entry.name});
+        errdefer alloc.free(rel_path);
+        const stats = try countFilesAndBytesRecursive(alloc, root, rel_path);
+        try entries.append(.{
+            .path = rel_path,
+            .bytes = stats.bytes,
+            .file_count = stats.file_count,
+        });
+    }
+
+    return .{ .entries = try entries.toOwnedSlice() };
+}
+
+fn countFilesAndBytesRecursive(alloc: std.mem.Allocator, dir: std.fs.Dir, root_path: []const u8) !struct {
+    file_count: usize,
+    bytes: u64,
+} {
+    const files = try listFilesRecursive(alloc, dir, root_path);
+    defer freeOwnedStrings(alloc, files);
+
+    var file_count: usize = 0;
+    var bytes: u64 = 0;
+    for (files) |path| {
+        const stat = try dir.statFile(path);
+        file_count += 1;
+        bytes += stat.size;
+    }
+    return .{ .file_count = file_count, .bytes = bytes };
+}
+
+fn writeLostFoundEntries(alloc: std.mem.Allocator, root: std.fs.Dir, store: *object_store.ObjectStore, ids: []const object_store.ObjectId) !usize {
+    try root.makePath("lost-found/commit");
+    try root.makePath("lost-found/blob");
+    try root.makePath("lost-found/tree");
+
+    var written: usize = 0;
+    for (ids) |id| {
+        const loaded = try store.get(alloc, id);
+        defer alloc.free(loaded.payload);
+        const kind = switch (loaded.obj_type) {
+            .commit => "commit",
+            .blob => "blob",
+            .tree => "tree",
+            else => continue,
+        };
+        const hex = id.toHex();
+        const path = try std.fmt.allocPrint(alloc, "lost-found/{s}/{s}", .{ kind, hex[0..] });
+        defer alloc.free(path);
+        root.writeFile(.{
+            .sub_path = path,
+            .data = hex[0..],
+        }) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+        written += 1;
+    }
+    return written;
 }
 
 const CommitGraphBuildEntry = struct {
@@ -3462,15 +3800,32 @@ test "gc prunes unreachable commits" {
     try data_dir.writeFile("segments/stale.seg", "stale-segment");
     try data_dir.writeFile("wal/stale.wal", "stale-wal");
 
-    const dry_run = try cas_manager.gc(true);
+    const dry_run = try cas_manager.gc(.{
+        .dry_run = true,
+        .include_reflogs = false,
+        .grace_period_ms = 0,
+    });
     try std.testing.expect(dry_run.unreachable_count > 0);
     try std.testing.expect(dry_run.stale_segment_files > 0);
     try std.testing.expect(dry_run.stale_wal_files > 0);
-    const applied = try cas_manager.gc(false);
+    const applied = try cas_manager.gc(.{
+        .dry_run = false,
+        .include_reflogs = false,
+        .grace_period_ms = 0,
+    });
     try std.testing.expect(applied.deleted > 0);
+    try std.testing.expect(applied.quarantined_count > 0);
     try std.testing.expect(applied.mirror_deleted > 0);
     try std.testing.expectError(error.FileNotFound, data_dir.statFile("segments/stale.seg"));
     try std.testing.expectError(error.FileNotFound, data_dir.statFile("wal/stale.wal"));
+
+    std.Thread.sleep(2 * std.time.ns_per_ms);
+    const pruned = try cas_manager.gc(.{
+        .dry_run = false,
+        .include_reflogs = false,
+        .grace_period_ms = 0,
+    });
+    try std.testing.expect(pruned.pruned_count > 0);
 }
 
 test "fsck and pack preserve the reachable CAS head" {
@@ -3507,7 +3862,7 @@ test "fsck and pack preserve the reachable CAS head" {
     try std.testing.expect(!initial.eql(orphan));
     try cas_manager.refs.updateHeadAtomic(main_ref, initial);
 
-    const fsck = try cas_manager.fsck(data_dir);
+    const fsck = try cas_manager.fsck(data_dir, .{});
     try std.testing.expect(fsck.reachable_objects > 0);
     try std.testing.expect(fsck.commit_objects > 0);
     try std.testing.expect(fsck.commit_graph_entries_checked > 0);
@@ -3520,6 +3875,60 @@ test "fsck and pack preserve the reachable CAS head" {
     try std.testing.expectEqual(fsck.reachable_objects, all_ids.len);
     try std.testing.expect(containsObjectId(all_ids, initial));
     try std.testing.expect(!containsObjectId(all_ids, orphan));
+}
+
+test "gc and fsck protect reflog-referenced commits by default" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/reflog-protect", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    try std.fs.cwd().makePath(data_path);
+
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
+    defer series_catalog.deinit();
+
+    const sid = types.hash64("reflog.series");
+    _ = try series_catalog.register("reflog.series", "{}", sid);
+    const points = [_]types.Point{.{ .ts = 1_000, .value = 9.0 }};
+    const seg_path = try segment_mod.writeSegment(talloc, data_dir, sid, 0, points[0..]);
+    defer talloc.free(seg_path);
+    try manifest.add(data_dir, sid, 0, 1_000, 1_000, 1, seg_path);
+
+    var cas_manager = try CasManager.init(talloc, data_path, .none);
+    defer cas_manager.deinit();
+    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    const orphan = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, "reflog-orphan");
+    try std.testing.expect(!initial.eql(orphan));
+    try cas_manager.refs.updateHeadAtomic(main_ref, initial);
+
+    const protected_gc = try cas_manager.gc(.{ .dry_run = true });
+    try std.testing.expectEqual(@as(usize, 0), protected_gc.unreachable_count);
+    try std.testing.expect(protected_gc.reflog_protected > 0);
+
+    const protected_fsck = try cas_manager.fsck(data_dir, .{});
+    try std.testing.expectEqual(@as(usize, 0), protected_fsck.dangling_objects);
+
+    const orphan_hex = orphan.toHex();
+    const no_reflog_fsck = try cas_manager.fsck(data_dir, .{
+        .mode = .connectivity_only,
+        .include_reflogs = false,
+        .write_lost_found = true,
+    });
+    try std.testing.expect(no_reflog_fsck.dangling_objects > 0);
+    try std.testing.expect(no_reflog_fsck.lost_found_objects > 0);
+
+    const lost_found_path = try std.fmt.allocPrint(talloc, "lost-found/commit/{s}", .{orphan_hex[0..]});
+    defer talloc.free(lost_found_path);
+    _ = try cas_manager.store.root.statFile(lost_found_path);
 }
 
 test "bundle create, verify, and apply round-trip the CAS head" {

@@ -342,15 +342,35 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         return;
     }
     if (std.mem.eql(u8, sub, "gc")) {
-        const dry_run = !(args.len >= 4 and std.mem.eql(u8, std.mem.sliceTo(args[3], 0), "--apply"));
-        const result = try cas.gc(dry_run);
+        var options = cas_mod.GcOptions{};
+        var idx: usize = 3;
+        while (idx < args.len) : (idx += 1) {
+            const arg = std.mem.sliceTo(args[idx], 0);
+            if (std.mem.eql(u8, arg, "--apply")) {
+                options.dry_run = false;
+            } else if (std.mem.eql(u8, arg, "--no-reflogs")) {
+                options.include_reflogs = false;
+            } else if (std.mem.eql(u8, arg, "--grace-ms")) {
+                idx += 1;
+                if (idx >= args.len) return error.Invalid;
+                options.grace_period_ms = try std.fmt.parseInt(i64, std.mem.sliceTo(args[idx], 0), 10);
+            } else {
+                return error.Invalid;
+            }
+        }
+        const result = try cas.gc(options);
         std.debug.print(
-            "cas gc dry_run={} reachable={d} unreachable={d} unreachable_bytes={d} deleted={d} stale_segment_files={d} stale_segment_bytes={d} stale_wal_files={d} stale_wal_bytes={d} mirror_deleted={d}\n",
+            "cas gc dry_run={} reachable={d} unreachable={d} unreachable_bytes={d} reflog_protected={d} quarantined={d} quarantined_bytes={d} pruned={d} pruned_bytes={d} deleted={d} stale_segment_files={d} stale_segment_bytes={d} stale_wal_files={d} stale_wal_bytes={d} mirror_deleted={d}\n",
             .{
-                dry_run,
+                options.dry_run,
                 result.reachable,
                 result.unreachable_count,
                 result.unreachable_bytes,
+                result.reflog_protected,
+                result.quarantined_count,
+                result.quarantined_bytes,
+                result.pruned_count,
+                result.pruned_bytes,
                 result.deleted,
                 result.stale_segment_files,
                 result.stale_segment_bytes,
@@ -362,15 +382,32 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         return;
     }
     if (std.mem.eql(u8, sub, "fsck")) {
-        const report = try cas.fsck(data_dir);
+        var options = cas_mod.FsckOptions{};
+        for (args[3..]) |raw| {
+            const arg = std.mem.sliceTo(raw, 0);
+            if (std.mem.eql(u8, arg, "--connectivity-only")) {
+                options.mode = .connectivity_only;
+            } else if (std.mem.eql(u8, arg, "--no-reflogs")) {
+                options.include_reflogs = false;
+            } else if (std.mem.eql(u8, arg, "--lost-found")) {
+                options.write_lost_found = true;
+            } else {
+                return error.Invalid;
+            }
+        }
+        const report = try cas.fsck(data_dir, options);
         std.debug.print(
-            "cas fsck refs={d} reachable={d} commits={d} trees={d} blobs={d} commit_graph_entries_checked={d} segment_contents_checked={d} wal_contents_checked={d} missing_segment_mirrors={d} missing_wal_mirrors={d} reflog_files_checked={d} stale_reflog_files={d}\n",
+            "cas fsck mode={s} refs={d} reachable={d} reflog_heads={d} commits={d} trees={d} blobs={d} dangling={d} lost_found={d} commit_graph_entries_checked={d} segment_contents_checked={d} wal_contents_checked={d} missing_segment_mirrors={d} missing_wal_mirrors={d} reflog_files_checked={d} stale_reflog_files={d}\n",
             .{
+                if (options.mode == .connectivity_only) "connectivity-only" else "full",
                 report.refs,
                 report.reachable_objects,
+                report.reflog_heads,
                 report.commit_objects,
                 report.tree_objects,
                 report.blob_objects,
+                report.dangling_objects,
+                report.lost_found_objects,
                 report.commit_graph_entries_checked,
                 report.segment_contents_checked,
                 report.wal_contents_checked,

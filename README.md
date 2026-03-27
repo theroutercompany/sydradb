@@ -108,8 +108,8 @@ Apache-2.0
 ./zig-out/bin/sydradb cas tag <name> [spec]
 ./zig-out/bin/sydradb cas diff <lhs> <rhs>
 ./zig-out/bin/sydradb cas rollback <spec>
-./zig-out/bin/sydradb cas gc [--apply]
-./zig-out/bin/sydradb cas fsck
+./zig-out/bin/sydradb cas gc [--apply] [--no-reflogs] [--grace-ms <n>]
+./zig-out/bin/sydradb cas fsck [--connectivity-only] [--no-reflogs] [--lost-found]
 ./zig-out/bin/sydradb cas pack
 ./zig-out/bin/sydradb cas checkout <spec>
 ./zig-out/bin/sydradb cas export-legacy [spec]
@@ -141,5 +141,7 @@ Config notes:
 - `metadata_read_mode = "primary"` serves metadata from CAS and can boot even if `MANIFEST`, `tags.json`, or `series_catalog.jsonl` are missing.
 - WAL recovery order is sourced from the CAS commit graph when CAS is enabled, with any uncaptured live WAL files appended as tail replay.
 - `snapshot`/`restore` now operate on CAS bundles. A restored bundle only materializes `objects/` and `refs/`; use `metadata_read_mode = "primary"` for mirrorless startup, or run `cas checkout` / `cas export-legacy` if you need compatibility files regenerated.
+- `cas gc` is reflog-aware by default. `--apply` first quarantines unreachable content under `objects/cruft/<timestamp>/` and only prunes older cruft after the configured grace window; use `--no-reflogs` when you want rollback history to stop protecting old commits.
+- `cas fsck` defaults to full content and mirror validation. `--connectivity-only` limits it to graph/reflog/reachability checks, and `--lost-found` writes dangling commit/blob/tree ids under `lost-found/`.
 - `enable_influx` and `enable_prom` remain parseable config flags, but they should be treated as placeholder or experimental toggles until real adapter surfaces land.
 - `auth_token` is the only built-in API auth mechanism today; if it is empty, `/api/*` is unauthenticated.
