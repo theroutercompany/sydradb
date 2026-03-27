@@ -108,6 +108,7 @@ pub const WalChunkDescriptor = struct {
     file_size: u64,
     file_hash: [32]u8,
     mutable: bool,
+    captured_bytes: u64 = 0,
 
     pub fn deinit(self: *WalChunkDescriptor, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
@@ -118,7 +119,8 @@ pub const WalChunkDescriptor = struct {
             optionalObjectIdEql(self.content_id, other.content_id) and
             self.file_size == other.file_size and
             std.mem.eql(u8, self.file_hash[0..], other.file_hash[0..]) and
-            self.mutable == other.mutable;
+            self.mutable == other.mutable and
+            self.captured_bytes == other.captured_bytes;
     }
 };
 
@@ -485,12 +487,16 @@ pub const RefStore = struct {
 
         const old_hex = if (old_id) |id| id.toHex() else [_]u8{'0'} ** 64;
         const new_hex = new_id.toHex();
-        try file.writer().print("{d} {s} {s} {s}\n", .{
+        var write_buf: [256]u8 = undefined;
+        var writer_state = file.writer(&write_buf);
+        const writer = &writer_state.interface;
+        try writer.print("{d} {s} {s} {s}\n", .{
             std.time.milliTimestamp(),
             old_hex,
             new_hex,
             reason,
         });
+        try writer_state.end();
         if (self.fsync != .none) {
             try file.sync();
         }
@@ -866,7 +872,7 @@ pub const CommitReader = struct {
         defer stored.deinit(self.alloc);
 
         try verifyLegacySnapshot(live, stored);
-        try verifyWalFiles(stored.wal_index, data_dir);
+        try verifyWalFiles(self.alloc, stored.wal_index, data_dir, self.store);
     }
 
     fn loadTreeObject(self: *CommitReader, id: object_store.ObjectId) !Tree {
@@ -1230,7 +1236,7 @@ pub const CasManager = struct {
                     report.segment_contents_checked += 1;
                 }
                 if (descriptor.path.len != 0) {
-                    data_dir.statFile(descriptor.path) catch |err| switch (err) {
+                    _ = data_dir.statFile(descriptor.path) catch |err| switch (err) {
                         error.FileNotFound => report.missing_segment_mirrors += 1,
                         else => return err,
                     };
@@ -1253,7 +1259,7 @@ pub const CasManager = struct {
 
                 const path = try std.fmt.allocPrint(self.alloc, "wal/{s}", .{entry.name});
                 defer self.alloc.free(path);
-                data_dir.statFile(path) catch |err| switch (err) {
+                _ = data_dir.statFile(path) catch |err| switch (err) {
                     error.FileNotFound => report.missing_wal_mirrors += 1,
                     else => return err,
                 };
@@ -1670,12 +1676,13 @@ fn buildWalIndex(alloc: std.mem.Allocator, data_dir: std.fs.Dir, store: ?*object
             .file_size = info.size,
             .file_hash = info.hash,
             .mutable = std.mem.eql(u8, info.name, "current.wal"),
+            .captured_bytes = info.size,
         });
     }
     return .{ .entries = try entries.toOwnedSlice() };
 }
 
-fn verifyWalFiles(wal_index: WalIndex, data_dir: std.fs.Dir) !void {
+fn verifyWalFiles(alloc: std.mem.Allocator, wal_index: WalIndex, data_dir: std.fs.Dir, store: *object_store.ObjectStore) !void {
     for (wal_index.entries) |entry| {
         const path = try std.fmt.allocPrint(std.heap.page_allocator, "wal/{s}", .{entry.name});
         defer std.heap.page_allocator.free(path);
@@ -1688,10 +1695,16 @@ fn verifyWalFiles(wal_index: WalIndex, data_dir: std.fs.Dir) !void {
 
         const stat = try file.stat();
         if (!entry.mutable and stat.size != entry.file_size) return error.CasVerificationFailed;
-        if (entry.mutable and stat.size < entry.file_size) return error.CasVerificationFailed;
-        if (stat.size == entry.file_size) {
+        if (entry.mutable and stat.size < entry.captured_bytes) return error.CasVerificationFailed;
+        if (!entry.mutable or stat.size == entry.captured_bytes) {
             const live_hash = try hashFile(data_dir, path);
             if (!std.mem.eql(u8, live_hash[0..], entry.file_hash[0..])) return error.CasVerificationFailed;
+        } else if (entry.content_id) |content_id| {
+            const loaded = try store.get(alloc, content_id);
+            defer alloc.free(loaded.payload);
+            if (loaded.obj_type != .blob) return error.InvalidWalChunkObject;
+            if (loaded.payload.len != entry.captured_bytes) return error.CasVerificationFailed;
+            if (!try wal_mod.filePrefixMatches(data_dir, path, loaded.payload)) return error.CasVerificationFailed;
         }
     }
 }
@@ -1752,8 +1765,10 @@ fn encodeSegmentDescriptor(alloc: std.mem.Allocator, descriptor: SegmentDescript
     var bytes = std.array_list.Managed(u8).init(alloc);
     errdefer bytes.deinit();
 
-    try bytes.append(2);
-    try appendOptionalObjectId(&bytes, descriptor.content_id);
+    const content_id = descriptor.content_id orelse return error.MissingSegmentContentId;
+
+    try bytes.append(3);
+    try bytes.appendSlice(content_id.hash[0..]);
     try appendString(&bytes, descriptor.path);
     try bytes.appendSlice(descriptor.file_hash[0..]);
     try appendInt(&bytes, u64, descriptor.file_size);
@@ -1770,9 +1785,14 @@ fn encodeSegmentDescriptor(alloc: std.mem.Allocator, descriptor: SegmentDescript
 fn decodeSegmentDescriptor(alloc: std.mem.Allocator, payload: []const u8) !SegmentDescriptor {
     var cursor = Cursor{ .bytes = payload };
     const version = try cursor.readByte();
-    if (version != 1 and version != 2) return error.UnsupportedSegmentDescriptorVersion;
+    if (version != 1 and version != 2 and version != 3) return error.UnsupportedSegmentDescriptorVersion;
 
-    const content_id = if (version >= 2) try cursor.readOptionalObjectId() else null;
+    const content_id = if (version == 1)
+        null
+    else if (version == 2)
+        try cursor.readOptionalObjectId()
+    else
+        object_store.ObjectId{ .hash = try cursor.readHash() };
     const path = try cursor.readOwnedString(alloc);
     errdefer alloc.free(path);
 
@@ -1901,14 +1921,16 @@ fn encodeWalIndex(alloc: std.mem.Allocator, wal_index: WalIndex) ![]u8 {
     var bytes = std.array_list.Managed(u8).init(alloc);
     errdefer bytes.deinit();
 
-    try bytes.append(2);
+    try bytes.append(3);
     try appendInt(&bytes, u32, @intCast(wal_index.entries.len));
     for (wal_index.entries) |entry| {
+        const content_id = entry.content_id orelse return error.MissingWalContentId;
         try appendString(&bytes, entry.name);
-        try appendOptionalObjectId(&bytes, entry.content_id);
+        try bytes.appendSlice(content_id.hash[0..]);
         try appendInt(&bytes, u64, entry.file_size);
         try bytes.appendSlice(entry.file_hash[0..]);
         try bytes.append(if (entry.mutable) 1 else 0);
+        try appendInt(&bytes, u64, entry.captured_bytes);
     }
     return try bytes.toOwnedSlice();
 }
@@ -1916,7 +1938,7 @@ fn encodeWalIndex(alloc: std.mem.Allocator, wal_index: WalIndex) ![]u8 {
 fn decodeWalIndex(alloc: std.mem.Allocator, payload: []const u8) !WalIndex {
     var cursor = Cursor{ .bytes = payload };
     const version = try cursor.readByte();
-    if (version != 1 and version != 2) return error.UnsupportedWalIndexVersion;
+    if (version != 1 and version != 2 and version != 3) return error.UnsupportedWalIndexVersion;
 
     const entry_count = try cursor.readInt(u32);
     var entries = try alloc.alloc(WalChunkDescriptor, entry_count);
@@ -1929,16 +1951,23 @@ fn decodeWalIndex(alloc: std.mem.Allocator, payload: []const u8) !WalIndex {
     while (i < entry_count) : (i += 1) {
         const name = try cursor.readOwnedString(alloc);
         errdefer alloc.free(name);
-        const content_id = if (version >= 2) try cursor.readOptionalObjectId() else null;
+        const content_id = if (version == 1)
+            null
+        else if (version == 2)
+            try cursor.readOptionalObjectId()
+        else
+            object_store.ObjectId{ .hash = try cursor.readHash() };
         const file_size = try cursor.readInt(u64);
         const file_hash = try cursor.readHash();
         const mutable = (try cursor.readByte()) != 0;
+        const captured_bytes = if (version >= 3) try cursor.readInt(u64) else file_size;
         entries[i] = .{
             .name = name,
             .content_id = content_id,
             .file_size = file_size,
             .file_hash = file_hash,
             .mutable = mutable,
+            .captured_bytes = captured_bytes,
         };
         cursor.objects_read += 1;
     }
@@ -2344,8 +2373,10 @@ fn syncDir(dir: *std.fs.Dir) !void {
 }
 
 test "cas codecs are deterministic for identical logical data" {
+    const content_id = object_store.computeId(.blob, "deterministic-segment");
     var descriptor_a = SegmentDescriptor{
         .path = try std.testing.allocator.dupe(u8, "segments/1/a.seg"),
+        .content_id = content_id,
         .file_hash = [_]u8{0xAA} ** 32,
         .file_size = 64,
         .series_id = 123,
@@ -2360,6 +2391,7 @@ test "cas codecs are deterministic for identical logical data" {
 
     var descriptor_b = SegmentDescriptor{
         .path = try std.testing.allocator.dupe(u8, "segments/1/a.seg"),
+        .content_id = content_id,
         .file_hash = [_]u8{0xAA} ** 32,
         .file_size = 64,
         .series_id = 123,
@@ -2574,6 +2606,7 @@ test "wal index captures CAS content ids for mutable current wal" {
     try std.testing.expect(std.mem.eql(u8, index.entries[0].name, "current.wal"));
     try std.testing.expect(index.entries[0].content_id != null);
     try std.testing.expect(index.entries[0].mutable);
+    try std.testing.expectEqual(index.entries[0].file_size, index.entries[0].captured_bytes);
 }
 
 test "ref store rejects torn ref contents" {

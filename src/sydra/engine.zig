@@ -839,7 +839,8 @@ pub const Engine = struct {
                 const loaded = try cas.store.get(self.alloc, content_id);
                 defer self.alloc.free(loaded.payload);
                 if (loaded.obj_type != .blob) return error.InvalidWalChunkObject;
-                try wal_mod.replayBytes(self.alloc, loaded.payload, ctx);
+                const captured_len = @min(loaded.payload.len, @as(usize, @intCast(entry.captured_bytes)));
+                try wal_mod.replayBytes(self.alloc, loaded.payload[0..captured_len], ctx);
             } else if (entry.name.len != 0) {
                 const single = [_][]const u8{entry.name};
                 try self.wal.replayFiles(self.alloc, single[0..], ctx);
@@ -849,7 +850,33 @@ pub const Engine = struct {
         const live = try wal_mod.listWalFiles(self.alloc, self.data_dir);
         defer wal_mod.freeWalFiles(self.alloc, live);
         for (live) |name| {
-            if (!std.mem.eql(u8, name, "current.wal") and containsWalName(index.snapshot.wal_index.entries, name)) continue;
+            if (findWalEntry(index.snapshot.wal_index.entries, name)) |entry| {
+                if (!entry.mutable) continue;
+
+                const path = try std.fmt.allocPrint(self.alloc, "wal/{s}", .{name});
+                defer self.alloc.free(path);
+                const stat = self.data_dir.statFile(path) catch |err| switch (err) {
+                    error.FileNotFound => continue,
+                    else => return err,
+                };
+
+                if (entry.content_id) |content_id| {
+                    const loaded = try cas.store.get(self.alloc, content_id);
+                    defer self.alloc.free(loaded.payload);
+                    if (loaded.obj_type != .blob) return error.InvalidWalChunkObject;
+
+                    if (stat.size > entry.captured_bytes and try wal_mod.filePrefixMatches(self.data_dir, path, loaded.payload)) {
+                        try self.wal.replayFileFromOffset(self.alloc, name, entry.captured_bytes, ctx);
+                        continue;
+                    }
+
+                    if (stat.size == entry.captured_bytes and try wal_mod.filePrefixMatches(self.data_dir, path, loaded.payload)) {
+                        continue;
+                    }
+                }
+            } else if (!std.mem.eql(u8, name, "current.wal") and containsWalName(index.snapshot.wal_index.entries, name)) {
+                continue;
+            }
             const single = [_][]const u8{name};
             try self.wal.replayFiles(self.alloc, single[0..], ctx);
         }
@@ -884,6 +911,13 @@ fn containsWalName(entries: []const cas_mod.WalChunkDescriptor, needle: []const 
         if (std.mem.eql(u8, entry.name, needle)) return true;
     }
     return false;
+}
+
+fn findWalEntry(entries: []const cas_mod.WalChunkDescriptor, needle: []const u8) ?cas_mod.WalChunkDescriptor {
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.name, needle)) return entry;
+    }
+    return null;
 }
 
 const CompactibleDescriptorGroup = struct {
@@ -1406,6 +1440,66 @@ test "engine replays wal on startup" {
     try std.testing.expectApproxEqAbs(@as(f64, 42.0), results.items[0].value, 1e-9);
     try std.testing.expectEqual(@as(i64, 1_050), results.items[1].ts);
     try engine.verifyCasState();
+}
+
+test "engine replays only the uncaptured current wal tail after CAS snapshot recovery" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/wal-tail-recovery", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const sid = types.hash64("wal.tail.series");
+
+    try std.fs.cwd().makePath(data_path);
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var wal = try wal_mod.WAL.open(talloc, data_dir, .none);
+    defer wal.close();
+    _ = try wal.append(sid, 1_000, 10.0);
+
+    var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
+    defer series_catalog.deinit();
+
+    var cas_manager = try cas_mod.CasManager.init(talloc, data_path, .none);
+    defer cas_manager.deinit();
+    _ = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+
+    _ = try wal.append(sid, 2_000, 20.0);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .dual_write,
+        .metadata_read_mode = .primary,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    var results = std.array_list.Managed(types.Point).init(talloc);
+    defer results.deinit();
+    try engine.queryRange(sid, 0, 10_000, &results);
+    try std.testing.expectEqual(@as(usize, 2), results.items.len);
+    try std.testing.expectEqual(@as(i64, 1_000), results.items[0].ts);
+    try std.testing.expectApproxEqAbs(@as(f64, 10.0), results.items[0].value, 1e-9);
+    try std.testing.expectEqual(@as(i64, 2_000), results.items[1].ts);
+    try std.testing.expectApproxEqAbs(@as(f64, 20.0), results.items[1].value, 1e-9);
 }
 
 test "engine metrics track ingest and flush" {

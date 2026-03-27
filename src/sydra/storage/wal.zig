@@ -102,6 +102,24 @@ pub const WAL = struct {
             try replayFile(alloc, wal_dir, name, ctx_ptr);
         }
     }
+
+    pub fn replayFileFromOffset(self: *WAL, alloc: std.mem.Allocator, file_name: []const u8, offset: u64, ctx: anytype) !void {
+        var wal_dir = self.dir.openDir("wal", .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer wal_dir.close();
+
+        var file = try wal_dir.openFile(file_name, .{});
+        defer file.close();
+        try file.seekTo(offset);
+
+        var read_buf: [4096]u8 = undefined;
+        var reader_state = file.reader(&read_buf);
+        const reader = std.Io.Reader.adaptToOldInterface(&reader_state.interface);
+        const ctx_ptr = @constCast(ctx);
+        try replayReader(alloc, reader, ctx_ptr);
+    }
 };
 
 pub const WalFileInfo = struct {
@@ -195,6 +213,25 @@ fn replayFile(alloc: std.mem.Allocator, wal_dir: std.fs.Dir, file_name: []const 
 pub fn replayBytes(alloc: std.mem.Allocator, bytes: []const u8, ctx: anytype) !void {
     var stream = std.io.fixedBufferStream(bytes);
     try replayReader(alloc, stream.reader().any(), ctx);
+}
+
+pub fn filePrefixMatches(data_dir: std.fs.Dir, path: []const u8, expected_prefix: []const u8) !bool {
+    var file = data_dir.openFile(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer file.close();
+
+    var remaining = expected_prefix;
+    var scratch: [4096]u8 = undefined;
+    while (remaining.len > 0) {
+        const chunk_len = @min(remaining.len, scratch.len);
+        const read_len = try file.readAll(scratch[0..chunk_len]);
+        if (read_len != chunk_len) return false;
+        if (!std.mem.eql(u8, scratch[0..chunk_len], remaining[0..chunk_len])) return false;
+        remaining = remaining[chunk_len..];
+    }
+    return true;
 }
 
 fn replayReader(alloc: std.mem.Allocator, reader: anytype, ctx: anytype) !void {
