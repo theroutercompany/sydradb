@@ -332,20 +332,19 @@ pub const ObjectStore = struct {
         defer pack_file.close();
         try pack_file.seekTo(location.offset);
 
-        var read_buf: [4096]u8 = undefined;
-        var reader_state = pack_file.reader(&read_buf);
-        const reader = std.Io.Reader.adaptToOldInterface(&reader_state.interface);
         var id_buf: [32]u8 = undefined;
-        try reader.readNoEof(id_buf[0..]);
+        if (try pack_file.readAll(id_buf[0..]) != id_buf.len) return error.CorruptPack;
         if (!std.mem.eql(u8, id_buf[0..], id.hash[0..])) return error.CorruptPack;
 
-        const obj_type = std.meta.intToEnum(ObjectType, try reader.readByte()) catch return error.UnknownObjectType;
+        var type_buf: [1]u8 = undefined;
+        if (try pack_file.readAll(type_buf[0..]) != type_buf.len) return error.CorruptPack;
+        const obj_type = std.meta.intToEnum(ObjectType, type_buf[0]) catch return error.UnknownObjectType;
         var len_buf: [8]u8 = undefined;
-        try reader.readNoEof(len_buf[0..]);
+        if (try pack_file.readAll(len_buf[0..]) != len_buf.len) return error.CorruptPack;
         const payload_len = std.mem.readInt(u64, &len_buf, .little);
         const payload = try allocator.alloc(u8, @intCast(payload_len));
         errdefer allocator.free(payload);
-        const bytes_read = try reader.readAll(payload);
+        const bytes_read = try pack_file.readAll(payload);
         if (bytes_read != payload.len) return error.CorruptPack;
         if (!computeId(obj_type, payload).eql(id)) return error.ObjectHashMismatch;
         return .{
@@ -609,7 +608,7 @@ fn packPathForIndex(alloc: std.mem.Allocator, idx_path: []const u8) ![]u8 {
 
 fn appendInt(bytes: *std.array_list.Managed(u8), comptime T: type, value: T) !void {
     var raw: [@sizeOf(T)]u8 = undefined;
-    std.mem.writeInt(T, raw[0..], value, .little);
+    std.mem.writeInt(T, &raw, value, .little);
     try bytes.appendSlice(raw[0..]);
 }
 

@@ -363,13 +363,17 @@ pub const Engine = struct {
         };
         const data_dir = try std.fs.cwd().openDir(config.data_dir, .{ .iterate = true });
         var cas_manager: ?cas_mod.CasManager = null;
-        errdefer if (cas_manager) |*cas| cas.deinit();
+        var cas_manager_transferred = false;
+        errdefer if (!cas_manager_transferred) {
+            if (cas_manager) |*cas| cas.deinit();
+        };
         if (config.cas_mode == .dual_write) {
             cas_manager = try cas_mod.CasManager.init(alloc, config.data_dir, config.fsync);
         }
         var wal = try wal_mod.WAL.open(alloc, data_dir, config.fsync);
         var metadata = try MetadataState.load(alloc, data_dir, config, &wal, if (cas_manager) |*cas| cas else null);
-        errdefer metadata.deinit();
+        var metadata_transferred = false;
+        errdefer if (!metadata_transferred) metadata.deinit();
 
         var engine = try alloc.create(Engine);
         errdefer alloc.destroy(engine);
@@ -385,6 +389,8 @@ pub const Engine = struct {
             .queue = undefined,
             .cas = cas_manager,
         };
+        metadata_transferred = true;
+        cas_manager_transferred = true;
         errdefer {
             engine.mem.deinit();
             engine.metadata.deinit();
@@ -952,8 +958,13 @@ fn compactCasBackedSegments(engine: *Engine) !bool {
     const store = &(engine.cas orelse return false).store;
     var changed_any = false;
 
-    while (try findNextCompactibleDescriptorGroup(engine.alloc, snapshot_index.snapshot.segment_descriptors)) |group| {
-        defer engine.alloc.free(group.indices);
+    const groups = try collectCompactibleDescriptorGroups(engine.alloc, snapshot_index.snapshot.segment_descriptors);
+    defer {
+        for (groups) |group| engine.alloc.free(group.indices);
+        engine.alloc.free(groups);
+    }
+
+    for (groups) |group| {
         try compactDescriptorGroup(engine, store, snapshot_index.snapshot.segment_descriptors, group);
         changed_any = true;
     }
@@ -964,11 +975,23 @@ fn compactCasBackedSegments(engine: *Engine) !bool {
     return changed_any;
 }
 
-fn findNextCompactibleDescriptorGroup(
+fn collectCompactibleDescriptorGroups(
     alloc: std.mem.Allocator,
     descriptors: []const cas_mod.SegmentDescriptor,
-) !?CompactibleDescriptorGroup {
-    for (descriptors, 0..) |descriptor, idx| {
+) ![]CompactibleDescriptorGroup {
+    var groups = std.array_list.Managed(CompactibleDescriptorGroup).init(alloc);
+    errdefer {
+        for (groups.items) |group| alloc.free(group.indices);
+        groups.deinit();
+    }
+
+    descriptor_loop: for (descriptors, 0..) |descriptor, idx| {
+        for (descriptors[0..idx]) |prior| {
+            if (prior.series_id == descriptor.series_id and prior.hour_bucket == descriptor.hour_bucket) {
+                continue :descriptor_loop;
+            }
+        }
+
         var indices = std.array_list.Managed(usize).init(alloc);
         errdefer indices.deinit();
         try indices.append(idx);
@@ -982,15 +1005,16 @@ fn findNextCompactibleDescriptorGroup(
         }
 
         if (indices.items.len > 1) {
-            return .{
+            try groups.append(.{
                 .series_id = descriptor.series_id,
                 .hour_bucket = descriptor.hour_bucket,
                 .indices = try indices.toOwnedSlice(),
-            };
+            });
+            continue;
         }
         indices.deinit();
     }
-    return null;
+    return try groups.toOwnedSlice();
 }
 
 fn compactDescriptorGroup(
@@ -1061,7 +1085,6 @@ fn compactDescriptorGroup(
     }
 
     if (matched_descriptor_count != group.indices.len) {
-        rebuilt.deinit(engine.alloc);
         return error.CasCompactionManifestMismatch;
     }
 
@@ -1353,8 +1376,15 @@ const waitError = error{Timeout};
 fn waitForFlush(engine: *Engine, expected_entries: usize, timeout_ms: u64) waitError!void {
     const deadline: i64 = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
     while (std.time.milliTimestamp() < deadline) {
-        if (engine.metadata.manifest.entries.items.len >= expected_entries and engine.mem.bytes.load(.monotonic) == 0)
+        if (engine.metadata.manifest.entries.items.len >= expected_entries and engine.mem.bytes.load(.monotonic) == 0 and engine.queue.len() == 0) {
+            if (engine.cas != null) {
+                engine.verifyCasState() catch {
+                    sleepMs(10);
+                    continue;
+                };
+            }
             return;
+        }
         sleepMs(10);
     }
     return waitError.Timeout;

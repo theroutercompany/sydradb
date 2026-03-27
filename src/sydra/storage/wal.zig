@@ -338,6 +338,7 @@ test "wal replays series registrations before point records" {
     _ = try wal.append(77, 1_000, 3.5);
 
     var ctx = struct {
+        alloc: std.mem.Allocator,
         registered: bool = false,
         seen_series_id: ?u64 = null,
         seen_series: ?[]const u8 = null,
@@ -347,8 +348,10 @@ test "wal replays series registrations before point records" {
         pub fn onSeriesRegistration(self: *@This(), series_id: u64, series: []const u8, canonical_tags: []const u8) !void {
             self.registered = true;
             self.seen_series_id = series_id;
-            self.seen_series = series;
-            self.seen_tags = canonical_tags;
+            if (self.seen_series) |existing| self.alloc.free(existing);
+            if (self.seen_tags) |existing| self.alloc.free(existing);
+            self.seen_series = try self.alloc.dupe(u8, series);
+            self.seen_tags = try self.alloc.dupe(u8, canonical_tags);
         }
 
         pub fn onRecord(self: *@This(), series_id: u64, ts: i64, value: f64) !void {
@@ -358,7 +361,11 @@ test "wal replays series registrations before point records" {
             try std.testing.expectApproxEqAbs(@as(f64, 3.5), value, 1e-9);
             self.point_count += 1;
         }
-    }{};
+    }{ .alloc = alloc };
+    defer {
+        if (ctx.seen_series) |series| alloc.free(series);
+        if (ctx.seen_tags) |tags| alloc.free(tags);
+    }
 
     try wal.replay(alloc, &ctx);
 

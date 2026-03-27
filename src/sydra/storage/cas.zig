@@ -335,7 +335,9 @@ pub const RefStore = struct {
         try cwd.makePath(path);
         const root = try cwd.openDir(path, .{ .iterate = true });
         try root.makePath("refs");
+        try root.makePath("refs/heads");
         try root.makePath("logs/refs");
+        try root.makePath("logs/refs/heads");
         try root.makePath("refs/txn");
         return .{ .alloc = alloc, .root = root, .fsync = fsync };
     }
@@ -590,11 +592,25 @@ pub const CommitWriter = struct {
             for (wal_entries.items) |*entry| entry.deinit(self.alloc);
             wal_entries.deinit();
         }
+        var wal_chunk_ids = std.AutoHashMap(object_store.ObjectId, void).init(self.alloc);
+        defer wal_chunk_ids.deinit();
         try wal_entries.append(.{
             .name = try self.alloc.dupe(u8, "index"),
             .object_type = .blob,
             .object_id = wal_blob_id,
         });
+        for (snapshot.wal_index.entries) |entry| {
+            const content_id = entry.content_id orelse continue;
+            const gop = try wal_chunk_ids.getOrPut(content_id);
+            if (gop.found_existing) continue;
+
+            const chunk_hex = content_id.toHex();
+            try wal_entries.append(.{
+                .name = try std.fmt.allocPrint(self.alloc, "chunk-{s}", .{chunk_hex[0..]}),
+                .object_type = .blob,
+                .object_id = content_id,
+            });
+        }
         const wal_tree_id = try self.putTree(wal_entries.items);
 
         var root_entries = std.array_list.Managed(TreeEntry).init(self.alloc);
@@ -959,6 +975,7 @@ pub const FsckReport = struct {
     refs: usize,
     reachable_objects: usize,
     reflog_heads: usize,
+    reflog_protected_objects: usize,
     commit_objects: usize,
     tree_objects: usize,
     blob_objects: usize,
@@ -1403,11 +1420,14 @@ pub const CasManager = struct {
 
         var reachable = try self.collectReachableFromInputs(inputs);
         defer reachable.deinit();
+        var direct_reachable = try self.collectReachable(inputs.refs);
+        defer direct_reachable.deinit();
 
         var report = FsckReport{
             .refs = inputs.refs.len,
-            .reachable_objects = reachable.count(),
+            .reachable_objects = direct_reachable.count(),
             .reflog_heads = inputs.reflog_ids.len,
+            .reflog_protected_objects = countProtectedObjects(&reachable, &direct_reachable),
             .commit_objects = 0,
             .tree_objects = 0,
             .blob_objects = 0,
@@ -1422,7 +1442,7 @@ pub const CasManager = struct {
             .lost_found_objects = 0,
         };
 
-        var it = reachable.keyIterator();
+        var it = direct_reachable.keyIterator();
         while (it.next()) |id_ptr| {
             const loaded = try self.store.get(self.alloc, id_ptr.*);
             defer self.alloc.free(loaded.payload);
@@ -1541,18 +1561,38 @@ pub const CasManager = struct {
         var reachable = try self.collectReachable(refs);
         defer reachable.deinit();
 
+        const all_ids = try self.store.listIds(self.alloc);
+        defer self.alloc.free(all_ids);
+
         var ids = std.array_list.Managed(object_store.ObjectId).init(self.alloc);
         defer ids.deinit();
         var it = reachable.keyIterator();
         while (it.next()) |id_ptr| {
             try ids.append(id_ptr.*);
         }
-        var pack_write = try self.store.writePack(self.alloc, ids.items);
-        defer pack_write.deinit(self.alloc);
+
+        var rewritten_objects: usize = 0;
+        if (ids.items.len > 0) {
+            var pack_write = try self.store.writePack(self.alloc, ids.items);
+            defer pack_write.deinit(self.alloc);
+            rewritten_objects = pack_write.object_count;
+        } else {
+            const existing_pack_paths = try listFilesRecursive(self.alloc, self.store.root, "objects/packs");
+            defer freeOwnedStrings(self.alloc, existing_pack_paths);
+            try deleteActivePackFiles(self.store.root, existing_pack_paths);
+        }
+
+        for (all_ids) |id| {
+            if (reachable.contains(id)) continue;
+            self.store.delete(id) catch |err| switch (err) {
+                error.FileNotFound, error.ObjectStoredInPack => {},
+                else => return err,
+            };
+        }
 
         return .{
             .reachable_objects = reachable.count(),
-            .rewritten_objects = pack_write.object_count,
+            .rewritten_objects = rewritten_objects,
         };
     }
 
@@ -1635,7 +1675,7 @@ pub const CasManager = struct {
                         try stack.append(entry.object_id);
                     }
                 },
-                .blob => {},
+                .blob => try appendReferencedBlobObjects(&stack, loaded.payload),
                 else => return error.UnsupportedCasObjectType,
             }
         }
@@ -1643,6 +1683,136 @@ pub const CasManager = struct {
         return seen;
     }
 };
+
+fn appendReferencedBlobObjects(
+    stack: *std.array_list.Managed(object_store.ObjectId),
+    payload: []const u8,
+) !void {
+    if (appendSegmentDescriptorBlob(stack, payload) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => false,
+    }) return;
+    _ = appendWalIndexBlob(stack, payload) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => false,
+    };
+}
+
+fn appendSegmentDescriptorBlob(
+    stack: *std.array_list.Managed(object_store.ObjectId),
+    payload: []const u8,
+) !bool {
+    const original_len = stack.items.len;
+    errdefer stack.items.len = original_len;
+
+    if (payload.len == 0) return false;
+
+    var idx: usize = 0;
+    const version = payload[idx];
+    idx += 1;
+    if (version != 1 and version != 2 and version != 3) return false;
+
+    var content_id: ?object_store.ObjectId = null;
+    switch (version) {
+        1 => {},
+        2 => {
+            if (idx >= payload.len) return false;
+            const flag = payload[idx];
+            idx += 1;
+            switch (flag) {
+                0 => {},
+                1 => content_id = .{ .hash = try readHashAt(payload, &idx) },
+                else => return false,
+            }
+        },
+        3 => {
+            content_id = .{ .hash = try readHashAt(payload, &idx) };
+        },
+        else => unreachable,
+    }
+
+    _ = try readStringAt(payload, &idx);
+    idx += 32; // file hash
+    _ = try readIntAt(payload, &idx, u64); // file_size
+    _ = try readIntAt(payload, &idx, u64); // series_id
+    _ = try readIntAt(payload, &idx, i64); // hour_bucket
+    _ = try readIntAt(payload, &idx, i64); // start_ts
+    _ = try readIntAt(payload, &idx, i64); // end_ts
+    _ = try readIntAt(payload, &idx, u32); // count
+    if (idx + 2 != payload.len) return false;
+
+    if (content_id) |id| try stack.append(id);
+    return true;
+}
+
+fn appendWalIndexBlob(
+    stack: *std.array_list.Managed(object_store.ObjectId),
+    payload: []const u8,
+) !bool {
+    const original_len = stack.items.len;
+    errdefer stack.items.len = original_len;
+
+    if (payload.len == 0) return false;
+
+    var idx: usize = 0;
+    const version = payload[idx];
+    idx += 1;
+    if (version != 1 and version != 2 and version != 3) return false;
+
+    const entry_count = try readIntAt(payload, &idx, u32);
+    var entry_idx: u32 = 0;
+    while (entry_idx < entry_count) : (entry_idx += 1) {
+        _ = try readStringAt(payload, &idx);
+
+        switch (version) {
+            1 => {},
+            2 => {
+                if (idx >= payload.len) return false;
+                const flag = payload[idx];
+                idx += 1;
+                switch (flag) {
+                    0 => {},
+                    1 => try stack.append(.{ .hash = try readHashAt(payload, &idx) }),
+                    else => return false,
+                }
+            },
+            3 => try stack.append(.{ .hash = try readHashAt(payload, &idx) }),
+            else => unreachable,
+        }
+
+        _ = try readIntAt(payload, &idx, u64); // file_size
+        idx += 32; // file_hash
+        if (idx >= payload.len) return false;
+        idx += 1; // mutable
+        if (version >= 3) _ = try readIntAt(payload, &idx, u64); // captured_bytes
+    }
+
+    return idx == payload.len;
+}
+
+fn readIntAt(payload: []const u8, idx: *usize, comptime T: type) !T {
+    const size = @sizeOf(T);
+    if (idx.* + size > payload.len) return error.TruncatedObject;
+    const value = std.mem.readInt(T, @as(*const [size]u8, @ptrCast(payload[idx.* .. idx.* + size].ptr)), .little);
+    idx.* += size;
+    return value;
+}
+
+fn readHashAt(payload: []const u8, idx: *usize) ![32]u8 {
+    if (idx.* + 32 > payload.len) return error.TruncatedObject;
+    var out: [32]u8 = undefined;
+    @memcpy(out[0..], payload[idx.* .. idx.* + 32]);
+    idx.* += 32;
+    return out;
+}
+
+fn readStringAt(payload: []const u8, idx: *usize) ![]const u8 {
+    const len = try readIntAt(payload, idx, u32);
+    if (idx.* + len > payload.len) return error.TruncatedObject;
+    const start = idx.*;
+    idx.* += len;
+    return payload[start..idx.*];
+}
 
 const BundleRef = struct {
     name: []u8,
@@ -1897,7 +2067,8 @@ pub fn applyBundle(alloc: std.mem.Allocator, bundle_path: []const u8, dst_path: 
     defer dest.deinit();
 
     for (manifest.prerequisites) |prereq| {
-        _ = dest.store.get(alloc, prereq) catch return error.BundlePrerequisiteMissing;
+        const loaded = dest.store.get(alloc, prereq) catch return error.BundlePrerequisiteMissing;
+        alloc.free(loaded.payload);
     }
 
     const ids = try bundle_store.listIds(alloc);
@@ -3918,6 +4089,7 @@ test "gc and fsck protect reflog-referenced commits by default" {
 
     const protected_fsck = try cas_manager.fsck(data_dir, .{});
     try std.testing.expectEqual(@as(usize, 0), protected_fsck.dangling_objects);
+    try std.testing.expect(protected_fsck.reflog_protected_objects > 0);
 
     const orphan_hex = orphan.toHex();
     const no_reflog_fsck = try cas_manager.fsck(data_dir, .{

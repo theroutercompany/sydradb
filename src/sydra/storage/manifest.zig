@@ -38,11 +38,11 @@ pub const Manifest = struct {
             var parsed = try std.json.parseFromSlice(std.json.Value, alloc, s, .{});
             defer parsed.deinit();
             const obj = parsed.value.object;
-            const sid = obj.get("series_id").?.integer;
-            const hour = obj.get("hour_bucket").?.integer;
-            const start_ts = obj.get("start_ts").?.integer;
-            const end_ts = obj.get("end_ts").?.integer;
-            const count = obj.get("count").?.integer;
+            const sid = try jsonSeriesId(obj.get("series_id") orelse return error.InvalidCharacter);
+            const hour = try jsonI64(obj.get("hour_bucket") orelse return error.InvalidCharacter);
+            const start_ts = try jsonI64(obj.get("start_ts") orelse return error.InvalidCharacter);
+            const end_ts = try jsonI64(obj.get("end_ts") orelse return error.InvalidCharacter);
+            const count = try jsonU32(obj.get("count") orelse return error.InvalidCharacter);
             const path = obj.get("path").?.string;
             try mf.entries.append(alloc, .{
                 .series_id = @intCast(sid),
@@ -147,5 +147,29 @@ fn anyWriter(writer: *std.Io.Writer) std.Io.AnyWriter {
                 return w.write(bytes);
             }
         }.call,
+    };
+}
+
+fn jsonI64(value: std.json.Value) !i64 {
+    return switch (value) {
+        .integer => |integer| integer,
+        .number_string => |digits| try std.fmt.parseInt(i64, digits, 10),
+        else => error.InvalidCharacter,
+    };
+}
+
+fn jsonU32(value: std.json.Value) !u32 {
+    return switch (value) {
+        .integer => |integer| @intCast(integer),
+        .number_string => |digits| try std.fmt.parseInt(u32, digits, 10),
+        else => error.InvalidCharacter,
+    };
+}
+
+fn jsonSeriesId(value: std.json.Value) !types.SeriesId {
+    return switch (value) {
+        .integer => |integer| @intCast(integer),
+        .number_string => |digits| try std.fmt.parseInt(types.SeriesId, digits, 10),
+        else => error.InvalidCharacter,
     };
 }

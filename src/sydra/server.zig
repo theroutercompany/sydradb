@@ -397,12 +397,13 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         }
         const report = try cas.fsck(data_dir, options);
         std.debug.print(
-            "cas fsck mode={s} refs={d} reachable={d} reflog_heads={d} commits={d} trees={d} blobs={d} dangling={d} lost_found={d} commit_graph_entries_checked={d} segment_contents_checked={d} wal_contents_checked={d} missing_segment_mirrors={d} missing_wal_mirrors={d} reflog_files_checked={d} stale_reflog_files={d}\n",
+            "cas fsck mode={s} refs={d} reachable={d} reflog_heads={d} reflog_protected={d} commits={d} trees={d} blobs={d} dangling={d} lost_found={d} commit_graph_entries_checked={d} segment_contents_checked={d} wal_contents_checked={d} missing_segment_mirrors={d} missing_wal_mirrors={d} reflog_files_checked={d} stale_reflog_files={d}\n",
             .{
                 if (options.mode == .connectivity_only) "connectivity-only" else "full",
                 report.refs,
                 report.reachable_objects,
                 report.reflog_heads,
+                report.reflog_protected_objects,
                 report.commit_objects,
                 report.tree_objects,
                 report.blob_objects,

@@ -22,7 +22,11 @@ pub const TagIndex = struct {
             const key = entry.key_ptr.*;
             if (entry.value_ptr.* != .array) continue;
             var arr = std.ArrayListUnmanaged(types.SeriesId){};
-            for (entry.value_ptr.array.items) |v| if (v == .integer) try arr.append(alloc, @intCast(v.integer));
+            for (entry.value_ptr.array.items) |v| {
+                if (jsonSeriesId(v)) |series_id| {
+                    try arr.append(alloc, series_id);
+                } else |_| {}
+            }
             const owned_key = try alloc.dupe(u8, key);
             errdefer alloc.free(owned_key);
             try idx.map.put(owned_key, arr);
@@ -93,5 +97,13 @@ fn anyWriter(writer: *std.Io.Writer) std.Io.AnyWriter {
                 return w.write(bytes);
             }
         }.call,
+    };
+}
+
+fn jsonSeriesId(value: std.json.Value) !types.SeriesId {
+    return switch (value) {
+        .integer => |integer| @intCast(integer),
+        .number_string => |digits| try std.fmt.parseInt(types.SeriesId, digits, 10),
+        else => error.InvalidCharacter,
     };
 }
