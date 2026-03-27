@@ -3,7 +3,7 @@ const std = @import("std");
 const ast = @import("../ast.zig");
 const errors = @import("errors.zig");
 const ir = @import("ir.zig");
-const optimizer = @import("../optimizer.zig");
+const passes = @import("passes.zig");
 const physical = @import("../physical.zig");
 const plan = @import("../plan.zig");
 
@@ -11,58 +11,162 @@ pub fn lowerTypedQuery(
     allocator: std.mem.Allocator,
     typed_query: *const ir.TypedQuery,
 ) errors.CompileError!ir.BackendLoweringResult {
-    var bound_statement = typed_query.statement;
-
-    if (typed_query.statement.* == .select and typed_query.bound_selector != null) {
-        const original_select = typed_query.select;
-        const selector_ptr = try allocator.create(ast.Selector);
-        selector_ptr.* = .{
-            .series = .{ .by_id = .{
-                .value = typed_query.bound_selector.?.series_id,
-                .span = typed_query.bound_selector.?.span,
-            } },
-            .tag_filter = null,
-            .span = original_select.selector.?.span,
-        };
-
-        const select_ptr = try allocator.create(ast.Select);
-        select_ptr.* = .{
-            .projections = original_select.projections,
-            .selector = selector_ptr.*,
-            .predicate = original_select.predicate,
-            .groupings = original_select.groupings,
-            .fill = original_select.fill,
-            .ordering = original_select.ordering,
-            .limit = original_select.limit,
-            .span = original_select.span,
-        };
-
-        const statement_ptr = try allocator.create(ast.Statement);
-        statement_ptr.* = .{ .select = select_ptr };
-        bound_statement = statement_ptr;
-    }
-
-    const logical_start = std.time.microTimestamp();
-    var builder = plan.Builder.init(allocator);
-    const logical_plan = try builder.build(bound_statement);
-    const logical_end = std.time.microTimestamp();
-
-    const optimize_start = std.time.microTimestamp();
-    const optimized_plan = try optimizer.optimize(allocator, logical_plan);
-    const optimize_end = std.time.microTimestamp();
-
     const physical_start = std.time.microTimestamp();
-    const physical_plan = try physical.build(allocator, optimized_plan);
+    const physical_plan = try buildPhysicalPlan(allocator, typed_query);
     const physical_end = std.time.microTimestamp();
 
     return .{
-        .logical_plan = logical_plan,
-        .optimized_plan = optimized_plan,
         .physical_plan = physical_plan,
-        .logical_us = durationMicros(logical_end - logical_start),
-        .optimize_us = durationMicros(optimize_end - optimize_start),
         .physical_us = durationMicros(physical_end - physical_start),
     };
+}
+
+fn buildPhysicalPlan(
+    allocator: std.mem.Allocator,
+    typed_query: *const ir.TypedQuery,
+) errors.CompileError!physical.PhysicalPlan {
+    var current = try buildInputNode(allocator, typed_query);
+    const final_columns = try buildProjectionColumns(allocator, typed_query.projections);
+    const time_bounds = lowerTimeBounds(typed_query.time_range);
+
+    if (typed_query.predicate) |predicate| {
+        current = try makeNode(allocator, .{
+            .filter = .{
+                .predicate = predicate.expr,
+                .output = physical.nodeOutput(current),
+                .child = current,
+                .conjunction_count = countConjunctions(predicate.expr),
+                .time_bounds = time_bounds,
+            },
+        });
+    }
+
+    if (typed_query.is_aggregate_query) {
+        current = try makeNode(allocator, .{
+            .aggregate = .{
+                .groupings = typed_query.select.groupings,
+                .rollup_hint = detectRollupHint(typed_query),
+                .output = final_columns,
+                .child = current,
+                .requires_hash = typed_query.groupings.len != 0,
+                .has_fill_clause = false,
+            },
+        });
+    } else {
+        current = try makeNode(allocator, .{
+            .project = .{
+                .columns = final_columns,
+                .child = current,
+                .reuse_child_schema = false,
+            },
+        });
+    }
+
+    if (typed_query.ordering.len != 0) {
+        current = try makeNode(allocator, .{
+            .sort = .{
+                .ordering = typed_query.select.ordering,
+                .child = current,
+                .is_stable = true,
+                .output = physical.nodeOutput(current),
+            },
+        });
+    }
+
+    if (typed_query.select.limit) |limit_clause| {
+        current = try makeNode(allocator, .{
+            .limit = .{
+                .limit = limit_clause,
+                .child = current,
+                .offset = limit_clause.offset orelse 0,
+                .output = physical.nodeOutput(current),
+            },
+        });
+    }
+
+    return .{ .root = current };
+}
+
+fn buildInputNode(
+    allocator: std.mem.Allocator,
+    typed_query: *const ir.TypedQuery,
+) errors.CompileError!*physical.Node {
+    if (typed_query.select.selector == null) {
+        return makeNode(allocator, .{
+            .one_row = .{
+                .output = &.{},
+            },
+        });
+    }
+
+    const bound_selector = typed_query.bound_selector orelse return error.SeriesNotFound;
+    const scan_columns = try passes.pruneScanColumns(allocator, typed_query);
+    return makeNode(allocator, .{
+        .scan = .{
+            .selector = .{ .bound = .{
+                .source = switch (bound_selector.source) {
+                    .by_id => .by_id,
+                    .unique_name => .unique_name,
+                    .exact_match => .exact_match,
+                },
+                .series_id = bound_selector.series_id,
+                .name = bound_selector.name,
+                .canonical_tags = bound_selector.canonical_tags,
+                .span = bound_selector.span,
+            } },
+            .output = scan_columns,
+            .rollup_hint = null,
+            .time_bounds = lowerTimeBounds(typed_query.time_range),
+        },
+    });
+}
+
+fn buildProjectionColumns(
+    allocator: std.mem.Allocator,
+    projections: []const ir.TypedProjection,
+) ![]const plan.ColumnInfo {
+    const columns = try allocator.alloc(plan.ColumnInfo, projections.len);
+    for (projections, 0..) |projection, idx| {
+        columns[idx] = .{
+            .name = projection.name,
+            .expr = projection.expr.expr,
+        };
+    }
+    return columns;
+}
+
+fn detectRollupHint(typed_query: *const ir.TypedQuery) ?plan.RollupHint {
+    for (typed_query.groupings) |grouping| {
+        if (grouping.is_time_bucket) {
+            return .{ .bucket_expr = grouping.expr.expr };
+        }
+    }
+    return null;
+}
+
+fn lowerTimeBounds(time_range: ir.TimeRange) physical.TimeBounds {
+    return .{
+        .min = if (time_range.start) |bound| bound.value else null,
+        .min_inclusive = if (time_range.start) |bound| bound.inclusive else true,
+        .max = if (time_range.end) |bound| bound.value else null,
+        .max_inclusive = if (time_range.end) |bound| bound.inclusive else true,
+    };
+}
+
+fn countConjunctions(expr: *const ast.Expr) usize {
+    return switch (expr.*) {
+        .binary => |binary| if (binary.op == .logical_and)
+            countConjunctions(binary.left) + countConjunctions(binary.right)
+        else
+            1,
+        else => 1,
+    };
+}
+
+fn makeNode(allocator: std.mem.Allocator, node: physical.Node) !*physical.Node {
+    const ptr = try allocator.create(physical.Node);
+    ptr.* = node;
+    return ptr;
 }
 
 fn durationMicros(value: i64) u64 {

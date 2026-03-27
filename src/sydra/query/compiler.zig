@@ -187,7 +187,20 @@ test "compiler binds unique series names and lowers to backend" {
 
     try std.testing.expect(compiled.typed_query.bound_selector != null);
     try std.testing.expectEqual(@as(@import("../types.zig").SeriesId, 99), compiled.typed_query.bound_selector.?.series_id);
+    try std.testing.expect(compiled.backend.logical_plan == null);
+    try std.testing.expect(compiled.backend.optimized_plan == null);
     try std.testing.expect(compiled.backend.physical_plan.root.* == .limit);
+    const sort_node = compiled.backend.physical_plan.root.limit.child;
+    try std.testing.expect(sort_node.* == .sort);
+    const project_node = sort_node.sort.child;
+    try std.testing.expect(project_node.* == .project);
+    const filter_node = project_node.project.child;
+    try std.testing.expect(filter_node.* == .filter);
+    const scan_node = filter_node.filter.child;
+    try std.testing.expect(scan_node.* == .scan);
+    try std.testing.expect(scan_node.scan.selector != null);
+    try std.testing.expect(scan_node.scan.selector.? == .bound);
+    try std.testing.expectEqual(@as(@import("../types.zig").SeriesId, 99), scan_node.scan.selector.?.bound.series_id);
     try std.testing.expect(compiled.bind_us > 0);
 }
 
