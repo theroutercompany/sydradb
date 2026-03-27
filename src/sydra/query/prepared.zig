@@ -9,6 +9,7 @@ const parser = @import("parser.zig");
 const plan = @import("plan.zig");
 const translator = @import("translator.zig");
 const value_mod = @import("value.zig");
+const vm = @import("vm.zig");
 
 pub const QueryLanguage = enum {
     sydraql,
@@ -49,19 +50,25 @@ pub const PreparedStmt = struct {
     diagnostics: []const frontend.diagnostics.Diagnostic = &.{},
     owned_source_text: bool = false,
     owned_statement: ?*const ast.Statement = null,
+    machine: ?vm.VirtualMachine = null,
     finalized: bool = false,
 
     pub fn step(self: *PreparedStmt) StepError!StepResult {
-        _ = self;
-        return error.NotImplemented;
+        if (self.finalized) return error.Finalized;
+        var machine = &(self.machine orelse return error.NotImplemented);
+        return switch (try machine.step()) {
+            .row => |row| .{ .row = row },
+            .done => .done,
+        };
     }
 
     pub fn reset(self: *PreparedStmt) void {
-        _ = self;
+        if (self.machine) |*machine| machine.reset();
     }
 
     pub fn finalize(self: *PreparedStmt) void {
         if (self.finalized) return;
+        if (self.machine) |*machine| machine.deinit();
         self.program.deinit();
         if (self.owned_source_text) {
             self.allocator.free(self.source_text);
@@ -184,6 +191,7 @@ test "prepared statement disassembles bytecode programs" {
         .normalized = .{ .ast_statement = placeholder_stmt },
         .owned_statement = placeholder_stmt,
     };
+    stmt.machine = try vm.VirtualMachine.init(alloc, &engine, &stmt.program);
     defer stmt.finalize();
 
     const lines = try stmt.explainBytecode(alloc);
@@ -191,4 +199,11 @@ test "prepared statement disassembles bytecode programs" {
 
     try std.testing.expectEqual(@as(usize, 2), lines.len);
     try std.testing.expectEqualStrings("load_const", lines[0].opcode);
+    const first = try stmt.step();
+    try std.testing.expect(first == .row);
+    try std.testing.expectEqual(@as(i64, 1), first.row[0].integer);
+    try std.testing.expect((try stmt.step()) == .done);
+    stmt.reset();
+    const replay = try stmt.step();
+    try std.testing.expect(replay == .row);
 }
