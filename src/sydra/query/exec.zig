@@ -11,10 +11,11 @@ const plan_builder = @import("plan.zig");
 const optimizer = @import("optimizer.zig");
 const physical = @import("physical.zig");
 const executor = @import("executor.zig");
+const vm = @import("vm.zig");
 const cfg = @import("../config.zig");
 const engine_mod = @import("../engine.zig");
 
-pub const ExecuteError = parser.ParseError || validator.AnalyzeError || plan_builder.BuildError || optimizer.OptimizeError || physical.BuildError || executor.ExecuteError || compiler.CompileError || codegen.CodegenError || std.mem.Allocator.Error || error{ValidationFailed};
+pub const ExecuteError = parser.ParseError || validator.AnalyzeError || plan_builder.BuildError || optimizer.OptimizeError || physical.BuildError || executor.ExecuteError || compiler.CompileError || codegen.CodegenError || vm.VmError || std.mem.Allocator.Error || error{ValidationFailed};
 
 pub const ExecutionMode = compiler.ExecutionMode;
 
@@ -153,10 +154,79 @@ fn executeCompiled(
     const backend_us = compiled.backend.logical_us + compiled.backend.optimize_us + compiled.backend.physical_us;
     const frontend_compile_us = total_compile_us -| backend_us;
 
+    const lowered = codegen.buildProgram(prepared.allocator, compiled) catch |err| {
+        if (codegenFallbackReason(err) != null) {
+            return executeCompiledPhysical(prepared, mode, compiled, frontend_compile_us);
+        }
+        return err;
+    };
+    return executeCompiledBytecode(prepared, mode, compiled, lowered, frontend_compile_us);
+}
+
+fn executeCompiledPhysical(
+    prepared: Prepared,
+    mode: ExecutionMode,
+    compiled: compiler.CompiledSelect,
+    frontend_compile_us: u64,
+) ExecuteError!executor.ExecutionCursor {
     var exec_inst = executor.Executor.init(prepared.allocator, prepared.engine, compiled.backend.physical_plan);
     defer exec_inst.deinit();
     const pipeline_start = std.time.microTimestamp();
     var cursor = try exec_inst.run();
+    const pipeline_end = std.time.microTimestamp();
+
+    try finalizeCursor(
+        prepared,
+        &cursor,
+        mode,
+        false,
+        "",
+        compiled.bind_us,
+        frontend_compile_us,
+        compiled.backend.logical_us,
+        compiled.backend.optimize_us,
+        compiled.backend.physical_us,
+        durationMicros(pipeline_end - pipeline_start),
+    );
+    return cursor;
+}
+
+fn executeCompiledBytecode(
+    prepared: Prepared,
+    mode: ExecutionMode,
+    compiled: compiler.CompiledSelect,
+    lowered: codegen.CodegenResult,
+    frontend_compile_us: u64,
+) ExecuteError!executor.ExecutionCursor {
+    defer {
+        lowered.program.deinit();
+        if (lowered.columns.len != 0) prepared.allocator.free(lowered.columns);
+    }
+
+    var machine = try vm.VirtualMachine.init(prepared.allocator, prepared.engine, &lowered.program);
+    defer machine.deinit();
+
+    var row_list = std.array_list.Managed([]executor.Value).init(prepared.allocator);
+    defer row_list.deinit();
+
+    const arena = prepared.arena_ptr.allocator();
+    const pipeline_start = std.time.microTimestamp();
+    while (true) {
+        const step = try machine.step();
+        switch (step) {
+            .done => break,
+            .row => |row| {
+                const values = try arena.alloc(executor.Value, row.len);
+                for (row, 0..) |value, idx| values[idx] = value;
+                try row_list.append(values);
+            },
+        }
+    }
+    const rows = try arena.alloc([]executor.Value, row_list.items.len);
+    @memcpy(rows, row_list.items);
+    const columns = try arena.dupe(plan_builder.ColumnInfo, lowered.columns);
+    var cursor = try executor.cursorFromRows(prepared.allocator, columns, rows);
+    cursor.arena = prepared.arena_ptr;
     const pipeline_end = std.time.microTimestamp();
 
     try finalizeCursor(
