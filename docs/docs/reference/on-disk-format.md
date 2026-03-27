@@ -113,6 +113,11 @@ Current typed metadata payloads include:
 - WAL indexes with a canonical `ContentRef`, optional mirror names, and captured byte counts for mutable `current.wal`
 - tree objects and commit objects that link the metadata DAG together
 
+`ContentRef` currently supports:
+
+- `blob(<object id>)` for legacy compatibility payloads
+- `extent_tree { root_id, size_bytes, chunk_bytes }` for chunked segment and WAL content stored as Merkle trees of chunk blobs
+
 See [`src/sydra/storage/manifest.zig`](./source/sydra/storage/manifest.md) for the in-memory model and load/save behavior.
 
 ## Snapshot/restore

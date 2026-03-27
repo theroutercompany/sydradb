@@ -6,7 +6,7 @@ sidebar_position: 6
 # ADR 0006: Git-Inspired Storage Model for SydraDB
 
 ## Status
-Proposed
+Accepted
 
 Implementation reference (current, related subsystems):
 

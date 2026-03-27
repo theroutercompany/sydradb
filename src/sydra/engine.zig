@@ -9,6 +9,7 @@ const segment_mod = @import("storage/segment.zig");
 const tags_mod = @import("storage/tags.zig");
 const retention = @import("storage/retention.zig");
 const cas_mod = @import("storage/cas.zig");
+const extents = @import("storage/extents.zig");
 
 fn sleepMs(ms: u64) void {
     if (@hasDecl(std.time, "sleep")) {
@@ -871,7 +872,12 @@ pub const Engine = struct {
                         const captured_len = @min(loaded.payload.len, @as(usize, @intCast(entry.captured_bytes)));
                         try wal_mod.replayBytes(self.alloc, loaded.payload[0..captured_len], ctx);
                     },
-                    .extent_tree => return error.ExtentTreeUnsupported,
+                    .extent_tree => |tree| {
+                        const bytes = try extents.readAll(self.alloc, &cas.store, tree);
+                        defer self.alloc.free(bytes);
+                        const captured_len = @min(bytes.len, @as(usize, @intCast(entry.captured_bytes)));
+                        try wal_mod.replayBytes(self.alloc, bytes[0..captured_len], ctx);
+                    },
                 }
             } else if (entry.mirrorName().len != 0) {
                 const single = [_][]const u8{entry.mirrorName()};
@@ -908,7 +914,17 @@ pub const Engine = struct {
                                 continue;
                             }
                         },
-                        .extent_tree => return error.ExtentTreeUnsupported,
+                        .extent_tree => |tree| {
+                            const bytes = try extents.readAll(self.alloc, &cas.store, tree);
+                            defer self.alloc.free(bytes);
+                            if (stat.size > entry.captured_bytes and try wal_mod.filePrefixMatches(self.data_dir, path, bytes)) {
+                                try self.wal.replayFileFromOffset(self.alloc, name, entry.captured_bytes, ctx);
+                                continue;
+                            }
+                            if (stat.size == entry.captured_bytes and try wal_mod.filePrefixMatches(self.data_dir, path, bytes)) {
+                                continue;
+                            }
+                        },
                     }
                 }
             } else if (!std.mem.eql(u8, name, "current.wal") and containsWalName(index.snapshot.wal_index.entries, name)) {
@@ -1076,8 +1092,8 @@ fn compactDescriptorGroup(
 
     for (group.indices) |descriptor_index| {
         const descriptor = descriptors[descriptor_index];
-        if (descriptor.path.len != 0) {
-            engine.data_dir.deleteFile(descriptor.path) catch {};
+        if (descriptor.mirrorPath().len != 0) {
+            engine.data_dir.deleteFile(descriptor.mirrorPath()) catch {};
         }
     }
 

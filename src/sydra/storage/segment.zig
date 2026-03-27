@@ -1,6 +1,7 @@
 const std = @import("std");
 const types = @import("../types.zig");
 const object_store = @import("object_store.zig");
+const extents = @import("extents.zig");
 const manifest_mod = @import("manifest.zig");
 
 // Segment format v2 (SYSEG3):
@@ -131,7 +132,11 @@ pub fn readAllDescriptor(alloc: std.mem.Allocator, data_dir: std.fs.Dir, store: 
                     if (loaded.obj_type != .blob) return error.InvalidSegmentContentObject;
                     return try readAllFromBytes(alloc, loaded.payload);
                 },
-                .extent_tree => return error.ExtentTreeUnsupported,
+                .extent_tree => |tree| {
+                    const bytes = try extents.readAll(alloc, store, tree);
+                    defer alloc.free(bytes);
+                    return try readAllFromBytes(alloc, bytes);
+                },
             }
         }
     }

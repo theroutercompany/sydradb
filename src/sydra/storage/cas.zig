@@ -4,6 +4,7 @@ const types = @import("../types.zig");
 const manifest_mod = @import("manifest.zig");
 const compact_mod = @import("compact.zig");
 const object_store = @import("object_store.zig");
+const extents = @import("extents.zig");
 const segment_mod = @import("segment.zig");
 const series_catalog_mod = @import("series_catalog.zig");
 const tags_mod = @import("tags.zig");
@@ -606,6 +607,7 @@ pub const RefStore = struct {
 pub const CommitWriter = struct {
     alloc: std.mem.Allocator,
     store: *object_store.ObjectStore,
+    extent_chunk_bytes: u32 = default_extent_chunk_bytes,
 
     pub fn writeSnapshot(
         self: *CommitWriter,
@@ -616,7 +618,7 @@ pub const CommitWriter = struct {
         parent: ?object_store.ObjectId,
         reason: []const u8,
     ) !object_store.ObjectId {
-        var snapshot = try buildLegacySnapshot(self.alloc, data_dir, manifest, tags, series_catalog, self.store);
+        var snapshot = try buildLegacySnapshot(self.alloc, data_dir, manifest, tags, series_catalog, self.store, self.extent_chunk_bytes);
         defer snapshot.deinit(self.alloc);
         return try self.writePreparedSnapshot(&snapshot, parent, reason);
     }
@@ -961,7 +963,7 @@ pub const CommitReader = struct {
         tags: *const tags_mod.TagIndex,
         series_catalog: *const series_catalog_mod.SeriesCatalog,
     ) !void {
-        var live = try buildLegacySnapshot(self.alloc, data_dir, manifest, tags, series_catalog, self.store);
+        var live = try buildLegacySnapshot(self.alloc, data_dir, manifest, tags, series_catalog, self.store, default_extent_chunk_bytes);
         defer live.deinit(self.alloc);
 
         var stored = try self.loadHeadSnapshot();
@@ -1194,7 +1196,7 @@ pub const CasManager = struct {
         series_catalog: *const series_catalog_mod.SeriesCatalog,
     ) !object_store.ObjectId {
         if (try self.refs.readHead(main_ref)) |head| return head;
-        var writer = CommitWriter{ .alloc = self.alloc, .store = &self.store };
+        var writer = CommitWriter{ .alloc = self.alloc, .store = &self.store, .extent_chunk_bytes = self.format.extent_chunk_bytes };
         const commit_id = try writer.writeSnapshot(data_dir, manifest, tags, series_catalog, null, "bootstrap");
         try self.refs.compareAndSwapRef(main_ref, null, commit_id, "bootstrap");
         try self.refreshCommitGraph();
@@ -1210,7 +1212,7 @@ pub const CasManager = struct {
         reason: []const u8,
     ) !object_store.ObjectId {
         const parent = try self.refs.readHead(main_ref);
-        var writer = CommitWriter{ .alloc = self.alloc, .store = &self.store };
+        var writer = CommitWriter{ .alloc = self.alloc, .store = &self.store, .extent_chunk_bytes = self.format.extent_chunk_bytes };
         const commit_id = try writer.writeSnapshot(data_dir, manifest, tags, series_catalog, parent, reason);
         try self.refs.compareAndSwapRef(main_ref, parent, commit_id, reason);
         try self.refreshCommitGraph();
@@ -1386,9 +1388,11 @@ pub const CasManager = struct {
         var snapshot = try self.loadSnapshotForSpec(spec);
         defer snapshot.deinit(self.alloc);
 
+        try materializeSnapshotMirrors(self.alloc, data_dir, &self.store, snapshot);
         try writeManifestFile(self.alloc, data_dir, snapshot.segment_descriptors);
         try writeTagsFile(self.alloc, data_dir, snapshot.tag_snapshot);
         try writeSeriesCatalogFile(self.alloc, data_dir, snapshot.series_catalog_snapshot);
+        _ = try cleanupStaleMirrors(self.alloc, data_dir, snapshot, false);
     }
 
     pub fn gc(self: *CasManager, options: GcOptions) !GcResult {
@@ -1571,16 +1575,26 @@ pub const CasManager = struct {
             defer snapshot.deinit();
 
             for (snapshot.snapshot.segment_descriptors) |descriptor| {
-                if (descriptor.content_id) |content_id| {
-                    const loaded = try self.store.get(self.alloc, content_id);
-                    defer self.alloc.free(loaded.payload);
-                    if (loaded.obj_type != .blob) return error.InvalidSegmentContentObject;
-                    const points = try segment_mod.readAllFromBytes(self.alloc, loaded.payload);
-                    self.alloc.free(points);
+                if (descriptor.contentRef()) |content| {
+                    switch (content) {
+                        .blob => |content_id| {
+                            const loaded = try self.store.get(self.alloc, content_id);
+                            defer self.alloc.free(loaded.payload);
+                            if (loaded.obj_type != .blob) return error.InvalidSegmentContentObject;
+                            const points = try segment_mod.readAllFromBytes(self.alloc, loaded.payload);
+                            self.alloc.free(points);
+                        },
+                        .extent_tree => |tree| {
+                            const bytes = try extents.readAll(self.alloc, &self.store, tree);
+                            defer self.alloc.free(bytes);
+                            const points = try segment_mod.readAllFromBytes(self.alloc, bytes);
+                            self.alloc.free(points);
+                        },
+                    }
                     report.segment_contents_checked += 1;
                 }
-                if (descriptor.path.len != 0) {
-                    _ = data_dir.statFile(descriptor.path) catch |err| switch (err) {
+                if (descriptor.mirrorPath().len != 0) {
+                    _ = data_dir.statFile(descriptor.mirrorPath()) catch |err| switch (err) {
                         error.FileNotFound => report.missing_segment_mirrors += 1,
                         else => return err,
                     };
@@ -1588,20 +1602,28 @@ pub const CasManager = struct {
             }
 
             for (snapshot.snapshot.wal_index.entries) |entry| {
-                if (entry.content_id) |content_id| {
-                    const loaded = try self.store.get(self.alloc, content_id);
-                    defer self.alloc.free(loaded.payload);
-                    if (loaded.obj_type != .blob) return error.InvalidWalChunkObject;
-
+                if (entry.contentRef()) |content| {
                     var noop_ctx = struct {
                         pub fn onSeriesRegistration(_: *@This(), _: types.SeriesId, _: []const u8, _: []const u8) !void {}
                         pub fn onRecord(_: *@This(), _: types.SeriesId, _: i64, _: f64) !void {}
                     }{};
-                    try wal_mod.replayBytes(self.alloc, loaded.payload, &noop_ctx);
+                    switch (content) {
+                        .blob => |content_id| {
+                            const loaded = try self.store.get(self.alloc, content_id);
+                            defer self.alloc.free(loaded.payload);
+                            if (loaded.obj_type != .blob) return error.InvalidWalChunkObject;
+                            try wal_mod.replayBytes(self.alloc, loaded.payload, &noop_ctx);
+                        },
+                        .extent_tree => |tree| {
+                            const bytes = try extents.readAll(self.alloc, &self.store, tree);
+                            defer self.alloc.free(bytes);
+                            try wal_mod.replayBytes(self.alloc, bytes, &noop_ctx);
+                        },
+                    }
                     report.wal_contents_checked += 1;
                 }
 
-                const path = try std.fmt.allocPrint(self.alloc, "wal/{s}", .{entry.name});
+                const path = try std.fmt.allocPrint(self.alloc, "wal/{s}", .{entry.mirrorName()});
                 defer self.alloc.free(path);
                 _ = data_dir.statFile(path) catch |err| switch (err) {
                     error.FileNotFound => report.missing_wal_mirrors += 1,
@@ -2229,8 +2251,9 @@ fn cleanupStaleMirrors(alloc: std.mem.Allocator, data_dir: std.fs.Dir, snapshot:
     var expected_segments = std.StringHashMap(void).init(alloc);
     defer expected_segments.deinit();
     for (snapshot.segment_descriptors) |descriptor| {
-        if (descriptor.path.len == 0) continue;
-        try expected_segments.put(descriptor.path, {});
+        const mirror_path = descriptor.mirrorPath();
+        if (mirror_path.len == 0) continue;
+        try expected_segments.put(mirror_path, {});
     }
 
     var stale_segment_files: usize = 0;
@@ -2296,7 +2319,7 @@ const CruftScan = struct {
 fn walPathReferenced(entries: []const WalChunkDescriptor, path: []const u8) bool {
     for (entries) |entry| {
         var buf: [256]u8 = undefined;
-        const candidate = std.fmt.bufPrint(&buf, "wal/{s}", .{entry.name}) catch continue;
+        const candidate = std.fmt.bufPrint(&buf, "wal/{s}", .{entry.mirrorName()}) catch continue;
         if (std.mem.eql(u8, candidate, path)) return true;
     }
     return false;
@@ -2889,6 +2912,7 @@ pub fn buildLegacySnapshot(
     tags: *const tags_mod.TagIndex,
     series_catalog: *const series_catalog_mod.SeriesCatalog,
     store: ?*object_store.ObjectStore,
+    extent_chunk_bytes: u32,
 ) !LegacySnapshot {
     var descriptors = std.array_list.Managed(SegmentDescriptor).init(alloc);
     errdefer {
@@ -2902,12 +2926,15 @@ pub fn buildLegacySnapshot(
         if (metadata.series_id != entry.series_id or metadata.hour_bucket != entry.hour_bucket or metadata.start_ts != entry.start_ts or metadata.end_ts != entry.end_ts or metadata.count != entry.count) {
             return error.ManifestSegmentMismatch;
         }
-        const content_id = try ensureBlobForFile(alloc, store, data_dir, entry.path);
+        const content = try ensureContentRefForFile(alloc, store, data_dir, entry.path, extent_chunk_bytes);
         try descriptors.append(.{
             .path = try alloc.dupe(u8, entry.path),
             .mirror_path = &[_]u8{},
-            .content_id = content_id,
-            .content = if (content_id) |id| .{ .blob = id } else null,
+            .content_id = if (content) |ref| switch (ref) {
+                .blob => |id| id,
+                .extent_tree => null,
+            } else null,
+            .content = content,
             .file_hash = try hashFile(data_dir, entry.path),
             .file_size = metadata.file_size,
             .series_id = entry.series_id,
@@ -2926,7 +2953,7 @@ pub fn buildLegacySnapshot(
         .segment_descriptors = try descriptors.toOwnedSlice(),
         .tag_snapshot = try buildTagSnapshot(alloc, tags),
         .series_catalog_snapshot = try buildSeriesCatalogSnapshot(alloc, series_catalog),
-        .wal_index = try buildWalIndex(alloc, data_dir, store),
+        .wal_index = try buildWalIndex(alloc, data_dir, store, extent_chunk_bytes),
     };
 }
 
@@ -3006,7 +3033,7 @@ fn buildSeriesCatalogSnapshot(alloc: std.mem.Allocator, series_catalog: *const s
     return .{ .entries = try entries.toOwnedSlice() };
 }
 
-fn buildWalIndex(alloc: std.mem.Allocator, data_dir: std.fs.Dir, store: ?*object_store.ObjectStore) !WalIndex {
+fn buildWalIndex(alloc: std.mem.Allocator, data_dir: std.fs.Dir, store: ?*object_store.ObjectStore, extent_chunk_bytes: u32) !WalIndex {
     const infos = try wal_mod.collectWalFileInfos(alloc, data_dir);
     defer wal_mod.freeWalFileInfos(alloc, infos);
 
@@ -3017,12 +3044,15 @@ fn buildWalIndex(alloc: std.mem.Allocator, data_dir: std.fs.Dir, store: ?*object
     }
 
     for (infos) |info| {
-        const content_id = try ensureBlobForWalFile(alloc, store, data_dir, info.name);
+        const content = try ensureContentRefForWalFile(alloc, store, data_dir, info.name, extent_chunk_bytes);
         try entries.append(.{
             .name = try alloc.dupe(u8, info.name),
             .mirror_name = &[_]u8{},
-            .content_id = content_id,
-            .content = if (content_id) |id| .{ .blob = id } else null,
+            .content_id = if (content) |ref| switch (ref) {
+                .blob => |id| id,
+                .extent_tree => null,
+            } else null,
+            .content = content,
             .file_size = info.size,
             .file_hash = info.hash,
             .mutable = std.mem.eql(u8, info.name, "current.wal"),
@@ -3034,7 +3064,7 @@ fn buildWalIndex(alloc: std.mem.Allocator, data_dir: std.fs.Dir, store: ?*object
 
 fn verifyWalFiles(alloc: std.mem.Allocator, wal_index: WalIndex, data_dir: std.fs.Dir, store: *object_store.ObjectStore) !void {
     for (wal_index.entries) |entry| {
-        const path = try std.fmt.allocPrint(std.heap.page_allocator, "wal/{s}", .{entry.name});
+        const path = try std.fmt.allocPrint(std.heap.page_allocator, "wal/{s}", .{entry.mirrorName()});
         defer std.heap.page_allocator.free(path);
 
         var file = data_dir.openFile(path, .{}) catch |err| switch (err) {
@@ -3049,12 +3079,22 @@ fn verifyWalFiles(alloc: std.mem.Allocator, wal_index: WalIndex, data_dir: std.f
         if (!entry.mutable or stat.size == entry.captured_bytes) {
             const live_hash = try hashFile(data_dir, path);
             if (!std.mem.eql(u8, live_hash[0..], entry.file_hash[0..])) return error.CasVerificationFailed;
-        } else if (entry.content_id) |content_id| {
-            const loaded = try store.get(alloc, content_id);
-            defer alloc.free(loaded.payload);
-            if (loaded.obj_type != .blob) return error.InvalidWalChunkObject;
-            if (loaded.payload.len != entry.captured_bytes) return error.CasVerificationFailed;
-            if (!try wal_mod.filePrefixMatches(data_dir, path, loaded.payload)) return error.CasVerificationFailed;
+        } else if (entry.contentRef()) |content| {
+            switch (content) {
+                .blob => |content_id| {
+                    const loaded = try store.get(alloc, content_id);
+                    defer alloc.free(loaded.payload);
+                    if (loaded.obj_type != .blob) return error.InvalidWalChunkObject;
+                    if (loaded.payload.len != entry.captured_bytes) return error.CasVerificationFailed;
+                    if (!try wal_mod.filePrefixMatches(data_dir, path, loaded.payload)) return error.CasVerificationFailed;
+                },
+                .extent_tree => |tree| {
+                    const bytes = try extents.readAll(alloc, store, tree);
+                    defer alloc.free(bytes);
+                    if (bytes.len != entry.captured_bytes) return error.CasVerificationFailed;
+                    if (!try wal_mod.filePrefixMatches(data_dir, path, bytes)) return error.CasVerificationFailed;
+                },
+            }
         }
     }
 }
@@ -3084,31 +3124,37 @@ fn hashFile(data_dir: std.fs.Dir, path: []const u8) ![32]u8 {
     return out;
 }
 
-fn ensureBlobForFile(
+fn ensureContentRefForFile(
     alloc: std.mem.Allocator,
     store: ?*object_store.ObjectStore,
     data_dir: std.fs.Dir,
     path: []const u8,
-) !?object_store.ObjectId {
+    chunk_bytes: u32,
+) !?ContentRef {
     const bytes = try data_dir.readFileAlloc(alloc, path, 128 * 1024 * 1024);
     defer alloc.free(bytes);
-    const id = object_store.computeId(.blob, bytes);
     if (store) |object_store_ref| {
-        const stored = try object_store_ref.put(.blob, bytes);
-        if (!stored.eql(id)) return error.UnexpectedObjectId;
+        const written = try extents.writeAll(alloc, object_store_ref, bytes, chunk_bytes);
+        return ContentRef{ .extent_tree = .{
+            .root_id = written.root_id,
+            .size_bytes = written.size_bytes,
+            .chunk_bytes = written.chunk_bytes,
+        } };
     }
-    return id;
+    const blob_id = object_store.computeId(.blob, bytes);
+    return ContentRef{ .blob = blob_id };
 }
 
-fn ensureBlobForWalFile(
+fn ensureContentRefForWalFile(
     alloc: std.mem.Allocator,
     store: ?*object_store.ObjectStore,
     data_dir: std.fs.Dir,
     wal_name: []const u8,
-) !?object_store.ObjectId {
+    chunk_bytes: u32,
+) !?ContentRef {
     const path = try std.fmt.allocPrint(alloc, "wal/{s}", .{wal_name});
     defer alloc.free(path);
-    return try ensureBlobForFile(alloc, store, data_dir, path);
+    return try ensureContentRefForFile(alloc, store, data_dir, path, chunk_bytes);
 }
 
 fn encodeSegmentDescriptor(alloc: std.mem.Allocator, descriptor: SegmentDescriptor) ![]u8 {
@@ -3766,6 +3812,68 @@ fn writeSeriesCatalogFile(alloc: std.mem.Allocator, data_dir: std.fs.Dir, series
     try data_dir.rename(temp_name, "series_catalog.jsonl");
 }
 
+fn readContentBytes(alloc: std.mem.Allocator, store: *object_store.ObjectStore, content: ContentRef) ![]u8 {
+    return switch (content) {
+        .blob => |content_id| blk: {
+            const loaded = try store.get(alloc, content_id);
+            defer alloc.free(loaded.payload);
+            if (loaded.obj_type != .blob) return error.InvalidContentBlobObject;
+            break :blk try alloc.dupe(u8, loaded.payload);
+        },
+        .extent_tree => |tree| try extents.readAll(alloc, store, tree),
+    };
+}
+
+fn materializeSnapshotMirrors(
+    alloc: std.mem.Allocator,
+    data_dir: std.fs.Dir,
+    store: *object_store.ObjectStore,
+    snapshot: Snapshot,
+) !void {
+    for (snapshot.segment_descriptors) |descriptor| {
+        const mirror_path = descriptor.mirrorPath();
+        if (mirror_path.len == 0) continue;
+        const content = descriptor.contentRef() orelse continue;
+        try writeContentRefToPath(alloc, data_dir, store, mirror_path, content);
+    }
+    for (snapshot.wal_index.entries) |entry| {
+        const mirror_name = entry.mirrorName();
+        if (mirror_name.len == 0) continue;
+        const content = entry.contentRef() orelse continue;
+        const path = try std.fmt.allocPrint(alloc, "wal/{s}", .{mirror_name});
+        defer alloc.free(path);
+        try writeContentRefToPath(alloc, data_dir, store, path, content);
+    }
+}
+
+fn writeContentRefToPath(
+    alloc: std.mem.Allocator,
+    data_dir: std.fs.Dir,
+    store: *object_store.ObjectStore,
+    path: []const u8,
+    content: ContentRef,
+) !void {
+    const bytes = try readContentBytes(alloc, store, content);
+    defer alloc.free(bytes);
+
+    if (std.fs.path.dirname(path)) |dirname| try data_dir.makePath(dirname);
+    const temp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
+    defer alloc.free(temp_path);
+
+    var file = try data_dir.createFile(temp_path, .{ .truncate = true, .read = true });
+    defer file.close();
+    errdefer data_dir.deleteFile(temp_path) catch {};
+    try file.writeAll(bytes);
+    try file.sync();
+    data_dir.rename(temp_path, path) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            data_dir.deleteFile(path) catch {};
+            try data_dir.rename(temp_path, path);
+        },
+        else => return err,
+    };
+}
+
 fn syncDir(dir: *std.fs.Dir) !void {
     if (@hasDecl(std.fs.Dir, "sync")) {
         try dir.sync();
@@ -4065,7 +4173,7 @@ test "wal index captures CAS content ids for mutable current wal" {
     defer wal.close();
     _ = try wal.append(77, 1_000, 3.25);
 
-    var index = try buildWalIndex(talloc, data_dir, null);
+    var index = try buildWalIndex(talloc, data_dir, null, default_extent_chunk_bytes);
     defer index.deinit(talloc);
 
     try std.testing.expectEqual(@as(usize, 1), index.entries.len);
@@ -4513,4 +4621,73 @@ test "incremental bundle apply requires its prerequisite head" {
     defer restored.deinit();
     const restored_head = try restored.refs.readHead(main_ref) orelse return error.MissingCasHead;
     try std.testing.expect(restored_head.eql(advanced));
+}
+
+test "exportSpecToLegacy materializes segment and wal mirrors from content refs" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/checkout-export", .{tmp.sub_path});
+    defer alloc.free(data_path);
+    try std.fs.cwd().makePath(data_path);
+
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var manifest = manifest_mod.Manifest{ .alloc = alloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = alloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(alloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(alloc, data_dir, .none);
+    defer series_catalog.deinit();
+
+    const sid = types.hash64("checkout.series");
+    const points = [_]types.Point{
+        .{ .ts = 10, .value = 1.0 },
+        .{ .ts = 20, .value = 2.0 },
+    };
+    const seg_path = try segment_mod.writeSegment(alloc, data_dir, sid, 0, points[0..]);
+    defer alloc.free(seg_path);
+    try manifest.add(data_dir, sid, 0, points[0].ts, points[points.len - 1].ts, @intCast(points.len), seg_path);
+    try tags.add("host=checkout", sid);
+    _ = try series_catalog.register("checkout.series", "{}", sid);
+
+    var wal = try wal_mod.WAL.open(alloc, data_dir, .none);
+    defer wal.close();
+    _ = try wal.appendSeriesRegistration(sid, "checkout.series", "{}");
+    _ = try wal.append(sid, 30, 3.0);
+
+    var cas_manager = try CasManager.init(alloc, data_path, .none);
+    defer cas_manager.deinit();
+    _ = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+
+    try data_dir.deleteFile(seg_path);
+    try data_dir.deleteFile("wal/current.wal");
+
+    try cas_manager.exportSpecToLegacy(main_ref, data_dir);
+
+    const restored_points = try segment_mod.readAll(alloc, data_dir, seg_path);
+    defer alloc.free(restored_points);
+    try std.testing.expectEqual(@as(usize, 2), restored_points.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), restored_points[0].value, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), restored_points[1].value, 1e-9);
+
+    var seen = struct {
+        records: usize = 0,
+        registrations: usize = 0,
+
+        pub fn onSeriesRegistration(self: *@This(), _: types.SeriesId, _: []const u8, _: []const u8) !void {
+            self.registrations += 1;
+        }
+
+        pub fn onRecord(self: *@This(), _: types.SeriesId, _: i64, _: f64) !void {
+            self.records += 1;
+        }
+    }{};
+    const wal_bytes = try data_dir.readFileAlloc(alloc, "wal/current.wal", 1024 * 1024);
+    defer alloc.free(wal_bytes);
+    try wal_mod.replayBytes(alloc, wal_bytes, &seen);
+    try std.testing.expectEqual(@as(usize, 1), seen.registrations);
+    try std.testing.expectEqual(@as(usize, 1), seen.records);
 }
