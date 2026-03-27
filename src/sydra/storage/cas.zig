@@ -452,13 +452,16 @@ pub const RefStore = struct {
         defer file.close();
         errdefer self.root.deleteFile(intent_path) catch {};
 
-        var writer = file.writer();
+        var write_buf: [1024]u8 = undefined;
+        var writer_state = file.writer(&write_buf);
+        const writer = &writer_state.interface;
         try writer.print("reason={s}\n", .{reason});
         for (updates) |update| {
             const expected = if (update.expected_old) |id| id.toHex() else [_]u8{'-'} ** 64;
             const next = update.new_id.toHex();
             try writer.print("{s} {s} {s}\n", .{ update.ref_name, expected, next });
         }
+        try writer_state.end();
         if (self.fsync != .none) {
             try file.sync();
             try syncDir(&self.root);
@@ -2583,7 +2586,10 @@ test "ref store rejects torn ref contents" {
     var refs = try RefStore.init(std.testing.allocator, path, .none);
     defer refs.deinit();
 
-    try refs.root.writeFile("refs/heads/main", "deadbeef\n");
+    try refs.root.writeFile(.{
+        .sub_path = "refs/heads/main",
+        .data = "deadbeef\n",
+    });
     try std.testing.expectError(error.InvalidObjectIdHex, refs.readHead(main_ref));
 }
 

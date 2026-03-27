@@ -63,7 +63,7 @@ pub const Engine = struct {
         ) !MetadataState {
             if (config.metadata_read_mode == .primary and cas_manager != null) {
                 if (try cas_manager.?.refs.readHead(cas_mod.main_ref) != null) {
-                    return try loadFromCas(alloc, data_dir, config.fsync, wal, cas_manager.?);
+                    return try loadFromCas(alloc, config.fsync, cas_manager.?);
                 }
             }
             return try loadFromLegacy(alloc, data_dir, config.fsync, wal, cas_manager);
@@ -107,19 +107,24 @@ pub const Engine = struct {
 
         fn loadFromCas(
             alloc: std.mem.Allocator,
-            data_dir: std.fs.Dir,
             fsync: cfg.FsyncPolicy,
-            wal: *wal_mod.WAL,
             cas_manager: *cas_mod.CasManager,
         ) !MetadataState {
             var index = try cas_manager.loadHeadIndex();
             errdefer index.deinit();
-
-            try cas_manager.exportHeadToLegacy(data_dir);
-
-            var state = try loadFromLegacy(alloc, data_dir, fsync, wal, cas_manager);
-            state.cas_index = index;
-            return state;
+            var manifest = try manifestFromSnapshot(alloc, index.snapshot.segment_descriptors);
+            errdefer manifest.deinit();
+            var tags = try tagIndexFromSnapshot(alloc, index.snapshot.tag_snapshot);
+            errdefer tags.deinit();
+            var series_catalog = try seriesCatalogFromSnapshot(alloc, fsync, index.snapshot.series_catalog_snapshot);
+            errdefer series_catalog.deinit();
+            return .{
+                .alloc = alloc,
+                .manifest = manifest,
+                .tags = tags,
+                .series_catalog = series_catalog,
+                .cas_index = index,
+            };
         }
     };
 
