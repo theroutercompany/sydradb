@@ -432,7 +432,8 @@ pub const Engine = struct {
         const flushed = try flushMemtable(self);
         if (flushed) try self.syncCasSnapshot("snapshot-flush");
         try self.wal.file.sync();
-        try @import("snapshot.zig").snapshot(self.alloc, self.data_dir, dst_path);
+        if (!flushed or self.cas == null) try self.ensureSnapshotBundleHead();
+        try @import("snapshot.zig").snapshot(self.alloc, self.config.data_dir, dst_path, self.config.fsync);
     }
 
     pub fn ingest(self: *Engine, item: IngestItem) !void {
@@ -758,6 +759,26 @@ pub const Engine = struct {
         if (self.cas) |*cas| {
             _ = try cas.syncLegacySnapshot(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog, reason);
             try self.metadata.refreshCasIndex(cas);
+        }
+    }
+
+    fn ensureSnapshotBundleHead(self: *Engine) !void {
+        if (self.cas) |*cas| {
+            if (try cas.refs.readHead(cas_mod.main_ref) == null) {
+                _ = try cas.bootstrapIfMissing(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog);
+            } else {
+                _ = try cas.syncLegacySnapshot(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog, "snapshot");
+            }
+            try self.metadata.refreshCasIndex(cas);
+            return;
+        }
+
+        var temp = try cas_mod.CasManager.init(self.alloc, self.config.data_dir, self.config.fsync);
+        defer temp.deinit();
+        if (try temp.refs.readHead(cas_mod.main_ref) == null) {
+            _ = try temp.bootstrapIfMissing(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog);
+        } else {
+            _ = try temp.syncLegacySnapshot(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog, "snapshot");
         }
     }
 
@@ -1547,7 +1568,7 @@ test "engine metrics track ingest and flush" {
     try std.testing.expect(flush_ns > 0);
 }
 
-test "engine snapshotTo captures a restorable point-in-time copy" {
+test "engine snapshotTo captures a restorable CAS bundle" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -1590,9 +1611,13 @@ test "engine snapshotTo captures a restorable point-in-time copy" {
 
     {
         try std.fs.cwd().makePath(restore_path);
+        try @import("snapshot.zig").restore(talloc, restore_path, snapshot_path, .none);
+
         var restore_dir = try std.fs.cwd().openDir(restore_path, .{ .iterate = true });
         defer restore_dir.close();
-        try @import("snapshot.zig").restore(talloc, restore_dir, snapshot_path);
+        try std.testing.expectError(error.FileNotFound, restore_dir.statFile("MANIFEST"));
+        try std.testing.expectError(error.FileNotFound, restore_dir.statFile("tags.json"));
+        try std.testing.expectError(error.FileNotFound, restore_dir.statFile("series_catalog.jsonl"));
 
         const restored_cfg = cfg.Config{
             .data_dir = try talloc.dupe(u8, restore_path),
@@ -1606,6 +1631,7 @@ test "engine snapshotTo captures a restorable point-in-time copy" {
             .enable_prom = false,
             .mem_limit_bytes = 1024 * 1024,
             .cas_mode = .dual_write,
+            .metadata_read_mode = .primary,
             .retention_ns = std.StringHashMap(u32).init(talloc),
         };
 
@@ -1627,7 +1653,6 @@ test "engine snapshotTo captures a restorable point-in-time copy" {
             .resolved => |resolved| try std.testing.expectEqual(sid, resolved),
             else => return error.TestUnexpectedResult,
         }
-        try restored.verifyCasState();
     }
 }
 

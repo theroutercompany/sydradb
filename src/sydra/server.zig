@@ -208,9 +208,7 @@ fn cmdRestore(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     if (args.len < 3) return error.Invalid;
     var cfg = try loadConfigOrDefault(alloc);
     defer cfg.deinit(alloc);
-    var data_dir = try std.fs.cwd().openDir(cfg.data_dir, .{ .iterate = true });
-    defer data_dir.close();
-    try @import("snapshot.zig").restore(alloc, data_dir, args[2]);
+    try @import("snapshot.zig").restore(alloc, cfg.data_dir, args[2], cfg.fsync);
 }
 
 fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
@@ -226,6 +224,43 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     defer cas.deinit();
 
     const sub = std.mem.sliceTo(args[2], 0);
+    if (std.mem.eql(u8, sub, "bundle")) {
+        if (args.len < 5) return error.Invalid;
+        const action = std.mem.sliceTo(args[3], 0);
+        if (std.mem.eql(u8, action, "create")) {
+            const dst = std.mem.sliceTo(args[4], 0);
+            var since_spec: ?[]const u8 = null;
+            if (args.len >= 7) {
+                if (!std.mem.eql(u8, std.mem.sliceTo(args[5], 0), "--since")) return error.Invalid;
+                since_spec = std.mem.sliceTo(args[6], 0);
+            } else if (args.len == 6) {
+                return error.Invalid;
+            }
+            const result = try cas_mod.createBundle(alloc, cfg.data_dir, dst, cfg.fsync, since_spec);
+            std.debug.print(
+                "cas bundle create refs={d} prerequisites={d} objects={d}\n",
+                .{ result.ref_count, result.prerequisite_count, result.object_count },
+            );
+            return;
+        }
+        if (std.mem.eql(u8, action, "verify")) {
+            const result = try cas_mod.verifyBundle(alloc, std.mem.sliceTo(args[4], 0));
+            std.debug.print(
+                "cas bundle verify refs={d} prerequisites={d} objects={d}\n",
+                .{ result.ref_count, result.prerequisite_count, result.object_count },
+            );
+            return;
+        }
+        if (std.mem.eql(u8, action, "apply")) {
+            const result = try cas_mod.applyBundle(alloc, std.mem.sliceTo(args[4], 0), cfg.data_dir, cfg.fsync);
+            std.debug.print(
+                "cas bundle apply refs={d} prerequisites={d} objects={d}\n",
+                .{ result.ref_count, result.prerequisite_count, result.object_count },
+            );
+            return;
+        }
+        return error.Invalid;
+    }
     if (std.mem.eql(u8, sub, "verify")) {
         var manifest = try @import("storage/manifest.zig").Manifest.loadOrInit(alloc, data_dir);
         defer manifest.deinit();

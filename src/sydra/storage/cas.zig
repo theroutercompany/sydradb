@@ -1467,14 +1467,21 @@ pub const CasManager = struct {
     }
 
     fn collectReachable(self: *CasManager, refs: []const RefEntry) !std.AutoHashMap(object_store.ObjectId, void) {
+        var starts = std.array_list.Managed(object_store.ObjectId).init(self.alloc);
+        defer starts.deinit();
+        for (refs) |entry| try starts.append(entry.id);
+        return try self.collectReachableFromIds(starts.items);
+    }
+
+    fn collectReachableFromIds(self: *CasManager, starts: []const object_store.ObjectId) !std.AutoHashMap(object_store.ObjectId, void) {
         var seen = std.AutoHashMap(object_store.ObjectId, void).init(self.alloc);
         errdefer seen.deinit();
 
         var stack = std.array_list.Managed(object_store.ObjectId).init(self.alloc);
         defer stack.deinit();
 
-        for (refs) |entry| {
-            try stack.append(entry.id);
+        for (starts) |id| {
+            try stack.append(id);
         }
 
         while (stack.pop()) |id| {
@@ -1508,6 +1515,290 @@ pub const CasManager = struct {
         return seen;
     }
 };
+
+const BundleRef = struct {
+    name: []u8,
+    id: object_store.ObjectId,
+
+    fn deinit(self: *BundleRef, alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+    }
+};
+
+const BundleManifest = struct {
+    format_version: u16,
+    incremental: bool,
+    refs: []BundleRef,
+    prerequisites: []object_store.ObjectId,
+    object_count: usize,
+
+    fn deinit(self: *BundleManifest, alloc: std.mem.Allocator) void {
+        for (self.refs) |*entry| entry.deinit(alloc);
+        alloc.free(self.refs);
+        alloc.free(self.prerequisites);
+    }
+};
+
+pub const BundleResult = struct {
+    ref_count: usize,
+    prerequisite_count: usize,
+    object_count: usize,
+};
+
+const bundle_manifest_name = "bundle.manifest";
+const bundle_manifest_magic = "SYDBUNDLE1";
+
+fn cloneBundleRefs(alloc: std.mem.Allocator, refs: []const RefEntry) ![]BundleRef {
+    const cloned = try alloc.alloc(BundleRef, refs.len);
+    errdefer {
+        for (cloned[0..]) |*entry| {
+            if (entry.name.len != 0) entry.deinit(alloc);
+        }
+        alloc.free(cloned);
+    }
+
+    for (cloned) |*entry| entry.* = .{ .name = &[_]u8{}, .id = undefined };
+    for (refs, 0..) |ref, idx| {
+        cloned[idx] = .{
+            .name = try alloc.dupe(u8, ref.name),
+            .id = ref.id,
+        };
+    }
+    return cloned;
+}
+
+fn writeBundleManifest(alloc: std.mem.Allocator, dst_path: []const u8, manifest: BundleManifest) !void {
+    _ = alloc;
+    var root = try std.fs.cwd().openDir(dst_path, .{ .iterate = true });
+    defer root.close();
+
+    const temp_name = bundle_manifest_name ++ ".tmp";
+    var file = try root.createFile(temp_name, .{ .truncate = true, .read = true });
+    defer file.close();
+    errdefer root.deleteFile(temp_name) catch {};
+
+    var write_buf: [4096]u8 = undefined;
+    var writer_state = file.writer(&write_buf);
+    const writer = &writer_state.interface;
+
+    try writer.print("{s}\n", .{bundle_manifest_magic});
+    try writer.print("format_version {d}\n", .{manifest.format_version});
+    try writer.print("incremental {d}\n", .{@intFromBool(manifest.incremental)});
+    try writer.print("object_count {d}\n", .{manifest.object_count});
+    try writer.print("prerequisites {d}\n", .{manifest.prerequisites.len});
+    for (manifest.prerequisites) |prerequisite| {
+        const hex = prerequisite.toHex();
+        try writer.print("{s}\n", .{hex});
+    }
+    try writer.print("refs {d}\n", .{manifest.refs.len});
+    for (manifest.refs) |entry| {
+        const hex = entry.id.toHex();
+        try writer.print("{s} {s}\n", .{ entry.name, hex });
+    }
+    try writer_state.end();
+    try file.sync();
+    try root.rename(temp_name, bundle_manifest_name);
+}
+
+fn readBundleManifest(alloc: std.mem.Allocator, bundle_path: []const u8) !BundleManifest {
+    var root = try std.fs.cwd().openDir(bundle_path, .{ .iterate = true });
+    defer root.close();
+
+    const body = try root.readFileAlloc(alloc, bundle_manifest_name, 1024 * 1024);
+    defer alloc.free(body);
+
+    var line_it = std.mem.tokenizeAny(u8, body, "\r\n");
+    const magic = line_it.next() orelse return error.InvalidBundle;
+    if (!std.mem.eql(u8, magic, bundle_manifest_magic)) return error.InvalidBundle;
+
+    const format_version = try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "format_version");
+    if (format_version != 1) return error.UnsupportedBundleFormatVersion;
+    const incremental_value = try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "incremental");
+    const object_count = try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "object_count");
+    const prerequisite_count = try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "prerequisites");
+
+    const prerequisites = try alloc.alloc(object_store.ObjectId, prerequisite_count);
+    errdefer alloc.free(prerequisites);
+    for (prerequisites) |*entry| {
+        const line = line_it.next() orelse return error.InvalidBundle;
+        entry.* = try object_store.ObjectId.fromHex(line);
+    }
+
+    const ref_count = try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "refs");
+    const refs = try alloc.alloc(BundleRef, ref_count);
+    errdefer {
+        for (refs[0..]) |*entry| {
+            if (entry.name.len != 0) entry.deinit(alloc);
+        }
+        alloc.free(refs);
+    }
+    for (refs) |*entry| entry.* = .{ .name = &[_]u8{}, .id = undefined };
+    for (refs) |*entry| {
+        const line = line_it.next() orelse return error.InvalidBundle;
+        const sep = std.mem.indexOfScalar(u8, line, ' ') orelse return error.InvalidBundle;
+        entry.* = .{
+            .name = try alloc.dupe(u8, line[0..sep]),
+            .id = try object_store.ObjectId.fromHex(line[sep + 1 ..]),
+        };
+    }
+
+    return .{
+        .format_version = @intCast(format_version),
+        .incremental = incremental_value != 0,
+        .refs = refs,
+        .prerequisites = prerequisites,
+        .object_count = object_count,
+    };
+}
+
+fn parseBundleCountLine(line: []const u8, key: []const u8) !usize {
+    if (line.len <= key.len or !std.mem.eql(u8, line[0..key.len], key) or line[key.len] != ' ') {
+        return error.InvalidBundle;
+    }
+    return try std.fmt.parseInt(usize, line[key.len + 1 ..], 10);
+}
+
+pub fn createBundle(alloc: std.mem.Allocator, src_path: []const u8, dst_path: []const u8, fsync: cfg.FsyncPolicy, since_spec: ?[]const u8) !BundleResult {
+    var source = try CasManager.init(alloc, src_path, fsync);
+    defer source.deinit();
+
+    try std.fs.cwd().makePath(dst_path);
+    var dst_root = try std.fs.cwd().openDir(dst_path, .{ .iterate = true });
+    defer dst_root.close();
+    var dst_it = dst_root.iterate();
+    if (try dst_it.next() != null) return error.BundleDestinationNotEmpty;
+
+    const refs = try source.refs.listRefs(alloc);
+    defer {
+        for (refs) |*entry| entry.deinit(alloc);
+        alloc.free(refs);
+    }
+    var reachable = try source.collectReachable(refs);
+    defer reachable.deinit();
+
+    var prerequisite_ids = std.array_list.Managed(object_store.ObjectId).init(alloc);
+    defer prerequisite_ids.deinit();
+    var base_reachable: ?std.AutoHashMap(object_store.ObjectId, void) = null;
+    defer if (base_reachable) |*map| map.deinit();
+    if (since_spec) |spec| {
+        const base_id = try source.resolveCommitSpec(spec);
+        try prerequisite_ids.append(base_id);
+        base_reachable = try source.collectReachableFromIds(&[_]object_store.ObjectId{base_id});
+    }
+
+    var bundle_store = try object_store.ObjectStore.init(alloc, dst_path, .none);
+    defer bundle_store.deinit();
+
+    var selected = std.array_list.Managed(object_store.ObjectId).init(alloc);
+    defer selected.deinit();
+    var it = reachable.keyIterator();
+    while (it.next()) |id_ptr| {
+        if (base_reachable) |*base| {
+            if (base.contains(id_ptr.*)) continue;
+        }
+        const loaded = try source.store.get(alloc, id_ptr.*);
+        defer alloc.free(loaded.payload);
+        const stored_id = try bundle_store.put(loaded.obj_type, loaded.payload);
+        try selected.append(stored_id);
+    }
+
+    var pack_write = try bundle_store.writePack(alloc, selected.items);
+    defer pack_write.deinit(alloc);
+
+    const manifest = BundleManifest{
+        .format_version = 1,
+        .incremental = since_spec != null,
+        .refs = try cloneBundleRefs(alloc, refs),
+        .prerequisites = try alloc.dupe(object_store.ObjectId, prerequisite_ids.items),
+        .object_count = selected.items.len,
+    };
+    defer {
+        var owned = manifest;
+        owned.deinit(alloc);
+    }
+    try writeBundleManifest(alloc, dst_path, manifest);
+    return .{
+        .ref_count = refs.len,
+        .prerequisite_count = prerequisite_ids.items.len,
+        .object_count = selected.items.len,
+    };
+}
+
+pub fn verifyBundle(alloc: std.mem.Allocator, bundle_path: []const u8) !BundleResult {
+    var manifest = try readBundleManifest(alloc, bundle_path);
+    defer manifest.deinit(alloc);
+
+    var root = try std.fs.cwd().openDir(bundle_path, .{ .iterate = true });
+    defer root.close();
+    var store = object_store.ObjectStore{ .allocator = alloc, .root = root, .fsync = .none };
+
+    const ids = try store.listIds(alloc);
+    defer alloc.free(ids);
+    if (ids.len != manifest.object_count) return error.InvalidBundle;
+
+    for (ids) |id| {
+        const loaded = try store.get(alloc, id);
+        alloc.free(loaded.payload);
+    }
+
+    for (manifest.refs) |entry| {
+        if (!containsObjectId(ids, entry.id) and !containsObjectId(manifest.prerequisites, entry.id)) {
+            return error.BundleMissingRefObject;
+        }
+    }
+
+    return .{
+        .ref_count = manifest.refs.len,
+        .prerequisite_count = manifest.prerequisites.len,
+        .object_count = ids.len,
+    };
+}
+
+pub fn applyBundle(alloc: std.mem.Allocator, bundle_path: []const u8, dst_path: []const u8, fsync: cfg.FsyncPolicy) !BundleResult {
+    var manifest = try readBundleManifest(alloc, bundle_path);
+    defer manifest.deinit(alloc);
+
+    const verify = try verifyBundle(alloc, bundle_path);
+    _ = verify;
+
+    var bundle_root = try std.fs.cwd().openDir(bundle_path, .{ .iterate = true });
+    defer bundle_root.close();
+    var bundle_store = object_store.ObjectStore{ .allocator = alloc, .root = bundle_root, .fsync = .none };
+
+    var dest = try CasManager.init(alloc, dst_path, fsync);
+    defer dest.deinit();
+
+    for (manifest.prerequisites) |prereq| {
+        _ = dest.store.get(alloc, prereq) catch return error.BundlePrerequisiteMissing;
+    }
+
+    const ids = try bundle_store.listIds(alloc);
+    defer alloc.free(ids);
+    for (ids) |id| {
+        const loaded = try bundle_store.get(alloc, id);
+        defer alloc.free(loaded.payload);
+        _ = try dest.store.put(loaded.obj_type, loaded.payload);
+    }
+
+    var updates = try alloc.alloc(RefTxnUpdate, manifest.refs.len);
+    defer alloc.free(updates);
+    for (manifest.refs, 0..) |entry, idx| {
+        updates[idx] = .{
+            .ref_name = entry.name,
+            .new_id = entry.id,
+        };
+    }
+    if (updates.len > 0) {
+        try dest.refs.updateRefTxn(updates, "bundle-apply");
+    }
+    try dest.refreshCommitGraph();
+
+    return .{
+        .ref_count = manifest.refs.len,
+        .prerequisite_count = manifest.prerequisites.len,
+        .object_count = ids.len,
+    };
+}
 
 const MirrorGcResult = struct {
     stale_segment_files: usize,
@@ -3229,4 +3520,124 @@ test "fsck and pack preserve the reachable CAS head" {
     try std.testing.expectEqual(fsck.reachable_objects, all_ids.len);
     try std.testing.expect(containsObjectId(all_ids, initial));
     try std.testing.expect(!containsObjectId(all_ids, orphan));
+}
+
+test "bundle create, verify, and apply round-trip the CAS head" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/bundle-data", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    const bundle_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/bundle-out", .{tmp.sub_path});
+    defer talloc.free(bundle_path);
+    const restore_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/bundle-restore", .{tmp.sub_path});
+    defer talloc.free(restore_path);
+    try std.fs.cwd().makePath(data_path);
+
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
+    defer series_catalog.deinit();
+
+    const sid = types.hash64("bundle.series");
+    _ = try series_catalog.register("bundle.series", "{}", sid);
+    try tags.add("host=bundle", sid);
+    const points = [_]types.Point{.{ .ts = 1_000, .value = 7.0 }};
+    const seg_path = try segment_mod.writeSegment(talloc, data_dir, sid, 0, points[0..]);
+    defer talloc.free(seg_path);
+    try manifest.add(data_dir, sid, 0, 1_000, 1_000, 1, seg_path);
+
+    var cas_manager = try CasManager.init(talloc, data_path, .none);
+    defer cas_manager.deinit();
+    const head = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+
+    const created = try createBundle(talloc, data_path, bundle_path, .none, null);
+    try std.testing.expect(created.ref_count > 0);
+    try std.testing.expect(created.object_count > 0);
+
+    const verified = try verifyBundle(talloc, bundle_path);
+    try std.testing.expectEqual(created.ref_count, verified.ref_count);
+    try std.testing.expectEqual(created.object_count, verified.object_count);
+
+    const applied = try applyBundle(talloc, bundle_path, restore_path, .none);
+    try std.testing.expectEqual(verified.object_count, applied.object_count);
+
+    var restored = try CasManager.init(talloc, restore_path, .none);
+    defer restored.deinit();
+    const restored_head = try restored.refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(restored_head.eql(head));
+
+    var restored_snapshot = try restored.loadHeadIndex();
+    defer restored_snapshot.deinit();
+    try std.testing.expectEqual(@as(usize, 1), restored_snapshot.snapshot.segment_descriptors.len);
+    try std.testing.expectEqual(@as(usize, 1), restored_snapshot.snapshot.tag_snapshot.entries.len);
+    try std.testing.expectEqual(@as(usize, 1), restored_snapshot.snapshot.series_catalog_snapshot.entries.len);
+}
+
+test "incremental bundle apply requires its prerequisite head" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/incremental-data", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    const base_bundle_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/bundle-base", .{tmp.sub_path});
+    defer talloc.free(base_bundle_path);
+    const incremental_bundle_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/bundle-incremental", .{tmp.sub_path});
+    defer talloc.free(incremental_bundle_path);
+    const restore_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/bundle-dst", .{tmp.sub_path});
+    defer talloc.free(restore_path);
+    try std.fs.cwd().makePath(data_path);
+
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
+    defer series_catalog.deinit();
+
+    const sid = types.hash64("bundle.incremental");
+    _ = try series_catalog.register("bundle.incremental", "{}", sid);
+
+    const first_points = [_]types.Point{.{ .ts = 1_000, .value = 1.0 }};
+    const first_path = try segment_mod.writeSegment(talloc, data_dir, sid, 0, first_points[0..]);
+    defer talloc.free(first_path);
+    try manifest.add(data_dir, sid, 0, 1_000, 1_000, 1, first_path);
+
+    var cas_manager = try CasManager.init(talloc, data_path, .none);
+    defer cas_manager.deinit();
+    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    const initial_hex = initial.toHex();
+
+    _ = try createBundle(talloc, data_path, base_bundle_path, .none, null);
+
+    const second_points = [_]types.Point{.{ .ts = 2_000, .value = 2.0 }};
+    const second_path = try segment_mod.writeSegment(talloc, data_dir, sid, 0, second_points[0..]);
+    defer talloc.free(second_path);
+    try manifest.add(data_dir, sid, 0, 2_000, 2_000, 1, second_path);
+    const advanced = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, "advance-bundle");
+    try std.testing.expect(!advanced.eql(initial));
+
+    const created = try createBundle(talloc, data_path, incremental_bundle_path, .none, initial_hex[0..]);
+    try std.testing.expectEqual(@as(usize, 1), created.prerequisite_count);
+    try std.testing.expect(created.object_count > 0);
+
+    try std.testing.expectError(error.BundlePrerequisiteMissing, applyBundle(talloc, incremental_bundle_path, restore_path, .none));
+
+    _ = try applyBundle(talloc, base_bundle_path, restore_path, .none);
+    _ = try applyBundle(talloc, incremental_bundle_path, restore_path, .none);
+
+    var restored = try CasManager.init(talloc, restore_path, .none);
+    defer restored.deinit();
+    const restored_head = try restored.refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(restored_head.eql(advanced));
 }

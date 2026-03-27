@@ -113,13 +113,21 @@ See [`src/sydra/storage/manifest.zig`](./source/sydra/storage/manifest.md) for t
 
 ## Snapshot/restore
 
-Current snapshot behavior still preserves compatibility mirrors and storage state together:
+`snapshot`/`restore` now operate on CAS bundles instead of directory-copying the live data directory.
 
-- `snapshot`/`restore` copy `MANIFEST`, `wal/`, `segments/`, `tags.json`, `series_catalog.jsonl`, `objects/`, and `refs/`
-- packed CAS objects are preserved because they live under `objects/`
-- callers should still treat snapshotting as an admin or offline operation unless the higher-level command explicitly documents stronger coordination semantics
+A bundle directory currently contains:
 
-See `Reference/Source Reference/src/sydra/snapshot.zig`.
+- `bundle.manifest` – versioned bundle manifest with exported refs, prerequisite commits for incremental bundles, and object counts
+- `objects/` – bundle-local loose and/or packed CAS objects
+- `objects/packs/*.pack` and `objects/packs/*.idx` – immutable pack payloads plus fanout indexes
+- `refs/` – created by the object-store bootstrap, but ref updates are sourced from `bundle.manifest` during apply
+
+Operational notes:
+
+- `snapshot` is a thin wrapper over `cas bundle create <dst_dir>`.
+- `restore` is a thin wrapper over `cas bundle apply <src_dir>`.
+- Applying a bundle restores `objects/` and `refs/` only; it does not recreate `MANIFEST`, `tags.json`, or `series_catalog.jsonl` unless an explicit CAS export command is run afterward.
+- Incremental bundles list prerequisite commits in `bundle.manifest`; `cas bundle apply` rejects them unless the destination store already contains those prerequisite objects.
 
 See also:
 
