@@ -198,12 +198,13 @@ fn executeCompiledBytecode(
     lowered: codegen.CodegenResult,
     frontend_compile_us: u64,
 ) ExecuteError!executor.ExecutionCursor {
+    var lowered_program = lowered;
     defer {
-        lowered.program.deinit();
-        if (lowered.columns.len != 0) prepared.allocator.free(lowered.columns);
+        lowered_program.program.deinit();
+        if (lowered_program.columns.len != 0) prepared.allocator.free(lowered_program.columns);
     }
 
-    var machine = try vm.VirtualMachine.init(prepared.allocator, prepared.engine, &lowered.program);
+    var machine = try vm.VirtualMachine.init(prepared.allocator, prepared.engine, &lowered_program.program);
     defer machine.deinit();
 
     var row_list = std.array_list.Managed([]executor.Value).init(prepared.allocator);
@@ -224,7 +225,7 @@ fn executeCompiledBytecode(
     }
     const rows = try arena.alloc([]executor.Value, row_list.items.len);
     @memcpy(rows, row_list.items);
-    const columns = try arena.dupe(plan_builder.ColumnInfo, lowered.columns);
+    const columns = try arena.dupe(plan_builder.ColumnInfo, lowered_program.columns);
     var cursor = try executor.cursorFromRows(prepared.allocator, columns, rows);
     cursor.arena = prepared.arena_ptr;
     const pipeline_end = std.time.microTimestamp();

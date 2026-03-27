@@ -555,6 +555,7 @@ fn spanOf(value: SemanticValue) ?common.Span {
     return switch (value) {
         .token => |token| token.span,
         .stmt => |stmt| stmt.span(),
+        .selector => |selector| selector.span,
         .clauses => |clauses| if (clauses.limit) |limit| limit.span else if (clauses.ordering.len != 0) common.Span.init(clauses.ordering[0].span.start, clauses.ordering[clauses.ordering.len - 1].span.end) else if (clauses.groupings.len != 0) common.Span.init(clauses.groupings[0].span.start, clauses.groupings[clauses.groupings.len - 1].span.end) else if (clauses.predicate) |predicate| predicate.span() else null,
         .projection => |projection| projection.span,
         .projections => |values| if (values.len == 0) null else common.Span.init(values[0].span.start, values[values.len - 1].span.end),
