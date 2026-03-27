@@ -10,6 +10,7 @@ const frontend = @import("frontend.zig");
 const parser = @import("parser.zig");
 const plan = @import("plan.zig");
 const translator = @import("translator.zig");
+const types = @import("../types.zig");
 const value_mod = @import("value.zig");
 const vm = @import("vm.zig");
 
@@ -45,6 +46,16 @@ pub const ShadowParityResult = struct {
     rows_match: bool,
     row_count: usize,
     mismatch_reason: []const u8 = "",
+};
+
+pub const TableUseKind = enum {
+    series,
+};
+
+pub const TableUse = struct {
+    kind: TableUseKind,
+    name: []const u8,
+    series_id: ?types.SeriesId = null,
 };
 
 pub const PreparedStmt = struct {
@@ -103,6 +114,25 @@ pub const PreparedStmt = struct {
     pub fn explainBytecode(self: *PreparedStmt, allocator: std.mem.Allocator) ![]bytecode.DisassemblyLine {
         return try bytecode.disassemble(allocator, self.program);
     }
+
+    pub fn tablesUsed(self: *const PreparedStmt, allocator: std.mem.Allocator) ![]TableUse {
+        var uses = std.array_list.Managed(TableUse).init(allocator);
+        errdefer for (uses.items) |use| allocator.free(use.name);
+        defer uses.deinit();
+
+        switch (self.normalized) {
+            .typed_query => |typed_query| {
+                if (typed_query.bound_selector) |selector| {
+                    try appendBoundSelectorTableUse(allocator, &uses, selector);
+                } else if (typed_query.select.selector) |selector| {
+                    try appendSelectorTableUse(allocator, &uses, selector);
+                }
+            },
+            .ast_statement => |statement| try appendStatementTableUses(allocator, &uses, statement),
+        }
+
+        return try uses.toOwnedSlice();
+    }
 };
 
 pub const PrepareError = std.mem.Allocator.Error || parser.ParseError || compiler.CompileError || frontend.normalize.NormalizeError || error{
@@ -114,6 +144,13 @@ pub const StepError = vm.VmError || error{
     NotImplemented,
     Finalized,
 };
+
+pub fn freeTableUses(allocator: std.mem.Allocator, uses: []TableUse) void {
+    for (uses) |use| {
+        if (use.name.len != 0) allocator.free(use.name);
+    }
+    allocator.free(uses);
+}
 
 pub fn prepareSydraQL(
     allocator: std.mem.Allocator,
@@ -302,6 +339,100 @@ fn prepareParsedStatement(
     return stmt;
 }
 
+fn appendStatementTableUses(
+    allocator: std.mem.Allocator,
+    uses: *std.array_list.Managed(TableUse),
+    statement: *const ast.Statement,
+) !void {
+    switch (statement.*) {
+        .select => |select| {
+            if (select.selector) |selector| {
+                try appendSelectorTableUse(allocator, uses, selector);
+            }
+        },
+        .insert => |insert| {
+            try appendTableUse(allocator, uses, .series, insert.series.value, null);
+        },
+        .delete => |delete| {
+            try appendSelectorTableUse(allocator, uses, delete.selector);
+        },
+        .explain => |explain| try appendStatementTableUses(allocator, uses, explain.target),
+        .invalid => {},
+    }
+}
+
+fn appendBoundSelectorTableUse(
+    allocator: std.mem.Allocator,
+    uses: *std.array_list.Managed(TableUse),
+    selector: compiler.BoundSelector,
+) !void {
+    if (selector.name) |name| {
+        try appendTableUse(allocator, uses, .series, name, selector.series_id);
+        return;
+    }
+
+    const rendered = try std.fmt.allocPrint(allocator, "series_id:{d}", .{selector.series_id});
+    errdefer allocator.free(rendered);
+    for (uses.items) |existing| {
+        if (existing.kind == .series and existing.series_id == selector.series_id and std.mem.eql(u8, existing.name, rendered)) {
+            allocator.free(rendered);
+            return;
+        }
+    }
+    try appendOwnedTableUse(uses, .series, rendered, selector.series_id);
+}
+
+fn appendSelectorTableUse(
+    allocator: std.mem.Allocator,
+    uses: *std.array_list.Managed(TableUse),
+    selector: ast.Selector,
+) !void {
+    switch (selector.series) {
+        .name => |name| try appendTableUse(allocator, uses, .series, name.value, null),
+        .by_id => |by_id| {
+            const rendered = try std.fmt.allocPrint(allocator, "series_id:{d}", .{by_id.value});
+            errdefer allocator.free(rendered);
+            for (uses.items) |existing| {
+                if (existing.kind == .series and existing.series_id == @as(types.SeriesId, @intCast(by_id.value)) and std.mem.eql(u8, existing.name, rendered)) {
+                    allocator.free(rendered);
+                    return;
+                }
+            }
+            try appendOwnedTableUse(uses, .series, rendered, @intCast(by_id.value));
+        },
+    }
+}
+
+fn appendTableUse(
+    allocator: std.mem.Allocator,
+    uses: *std.array_list.Managed(TableUse),
+    kind: TableUseKind,
+    name: []const u8,
+    series_id: ?types.SeriesId,
+) !void {
+    for (uses.items) |existing| {
+        if (existing.kind == kind and existing.series_id == series_id and std.mem.eql(u8, existing.name, name)) {
+            return;
+        }
+    }
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    try appendOwnedTableUse(uses, kind, owned_name, series_id);
+}
+
+fn appendOwnedTableUse(
+    uses: *std.array_list.Managed(TableUse),
+    kind: TableUseKind,
+    owned_name: []const u8,
+    series_id: ?types.SeriesId,
+) !void {
+    try uses.append(.{
+        .kind = kind,
+        .name = owned_name,
+        .series_id = series_id,
+    });
+}
+
 test "prepared statement disassembles bytecode programs" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -365,6 +496,49 @@ test "prepared statement disassembles bytecode programs" {
     stmt.reset();
     const replay = try stmt.step();
     try std.testing.expect(replay == .row);
+}
+
+test "prepared statement reports tables used for constant and scan queries" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-tables-used", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .legacy,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    var constant_stmt = try prepareSydraQL(alloc, engine, "select 1", .{});
+    defer constant_stmt.finalize();
+    const constant_uses = try constant_stmt.tablesUsed(alloc);
+    defer freeTableUses(alloc, constant_uses);
+    try std.testing.expectEqual(@as(usize, 0), constant_uses.len);
+
+    try engine.registerSeries("weather.room1", "{}", 41);
+    var scan_stmt = try prepareSydraQL(alloc, engine, "select time, value from weather.room1 where time >= 0", .{});
+    defer scan_stmt.finalize();
+    const scan_uses = try scan_stmt.tablesUsed(alloc);
+    defer freeTableUses(alloc, scan_uses);
+    try std.testing.expectEqual(@as(usize, 1), scan_uses.len);
+    try std.testing.expectEqual(TableUseKind.series, scan_uses[0].kind);
+    try std.testing.expectEqual(@as(?types.SeriesId, 41), scan_uses[0].series_id);
+    try std.testing.expectEqualStrings("weather.room1", scan_uses[0].name);
 }
 
 test "prepareSydraQL compiles constant and scan statements to bytecode" {
