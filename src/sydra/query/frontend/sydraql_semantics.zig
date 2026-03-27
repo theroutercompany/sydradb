@@ -155,6 +155,7 @@ const Dispatcher = struct {
         const expr = try exprFromValue(rhs[0]);
         return .{ .projection = .{
             .expr = expr,
+            .alias = null,
             .span = expr.span(),
         } };
     }

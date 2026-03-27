@@ -23,6 +23,7 @@ fn lowerSelect(allocator: std.mem.Allocator, select: stmt_mod.Select) NormalizeE
     for (select.projections, 0..) |projection, idx| {
         projections[idx] = .{
             .expr = try lowerExpr(allocator, projection.expr),
+            .alias = if (projection.alias) |alias| lowerIdentifier(alias) else null,
             .span = projection.span,
         };
     }

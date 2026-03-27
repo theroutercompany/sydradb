@@ -15,6 +15,7 @@ const SelectClauses = struct {
 const SemanticValue = union(enum) {
     token: TokenValue,
     stmt: stmt_mod.FrontendStmt,
+    selector: stmt_mod.Selector,
     clauses: SelectClauses,
     projection: stmt_mod.Projection,
     projections: []const stmt_mod.Projection,
@@ -77,6 +78,8 @@ const Dispatcher = struct {
         if (std.mem.eql(u8, action_name, "emitInsert()")) return try self.emitInsert(rhs);
         if (std.mem.eql(u8, action_name, "emitInsertValues()")) return try self.emitInsertValues(rhs);
         if (std.mem.eql(u8, action_name, "emitDelete()")) return try self.emitDelete(rhs);
+        if (std.mem.eql(u8, action_name, "emitSourceName()")) return try self.emitSourceName(rhs);
+        if (std.mem.eql(u8, action_name, "emitSourceCall()")) return try self.emitSourceCall(rhs);
         if (std.mem.eql(u8, action_name, "emitEmptyClauses()")) return .{ .clauses = .{} };
         if (std.mem.eql(u8, action_name, "attachWhere()")) return try mergeClauses(rhs);
         if (std.mem.eql(u8, action_name, "attachGroup()")) return try mergeClauses(rhs);
@@ -88,6 +91,7 @@ const Dispatcher = struct {
         if (std.mem.eql(u8, action_name, "attachGroupOrderLimit()")) return try mergeClauses(rhs);
         if (std.mem.eql(u8, action_name, "appendProjection()")) return try self.appendProjection(rhs);
         if (std.mem.eql(u8, action_name, "emitProjection()")) return try self.emitProjection(rhs);
+        if (std.mem.eql(u8, action_name, "emitProjectionAlias()")) return try self.emitProjectionAlias(rhs);
         if (std.mem.eql(u8, action_name, "emitStar()")) return try self.emitStar(rhs);
         if (std.mem.eql(u8, action_name, "emitPrimaryExpr()")) return rhs[0];
         if (std.mem.eql(u8, action_name, "emitComparison()")) return try self.emitComparison(rhs);
@@ -133,15 +137,12 @@ const Dispatcher = struct {
     }
 
     fn emitSelect(_: *@This(), rhs: []const SemanticValue) !SemanticValue {
-        const target = try identifierFromValue(rhs[3]);
+        const target = try selectorFromValue(rhs[3]);
         const clauses = try clausesFromValue(rhs[4]);
         return .{ .stmt = .{
             .select = .{
                 .projections = try projectionsFromValue(rhs[1]),
-                .selector = .{
-                    .series = .{ .name = target },
-                    .span = target.span,
-                },
+                .selector = target,
                 .predicate = clauses.predicate,
                 .groupings = clauses.groupings,
                 .ordering = clauses.ordering,
@@ -186,6 +187,28 @@ const Dispatcher = struct {
         } };
     }
 
+    fn emitSourceName(_: *@This(), rhs: []const SemanticValue) !SemanticValue {
+        const name = try identifierFromValue(rhs[0]);
+        return .{ .selector = .{
+            .series = .{ .name = name },
+            .span = name.span,
+        } };
+    }
+
+    fn emitSourceCall(_: *@This(), rhs: []const SemanticValue) !SemanticValue {
+        const callee = try tokenFromValue(rhs[0]);
+        if (!std.ascii.eqlIgnoreCase(callee.lexeme, "by_id")) return error.InvalidTrace;
+        const number_token = try tokenFromValue(rhs[2]);
+        const value = try std.fmt.parseInt(u64, number_token.lexeme, 10);
+        return .{ .selector = .{
+            .series = .{ .by_id = .{
+                .value = value,
+                .span = number_token.span,
+            } },
+            .span = combinedSpan(rhs),
+        } };
+    }
+
     fn appendProjection(self: *@This(), rhs: []const SemanticValue) !SemanticValue {
         if (rhs.len == 1) {
             const projection = try projectionFromValue(rhs[0]);
@@ -205,7 +228,18 @@ const Dispatcher = struct {
         const expr = try exprFromValue(rhs[0]);
         return .{ .projection = .{
             .expr = expr,
+            .alias = null,
             .span = expr.span(),
+        } };
+    }
+
+    fn emitProjectionAlias(_: *@This(), rhs: []const SemanticValue) !SemanticValue {
+        const expr = try exprFromValue(rhs[0]);
+        const alias = try identifierFromValue(rhs[2]);
+        return .{ .projection = .{
+            .expr = expr,
+            .alias = alias,
+            .span = combinedSpan(rhs),
         } };
     }
 
@@ -405,6 +439,13 @@ fn stmtFromValue(value: SemanticValue) !stmt_mod.FrontendStmt {
 fn clausesFromValue(value: SemanticValue) !SelectClauses {
     return switch (value) {
         .clauses => |clauses| clauses,
+        else => error.InvalidTrace,
+    };
+}
+
+fn selectorFromValue(value: SemanticValue) !stmt_mod.Selector {
+    return switch (value) {
+        .selector => |selector| selector,
         else => error.InvalidTrace,
     };
 }

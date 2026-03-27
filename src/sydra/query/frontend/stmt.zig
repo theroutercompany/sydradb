@@ -95,6 +95,7 @@ pub const LimitClause = struct {
 
 pub const Projection = struct {
     expr: *const Expr,
+    alias: ?Identifier = null,
     span: common.Span,
 };
 

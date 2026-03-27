@@ -285,6 +285,30 @@ test "sql core parser skeleton matches golden cases" {
     }
 }
 
+test "sql core parser skeleton preserves by_id sources and projection aliases" {
+    const alloc = std.testing.allocator;
+    var result = try parseSqlCoreSkeleton(alloc, "select value as reading from by_id(41) where time >= $1 order by reading limit 10");
+    defer result.deinit();
+
+    try std.testing.expectEqual(StatementKind.select, result.kind);
+    try std.testing.expectEqual(@as(usize, 0), result.diagnostics.len);
+    try std.testing.expect(result.used_generated_runtime);
+    try std.testing.expect(result.stmt != null);
+
+    const stmt = result.stmt.?;
+    try std.testing.expect(stmt == .select);
+    const select = stmt.select;
+    try std.testing.expect(select.selector != null);
+    try std.testing.expect(select.selector.?.series == .by_id);
+    try std.testing.expectEqual(@as(u64, 41), select.selector.?.series.by_id.value);
+    try std.testing.expectEqual(@as(usize, 1), select.projections.len);
+    try std.testing.expect(select.projections[0].alias != null);
+    try std.testing.expectEqualStrings("reading", select.projections[0].alias.?.value);
+    try std.testing.expectEqual(@as(usize, 1), select.ordering.len);
+    try std.testing.expect(select.ordering[0].expr.* == .identifier);
+    try std.testing.expectEqualStrings("reading", select.ordering[0].expr.identifier.value);
+}
+
 test "sql core parser skeleton reports grammar coverage gaps" {
     const alloc = std.testing.allocator;
     var result = try parseSqlCoreSkeleton(alloc, "select value from metrics where value =~ 'hot'");
