@@ -1139,7 +1139,7 @@ pub const CasManager = struct {
             self.alloc.free(refs);
         }
         _ = try self.collectReachable(refs);
-        _ = try loadCommitGraph(self.alloc, self.store.root) catch |err| switch (err) {
+        _ = loadCommitGraph(self.alloc, self.store.root) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
@@ -1160,14 +1160,14 @@ pub const CasManager = struct {
 
     pub fn loadLog(self: *CasManager, spec: []const u8, max_entries: usize) ![]LogEntry {
         const start = try self.resolveCommitSpec(spec);
-        if (loadCommitGraph(self.alloc, self.store.root)) |graph| {
+        if (loadCommitGraph(self.alloc, self.store.root)) |loaded_graph| {
+            var graph = loaded_graph;
             defer graph.deinit(self.alloc);
             return try graph.toLogEntries(self.alloc, start, max_entries);
         } else |err| switch (err) {
             error.FileNotFound,
             error.CorruptCommitGraph,
             error.UnsupportedCommitGraphVersion,
-            error.CommitGraphMissingCommit,
             => {},
             else => return err,
         }
@@ -1238,7 +1238,8 @@ pub const CasManager = struct {
     pub fn diffSnapshots(self: *CasManager, lhs_spec: []const u8, rhs_spec: []const u8) !SnapshotDiff {
         const lhs_commit_id = try self.resolveCommitSpec(lhs_spec);
         const rhs_commit_id = try self.resolveCommitSpec(rhs_spec);
-        if (loadCommitGraph(self.alloc, self.store.root)) |graph| {
+        if (loadCommitGraph(self.alloc, self.store.root)) |loaded_graph| {
+            var graph = loaded_graph;
             defer graph.deinit(self.alloc);
             if (graph.rootFor(lhs_commit_id)) |lhs_root| {
                 if (graph.rootFor(rhs_commit_id)) |rhs_root| {
@@ -1342,7 +1343,7 @@ pub const CasManager = struct {
             deleted = unreachable_ids.items.len;
         }
 
-        const prunable = try scanExpiredCruft(self.alloc, self.store.root, now_ms, options.grace_period_ms);
+        var prunable = try scanExpiredCruft(self.alloc, self.store.root, now_ms, options.grace_period_ms);
         defer prunable.deinit(self.alloc);
 
         var pruned_count: usize = 0;
@@ -1433,7 +1434,8 @@ pub const CasManager = struct {
             }
         }
 
-        if (loadCommitGraph(self.alloc, self.store.root)) |graph| {
+        if (loadCommitGraph(self.alloc, self.store.root)) |loaded_graph| {
+            var graph = loaded_graph;
             defer graph.deinit(self.alloc);
             if (graph.object_ids.len < report.commit_objects) return error.CorruptCommitGraph;
             for (graph.object_ids, 0..) |commit_id, idx| {
@@ -2310,7 +2312,7 @@ fn buildCommitGraph(
     defer stack.deinit();
     for (refs) |entry| try stack.append(entry.id);
 
-    while (stack.popOrNull()) |commit_id| {
+    while (stack.pop()) |commit_id| {
         if (seen.contains(commit_id)) continue;
         try seen.put(commit_id, {});
 
@@ -2456,7 +2458,7 @@ fn loadCommitGraph(alloc: std.mem.Allocator, root: std.fs.Dir) !CommitGraph {
     if (bytes.len < commit_graph_magic.len + @sizeOf(u16) + @sizeOf(u64)) return error.CorruptCommitGraph;
     if (!std.mem.eql(u8, bytes[0..commit_graph_magic.len], commit_graph_magic[0..])) return error.CorruptCommitGraph;
 
-    var cursor = Cursor{ .bytes = bytes, .offset = commit_graph_magic.len };
+    var cursor = Cursor{ .bytes = bytes, .index = commit_graph_magic.len };
     const version = try cursor.readInt(u16);
     if (version != 1) return error.UnsupportedCommitGraphVersion;
     const commit_count = try cursor.readInt(u64);
@@ -2493,8 +2495,8 @@ fn loadCommitGraph(alloc: std.mem.Allocator, root: std.fs.Dir) !CommitGraph {
     const reasons_len = reason_offsets[reason_offsets.len - 1];
     const reasons = try alloc.alloc(u8, @intCast(reasons_len));
     errdefer alloc.free(reasons);
-    @memcpy(reasons, cursor.bytes[cursor.offset .. cursor.offset + reasons.len]);
-    cursor.offset += reasons.len;
+    @memcpy(reasons, cursor.bytes[cursor.index .. cursor.index + reasons.len]);
+    cursor.index += reasons.len;
     try cursor.finish();
 
     return .{
@@ -3797,8 +3799,8 @@ test "gc prunes unreachable commits" {
     try cas_manager.refs.updateHeadAtomic(main_ref, initial);
 
     try data_dir.makePath("wal");
-    try data_dir.writeFile("segments/stale.seg", "stale-segment");
-    try data_dir.writeFile("wal/stale.wal", "stale-wal");
+    try data_dir.writeFile(.{ .sub_path = "segments/stale.seg", .data = "stale-segment" });
+    try data_dir.writeFile(.{ .sub_path = "wal/stale.wal", .data = "stale-wal" });
 
     const dry_run = try cas_manager.gc(.{
         .dry_run = true,

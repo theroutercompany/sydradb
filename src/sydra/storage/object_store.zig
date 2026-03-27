@@ -144,8 +144,10 @@ pub const ObjectStore = struct {
         const payload_len = std.mem.readInt(u32, buffer[1..5], .little);
         if (payload_len != buffer[5..].len) return error.CorruptObject;
 
-        const payload = buffer[5 .. 5 + payload_len];
-        if (!hash(obj_type, payload).eql(id)) return error.ObjectHashMismatch;
+        const encoded_payload = buffer[5 .. 5 + payload_len];
+        if (!hash(obj_type, encoded_payload).eql(id)) return error.ObjectHashMismatch;
+        const payload = try allocator.dupe(u8, encoded_payload);
+        allocator.free(buffer);
         return LoadedObject{
             .id = id,
             .obj_type = obj_type,
@@ -323,7 +325,7 @@ pub const ObjectStore = struct {
     }
 
     fn getPacked(self: *ObjectStore, allocator: std.mem.Allocator, id: ObjectId) !LoadedObject {
-        const location = try self.findPackedLocation(id) orelse return error.FileNotFound;
+        var location = try self.findPackedLocation(id) orelse return error.FileNotFound;
         defer location.deinit(allocator);
 
         var pack_file = try self.root.openFile(location.pack_path, .{ .mode = .read_only });
@@ -613,7 +615,9 @@ fn appendInt(bytes: *std.array_list.Managed(u8), comptime T: type, value: T) !vo
 
 fn readIntAt(bytes: []const u8, cursor: *usize, comptime T: type) T {
     defer cursor.* += @sizeOf(T);
-    return std.mem.readInt(T, bytes[cursor.* .. cursor.* + @sizeOf(T)], .little);
+    var raw: [@sizeOf(T)]u8 = undefined;
+    @memcpy(raw[0..], bytes[cursor.* .. cursor.* + @sizeOf(T)]);
+    return std.mem.readInt(T, &raw, .little);
 }
 
 fn hashRelativeFile(root: std.fs.Dir, alloc: std.mem.Allocator, path: []const u8) ![32]u8 {

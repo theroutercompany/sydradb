@@ -253,7 +253,7 @@ fn prepareParsedStatement(
     diagnostics: []const frontend.diagnostics.Diagnostic,
 ) PrepareError!PreparedStmt {
     const compiled = try compiler.compileSelect(arena_ptr.allocator(), engine, statement);
-    const lowered = try codegen.buildProgram(allocator, compiled);
+    var lowered = try codegen.buildProgram(allocator, compiled);
     errdefer lowered.program.deinit();
     errdefer if (lowered.columns.len != 0) allocator.free(lowered.columns);
 
@@ -374,7 +374,7 @@ test "prepareSydraQL compiles constant and scan statements to bytecode" {
     const sid = @import("../types.zig").seriesIdFrom("weather.room1", "{}");
     try engine.registerSeries("weather.room1", "{}", sid);
     try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 42.5, .tags_json = try alloc.dupe(u8, "{}") });
-    std.time.sleep(20 * std.time.ns_per_ms);
+    std.Thread.sleep(20 * std.time.ns_per_ms);
 
     var scan_stmt = try prepareSydraQL(alloc, engine, "select time, value from weather.room1 where time >= 0", .{});
     defer scan_stmt.finalize();
@@ -423,7 +423,7 @@ test "prepared bytecode snapshots stay stable for constant and scan plans" {
     const sid = @import("../types.zig").seriesIdFrom("weather.room1", "{}");
     try engine.registerSeries("weather.room1", "{}", sid);
     try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 42.5, .tags_json = try alloc.dupe(u8, "{}") });
-    std.time.sleep(20 * std.time.ns_per_ms);
+    std.Thread.sleep(20 * std.time.ns_per_ms);
 
     var scan_stmt = try prepareSydraQL(alloc, engine, "select time, value from weather.room1 where time >= 0", .{});
     defer scan_stmt.finalize();
@@ -468,7 +468,7 @@ test "prepared VM matches compiled executor on supported queries" {
     try engine.registerSeries("compare.room1", "{}", sid);
     try engine.ingest(.{ .series_id = sid, .ts = 100, .value = 1.0, .tags_json = try alloc.dupe(u8, "{}") });
     try engine.ingest(.{ .series_id = sid, .ts = 200, .value = 3.0, .tags_json = try alloc.dupe(u8, "{}") });
-    std.time.sleep(20 * std.time.ns_per_ms);
+    std.Thread.sleep(20 * std.time.ns_per_ms);
 
     const scan_parity = try shadowCompareSydraQL(alloc, engine, "select time, value from compare.room1 where time >= 0");
     try std.testing.expect(scan_parity.columns_match);
@@ -513,7 +513,7 @@ test "prepareSqlCore translates SQL into prepared bytecode programs" {
     const sid = @import("../types.zig").seriesIdFrom("weather.room1", "{}");
     try engine.registerSeries("weather.room1", "{}", sid);
     try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 42.5, .tags_json = try alloc.dupe(u8, "{}") });
-    std.time.sleep(20 * std.time.ns_per_ms);
+    std.Thread.sleep(20 * std.time.ns_per_ms);
 
     var scan_stmt = try prepareSqlCore(alloc, engine, "SELECT time, value FROM weather.room1 WHERE time >= 0", .{});
     defer scan_stmt.finalize();

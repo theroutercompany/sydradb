@@ -12,7 +12,7 @@ const cas_mod = @import("storage/cas.zig");
 
 fn sleepMs(ms: u64) void {
     if (@hasDecl(std.time, "sleep")) {
-        std.time.sleep(ms * std.time.ns_per_ms);
+        std.Thread.sleep(ms * std.time.ns_per_ms);
     } else {
         std.Thread.sleep(ms * std.time.ns_per_ms);
     }

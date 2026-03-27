@@ -87,7 +87,7 @@ pub fn loadCases(alloc: std.mem.Allocator, path: []const u8) !CaseList {
         const notes = try dupeOptionalField(alloc, obj, "notes", "");
 
         const expect_val = obj.get("expect") orelse return FixturesError.MissingField;
-        const expect = try parseExpect(alloc, expect_val.*);
+        const expect = try parseExpect(alloc, expect_val);
 
         try cases.append(.{ .name = name, .sql = sql, .expect = expect, .notes = notes });
     }
@@ -99,7 +99,7 @@ fn parseExpect(alloc: std.mem.Allocator, value: std.json.Value) !Expect {
     if (value != .object) return FixturesError.InvalidType;
     const obj = value.object;
     const kind_val = obj.get("kind") orelse return FixturesError.MissingField;
-    if (kind_val.* != .string) return FixturesError.InvalidType;
+    if (kind_val != .string) return FixturesError.InvalidType;
     const kind = kind_val.string;
 
     if (std.mem.eql(u8, kind, "success")) {
@@ -116,13 +116,13 @@ fn parseExpect(alloc: std.mem.Allocator, value: std.json.Value) !Expect {
 
 fn dupeField(alloc: std.mem.Allocator, obj: std.json.ObjectMap, key: []const u8) ![]u8 {
     const value = obj.get(key) orelse return FixturesError.MissingField;
-    if (value.* != .string) return FixturesError.InvalidType;
+    if (value != .string) return FixturesError.InvalidType;
     return alloc.dupe(u8, value.string);
 }
 
 fn dupeOptionalField(alloc: std.mem.Allocator, obj: std.json.ObjectMap, key: []const u8, default: []const u8) ![]u8 {
     const maybe = obj.get(key) orelse return alloc.dupe(u8, default);
-    if (maybe.* == .string) {
+    if (maybe == .string) {
         return alloc.dupe(u8, maybe.string);
     }
     return FixturesError.InvalidType;
@@ -130,7 +130,7 @@ fn dupeOptionalField(alloc: std.mem.Allocator, obj: std.json.ObjectMap, key: []c
 
 test "load translator fixtures" {
     const alloc = std.testing.allocator;
-    const list = try loadCases(alloc, "tests/translator/cases.jsonl");
+    var list = try loadCases(alloc, "tests/translator/cases.jsonl");
     defer list.deinit();
     try std.testing.expect(list.cases.len >= 2);
     const case0 = list.cases[0];

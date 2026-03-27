@@ -96,7 +96,22 @@ pub const ParserGenerator = struct {
 };
 
 fn writeQuoted(writer: anytype, value: []const u8) !void {
-    try writer.print("\"{s}\"", .{std.zig.fmtEscapes(value)});
+    try writer.writeByte('"');
+    for (value) |byte| switch (byte) {
+        '\\' => try writer.writeAll("\\\\"),
+        '"' => try writer.writeAll("\\\""),
+        '\n' => try writer.writeAll("\\n"),
+        '\r' => try writer.writeAll("\\r"),
+        '\t' => try writer.writeAll("\\t"),
+        else => {
+            if (std.ascii.isPrint(byte)) {
+                try writer.writeByte(byte);
+            } else {
+                try writer.print("\\x{X:0>2}", .{byte});
+            }
+        },
+    };
+    try writer.writeByte('"');
 }
 
 fn estimateStates(spec: grammar.GrammarSpec) usize {

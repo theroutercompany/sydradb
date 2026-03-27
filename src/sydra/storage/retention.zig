@@ -41,8 +41,8 @@ test "retention removes expired segments" {
     defer tmp.cleanup();
 
     try tmp.dir.makePath("segments");
-    try tmp.dir.writeFile("segments/old.seg", "old");
-    try tmp.dir.writeFile("segments/new.seg", "new");
+    try tmp.dir.writeFile(.{ .sub_path = "segments/old.seg", .data = "old" });
+    try tmp.dir.writeFile(.{ .sub_path = "segments/new.seg", .data = "new" });
 
     var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
     defer manifest.deinit();

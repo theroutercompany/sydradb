@@ -109,7 +109,7 @@ fn hasTerminal(tokens: []const grammar.TokenSpec, name: []const u8) bool {
 
 test "sql core parser skeleton matches golden cases" {
     const alloc = std.testing.allocator;
-    const contents = @embedFile("../../../../tests/sql_core/parser_cases.tsv");
+    const contents = @embedFile("sql_core_parser_cases.tsv");
     var lines = std.mem.splitScalar(u8, contents, '\n');
     while (lines.next()) |line_raw| {
         const line = std.mem.trim(u8, line_raw, " \t\r\n");

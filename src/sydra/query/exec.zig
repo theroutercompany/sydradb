@@ -751,7 +751,7 @@ fn waitForFlushForTest(engine: *engine_mod.Engine, min_flushes: u64, timeout_ms:
     while (std.time.milliTimestamp() - start < timeout_ms) {
         if (engine.metrics.flush_total.load(.monotonic) >= min_flushes) return;
         if (@hasDecl(std.time, "sleep")) {
-            std.time.sleep(5 * std.time.ns_per_ms);
+            std.Thread.sleep(5 * std.time.ns_per_ms);
         } else {
             std.Thread.sleep(5 * std.time.ns_per_ms);
         }

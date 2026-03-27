@@ -5,7 +5,9 @@ const engine_mod = @import("../engine.zig");
 const types = @import("../types.zig");
 const value_mod = @import("value.zig");
 
-pub const VmError = value_mod.ConvertError || error{
+const QueryRangeError = @typeInfo(@typeInfo(@TypeOf(engine_mod.Engine.queryRange)).@"fn".return_type.?).error_union.error_set;
+
+pub const VmError = value_mod.ConvertError || QueryRangeError || error{
     InvalidOpcode,
     InvalidRegister,
     InvalidConstant,
@@ -258,7 +260,7 @@ test "virtual machine yields a row and halts" {
     };
     defer program.deinit();
 
-    var machine = try VirtualMachine.init(alloc, &engine, &program);
+    var machine = try VirtualMachine.init(alloc, engine, &program);
     defer machine.deinit();
 
     const first = try machine.step();
