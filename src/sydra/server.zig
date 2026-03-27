@@ -309,7 +309,21 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     if (std.mem.eql(u8, sub, "gc")) {
         const dry_run = !(args.len >= 4 and std.mem.eql(u8, std.mem.sliceTo(args[3], 0), "--apply"));
         const result = try cas.gc(dry_run);
-        std.debug.print("cas gc dry_run={} reachable={d} unreachable={d} deleted={d}\n", .{ dry_run, result.reachable, result.unreachable_count, result.deleted });
+        std.debug.print(
+            "cas gc dry_run={} reachable={d} unreachable={d} unreachable_bytes={d} deleted={d} stale_segment_files={d} stale_segment_bytes={d} stale_wal_files={d} stale_wal_bytes={d} mirror_deleted={d}\n",
+            .{
+                dry_run,
+                result.reachable,
+                result.unreachable_count,
+                result.unreachable_bytes,
+                result.deleted,
+                result.stale_segment_files,
+                result.stale_segment_bytes,
+                result.stale_wal_files,
+                result.stale_wal_bytes,
+                result.mirror_deleted,
+            },
+        );
         return;
     }
     if (std.mem.eql(u8, sub, "checkout")) {

@@ -915,7 +915,13 @@ pub const SnapshotDiff = struct {
 pub const GcResult = struct {
     reachable: usize,
     unreachable_count: usize,
+    unreachable_bytes: u64,
     deleted: usize,
+    stale_segment_files: usize,
+    stale_segment_bytes: u64,
+    stale_wal_files: usize,
+    stale_wal_bytes: u64,
+    mirror_deleted: usize,
 };
 
 pub const CasManager = struct {
@@ -1109,20 +1115,46 @@ pub const CasManager = struct {
         defer self.alloc.free(all);
 
         var unreachable_count: usize = 0;
+        var unreachable_bytes: u64 = 0;
         var deleted: usize = 0;
         for (all) |id| {
             if (reachable.contains(id)) continue;
             unreachable_count += 1;
+            unreachable_bytes += try objectSize(&self.store, id);
             if (!dry_run) {
                 try self.store.delete(id);
                 deleted += 1;
             }
         }
 
+        var stale_segment_files: usize = 0;
+        var stale_segment_bytes: u64 = 0;
+        var stale_wal_files: usize = 0;
+        var stale_wal_bytes: u64 = 0;
+        var mirror_deleted: usize = 0;
+
+        if (try self.refs.readHead(main_ref) != null) {
+            var head = try self.loadHeadIndex();
+            defer head.deinit();
+
+            const mirror_result = try cleanupStaleMirrors(self.alloc, self.store.root, head.snapshot, dry_run);
+            stale_segment_files = mirror_result.stale_segment_files;
+            stale_segment_bytes = mirror_result.stale_segment_bytes;
+            stale_wal_files = mirror_result.stale_wal_files;
+            stale_wal_bytes = mirror_result.stale_wal_bytes;
+            mirror_deleted = mirror_result.deleted;
+        }
+
         return .{
             .reachable = reachable.count(),
             .unreachable_count = unreachable_count,
+            .unreachable_bytes = unreachable_bytes,
             .deleted = deleted,
+            .stale_segment_files = stale_segment_files,
+            .stale_segment_bytes = stale_segment_bytes,
+            .stale_wal_files = stale_wal_files,
+            .stale_wal_bytes = stale_wal_bytes,
+            .mirror_deleted = mirror_deleted,
         };
     }
 
@@ -1168,6 +1200,123 @@ pub const CasManager = struct {
         return seen;
     }
 };
+
+const MirrorGcResult = struct {
+    stale_segment_files: usize,
+    stale_segment_bytes: u64,
+    stale_wal_files: usize,
+    stale_wal_bytes: u64,
+    deleted: usize,
+};
+
+fn cleanupStaleMirrors(alloc: std.mem.Allocator, data_dir: std.fs.Dir, snapshot: Snapshot, dry_run: bool) !MirrorGcResult {
+    var expected_segments = std.StringHashMap(void).init(alloc);
+    defer expected_segments.deinit();
+    for (snapshot.segment_descriptors) |descriptor| {
+        if (descriptor.path.len == 0) continue;
+        try expected_segments.put(descriptor.path, {});
+    }
+
+    var stale_segment_files: usize = 0;
+    var stale_segment_bytes: u64 = 0;
+    var deleted: usize = 0;
+
+    const segment_paths = try listFilesRecursive(alloc, data_dir, "segments");
+    defer freeOwnedStrings(alloc, segment_paths);
+    for (segment_paths) |path| {
+        if (expected_segments.contains(path)) continue;
+        const stat = try data_dir.statFile(path);
+        stale_segment_files += 1;
+        stale_segment_bytes += stat.size;
+        if (!dry_run) {
+            data_dir.deleteFile(path) catch {};
+            deleted += 1;
+        }
+    }
+
+    var stale_wal_files: usize = 0;
+    var stale_wal_bytes: u64 = 0;
+    const wal_paths = try listFilesRecursive(alloc, data_dir, "wal");
+    defer freeOwnedStrings(alloc, wal_paths);
+    for (wal_paths) |path| {
+        if (std.mem.eql(u8, path, "wal/current.wal") or walPathReferenced(snapshot.wal_index.entries, path)) continue;
+        const stat = try data_dir.statFile(path);
+        stale_wal_files += 1;
+        stale_wal_bytes += stat.size;
+        if (!dry_run) {
+            data_dir.deleteFile(path) catch {};
+            deleted += 1;
+        }
+    }
+
+    return .{
+        .stale_segment_files = stale_segment_files,
+        .stale_segment_bytes = stale_segment_bytes,
+        .stale_wal_files = stale_wal_files,
+        .stale_wal_bytes = stale_wal_bytes,
+        .deleted = deleted,
+    };
+}
+
+fn walPathReferenced(entries: []const WalChunkDescriptor, path: []const u8) bool {
+    for (entries) |entry| {
+        var buf: [256]u8 = undefined;
+        const candidate = std.fmt.bufPrint(&buf, "wal/{s}", .{entry.name}) catch continue;
+        if (std.mem.eql(u8, candidate, path)) return true;
+    }
+    return false;
+}
+
+fn listFilesRecursive(alloc: std.mem.Allocator, dir: std.fs.Dir, root_path: []const u8) ![][]u8 {
+    var subdir = dir.openDir(root_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return try alloc.alloc([]u8, 0),
+        else => return err,
+    };
+    defer subdir.close();
+
+    var files = std.array_list.Managed([]u8).init(alloc);
+    errdefer {
+        for (files.items) |item| alloc.free(item);
+        files.deinit();
+    }
+    try appendFilesRecursive(alloc, &files, subdir, root_path);
+    return try files.toOwnedSlice();
+}
+
+fn appendFilesRecursive(alloc: std.mem.Allocator, files: *std.array_list.Managed([]u8), dir: std.fs.Dir, prefix: []const u8) !void {
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        const path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ prefix, entry.name });
+        defer alloc.free(path);
+        switch (entry.kind) {
+            .file => try files.append(try alloc.dupe(u8, path)),
+            .directory => {
+                var child = try dir.openDir(entry.name, .{ .iterate = true });
+                defer child.close();
+                try appendFilesRecursive(alloc, files, child, path);
+            },
+            else => {},
+        }
+    }
+}
+
+fn freeOwnedStrings(alloc: std.mem.Allocator, values: [][]u8) void {
+    for (values) |value| alloc.free(value);
+    alloc.free(values);
+}
+
+fn objectSize(store: *object_store.ObjectStore, id: object_store.ObjectId) !u64 {
+    var objects_dir = try store.root.openDir("objects", .{ .iterate = true });
+    defer objects_dir.close();
+
+    const bucket_name = std.fmt.bytesToHex([_]u8{id.hash[0]}, .lower);
+    var bucket_dir = try objects_dir.openDir(bucket_name[0..], .{});
+    defer bucket_dir.close();
+
+    const object_name = id.toHex();
+    const stat = try bucket_dir.statFile(object_name[0..]);
+    return stat.size;
+}
 
 pub fn buildLegacySnapshot(
     alloc: std.mem.Allocator,
@@ -2330,8 +2479,17 @@ test "gc prunes unreachable commits" {
     try std.testing.expect(!initial.eql(orphan));
     try cas_manager.refs.updateHeadAtomic(main_ref, initial);
 
+    try data_dir.makePath("wal");
+    try data_dir.writeFile("segments/stale.seg", "stale-segment");
+    try data_dir.writeFile("wal/stale.wal", "stale-wal");
+
     const dry_run = try cas_manager.gc(true);
     try std.testing.expect(dry_run.unreachable_count > 0);
+    try std.testing.expect(dry_run.stale_segment_files > 0);
+    try std.testing.expect(dry_run.stale_wal_files > 0);
     const applied = try cas_manager.gc(false);
     try std.testing.expect(applied.deleted > 0);
+    try std.testing.expect(applied.mirror_deleted > 0);
+    try std.testing.expectError(error.FileNotFound, data_dir.statFile("segments/stale.seg"));
+    try std.testing.expectError(error.FileNotFound, data_dir.statFile("wal/stale.wal"));
 }
