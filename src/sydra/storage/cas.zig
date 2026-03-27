@@ -304,6 +304,25 @@ pub const RefEntry = struct {
     }
 };
 
+pub const RefTxnUpdate = struct {
+    ref_name: []const u8,
+    expected_old: ?object_store.ObjectId = null,
+    new_id: object_store.ObjectId,
+};
+
+pub const ReflogEntry = struct {
+    ref_name: []u8,
+    old_id: ?object_store.ObjectId,
+    new_id: object_store.ObjectId,
+    timestamp_ms: i64,
+    reason: []u8,
+
+    pub fn deinit(self: *ReflogEntry, alloc: std.mem.Allocator) void {
+        alloc.free(self.ref_name);
+        alloc.free(self.reason);
+    }
+};
+
 pub const RefStore = struct {
     alloc: std.mem.Allocator,
     root: std.fs.Dir,
@@ -314,6 +333,8 @@ pub const RefStore = struct {
         try cwd.makePath(path);
         const root = try cwd.openDir(path, .{ .iterate = true });
         try root.makePath("refs");
+        try root.makePath("logs/refs");
+        try root.makePath("refs/txn");
         return .{ .alloc = alloc, .root = root, .fsync = fsync };
     }
 
@@ -343,10 +364,54 @@ pub const RefStore = struct {
     }
 
     pub fn updateHeadAtomic(self: *RefStore, ref_name: []const u8, id: object_store.ObjectId) !void {
-        try self.updateRefAtomic(ref_name, id);
+        try self.updateRefTxn(&[_]RefTxnUpdate{.{
+            .ref_name = ref_name,
+            .new_id = id,
+        }}, "update-head");
     }
 
     pub fn updateRefAtomic(self: *RefStore, ref_name: []const u8, id: object_store.ObjectId) !void {
+        try self.updateRefTxn(&[_]RefTxnUpdate{.{
+            .ref_name = ref_name,
+            .new_id = id,
+        }}, "update-ref");
+    }
+
+    pub fn compareAndSwapRef(self: *RefStore, ref_name: []const u8, expected_old: ?object_store.ObjectId, id: object_store.ObjectId, reason: []const u8) !void {
+        try self.updateRefTxn(&[_]RefTxnUpdate{.{
+            .ref_name = ref_name,
+            .expected_old = expected_old,
+            .new_id = id,
+        }}, reason);
+    }
+
+    pub fn updateRefTxn(self: *RefStore, updates: []const RefTxnUpdate, reason: []const u8) !void {
+        if (updates.len == 0) return;
+
+        const intent_path = try self.writeIntent(updates, reason);
+        defer {
+            self.root.deleteFile(intent_path) catch {};
+            self.alloc.free(intent_path);
+        }
+
+        var old_ids = try self.alloc.alloc(?object_store.ObjectId, updates.len);
+        defer self.alloc.free(old_ids);
+
+        for (updates, 0..) |update, idx| {
+            const current = try self.readRef(update.ref_name);
+            old_ids[idx] = current;
+            if (!optionalObjectIdEql(update.expected_old, current)) {
+                if (update.expected_old != null) return error.RefConflict;
+            }
+        }
+
+        for (updates, 0..) |update, idx| {
+            try self.writeRefFileAtomic(update.ref_name, update.new_id);
+            try self.appendReflog(update.ref_name, old_ids[idx], update.new_id, reason);
+        }
+    }
+
+    fn writeRefFileAtomic(self: *RefStore, ref_name: []const u8, id: object_store.ObjectId) !void {
         const full_path = try std.fmt.allocPrint(self.alloc, "refs/{s}", .{ref_name});
         defer self.alloc.free(full_path);
         if (std.fs.path.dirname(full_path)) |dirname| {
@@ -376,6 +441,55 @@ pub const RefStore = struct {
         };
         if (self.fsync != .none) {
             try syncDir(&self.root);
+        }
+    }
+
+    fn writeIntent(self: *RefStore, updates: []const RefTxnUpdate, reason: []const u8) ![]u8 {
+        const intent_path = try std.fmt.allocPrint(self.alloc, "refs/txn/{d}.intent", .{std.time.nanoTimestamp()});
+        errdefer self.alloc.free(intent_path);
+
+        var file = try self.root.createFile(intent_path, .{ .truncate = true, .read = true });
+        defer file.close();
+        errdefer self.root.deleteFile(intent_path) catch {};
+
+        var writer = file.writer();
+        try writer.print("reason={s}\n", .{reason});
+        for (updates) |update| {
+            const expected = if (update.expected_old) |id| id.toHex() else [_]u8{'-'} ** 64;
+            const next = update.new_id.toHex();
+            try writer.print("{s} {s} {s}\n", .{ update.ref_name, expected, next });
+        }
+        if (self.fsync != .none) {
+            try file.sync();
+            try syncDir(&self.root);
+        }
+        return intent_path;
+    }
+
+    fn appendReflog(self: *RefStore, ref_name: []const u8, old_id: ?object_store.ObjectId, new_id: object_store.ObjectId, reason: []const u8) !void {
+        const log_path = try std.fmt.allocPrint(self.alloc, "logs/refs/{s}", .{ref_name});
+        defer self.alloc.free(log_path);
+        if (std.fs.path.dirname(log_path)) |dirname| {
+            try self.root.makePath(dirname);
+        }
+
+        var file = self.root.openFile(log_path, .{ .mode = .read_write }) catch |err| switch (err) {
+            error.FileNotFound => try self.root.createFile(log_path, .{ .read = true }),
+            else => return err,
+        };
+        defer file.close();
+        try file.seekFromEnd(0);
+
+        const old_hex = if (old_id) |id| id.toHex() else [_]u8{'0'} ** 64;
+        const new_hex = new_id.toHex();
+        try file.writer().print("{d} {s} {s} {s}\n", .{
+            std.time.milliTimestamp(),
+            old_hex,
+            new_hex,
+            reason,
+        });
+        if (self.fsync != .none) {
+            try file.sync();
         }
     }
 
@@ -1986,6 +2100,32 @@ test "ref store rejects torn ref contents" {
 
     try refs.root.writeFile("refs/heads/main", "deadbeef\n");
     try std.testing.expectError(error.InvalidObjectIdHex, refs.readHead(main_ref));
+}
+
+test "ref transactions enforce compare-and-swap and append reflogs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/ref-txn", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+
+    var refs = try RefStore.init(std.testing.allocator, path, .none);
+    defer refs.deinit();
+
+    const first = object_store.computeId(.commit, "first");
+    const second = object_store.computeId(.commit, "second");
+    const wrong = object_store.computeId(.commit, "wrong");
+
+    try refs.updateRefAtomic(main_ref, first);
+    try std.testing.expectError(error.RefConflict, refs.compareAndSwapRef(main_ref, wrong, second, "should-conflict"));
+    try refs.compareAndSwapRef(main_ref, first, second, "advance-main");
+
+    const head = try refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(head.eql(second));
+
+    const reflog = try refs.root.readFileAlloc(std.testing.allocator, "logs/refs/heads/main", 4096);
+    defer std.testing.allocator.free(reflog);
+    try std.testing.expect(std.mem.indexOf(u8, reflog, "advance-main") != null);
 }
 
 test "gc prunes unreachable commits" {
