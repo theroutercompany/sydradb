@@ -83,3 +83,18 @@ pub const Executor = struct {
         };
     }
 };
+
+pub fn cursorFromRows(
+    allocator: std.mem.Allocator,
+    columns: []const plan.ColumnInfo,
+    rows: []([]Value),
+) ExecuteError!ExecutionCursor {
+    const op = try operator.createTestSourceOperator(allocator, columns, rows);
+    return .{
+        .allocator = allocator,
+        .operator = op,
+        .columns = columns,
+        .arena = null,
+        .stats = .{},
+    };
+}

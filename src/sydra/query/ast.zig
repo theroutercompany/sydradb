@@ -37,7 +37,13 @@ pub const Delete = struct {
     span: common.Span,
 };
 
+pub const ExplainMode = enum {
+    standard,
+    bytecode,
+};
+
 pub const Explain = struct {
+    mode: ExplainMode = .standard,
     target: *const Statement,
     span: common.Span,
 };

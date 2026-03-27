@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const bytecode = @import("bytecode.zig");
+const codegen = @import("codegen.zig");
 const compiler = @import("compiler.zig");
 const compiler_diagnostics = @import("compiler/diagnostics.zig");
 const parser = @import("parser.zig");
@@ -12,7 +14,7 @@ const executor = @import("executor.zig");
 const cfg = @import("../config.zig");
 const engine_mod = @import("../engine.zig");
 
-pub const ExecuteError = parser.ParseError || validator.AnalyzeError || plan_builder.BuildError || optimizer.OptimizeError || physical.BuildError || executor.ExecuteError || compiler.CompileError || std.mem.Allocator.Error || error{ValidationFailed};
+pub const ExecuteError = parser.ParseError || validator.AnalyzeError || plan_builder.BuildError || optimizer.OptimizeError || physical.BuildError || executor.ExecuteError || compiler.CompileError || codegen.CodegenError || std.mem.Allocator.Error || error{ValidationFailed};
 
 pub const ExecutionMode = compiler.ExecutionMode;
 
@@ -58,6 +60,12 @@ pub fn executeWithMode(
         .parse_us = parse_us,
         .validate_us = validate_us,
     };
+
+    if (statement == .explain and statement.explain.mode == .bytecode) {
+        const result = try executeExplainBytecode(prepared, mode, statement.explain);
+        arena_cleanup = false;
+        return result;
+    }
 
     const result = switch (mode) {
         .legacy => try executeLegacy(prepared, .legacy, false, ""),
@@ -177,6 +185,113 @@ fn executeCompiledPreferred(
             return executeLegacy(prepared, mode, true, compiler_diagnostics.reasonName(reason));
         }
         return err;
+    };
+}
+
+fn executeExplainBytecode(
+    prepared: Prepared,
+    mode: ExecutionMode,
+    explain: *const ast.Explain,
+) ExecuteError!executor.ExecutionCursor {
+    const compile_start = std.time.microTimestamp();
+    recordCompileAttempt(prepared.engine);
+
+    const compiled = compiler.compileSelect(prepared.arena_ptr.allocator(), prepared.engine, explain.target) catch |err| {
+        if (compiler_diagnostics.fromCompileError(err)) |reason| {
+            recordCompileFallback(prepared.engine, reason);
+        }
+        return err;
+    };
+
+    var lowered = codegen.buildProgram(prepared.allocator, compiled) catch |err| {
+        if (codegenFallbackReason(err)) |reason| {
+            recordCompileFallback(prepared.engine, reason);
+        }
+        return err;
+    };
+    defer {
+        lowered.program.deinit();
+        if (lowered.columns.len != 0) prepared.allocator.free(lowered.columns);
+    }
+
+    recordCompileSuccess(prepared.engine);
+
+    const lines = try bytecode.disassemble(prepared.arena_ptr.allocator(), lowered.program);
+    const columns = try buildExplainBytecodeColumns(prepared.arena_ptr.allocator());
+    const rows = try buildExplainBytecodeRows(prepared.arena_ptr.allocator(), lines);
+    var cursor = try executor.cursorFromRows(prepared.allocator, columns, rows);
+    const compile_end = std.time.microTimestamp();
+
+    try finalizeCursor(
+        prepared,
+        &cursor,
+        mode,
+        false,
+        "",
+        compiled.bind_us,
+        durationMicros(compile_end - compile_start) -| compiled.bind_us,
+        0,
+        0,
+        0,
+        0,
+    );
+    return cursor;
+}
+
+fn buildExplainBytecodeColumns(allocator: std.mem.Allocator) ![]const plan_builder.ColumnInfo {
+    const names = [_][]const u8{
+        "addr",
+        "opcode",
+        "p1",
+        "p2",
+        "p3",
+        "p4",
+        "p5",
+        "comment",
+    };
+
+    const columns = try allocator.alloc(plan_builder.ColumnInfo, names.len);
+    for (names, 0..) |name, idx| {
+        const expr = try allocator.create(ast.Expr);
+        expr.* = .{
+            .identifier = .{
+                .value = name,
+                .quoted = false,
+                .span = .{ .start = 0, .end = 0 },
+            },
+        };
+        columns[idx] = .{ .name = name, .expr = expr };
+    }
+    return columns;
+}
+
+fn buildExplainBytecodeRows(
+    allocator: std.mem.Allocator,
+    lines: []const bytecode.DisassemblyLine,
+) ![]([]executor.Value) {
+    const rows = try allocator.alloc([]executor.Value, lines.len);
+    for (lines, 0..) |line, idx| {
+        const values = try allocator.alloc(executor.Value, 8);
+        values[0] = .{ .integer = @intCast(line.pc) };
+        values[1] = .{ .string = line.opcode };
+        values[2] = .{ .integer = line.p1 };
+        values[3] = .{ .integer = line.p2 };
+        values[4] = .{ .integer = line.p3 };
+        values[5] = .{ .string = line.p4 };
+        values[6] = .{ .integer = line.p5 };
+        values[7] = .{ .string = line.comment };
+        rows[idx] = values;
+    }
+    return rows;
+}
+
+fn codegenFallbackReason(err: anyerror) ?compiler.FallbackReason {
+    return switch (err) {
+        error.UnsupportedPreparedQuery => .unsupported_statement,
+        error.UnsupportedProjection => .unsupported_projection,
+        error.UnsupportedPredicate => .unsupported_predicate,
+        error.InvalidLiteral => .unsupported_expression,
+        else => null,
     };
 }
 
@@ -335,6 +450,53 @@ test "execute supports select 1" {
 
     const second = try cursor.next();
     try std.testing.expect(second == null);
+}
+
+test "execute supports explain bytecode" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/explain-bytecode", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try engine_mod.Engine.init(talloc, config);
+    defer engine.deinit();
+
+    var cursor = try execute(talloc, engine, "explain bytecode select 1");
+    defer cursor.deinit();
+
+    try std.testing.expectEqualStrings("compiled", cursor.stats.execution_mode);
+    try std.testing.expectEqual(@as(usize, 8), cursor.columns.len);
+
+    const first = try cursor.next();
+    try std.testing.expect(first != null);
+    try std.testing.expect(executor.Value.equals(first.?.values[0], executor.Value{ .integer = 0 }));
+    try std.testing.expectEqualStrings("load_const", try first.?.values[1].asString());
+
+    const second = try cursor.next();
+    try std.testing.expect(second != null);
+    try std.testing.expectEqualStrings("result_row", try second.?.values[1].asString());
+
+    const third = try cursor.next();
+    try std.testing.expect(third != null);
+    try std.testing.expectEqualStrings("halt", try third.?.values[1].asString());
+    try std.testing.expect((try cursor.next()) == null);
 }
 
 test "executeWithMode compiled supports uniquely bound series names" {

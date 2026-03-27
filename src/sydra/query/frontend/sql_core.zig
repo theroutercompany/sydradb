@@ -70,6 +70,7 @@ fn terminalNameForToken(token: lexer.Token) []const u8 {
             .insert => "insert",
             .delete => "delete",
             .explain => "explain",
+            .bytecode => "bytecode",
             .into => "into",
             .from => "from",
             .where => "where",

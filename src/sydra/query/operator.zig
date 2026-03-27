@@ -944,7 +944,7 @@ fn namesEqual(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
 }
 
-fn createTestSourceOperator(allocator: std.mem.Allocator, schema: []const plan.ColumnInfo, rows: []([]Value)) ExecuteError!*Operator {
+pub fn createTestSourceOperator(allocator: std.mem.Allocator, schema: []const plan.ColumnInfo, rows: []([]Value)) ExecuteError!*Operator {
     const payload = Operator.TestSource{ .schema = schema, .rows = rows, .index = 0 };
     return try createOperator(allocator, schema, "test_source", testSourceNext, testSourceDestroy, .{ .test_source = payload });
 }

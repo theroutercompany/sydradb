@@ -108,6 +108,7 @@ fn terminalNameForToken(token: lexer.Token) []const u8 {
             .insert => "insert",
             .delete => "delete",
             .explain => "explain",
+            .bytecode => "bytecode",
             .from => "from",
             .where => "where",
             .group => "group",
@@ -160,4 +161,14 @@ test "shadow sydraql parser tracks insert and delete statement kinds" {
     defer alloc.free(delete_result.emitted.emitted_source);
     try std.testing.expect(delete_result.statement == .delete);
     try std.testing.expect(!delete_result.hasMismatch());
+}
+
+test "shadow sydraql parser covers explain bytecode" {
+    const alloc = std.testing.allocator;
+    const result = try parseSydraqlShadow(alloc, "explain bytecode select 1");
+    defer alloc.free(result.diagnostics);
+    defer alloc.free(result.emitted.emitted_source);
+
+    try std.testing.expect(result.statement == .explain);
+    try std.testing.expect(!result.hasMismatch());
 }

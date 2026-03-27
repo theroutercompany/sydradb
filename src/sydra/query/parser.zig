@@ -77,8 +77,13 @@ pub const Parser = struct {
             },
             .explain => {
                 const explain_token = try self.advance();
+                var mode: ast.ExplainMode = .standard;
+                if (try self.matchKeyword(.bytecode)) {
+                    mode = .bytecode;
+                }
                 const inner = try self.parseStatement();
                 const explain_ptr = try self.allocExplain(.{
+                    .mode = mode,
                     .target = try self.allocStatement(inner),
                     .span = common.Span.init(explain_token.span.start, self.lastEnd()),
                 });
@@ -838,6 +843,17 @@ test "parse delete statement" {
     try std.testing.expect(statement == .delete);
     const delete_stmt = statement.delete.*;
     try std.testing.expect(delete_stmt.predicate != null);
+}
+
+test "parse explain bytecode statement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser_inst = Parser.init(arena.allocator(), "explain bytecode select 1");
+    const statement = try parser_inst.parse();
+    try std.testing.expect(statement == .explain);
+    try std.testing.expectEqual(ast.ExplainMode.bytecode, statement.explain.mode);
+    try std.testing.expect(statement.explain.target.* == .select);
 }
 
 test "parse select with group fill order" {
