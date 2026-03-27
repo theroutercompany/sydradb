@@ -269,3 +269,7 @@ fn testConfig(alloc: std.mem.Allocator, data_path: []const u8) !cfg_mod.Config {
         .retention_ns = std.StringHashMap(u32).init(alloc),
     };
 }
+
+test {
+    _ = @import("frontend/shadow.zig");
+}
