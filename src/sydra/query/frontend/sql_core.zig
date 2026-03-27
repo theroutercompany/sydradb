@@ -262,3 +262,27 @@ test "sql core parser skeleton reports parse errors for covered invalid syntax" 
     try std.testing.expectEqual(diagnostics.DiagnosticCode.unexpected_token, result.diagnostics[0].code);
     try std.testing.expect(result.used_generated_runtime);
 }
+
+test "sql core parser skeleton matches error fixture cases" {
+    const alloc = std.testing.allocator;
+    const contents = @embedFile("sql_core_error_cases.tsv");
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len == 0 or line[0] == '#') continue;
+
+        var fields = std.mem.splitScalar(u8, line, '|');
+        const code_text = fields.next() orelse return error.InvalidCharacter;
+        const generated_text = fields.next() orelse return error.InvalidCharacter;
+        const sql = fields.next() orelse return error.InvalidCharacter;
+
+        const result = try parseSqlCoreSkeleton(alloc, sql);
+        defer alloc.free(result.diagnostics);
+
+        const expected_code = std.meta.stringToEnum(diagnostics.DiagnosticCode, code_text) orelse return error.InvalidCharacter;
+        const expected_generated = std.mem.eql(u8, generated_text, "true");
+        try std.testing.expectEqual(@as(usize, 1), result.diagnostics.len);
+        try std.testing.expectEqual(expected_code, result.diagnostics[0].code);
+        try std.testing.expectEqual(expected_generated, result.used_generated_runtime);
+    }
+}

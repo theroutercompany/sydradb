@@ -338,3 +338,29 @@ test "shadow sydraql parser uses generated runtime on covered selects" {
     try std.testing.expect(result.statement == .select);
     try std.testing.expect(!result.hasMismatch());
 }
+
+test "shadow sydraql parser matches fixture cases" {
+    const alloc = std.testing.allocator;
+    const contents = @embedFile("sydraql_shadow_cases.tsv");
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len == 0 or line[0] == '#') continue;
+
+        var fields = std.mem.splitScalar(u8, line, '|');
+        const kind_text = fields.next() orelse return error.InvalidCharacter;
+        const mismatch_text = fields.next() orelse return error.InvalidCharacter;
+        const query = fields.next() orelse return error.InvalidCharacter;
+
+        const result = try parseSydraqlShadow(alloc, query);
+        defer {
+            var owned = result;
+            owned.deinit();
+        }
+
+        const expected_tag = std.meta.stringToEnum(std.meta.Tag(ast.Statement), kind_text) orelse return error.InvalidCharacter;
+        const expected_mismatch = std.mem.eql(u8, mismatch_text, "true");
+        try std.testing.expectEqual(expected_tag, std.meta.activeTag(result.statement));
+        try std.testing.expectEqual(expected_mismatch, result.hasMismatch());
+    }
+}
