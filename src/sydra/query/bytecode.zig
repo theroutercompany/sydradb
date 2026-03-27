@@ -16,6 +16,15 @@ pub const SchemaId = u8;
 pub const OrderingId = u8;
 pub const AggregateId = u8;
 
+pub const CompareKind = enum(u8) {
+    eq = 1,
+    ne = 2,
+    lt = 3,
+    le = 4,
+    gt = 5,
+    ge = 6,
+};
+
 pub const Opcode = enum {
     open_series,
     open_rollup,

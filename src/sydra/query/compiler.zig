@@ -274,6 +274,7 @@ test {
     _ = @import("frontend/shadow.zig");
     _ = @import("frontend/sql_core.zig");
     _ = @import("bytecode.zig");
+    _ = @import("codegen.zig");
     _ = @import("prepared.zig");
     _ = @import("vm.zig");
 }

@@ -2,6 +2,7 @@ const std = @import("std");
 
 const bytecode = @import("bytecode.zig");
 const engine_mod = @import("../engine.zig");
+const types = @import("../types.zig");
 const value_mod = @import("value.zig");
 
 pub const VmError = value_mod.ConvertError || error{
@@ -17,11 +18,33 @@ pub const VmStep = union(enum) {
 };
 
 pub const VirtualMachine = struct {
+    const SeriesCursorState = struct {
+        points: std.array_list.Managed(types.Point),
+        index: usize = 0,
+        current: ?types.Point = null,
+
+        fn init(allocator: std.mem.Allocator) SeriesCursorState {
+            return .{ .points = std.array_list.Managed(types.Point).init(allocator) };
+        }
+
+        fn deinit(self: *SeriesCursorState) void {
+            self.points.deinit();
+            self.* = undefined;
+        }
+
+        fn reset(self: *SeriesCursorState) void {
+            self.points.clearRetainingCapacity();
+            self.index = 0;
+            self.current = null;
+        }
+    };
+
     allocator: std.mem.Allocator,
     engine: *engine_mod.Engine,
     program: *const bytecode.Program,
     registers: []value_mod.Value,
     row_buffer: []value_mod.Value,
+    series_cursors: []SeriesCursorState,
     pc: usize = 0,
     halted: bool = false,
 
@@ -35,16 +58,24 @@ pub const VirtualMachine = struct {
         errdefer allocator.free(row_buffer);
         for (row_buffer) |*slot| slot.* = .null;
 
+        const cursor_count = @max(program.cursors.len, 1);
+        const series_cursors = try allocator.alloc(SeriesCursorState, cursor_count);
+        errdefer allocator.free(series_cursors);
+        for (series_cursors) |*cursor| cursor.* = SeriesCursorState.init(allocator);
+
         return .{
             .allocator = allocator,
             .engine = engine,
             .program = program,
             .registers = registers,
             .row_buffer = row_buffer,
+            .series_cursors = series_cursors,
         };
     }
 
     pub fn deinit(self: *VirtualMachine) void {
+        for (self.series_cursors) |*cursor| cursor.deinit();
+        self.allocator.free(self.series_cursors);
         self.allocator.free(self.registers);
         self.allocator.free(self.row_buffer);
         self.* = undefined;
@@ -55,6 +86,7 @@ pub const VirtualMachine = struct {
         self.halted = false;
         for (self.registers) |*slot| slot.* = .null;
         for (self.row_buffer) |*slot| slot.* = .null;
+        for (self.series_cursors) |*cursor| cursor.reset();
     }
 
     pub fn step(self: *VirtualMachine) VmError!VmStep {
@@ -68,7 +100,11 @@ pub const VirtualMachine = struct {
             const instruction = self.program.instructions[self.pc];
             self.pc += 1;
             switch (instruction.opcode) {
+                .open_series => try self.executeOpenSeries(instruction),
+                .next_point => try self.executeNextPoint(instruction),
                 .load_const => try self.executeLoadConst(instruction),
+                .column => try self.executeColumn(instruction),
+                .compare => try self.executeCompare(instruction),
                 .jump => try self.executeJump(instruction.p2),
                 .jump_if_false => try self.executeJumpIfFalse(instruction),
                 .result_row => return .{ .row = try self.executeResultRow(instruction) },
@@ -90,6 +126,61 @@ pub const VirtualMachine = struct {
         };
         if (constant_id >= self.program.constants.len) return error.InvalidConstant;
         dst.* = self.program.constants[constant_id];
+    }
+
+    fn executeOpenSeries(self: *VirtualMachine, instruction: bytecode.Instruction) VmError!void {
+        const cursor_id: usize = @intCast(instruction.p1);
+        if (cursor_id >= self.series_cursors.len) return error.InvalidRegister;
+        const selector_id = switch (instruction.p4) {
+            .selector => |id| id,
+            else => return error.InvalidConstant,
+        };
+        if (selector_id >= self.program.selectors.len) return error.InvalidConstant;
+        const selector = self.program.selectors[selector_id];
+        var cursor = &self.series_cursors[cursor_id];
+        cursor.reset();
+        try self.engine.queryRange(selector.series_id, instruction.p2, instruction.p3, &cursor.points);
+    }
+
+    fn executeNextPoint(self: *VirtualMachine, instruction: bytecode.Instruction) VmError!void {
+        const cursor_id: usize = @intCast(instruction.p1);
+        if (cursor_id >= self.series_cursors.len) return error.InvalidRegister;
+        var cursor = &self.series_cursors[cursor_id];
+        if (cursor.index >= cursor.points.items.len) {
+            cursor.current = null;
+            try self.executeJump(instruction.p2);
+            return;
+        }
+        cursor.current = cursor.points.items[cursor.index];
+        cursor.index += 1;
+    }
+
+    fn executeColumn(self: *VirtualMachine, instruction: bytecode.Instruction) VmError!void {
+        const cursor_id: usize = @intCast(instruction.p1);
+        if (cursor_id >= self.series_cursors.len) return error.InvalidRegister;
+        const point = self.series_cursors[cursor_id].current orelse return error.InvalidOpcode;
+        const dst = try self.registerPtr(@intCast(instruction.p3));
+        dst.* = switch (instruction.p2) {
+            0 => .{ .integer = point.ts },
+            1 => .{ .float = point.value },
+            else => return error.InvalidOpcode,
+        };
+    }
+
+    fn executeCompare(self: *VirtualMachine, instruction: bytecode.Instruction) VmError!void {
+        const lhs = try self.registerValue(@intCast(instruction.p1));
+        const rhs = try self.registerValue(@intCast(instruction.p2));
+        const dst = try self.registerPtr(@intCast(instruction.p3));
+        const kind: bytecode.CompareKind = @enumFromInt(instruction.p5);
+        const order = try value_mod.Value.compareNumeric(lhs, rhs);
+        dst.* = .{ .boolean = switch (kind) {
+            .eq => value_mod.Value.equals(lhs, rhs),
+            .ne => !value_mod.Value.equals(lhs, rhs),
+            .lt => order == .lt,
+            .le => order == .lt or order == .eq,
+            .gt => order == .gt,
+            .ge => order == .gt or order == .eq,
+        } };
     }
 
     fn executeJump(self: *VirtualMachine, target_raw: i64) VmError!void {

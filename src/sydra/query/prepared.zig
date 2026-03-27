@@ -2,6 +2,7 @@ const std = @import("std");
 
 const ast = @import("ast.zig");
 const bytecode = @import("bytecode.zig");
+const codegen = @import("codegen.zig");
 const compiler = @import("compiler.zig");
 const engine_mod = @import("../engine.zig");
 const frontend = @import("frontend.zig");
@@ -50,6 +51,7 @@ pub const PreparedStmt = struct {
     diagnostics: []const frontend.diagnostics.Diagnostic = &.{},
     owned_source_text: bool = false,
     owned_statement: ?*const ast.Statement = null,
+    arena_ptr: ?*std.heap.ArenaAllocator = null,
     machine: ?vm.VirtualMachine = null,
     finalized: bool = false,
 
@@ -76,6 +78,10 @@ pub const PreparedStmt = struct {
         if (self.owned_statement) |stmt| {
             self.allocator.destroy(@constCast(stmt));
         }
+        if (self.arena_ptr) |arena_ptr| {
+            arena_ptr.deinit();
+            self.allocator.destroy(arena_ptr);
+        }
         if (self.diagnostics.len != 0) self.allocator.free(self.diagnostics);
         self.finalized = true;
     }
@@ -90,7 +96,7 @@ pub const PrepareError = std.mem.Allocator.Error || parser.ParseError || compile
     NotImplemented,
 };
 
-pub const StepError = value_mod.ConvertError || error{
+pub const StepError = vm.VmError || error{
     NotImplemented,
     Finalized,
 };
@@ -101,11 +107,31 @@ pub fn prepareSydraQL(
     text: []const u8,
     flags: PrepareFlags,
 ) PrepareError!PreparedStmt {
-    _ = allocator;
-    _ = engine;
-    _ = text;
-    _ = flags;
-    return error.NotImplemented;
+    var arena_ptr = try allocator.create(std.heap.ArenaAllocator);
+    arena_ptr.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer {
+        arena_ptr.deinit();
+        allocator.destroy(arena_ptr);
+    }
+
+    var parser_inst = parser.Parser.init(arena_ptr.allocator(), text);
+    var statement = try parser_inst.parse();
+    const compiled = try compiler.compileSelect(arena_ptr.allocator(), engine, &statement);
+    const lowered = try codegen.buildProgram(allocator, compiled);
+
+    var stmt = PreparedStmt{
+        .allocator = allocator,
+        .engine = engine,
+        .language = .sydraql,
+        .source_text = text,
+        .flags = flags,
+        .program = lowered.program,
+        .columns = lowered.columns,
+        .normalized = .{ .typed_query = compiled.typed_query },
+        .arena_ptr = arena_ptr,
+    };
+    stmt.machine = try vm.VirtualMachine.init(allocator, engine, &stmt.program);
+    return stmt;
 }
 
 pub fn prepareSqlCore(
@@ -206,4 +232,48 @@ test "prepared statement disassembles bytecode programs" {
     stmt.reset();
     const replay = try stmt.step();
     try std.testing.expect(replay == .row);
+}
+
+test "prepareSydraQL compiles constant and scan statements to bytecode" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-compile", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .legacy,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    var constant_stmt = try prepareSydraQL(alloc, &engine, "select 1", .{});
+    defer constant_stmt.finalize();
+    const constant_row = try constant_stmt.step();
+    try std.testing.expect(constant_row == .row);
+    try std.testing.expectEqual(@as(i64, 1), constant_row.row[0].integer);
+
+    const sid = @import("../types.zig").seriesIdFrom("weather.room1", "{}");
+    try engine.registerSeries("weather.room1", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 42.5, .tags_json = try alloc.dupe(u8, "{}") });
+    std.time.sleep(20 * std.time.ns_per_ms);
+
+    var scan_stmt = try prepareSydraQL(alloc, &engine, "select time, value from weather.room1 where time >= 0", .{});
+    defer scan_stmt.finalize();
+    const first = try scan_stmt.step();
+    try std.testing.expect(first == .row);
+    try std.testing.expectEqual(@as(i64, 10), first.row[0].integer);
 }
