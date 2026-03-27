@@ -939,6 +939,7 @@ pub const FsckReport = struct {
     commit_objects: usize,
     tree_objects: usize,
     blob_objects: usize,
+    commit_graph_entries_checked: usize,
     segment_contents_checked: usize,
     wal_contents_checked: usize,
     missing_segment_mirrors: usize,
@@ -950,6 +951,83 @@ pub const FsckReport = struct {
 pub const PackResult = struct {
     reachable_objects: usize,
     rewritten_objects: usize,
+};
+
+const commit_graph_path = "objects/info/commit-graph";
+const commit_graph_magic = "SYDCGR1\x00";
+
+const CommitGraph = struct {
+    object_ids: []object_store.ObjectId,
+    roots: []object_store.ObjectId,
+    created_at_ms: []i64,
+    generations: []u32,
+    parent_offsets: []u64,
+    parent_positions: []u64,
+    reason_offsets: []u64,
+    reasons: []u8,
+
+    fn deinit(self: *CommitGraph, alloc: std.mem.Allocator) void {
+        alloc.free(self.object_ids);
+        alloc.free(self.roots);
+        alloc.free(self.created_at_ms);
+        alloc.free(self.generations);
+        alloc.free(self.parent_offsets);
+        alloc.free(self.parent_positions);
+        alloc.free(self.reason_offsets);
+        alloc.free(self.reasons);
+    }
+
+    fn lookup(self: *const CommitGraph, id: object_store.ObjectId) ?usize {
+        var lo: usize = 0;
+        var hi: usize = self.object_ids.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const candidate = self.object_ids[mid];
+            if (candidate.eql(id)) return mid;
+            if (std.mem.lessThan(u8, candidate.hash[0..], id.hash[0..])) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        return null;
+    }
+
+    fn reasonFor(self: *const CommitGraph, idx: usize) []const u8 {
+        const start: usize = @intCast(self.reason_offsets[idx]);
+        const end: usize = @intCast(self.reason_offsets[idx + 1]);
+        return self.reasons[start..end];
+    }
+
+    fn rootFor(self: *const CommitGraph, id: object_store.ObjectId) ?object_store.ObjectId {
+        const idx = self.lookup(id) orelse return null;
+        return self.roots[idx];
+    }
+
+    fn toLogEntries(self: *const CommitGraph, alloc: std.mem.Allocator, start_id: object_store.ObjectId, max_entries: usize) ![]LogEntry {
+        const start_idx = self.lookup(start_id) orelse return error.CommitGraphMissingCommit;
+        var out = std.array_list.Managed(LogEntry).init(alloc);
+        errdefer {
+            for (out.items) |*entry| entry.deinit(alloc);
+            out.deinit();
+        }
+
+        var next_idx: ?usize = start_idx;
+        while (next_idx != null and out.items.len < max_entries) {
+            const idx = next_idx.?;
+            try out.append(.{
+                .commit_id = self.object_ids[idx],
+                .created_at_ms = self.created_at_ms[idx],
+                .reason = try alloc.dupe(u8, self.reasonFor(idx)),
+                .parent_count = @intCast(self.parent_offsets[idx + 1] - self.parent_offsets[idx]),
+            });
+            next_idx = if (self.parent_offsets[idx + 1] == self.parent_offsets[idx])
+                null
+            else
+                @as(usize, @intCast(self.parent_positions[@intCast(self.parent_offsets[idx])]));
+        }
+        return try out.toOwnedSlice();
+    }
 };
 
 pub const CasManager = struct {
@@ -981,6 +1059,7 @@ pub const CasManager = struct {
         var writer = CommitWriter{ .alloc = self.alloc, .store = &self.store };
         const commit_id = try writer.writeSnapshot(data_dir, manifest, tags, series_catalog, null, "bootstrap");
         try self.refs.compareAndSwapRef(main_ref, null, commit_id, "bootstrap");
+        try self.refreshCommitGraph();
         return commit_id;
     }
 
@@ -996,6 +1075,7 @@ pub const CasManager = struct {
         var writer = CommitWriter{ .alloc = self.alloc, .store = &self.store };
         const commit_id = try writer.writeSnapshot(data_dir, manifest, tags, series_catalog, parent, reason);
         try self.refs.compareAndSwapRef(main_ref, parent, commit_id, reason);
+        try self.refreshCommitGraph();
         return commit_id;
     }
 
@@ -1023,6 +1103,10 @@ pub const CasManager = struct {
             self.alloc.free(refs);
         }
         _ = try self.collectReachable(refs);
+        _ = try loadCommitGraph(self.alloc, self.store.root) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
     }
 
     pub fn listRefs(self: *CasManager) ![]RefEntry {
@@ -1040,6 +1124,18 @@ pub const CasManager = struct {
 
     pub fn loadLog(self: *CasManager, spec: []const u8, max_entries: usize) ![]LogEntry {
         const start = try self.resolveCommitSpec(spec);
+        if (loadCommitGraph(self.alloc, self.store.root)) |graph| {
+            defer graph.deinit(self.alloc);
+            return try graph.toLogEntries(self.alloc, start, max_entries);
+        } else |err| switch (err) {
+            error.FileNotFound,
+            error.CorruptCommitGraph,
+            error.UnsupportedCommitGraphVersion,
+            error.CommitGraphMissingCommit,
+            => {},
+            else => return err,
+        }
+
         var out = std.array_list.Managed(LogEntry).init(self.alloc);
         errdefer {
             for (out.items) |*entry| entry.deinit(self.alloc);
@@ -1073,6 +1169,7 @@ pub const CasManager = struct {
             .ref_name = ref_name,
             .new_id = commit_id,
         }}, "create-ref");
+        try self.refreshCommitGraph();
     }
 
     pub fn createCheckpoint(self: *CasManager, prefix: []const u8) !?[]u8 {
@@ -1083,6 +1180,7 @@ pub const CasManager = struct {
             .ref_name = ref_name,
             .new_id = head,
         }}, prefix);
+        try self.refreshCommitGraph();
         return ref_name;
     }
 
@@ -1092,6 +1190,7 @@ pub const CasManager = struct {
         const reason = try std.fmt.allocPrint(self.alloc, "rollback:{s}", .{spec});
         defer self.alloc.free(reason);
         try self.refs.compareAndSwapRef(main_ref, current, target, reason);
+        try self.refreshCommitGraph();
     }
 
     pub fn loadSnapshotForSpec(self: *CasManager, spec: []const u8) !Snapshot {
@@ -1101,6 +1200,30 @@ pub const CasManager = struct {
     }
 
     pub fn diffSnapshots(self: *CasManager, lhs_spec: []const u8, rhs_spec: []const u8) !SnapshotDiff {
+        const lhs_commit_id = try self.resolveCommitSpec(lhs_spec);
+        const rhs_commit_id = try self.resolveCommitSpec(rhs_spec);
+        if (loadCommitGraph(self.alloc, self.store.root)) |graph| {
+            defer graph.deinit(self.alloc);
+            if (graph.rootFor(lhs_commit_id)) |lhs_root| {
+                if (graph.rootFor(rhs_commit_id)) |rhs_root| {
+                    if (lhs_root.eql(rhs_root)) return .{
+                        .segments_added = 0,
+                        .segments_removed = 0,
+                        .tags_changed = 0,
+                        .series_entries_changed = 0,
+                        .wal_chunks_added = 0,
+                        .wal_chunks_removed = 0,
+                    };
+                }
+            }
+        } else |err| switch (err) {
+            error.FileNotFound,
+            error.CorruptCommitGraph,
+            error.UnsupportedCommitGraphVersion,
+            => {},
+            else => return err,
+        }
+
         var lhs = try self.loadSnapshotForSpec(lhs_spec);
         defer lhs.deinit(self.alloc);
         var rhs = try self.loadSnapshotForSpec(rhs_spec);
@@ -1202,6 +1325,7 @@ pub const CasManager = struct {
             .commit_objects = 0,
             .tree_objects = 0,
             .blob_objects = 0,
+            .commit_graph_entries_checked = 0,
             .segment_contents_checked = 0,
             .wal_contents_checked = 0,
             .missing_segment_mirrors = 0,
@@ -1220,6 +1344,32 @@ pub const CasManager = struct {
                 .blob => report.blob_objects += 1,
                 else => return error.UnsupportedCasObjectType,
             }
+        }
+
+        if (loadCommitGraph(self.alloc, self.store.root)) |graph| {
+            defer graph.deinit(self.alloc);
+            if (graph.object_ids.len != report.commit_objects) return error.CorruptCommitGraph;
+            for (graph.object_ids, 0..) |commit_id, idx| {
+                if (!reachable.contains(commit_id)) return error.CorruptCommitGraph;
+                const loaded = try self.store.get(self.alloc, commit_id);
+                defer self.alloc.free(loaded.payload);
+                if (loaded.obj_type != .commit) return error.InvalidCommitObject;
+                var commit = try decodeCommit(self.alloc, loaded.payload);
+                defer commit.deinit(self.alloc);
+                if (!graph.roots[idx].eql(commit.root)) return error.CorruptCommitGraph;
+                if (graph.created_at_ms[idx] != commit.created_at_ms) return error.CorruptCommitGraph;
+                const parent_start: usize = @intCast(graph.parent_offsets[idx]);
+                const parent_end: usize = @intCast(graph.parent_offsets[idx + 1]);
+                if ((parent_end - parent_start) != commit.parents.len) return error.CorruptCommitGraph;
+                for (commit.parents, parent_start..) |parent, graph_parent_idx| {
+                    const parent_pos: usize = @intCast(graph.parent_positions[graph_parent_idx]);
+                    if (!graph.object_ids[parent_pos].eql(parent)) return error.CorruptCommitGraph;
+                }
+                report.commit_graph_entries_checked += 1;
+            }
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
         }
 
         if (try self.refs.readHead(main_ref) != null) {
@@ -1303,6 +1453,17 @@ pub const CasManager = struct {
             .reachable_objects = reachable.count(),
             .rewritten_objects = pack_write.object_count,
         };
+    }
+
+    fn refreshCommitGraph(self: *CasManager) !void {
+        const refs = try self.refs.listRefs(self.alloc);
+        defer {
+            for (refs) |*entry| entry.deinit(self.alloc);
+            self.alloc.free(refs);
+        }
+        var graph = try buildCommitGraph(self.alloc, &self.store, refs);
+        defer graph.deinit(self.alloc);
+        try writeCommitGraph(self.alloc, self.store.root, graph, self.store.fsync);
     }
 
     fn collectReachable(self: *CasManager, refs: []const RefEntry) !std.AutoHashMap(object_store.ObjectId, void) {
@@ -1487,6 +1648,236 @@ fn validateReflogFile(alloc: std.mem.Allocator, dir: std.fs.Dir, path: []const u
         _ = try object_store.ObjectId.fromHex(old_hex);
         _ = try object_store.ObjectId.fromHex(new_hex);
     }
+}
+
+const CommitGraphBuildEntry = struct {
+    id: object_store.ObjectId,
+    root: object_store.ObjectId,
+    parents: []object_store.ObjectId,
+    created_at_ms: i64,
+    reason: []u8,
+
+    fn deinit(self: *CommitGraphBuildEntry, alloc: std.mem.Allocator) void {
+        alloc.free(self.parents);
+        alloc.free(self.reason);
+    }
+};
+
+fn buildCommitGraph(
+    alloc: std.mem.Allocator,
+    store: *object_store.ObjectStore,
+    refs: []const RefEntry,
+) !CommitGraph {
+    var entries = std.array_list.Managed(CommitGraphBuildEntry).init(alloc);
+    defer {
+        for (entries.items) |*entry| entry.deinit(alloc);
+        entries.deinit();
+    }
+
+    var seen = std.AutoHashMap(object_store.ObjectId, void).init(alloc);
+    defer seen.deinit();
+
+    var stack = std.array_list.Managed(object_store.ObjectId).init(alloc);
+    defer stack.deinit();
+    for (refs) |entry| try stack.append(entry.id);
+
+    while (stack.popOrNull()) |commit_id| {
+        if (seen.contains(commit_id)) continue;
+        try seen.put(commit_id, {});
+
+        const loaded = try store.get(alloc, commit_id);
+        defer alloc.free(loaded.payload);
+        if (loaded.obj_type != .commit) return error.InvalidCommitObject;
+
+        const commit = try decodeCommit(alloc, loaded.payload);
+        try entries.append(.{
+            .id = commit_id,
+            .root = commit.root,
+            .parents = commit.parents,
+            .created_at_ms = commit.created_at_ms,
+            .reason = commit.reason,
+        });
+
+        for (entries.items[entries.items.len - 1].parents) |parent| {
+            try stack.append(parent);
+        }
+    }
+
+    std.sort.block(CommitGraphBuildEntry, entries.items, {}, struct {
+        fn lessThan(_: void, lhs: CommitGraphBuildEntry, rhs: CommitGraphBuildEntry) bool {
+            return std.mem.lessThan(u8, lhs.id.hash[0..], rhs.id.hash[0..]);
+        }
+    }.lessThan);
+
+    const object_ids = try alloc.alloc(object_store.ObjectId, entries.items.len);
+    errdefer alloc.free(object_ids);
+    const roots = try alloc.alloc(object_store.ObjectId, entries.items.len);
+    errdefer alloc.free(roots);
+    const created_at_ms = try alloc.alloc(i64, entries.items.len);
+    errdefer alloc.free(created_at_ms);
+    const generations = try alloc.alloc(u32, entries.items.len);
+    errdefer alloc.free(generations);
+    @memset(generations, 0);
+    const parent_offsets = try alloc.alloc(u64, entries.items.len + 1);
+    errdefer alloc.free(parent_offsets);
+    const reason_offsets = try alloc.alloc(u64, entries.items.len + 1);
+    errdefer alloc.free(reason_offsets);
+
+    var positions = std.AutoHashMap(object_store.ObjectId, usize).init(alloc);
+    defer positions.deinit();
+    for (entries.items, 0..) |entry, idx| try positions.put(entry.id, idx);
+
+    var parent_positions = std.array_list.Managed(u64).init(alloc);
+    defer parent_positions.deinit();
+    var reasons = std.array_list.Managed(u8).init(alloc);
+    defer reasons.deinit();
+
+    parent_offsets[0] = 0;
+    reason_offsets[0] = 0;
+    for (entries.items, 0..) |entry, idx| {
+        object_ids[idx] = entry.id;
+        roots[idx] = entry.root;
+        created_at_ms[idx] = entry.created_at_ms;
+        for (entry.parents) |parent| {
+            const parent_idx = positions.get(parent) orelse return error.CorruptCommitGraph;
+            try parent_positions.append(@intCast(parent_idx));
+        }
+        parent_offsets[idx + 1] = @intCast(parent_positions.items.len);
+        try reasons.appendSlice(entry.reason);
+        reason_offsets[idx + 1] = @intCast(reasons.items.len);
+    }
+
+    var idx: usize = 0;
+    while (idx < entries.items.len) : (idx += 1) {
+        generations[idx] = try computeCommitGeneration(idx, parent_offsets, parent_positions.items, generations);
+    }
+
+    return .{
+        .object_ids = object_ids,
+        .roots = roots,
+        .created_at_ms = created_at_ms,
+        .generations = generations,
+        .parent_offsets = parent_offsets,
+        .parent_positions = try parent_positions.toOwnedSlice(),
+        .reason_offsets = reason_offsets,
+        .reasons = try reasons.toOwnedSlice(),
+    };
+}
+
+fn computeCommitGeneration(
+    idx: usize,
+    parent_offsets: []const u64,
+    parent_positions: []const u64,
+    generations: []u32,
+) !u32 {
+    if (generations[idx] != 0) return generations[idx];
+    const start: usize = @intCast(parent_offsets[idx]);
+    const end: usize = @intCast(parent_offsets[idx + 1]);
+    if (start == end) {
+        generations[idx] = 1;
+        return 1;
+    }
+
+    var max_parent: u32 = 0;
+    for (parent_positions[start..end]) |parent_idx_u64| {
+        const parent_idx: usize = @intCast(parent_idx_u64);
+        const parent_generation = try computeCommitGeneration(parent_idx, parent_offsets, parent_positions, generations);
+        if (parent_generation > max_parent) max_parent = parent_generation;
+    }
+    generations[idx] = max_parent + 1;
+    return generations[idx];
+}
+
+fn writeCommitGraph(alloc: std.mem.Allocator, root: std.fs.Dir, graph: CommitGraph, fsync: cfg.FsyncPolicy) !void {
+    var bytes = std.array_list.Managed(u8).init(alloc);
+    defer bytes.deinit();
+
+    try bytes.appendSlice(commit_graph_magic[0..]);
+    try appendInt(&bytes, u16, 1);
+    try appendInt(&bytes, u64, @intCast(graph.object_ids.len));
+    for (graph.object_ids) |id| try bytes.appendSlice(id.hash[0..]);
+    for (graph.roots) |root_id| try bytes.appendSlice(root_id.hash[0..]);
+    for (graph.created_at_ms) |created| try appendInt(&bytes, i64, created);
+    for (graph.generations) |generation| try appendInt(&bytes, u32, generation);
+    for (graph.parent_offsets) |offset| try appendInt(&bytes, u64, offset);
+    for (graph.parent_positions) |position| try appendInt(&bytes, u64, position);
+    for (graph.reason_offsets) |offset| try appendInt(&bytes, u64, offset);
+    try bytes.appendSlice(graph.reasons);
+
+    const temp_path = "objects/info/commit-graph.tmp";
+    var file = try root.createFile(temp_path, .{ .truncate = true, .read = true });
+    defer file.close();
+    errdefer root.deleteFile(temp_path) catch {};
+    try file.writeAll(bytes.items);
+    if (fsync != .none) {
+        try file.sync();
+    }
+    root.rename(temp_path, commit_graph_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            root.deleteFile(commit_graph_path) catch {};
+            try root.rename(temp_path, commit_graph_path);
+        },
+        else => return err,
+    };
+}
+
+fn loadCommitGraph(alloc: std.mem.Allocator, root: std.fs.Dir) !CommitGraph {
+    const bytes = try root.readFileAlloc(alloc, commit_graph_path, 256 * 1024 * 1024);
+    defer alloc.free(bytes);
+    if (bytes.len < commit_graph_magic.len + @sizeOf(u16) + @sizeOf(u64)) return error.CorruptCommitGraph;
+    if (!std.mem.eql(u8, bytes[0..commit_graph_magic.len], commit_graph_magic[0..])) return error.CorruptCommitGraph;
+
+    var cursor = Cursor{ .bytes = bytes, .offset = commit_graph_magic.len };
+    const version = try cursor.readInt(u16);
+    if (version != 1) return error.UnsupportedCommitGraphVersion;
+    const commit_count = try cursor.readInt(u64);
+
+    const object_ids = try alloc.alloc(object_store.ObjectId, @intCast(commit_count));
+    errdefer alloc.free(object_ids);
+    for (object_ids) |*id| id.* = .{ .hash = try cursor.readHash() };
+
+    const roots = try alloc.alloc(object_store.ObjectId, @intCast(commit_count));
+    errdefer alloc.free(roots);
+    for (roots) |*root_id| root_id.* = .{ .hash = try cursor.readHash() };
+
+    const created_at_ms = try alloc.alloc(i64, @intCast(commit_count));
+    errdefer alloc.free(created_at_ms);
+    for (created_at_ms) |*created| created.* = try cursor.readInt(i64);
+
+    const generations = try alloc.alloc(u32, @intCast(commit_count));
+    errdefer alloc.free(generations);
+    for (generations) |*generation| generation.* = try cursor.readInt(u32);
+
+    const parent_offsets = try alloc.alloc(u64, @intCast(commit_count + 1));
+    errdefer alloc.free(parent_offsets);
+    for (parent_offsets) |*offset| offset.* = try cursor.readInt(u64);
+
+    const parent_count = parent_offsets[parent_offsets.len - 1];
+    const parent_positions = try alloc.alloc(u64, @intCast(parent_count));
+    errdefer alloc.free(parent_positions);
+    for (parent_positions) |*position| position.* = try cursor.readInt(u64);
+
+    const reason_offsets = try alloc.alloc(u64, @intCast(commit_count + 1));
+    errdefer alloc.free(reason_offsets);
+    for (reason_offsets) |*offset| offset.* = try cursor.readInt(u64);
+
+    const reasons_len = reason_offsets[reason_offsets.len - 1];
+    const reasons = try alloc.alloc(u8, @intCast(reasons_len));
+    errdefer alloc.free(reasons);
+    @memcpy(reasons, cursor.bytes[cursor.offset .. cursor.offset + reasons.len]);
+    cursor.offset += reasons.len;
+    try cursor.finish();
+
+    return .{
+        .object_ids = object_ids,
+        .roots = roots,
+        .created_at_ms = created_at_ms,
+        .generations = generations,
+        .parent_offsets = parent_offsets,
+        .parent_positions = parent_positions,
+        .reason_offsets = reason_offsets,
+        .reasons = reasons,
+    };
 }
 
 fn writePackedObject(
@@ -2684,6 +3075,65 @@ test "checkpoints support diffing and rollback" {
     try std.testing.expect(head.eql(initial));
 }
 
+test "commit graph indexes reachable commit ancestry" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/commit-graph", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    try std.fs.cwd().makePath(data_path);
+
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
+    defer series_catalog.deinit();
+
+    const sid = types.hash64("commit.graph.series");
+    _ = try series_catalog.register("commit.graph.series", "{}", sid);
+
+    const first_points = [_]types.Point{.{ .ts = 1_000, .value = 1.0 }};
+    const first_path = try segment_mod.writeSegment(talloc, data_dir, sid, 0, first_points[0..]);
+    defer talloc.free(first_path);
+    try manifest.add(data_dir, sid, 0, 1_000, 1_000, 1, first_path);
+
+    var cas_manager = try CasManager.init(talloc, data_path, .none);
+    defer cas_manager.deinit();
+    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+
+    const second_points = [_]types.Point{.{ .ts = 2_000, .value = 2.0 }};
+    const second_path = try segment_mod.writeSegment(talloc, data_dir, sid, 0, second_points[0..]);
+    defer talloc.free(second_path);
+    try manifest.add(data_dir, sid, 0, 2_000, 2_000, 1, second_path);
+
+    const advanced = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, "advance");
+    try std.testing.expect(!advanced.eql(initial));
+
+    var graph = try loadCommitGraph(talloc, cas_manager.store.root);
+    defer graph.deinit(talloc);
+    try std.testing.expectEqual(@as(usize, 2), graph.object_ids.len);
+
+    const advanced_idx = graph.lookup(advanced) orelse return error.CommitGraphMissingCommit;
+    const initial_idx = graph.lookup(initial) orelse return error.CommitGraphMissingCommit;
+    try std.testing.expect(graph.generations[advanced_idx] > graph.generations[initial_idx]);
+    try std.testing.expectEqual(@as(usize, 1), @as(usize, @intCast(graph.parent_offsets[advanced_idx + 1] - graph.parent_offsets[advanced_idx])));
+    try std.testing.expect(graph.object_ids[@intCast(graph.parent_positions[@intCast(graph.parent_offsets[advanced_idx])])].eql(initial));
+
+    const log_entries = try cas_manager.loadLog(main_ref, 8);
+    defer {
+        for (log_entries) |*entry| entry.deinit(talloc);
+        talloc.free(log_entries);
+    }
+    try std.testing.expectEqual(@as(usize, 2), log_entries.len);
+    try std.testing.expect(log_entries[0].commit_id.eql(advanced));
+    try std.testing.expectEqualStrings("advance", log_entries[0].reason);
+}
+
 test "gc prunes unreachable commits" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -2769,6 +3219,7 @@ test "fsck and pack preserve the reachable CAS head" {
     const fsck = try cas_manager.fsck(data_dir);
     try std.testing.expect(fsck.reachable_objects > 0);
     try std.testing.expect(fsck.commit_objects > 0);
+    try std.testing.expect(fsck.commit_graph_entries_checked > 0);
 
     const pack_result = try cas_manager.pack();
     try std.testing.expectEqual(fsck.reachable_objects, pack_result.reachable_objects);
