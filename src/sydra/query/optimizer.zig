@@ -80,6 +80,7 @@ fn pushdownPredicates(node: *plan.Node, allocator: std.mem.Allocator) !void {
             const child_tag = meta.activeTag(child.*);
             switch (child_tag) {
                 .project => {
+                    if (!canPushFilterBelowProject(node.filter, child.project)) return;
                     moveFilterBelowProject(node);
                     return try pushdownPredicates(node, allocator);
                 },
@@ -97,7 +98,7 @@ fn pushdownPredicates(node: *plan.Node, allocator: std.mem.Allocator) !void {
                 },
                 .aggregate => {
                     try pushFilterBelowAggregate(node, allocator);
-                    return try pushdownPredicates(node, allocator);
+                    return;
                 },
                 .scan,
                 .one_row,
@@ -123,6 +124,50 @@ fn moveFilterBelowProject(node_ptr: *plan.Node) void {
     project_ptr.* = .{ .filter = new_filter };
 
     node_ptr.* = .{ .project = project_data };
+}
+
+fn canPushFilterBelowProject(filter: plan.Filter, project: plan.Project) bool {
+    for (filter.conjunctive_predicates) |expr| {
+        if (exprResolvableFromColumns(expr, project.output)) continue;
+        if (project.input.* == .aggregate and exprUsesGrouping(expr, &project.input.aggregate)) continue;
+        return false;
+    }
+    return true;
+}
+
+fn exprResolvableFromColumns(expr: *const ast.Expr, columns: []const plan.ColumnInfo) bool {
+    if (expressionMatchesColumn(expr, columns)) return true;
+    return switch (expr.*) {
+        .identifier => |ident| identifierResolvableFromColumns(ident.value, columns),
+        .literal => true,
+        .unary => |unary| exprResolvableFromColumns(unary.operand, columns),
+        .binary => |binary| exprResolvableFromColumns(binary.left, columns) and exprResolvableFromColumns(binary.right, columns),
+        .call => |call| blk: {
+            for (call.args) |arg| {
+                if (!exprResolvableFromColumns(arg, columns)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
+}
+
+fn expressionMatchesColumn(expr: *const ast.Expr, columns: []const plan.ColumnInfo) bool {
+    for (columns) |column| {
+        if (expressionsEqual(expr, column.expr)) return true;
+    }
+    return false;
+}
+
+fn identifierResolvableFromColumns(name: []const u8, columns: []const plan.ColumnInfo) bool {
+    const unqualified = trailingSegment(name);
+    for (columns) |column| {
+        if (namesEqual(column.name, name) or namesEqual(column.name, unqualified)) return true;
+        if (column.expr.* == .identifier) {
+            const expr_ident = column.expr.identifier;
+            if (namesEqual(expr_ident.value, name) or namesEqual(expr_ident.value, unqualified)) return true;
+        }
+    }
+    return false;
 }
 
 fn moveFilterBelowSort(node_ptr: *plan.Node) void {
@@ -253,7 +298,7 @@ fn exprIsGroupingExpr(function_name: []const u8, aggregate: *const plan.Aggregat
             if (std.ascii.eqlIgnoreCase(call.callee.value, function_name) and call.args.len == args.len) {
                 var match = true;
                 for (args, 0..) |arg, idx| {
-                    if (call.args[idx] != arg) {
+                    if (!expressionsEqual(call.args[idx], arg)) {
                         match = false;
                         break;
                     }
@@ -307,6 +352,19 @@ fn expressionsEqual(a: *const ast.Expr, b: *const ast.Expr) bool {
             else => false,
         },
     };
+}
+
+fn namesEqual(a: []const u8, b: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(a, b);
+}
+
+fn trailingSegment(name: []const u8) []const u8 {
+    if (name.len == 0) return name;
+    var start: usize = 0;
+    for (name, 0..) |ch, idx| {
+        if (ch == '.') start = idx + 1;
+    }
+    return name[start..];
 }
 
 fn literalEqual(a: ast.Literal, b: ast.Literal) bool {

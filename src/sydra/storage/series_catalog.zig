@@ -242,7 +242,7 @@ pub const SeriesCatalog = struct {
         const series_val = obj.get("series") orelse return error.InvalidSeriesCatalog;
         const tags_val = obj.get("tags_json") orelse return error.InvalidSeriesCatalog;
         const series_id_val = obj.get("series_id") orelse return error.InvalidSeriesCatalog;
-        if (series_val != .string or tags_val != .string or series_id_val != .integer) {
+        if (series_val != .string or tags_val != .string) {
             return error.InvalidSeriesCatalog;
         }
 
@@ -253,7 +253,7 @@ pub const SeriesCatalog = struct {
         const selector_key = try buildSelectorKey(self.alloc, owned_series, owned_tags);
         errdefer self.alloc.free(selector_key);
 
-        _ = try self.insertOwned(owned_series, owned_tags, selector_key, @intCast(series_id_val.integer));
+        _ = try self.insertOwned(owned_series, owned_tags, selector_key, @intCast(try jsonSeriesId(series_id_val)));
     }
 
     fn insertOwned(self: *SeriesCatalog, owned_series: []const u8, owned_tags: []const u8, selector_key: []const u8, series_id: types.SeriesId) !bool {
@@ -354,6 +354,14 @@ pub const SeriesCatalog = struct {
         };
     }
 };
+
+fn jsonSeriesId(value: std.json.Value) !types.SeriesId {
+    return switch (value) {
+        .integer => |integer| @intCast(integer),
+        .number_string => |digits| try std.fmt.parseInt(types.SeriesId, digits, 10),
+        else => error.InvalidSeriesCatalog,
+    };
+}
 
 pub fn canonicalizeTagsJson(alloc: std.mem.Allocator, tags_json: []const u8) ![]u8 {
     const trimmed = std.mem.trim(u8, tags_json, " \t\r\n");

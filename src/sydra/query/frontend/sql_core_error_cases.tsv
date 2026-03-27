@@ -1,0 +1,3 @@
+# code|generated|sql
+lexer_mismatch|false|select value from metrics where value =~ 'hot'
+unexpected_token|true|select from metrics

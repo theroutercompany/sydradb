@@ -16,7 +16,9 @@ pub fn applyWithResult(data_dir: std.fs.Dir, manifest: *manifest_mod.Manifest, t
     for (manifest.entries.items) |e| {
         if ((now_secs - e.end_ts) > ttl_secs) {
             // delete segment file best-effort
-            data_dir.deleteFile(e.path) catch {};
+            if (e.path.len != 0) {
+                data_dir.deleteFile(e.path) catch {};
+            }
             manifest.alloc.free(e.path);
             changed = true;
             continue;
@@ -39,8 +41,8 @@ test "retention removes expired segments" {
     defer tmp.cleanup();
 
     try tmp.dir.makePath("segments");
-    try tmp.dir.writeFile("segments/old.seg", "old");
-    try tmp.dir.writeFile("segments/new.seg", "new");
+    try tmp.dir.writeFile(.{ .sub_path = "segments/old.seg", .data = "old" });
+    try tmp.dir.writeFile(.{ .sub_path = "segments/new.seg", .data = "new" });
 
     var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
     defer manifest.deinit();

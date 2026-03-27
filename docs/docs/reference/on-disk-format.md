@@ -28,7 +28,13 @@ Under `data_dir`, the engine uses:
   - rotated `*.wal` files named by epoch millis
 - `segments/<hour_bucket>/*.seg` – per-series, per-hour segment files
 - `tags.json` – tag index snapshot
-- `objects/<prefix>/<hex>` – content-addressed object store (used by some subsystems)
+- `objects/<prefix>/<hex>` – loose content-addressed objects
+- `objects/packs/*.pack` – immutable packed object containers
+- `objects/packs/*.idx` – fanout-based pack indexes for packed objects
+- `objects/info/commit-graph` – optional commit ancestry side index written by CAS maintenance
+- `objects/cruft/<timestamp>/...` – quarantined unreachable CAS content retained until the GC grace window expires
+- `refs/` – mutable plaintext refs and reflogs for the CAS head/branches/tags/checkpoints
+- `lost-found/` – optional fsck output for dangling commit/blob/tree ids
 
 ## WAL format (v0)
 
@@ -86,17 +92,52 @@ The manifest tracks segment entries and is used to:
 - find candidate segments during range queries
 - build per-series “highwater marks” during WAL recovery (so old WAL points aren’t duplicated)
 
+When `metadata_read_mode = "primary"` and a CAS head exists, the runtime can rebuild its in-memory manifest, tag index, and series catalog directly from the CAS snapshot without recreating these mirror files on startup. In `cas_mode = "dual_write"`, `MANIFEST`, `tags.json`, and `series_catalog.jsonl` remain compatibility mirrors written by normal flush/maintenance flows and by explicit CAS export commands.
+
+## CAS objects
+
+The CAS layer stores immutable objects addressed by a BLAKE3 hash of `(type, payload)`.
+
+- Loose objects live under `objects/<prefix>/<hex>`.
+- Packed objects live in `objects/packs/*.pack` and are indexed by `objects/packs/*.idx`.
+- The current implementation stores whole objects in packs; it does not use delta compression.
+- `cas pack` writes a new pack/index pair, prunes older pack files, and removes redundant loose copies for the packed reachable set.
+- `cas gc --apply` preserves unreachable content by first copying active pack files and moving loose unreachable objects into `objects/cruft/<timestamp>/`, then pruning older cruft directories after the configured grace window.
+
+Current typed metadata payloads include:
+
+- segment descriptors with required content ids for sealed segment blobs
+- tag snapshots
+- series catalog snapshots
+- WAL indexes with captured byte counts for mutable `current.wal`
+- tree objects and commit objects that link the metadata DAG together
+
 See [`src/sydra/storage/manifest.zig`](./source/sydra/storage/manifest.md) for the in-memory model and load/save behavior.
 
 ## Snapshot/restore
 
-Current snapshot behavior is conservative:
+`snapshot`/`restore` now operate on CAS bundles instead of directory-copying the live data directory.
 
-- the snapshot content is `MANIFEST`, `wal/`, `segments/`, and `tags.json`
-- the low-level copy mechanism is directory/file based
-- callers should still treat snapshotting as an admin or offline operation unless the higher-level command explicitly documents stronger coordination semantics
+A bundle directory currently contains:
 
-See `Reference/Source Reference/src/sydra/snapshot.zig`.
+- `bundle.manifest` – versioned bundle manifest with exported refs, prerequisite commits for incremental bundles, and object counts
+- `objects/` – bundle-local loose and/or packed CAS objects
+- `objects/packs/*.pack` and `objects/packs/*.idx` – immutable pack payloads plus fanout indexes
+- `refs/` – created by the object-store bootstrap, but ref updates are sourced from `bundle.manifest` during apply
+
+Operational notes:
+
+- `snapshot` is a thin wrapper over `cas bundle create <dst_dir>`.
+- `restore` is a thin wrapper over `cas bundle apply <src_dir>`.
+- Applying a bundle restores `objects/` and `refs/` only; it does not recreate `MANIFEST`, `tags.json`, or `series_catalog.jsonl` unless an explicit CAS export command is run afterward.
+- Incremental bundles list prerequisite commits in `bundle.manifest`; `cas bundle apply` rejects them unless the destination store already contains those prerequisite objects.
+
+## Integrity and cleanup
+
+- `cas fsck` is reflog-aware by default, so commits only referenced by reflogs are still considered reachable.
+- `cas fsck --connectivity-only` limits validation to refs, reflogs, reachable objects, commit-graph consistency, and dangling detection.
+- `cas fsck --lost-found` writes dangling commit/blob/tree ids into `lost-found/`.
+- `cas gc --no-reflogs` ignores reflog protection when deciding what is unreachable.
 
 See also:
 

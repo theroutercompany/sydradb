@@ -208,9 +208,7 @@ fn cmdRestore(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     if (args.len < 3) return error.Invalid;
     var cfg = try loadConfigOrDefault(alloc);
     defer cfg.deinit(alloc);
-    var data_dir = try std.fs.cwd().openDir(cfg.data_dir, .{ .iterate = true });
-    defer data_dir.close();
-    try @import("snapshot.zig").restore(alloc, data_dir, args[2]);
+    try @import("snapshot.zig").restore(alloc, cfg.data_dir, args[2], cfg.fsync);
 }
 
 fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
@@ -226,6 +224,43 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     defer cas.deinit();
 
     const sub = std.mem.sliceTo(args[2], 0);
+    if (std.mem.eql(u8, sub, "bundle")) {
+        if (args.len < 5) return error.Invalid;
+        const action = std.mem.sliceTo(args[3], 0);
+        if (std.mem.eql(u8, action, "create")) {
+            const dst = std.mem.sliceTo(args[4], 0);
+            var since_spec: ?[]const u8 = null;
+            if (args.len >= 7) {
+                if (!std.mem.eql(u8, std.mem.sliceTo(args[5], 0), "--since")) return error.Invalid;
+                since_spec = std.mem.sliceTo(args[6], 0);
+            } else if (args.len == 6) {
+                return error.Invalid;
+            }
+            const result = try cas_mod.createBundle(alloc, cfg.data_dir, dst, cfg.fsync, since_spec);
+            std.debug.print(
+                "cas bundle create refs={d} prerequisites={d} objects={d}\n",
+                .{ result.ref_count, result.prerequisite_count, result.object_count },
+            );
+            return;
+        }
+        if (std.mem.eql(u8, action, "verify")) {
+            const result = try cas_mod.verifyBundle(alloc, std.mem.sliceTo(args[4], 0));
+            std.debug.print(
+                "cas bundle verify refs={d} prerequisites={d} objects={d}\n",
+                .{ result.ref_count, result.prerequisite_count, result.object_count },
+            );
+            return;
+        }
+        if (std.mem.eql(u8, action, "apply")) {
+            const result = try cas_mod.applyBundle(alloc, std.mem.sliceTo(args[4], 0), cfg.data_dir, cfg.fsync);
+            std.debug.print(
+                "cas bundle apply refs={d} prerequisites={d} objects={d}\n",
+                .{ result.ref_count, result.prerequisite_count, result.object_count },
+            );
+            return;
+        }
+        return error.Invalid;
+    }
     if (std.mem.eql(u8, sub, "verify")) {
         var manifest = try @import("storage/manifest.zig").Manifest.loadOrInit(alloc, data_dir);
         defer manifest.deinit();
@@ -307,15 +342,35 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         return;
     }
     if (std.mem.eql(u8, sub, "gc")) {
-        const dry_run = !(args.len >= 4 and std.mem.eql(u8, std.mem.sliceTo(args[3], 0), "--apply"));
-        const result = try cas.gc(dry_run);
+        var options = cas_mod.GcOptions{};
+        var idx: usize = 3;
+        while (idx < args.len) : (idx += 1) {
+            const arg = std.mem.sliceTo(args[idx], 0);
+            if (std.mem.eql(u8, arg, "--apply")) {
+                options.dry_run = false;
+            } else if (std.mem.eql(u8, arg, "--no-reflogs")) {
+                options.include_reflogs = false;
+            } else if (std.mem.eql(u8, arg, "--grace-ms")) {
+                idx += 1;
+                if (idx >= args.len) return error.Invalid;
+                options.grace_period_ms = try std.fmt.parseInt(i64, std.mem.sliceTo(args[idx], 0), 10);
+            } else {
+                return error.Invalid;
+            }
+        }
+        const result = try cas.gc(options);
         std.debug.print(
-            "cas gc dry_run={} reachable={d} unreachable={d} unreachable_bytes={d} deleted={d} stale_segment_files={d} stale_segment_bytes={d} stale_wal_files={d} stale_wal_bytes={d} mirror_deleted={d}\n",
+            "cas gc dry_run={} reachable={d} unreachable={d} unreachable_bytes={d} reflog_protected={d} quarantined={d} quarantined_bytes={d} pruned={d} pruned_bytes={d} deleted={d} stale_segment_files={d} stale_segment_bytes={d} stale_wal_files={d} stale_wal_bytes={d} mirror_deleted={d}\n",
             .{
-                dry_run,
+                options.dry_run,
                 result.reachable,
                 result.unreachable_count,
                 result.unreachable_bytes,
+                result.reflog_protected,
+                result.quarantined_count,
+                result.quarantined_bytes,
+                result.pruned_count,
+                result.pruned_bytes,
                 result.deleted,
                 result.stale_segment_files,
                 result.stale_segment_bytes,
@@ -327,15 +382,34 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         return;
     }
     if (std.mem.eql(u8, sub, "fsck")) {
-        const report = try cas.fsck(data_dir);
+        var options = cas_mod.FsckOptions{};
+        for (args[3..]) |raw| {
+            const arg = std.mem.sliceTo(raw, 0);
+            if (std.mem.eql(u8, arg, "--connectivity-only")) {
+                options.mode = .connectivity_only;
+            } else if (std.mem.eql(u8, arg, "--no-reflogs")) {
+                options.include_reflogs = false;
+            } else if (std.mem.eql(u8, arg, "--lost-found")) {
+                options.write_lost_found = true;
+            } else {
+                return error.Invalid;
+            }
+        }
+        const report = try cas.fsck(data_dir, options);
         std.debug.print(
-            "cas fsck refs={d} reachable={d} commits={d} trees={d} blobs={d} segment_contents_checked={d} wal_contents_checked={d} missing_segment_mirrors={d} missing_wal_mirrors={d} reflog_files_checked={d} stale_reflog_files={d}\n",
+            "cas fsck mode={s} refs={d} reachable={d} reflog_heads={d} reflog_protected={d} commits={d} trees={d} blobs={d} dangling={d} lost_found={d} commit_graph_entries_checked={d} segment_contents_checked={d} wal_contents_checked={d} missing_segment_mirrors={d} missing_wal_mirrors={d} reflog_files_checked={d} stale_reflog_files={d}\n",
             .{
+                if (options.mode == .connectivity_only) "connectivity-only" else "full",
                 report.refs,
                 report.reachable_objects,
+                report.reflog_heads,
+                report.reflog_protected_objects,
                 report.commit_objects,
                 report.tree_objects,
                 report.blob_objects,
+                report.dangling_objects,
+                report.lost_found_objects,
+                report.commit_graph_entries_checked,
                 report.segment_contents_checked,
                 report.wal_contents_checked,
                 report.missing_segment_mirrors,

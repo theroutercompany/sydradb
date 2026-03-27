@@ -1,6 +1,7 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 const session_mod = @import("session.zig");
+const prepared_query = @import("../../query/prepared.zig");
 const translator = @import("../../query/translator.zig");
 const query_exec = @import("../../query/exec.zig");
 const plan = @import("../../query/plan.zig");
@@ -152,6 +153,10 @@ fn handleSimpleQuery(
 
     log.debug("simple query received: {s}", .{trimmed});
 
+    if (try handleSqlCorePreparedQuery(alloc, writer, engine, trimmed)) {
+        return;
+    }
+
     const translation = translator.translate(alloc, trimmed) catch |err| switch (err) {
         error.OutOfMemory => {
             try protocol.writeErrorResponse(writer, "FATAL", "53100", "out of memory during translation");
@@ -244,6 +249,62 @@ fn handleParseMessage(
     }
 
     try protocol.writeReadyForQuery(writer, 'I');
+}
+
+fn handleSqlCorePreparedQuery(
+    alloc: std.mem.Allocator,
+    writer: std.Io.AnyWriter,
+    engine: *engine_mod.Engine,
+    sql: []const u8,
+) !bool {
+    var stmt = prepared_query.prepareSqlCore(alloc, engine, sql, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => {
+            log.debug("sql_core prepared path falling back for {s}: {s}", .{ sql, @errorName(err) });
+            return false;
+        },
+    };
+    defer stmt.finalize();
+
+    try writeRowDescription(writer, stmt.columns);
+
+    var row_buffer = std.array_list.Managed(u8).init(alloc);
+    defer row_buffer.deinit();
+    var value_buffer = ManagedArrayList(u8).init(alloc);
+    defer value_buffer.deinit();
+
+    var row_count: usize = 0;
+    while (true) {
+        const step = stmt.step() catch |err| {
+            try protocol.writeErrorResponse(writer, "ERROR", "XX000", @errorName(err));
+            try protocol.writeReadyForQuery(writer, 'I');
+            return true;
+        };
+        switch (step) {
+            .row => |values| {
+                writeDataRow(writer, values, &row_buffer, &value_buffer) catch |err| {
+                    try protocol.writeErrorResponse(writer, "ERROR", "XX000", @errorName(err));
+                    try protocol.writeReadyForQuery(writer, 'I');
+                    return true;
+                };
+                row_count += 1;
+            },
+            .done => break,
+        }
+    }
+
+    if (stmt.columns.len != 0) {
+        const schema_notice = try formatSchemaNotice(alloc, stmt.columns);
+        defer alloc.free(schema_notice);
+        try protocol.writeNoticeResponse(writer, schema_notice);
+    }
+    try protocol.writeNoticeResponse(writer, "execution_mode=sql_core_vm legacy_fallback=false");
+
+    const tag = try formatSelectTag(alloc, row_count);
+    defer alloc.free(tag);
+    try protocol.writeCommandComplete(writer, tag);
+    try protocol.writeReadyForQuery(writer, 'I');
+    return true;
 }
 
 fn handleSydraqlQuery(
@@ -511,4 +572,39 @@ test "formatTraceNotice renders id" {
     const notice = try formatTraceNotice(alloc, "xyz");
     defer alloc.free(notice);
     try std.testing.expectEqualStrings("trace_id=xyz", notice);
+}
+
+test "sql core prepared path handles simple select queries" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/pgwire-sql-core", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .compiled,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    var allocating_writer: std.Io.Writer.Allocating = .init(alloc);
+    defer allocating_writer.deinit();
+
+    const handled = try handleSqlCorePreparedQuery(alloc, anyWriter(&allocating_writer.writer), engine, "SELECT 1");
+    try std.testing.expect(handled);
+    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "execution_mode=sql_core_vm") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "SELECT 1") != null);
 }

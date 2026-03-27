@@ -60,6 +60,7 @@ pub const Keyword = enum {
     values,
     delete,
     explain,
+    bytecode,
     as,
     tag,
     time,
@@ -119,7 +120,7 @@ pub const Token = struct {
 };
 
 /// Lexer errors are returned for malformed literals (e.g. unterminated strings).
-pub const LexError = error{
+pub const LexError = std.mem.Allocator.Error || error{
     InvalidLiteral,
     UnterminatedString,
 };
@@ -557,6 +558,7 @@ const keyword_table = [_]struct {
     .{ .name = "values", .keyword = .values },
     .{ .name = "delete", .keyword = .delete },
     .{ .name = "explain", .keyword = .explain },
+    .{ .name = "bytecode", .keyword = .bytecode },
     .{ .name = "as", .keyword = .as },
     .{ .name = "tag", .keyword = .tag },
     .{ .name = "time", .keyword = .time },
@@ -576,7 +578,7 @@ const keyword_table = [_]struct {
 
 test "lexer emits eof for empty input" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(!gpa.deinit());
+    defer std.debug.assert(gpa.deinit() == .ok);
     const alloc = gpa.allocator();
 
     var lexer = Lexer.init(alloc, "");
@@ -588,7 +590,7 @@ test "lexer emits eof for empty input" {
 
 test "identifier recognised as keyword" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(!gpa.deinit());
+    defer std.debug.assert(gpa.deinit() == .ok);
     const alloc = gpa.allocator();
 
     var lexer = Lexer.init(alloc, "SELECT");
@@ -600,7 +602,7 @@ test "identifier recognised as keyword" {
 
 test "numbers and strings lex" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(!gpa.deinit());
+    defer std.debug.assert(gpa.deinit() == .ok);
     const alloc = gpa.allocator();
 
     var lexer = Lexer.init(alloc, "42 'value'");
@@ -613,7 +615,7 @@ test "numbers and strings lex" {
 
 test "lexer recognizes parameter, duration, and timestamp tokens" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(!gpa.deinit());
+    defer std.debug.assert(gpa.deinit() == .ok);
     const alloc = gpa.allocator();
 
     var lexer = Lexer.init(alloc, "$1 :name 5m 2026-03-27T10:15:00Z");
@@ -636,7 +638,7 @@ test "lexer recognizes parameter, duration, and timestamp tokens" {
 
 test "keyword fallback preserves identifier-like tokens" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(!gpa.deinit());
+    defer std.debug.assert(gpa.deinit() == .ok);
     const alloc = gpa.allocator();
 
     var lexer = Lexer.init(alloc, "time tag previous linear");
@@ -656,7 +658,7 @@ test "keyword fallback preserves identifier-like tokens" {
 
 test "collectAll returns a full token stream" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(!gpa.deinit());
+    defer std.debug.assert(gpa.deinit() == .ok);
     const alloc = gpa.allocator();
 
     var lexer = Lexer.init(alloc, "select $1");
@@ -671,7 +673,7 @@ test "collectAll returns a full token stream" {
 
 test "lexer skips comments" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(!gpa.deinit());
+    defer std.debug.assert(gpa.deinit() == .ok);
     const alloc = gpa.allocator();
 
     var lexer = Lexer.init(alloc, "-- comment\r\n/* block */ SELECT");
@@ -683,7 +685,7 @@ test "lexer skips comments" {
 
 test "peek does not consume token" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(!gpa.deinit());
+    defer std.debug.assert(gpa.deinit() == .ok);
     const alloc = gpa.allocator();
 
     var lexer = Lexer.init(alloc, "select from");
@@ -699,7 +701,7 @@ test "peek does not consume token" {
 
 test "unterminated string returns error" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(!gpa.deinit());
+    defer std.debug.assert(gpa.deinit() == .ok);
     const alloc = gpa.allocator();
 
     var lexer = Lexer.init(alloc, "'broken");

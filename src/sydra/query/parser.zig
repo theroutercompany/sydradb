@@ -77,8 +77,13 @@ pub const Parser = struct {
             },
             .explain => {
                 const explain_token = try self.advance();
+                var mode: ast.ExplainMode = .standard;
+                if (try self.matchKeyword(.bytecode)) {
+                    mode = .bytecode;
+                }
                 const inner = try self.parseStatement();
                 const explain_ptr = try self.allocExplain(.{
+                    .mode = mode,
                     .target = try self.allocStatement(inner),
                     .span = common.Span.init(explain_token.span.start, self.lastEnd()),
                 });
@@ -220,7 +225,10 @@ pub const Parser = struct {
 
     fn parseProjectionList(self: *Parser, list: *ProjectionList) ParseError!void {
         while (true) {
-            const expr = try self.parseExpression();
+            const expr = if ((try self.peek()).kind == .star)
+                try self.parseWildcardProjection()
+            else
+                try self.parseExpression();
             var alias: ?ast.Identifier = null;
             if (try self.matchKeyword(.as)) {
                 alias = try self.parseAliasIdentifier();
@@ -236,6 +244,16 @@ pub const Parser = struct {
                 break;
             }
         }
+    }
+
+    fn parseWildcardProjection(self: *Parser) ParseError!*const ast.Expr {
+        const token = try self.expectKind(.star);
+        const wildcard = ast.Identifier{
+            .value = try self.allocator.dupe(u8, token.lexeme),
+            .quoted = false,
+            .span = token.span,
+        };
+        return self.makeIdentifierExpr(wildcard);
     }
 
     fn parseAliasIdentifier(self: *Parser) ParseError!ast.Identifier {
@@ -838,6 +856,17 @@ test "parse delete statement" {
     try std.testing.expect(statement == .delete);
     const delete_stmt = statement.delete.*;
     try std.testing.expect(delete_stmt.predicate != null);
+}
+
+test "parse explain bytecode statement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser_inst = Parser.init(arena.allocator(), "explain bytecode select 1");
+    const statement = try parser_inst.parse();
+    try std.testing.expect(statement == .explain);
+    try std.testing.expectEqual(ast.ExplainMode.bytecode, statement.explain.mode);
+    try std.testing.expect(statement.explain.target.* == .select);
 }
 
 test "parse select with group fill order" {

@@ -24,7 +24,7 @@ pub fn initDiagnostic(alloc: std.mem.Allocator, code: ErrorCode, message: []cons
 
 test "diagnostic init clones message" {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer std.debug.assert(!gpa.deinit());
+    defer std.debug.assert(gpa.deinit() == .ok);
     const alloc = gpa.allocator();
 
     const diag = try initDiagnostic(alloc, .unimplemented, "stub", null);

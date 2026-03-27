@@ -2,6 +2,7 @@ const std = @import("std");
 const cfg = @import("config.zig");
 const types = @import("types.zig");
 const manifest_mod = @import("storage/manifest.zig");
+const object_store = @import("storage/object_store.zig");
 const series_catalog_mod = @import("storage/series_catalog.zig");
 const wal_mod = @import("storage/wal.zig");
 const segment_mod = @import("storage/segment.zig");
@@ -11,7 +12,7 @@ const cas_mod = @import("storage/cas.zig");
 
 fn sleepMs(ms: u64) void {
     if (@hasDecl(std.time, "sleep")) {
-        std.time.sleep(ms * std.time.ns_per_ms);
+        std.Thread.sleep(ms * std.time.ns_per_ms);
     } else {
         std.Thread.sleep(ms * std.time.ns_per_ms);
     }
@@ -63,7 +64,7 @@ pub const Engine = struct {
         ) !MetadataState {
             if (config.metadata_read_mode == .primary and cas_manager != null) {
                 if (try cas_manager.?.refs.readHead(cas_mod.main_ref) != null) {
-                    return try loadFromCas(alloc, data_dir, config.fsync, wal, cas_manager.?);
+                    return try loadFromCas(alloc, config.fsync, cas_manager.?);
                 }
             }
             return try loadFromLegacy(alloc, data_dir, config.fsync, wal, cas_manager);
@@ -107,19 +108,24 @@ pub const Engine = struct {
 
         fn loadFromCas(
             alloc: std.mem.Allocator,
-            data_dir: std.fs.Dir,
             fsync: cfg.FsyncPolicy,
-            wal: *wal_mod.WAL,
             cas_manager: *cas_mod.CasManager,
         ) !MetadataState {
             var index = try cas_manager.loadHeadIndex();
             errdefer index.deinit();
-
-            try cas_manager.exportHeadToLegacy(data_dir);
-
-            var state = try loadFromLegacy(alloc, data_dir, fsync, wal, cas_manager);
-            state.cas_index = index;
-            return state;
+            var manifest = try manifestFromSnapshot(alloc, index.snapshot.segment_descriptors);
+            errdefer manifest.deinit();
+            var tags = try tagIndexFromSnapshot(alloc, index.snapshot.tag_snapshot);
+            errdefer tags.deinit();
+            var series_catalog = try seriesCatalogFromSnapshot(alloc, fsync, index.snapshot.series_catalog_snapshot);
+            errdefer series_catalog.deinit();
+            return .{
+                .alloc = alloc,
+                .manifest = manifest,
+                .tags = tags,
+                .series_catalog = series_catalog,
+                .cas_index = index,
+            };
         }
     };
 
@@ -357,13 +363,17 @@ pub const Engine = struct {
         };
         const data_dir = try std.fs.cwd().openDir(config.data_dir, .{ .iterate = true });
         var cas_manager: ?cas_mod.CasManager = null;
-        errdefer if (cas_manager) |*cas| cas.deinit();
+        var cas_manager_transferred = false;
+        errdefer if (!cas_manager_transferred) {
+            if (cas_manager) |*cas| cas.deinit();
+        };
         if (config.cas_mode == .dual_write) {
             cas_manager = try cas_mod.CasManager.init(alloc, config.data_dir, config.fsync);
         }
         var wal = try wal_mod.WAL.open(alloc, data_dir, config.fsync);
         var metadata = try MetadataState.load(alloc, data_dir, config, &wal, if (cas_manager) |*cas| cas else null);
-        errdefer metadata.deinit();
+        var metadata_transferred = false;
+        errdefer if (!metadata_transferred) metadata.deinit();
 
         var engine = try alloc.create(Engine);
         errdefer alloc.destroy(engine);
@@ -379,6 +389,8 @@ pub const Engine = struct {
             .queue = undefined,
             .cas = cas_manager,
         };
+        metadata_transferred = true;
+        cas_manager_transferred = true;
         errdefer {
             engine.mem.deinit();
             engine.metadata.deinit();
@@ -426,7 +438,8 @@ pub const Engine = struct {
         const flushed = try flushMemtable(self);
         if (flushed) try self.syncCasSnapshot("snapshot-flush");
         try self.wal.file.sync();
-        try @import("snapshot.zig").snapshot(self.alloc, self.data_dir, dst_path);
+        if (!flushed or self.cas == null) try self.ensureSnapshotBundleHead();
+        try @import("snapshot.zig").snapshot(self.alloc, self.config.data_dir, dst_path, self.config.fsync);
     }
 
     pub fn ingest(self: *Engine, item: IngestItem) !void {
@@ -737,7 +750,10 @@ pub const Engine = struct {
     }
 
     pub fn compactNow(self: *Engine) !bool {
-        const changed = try @import("storage/compact.zig").compactAllWithResult(self.alloc, self.data_dir, &self.metadata.manifest);
+        const changed = if (self.metadata.cas_index != null and self.cas != null)
+            try compactCasBackedSegments(self)
+        else
+            try @import("storage/compact.zig").compactAllWithResult(self.alloc, self.data_dir, &self.metadata.manifest);
         if (changed) {
             try self.createMaintenanceCheckpoint("compaction");
             try self.syncCasSnapshot("compaction");
@@ -749,6 +765,26 @@ pub const Engine = struct {
         if (self.cas) |*cas| {
             _ = try cas.syncLegacySnapshot(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog, reason);
             try self.metadata.refreshCasIndex(cas);
+        }
+    }
+
+    fn ensureSnapshotBundleHead(self: *Engine) !void {
+        if (self.cas) |*cas| {
+            if (try cas.refs.readHead(cas_mod.main_ref) == null) {
+                _ = try cas.bootstrapIfMissing(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog);
+            } else {
+                _ = try cas.syncLegacySnapshot(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog, "snapshot");
+            }
+            try self.metadata.refreshCasIndex(cas);
+            return;
+        }
+
+        var temp = try cas_mod.CasManager.init(self.alloc, self.config.data_dir, self.config.fsync);
+        defer temp.deinit();
+        if (try temp.refs.readHead(cas_mod.main_ref) == null) {
+            _ = try temp.bootstrapIfMissing(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog);
+        } else {
+            _ = try temp.syncLegacySnapshot(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog, "snapshot");
         }
     }
 
@@ -830,7 +866,8 @@ pub const Engine = struct {
                 const loaded = try cas.store.get(self.alloc, content_id);
                 defer self.alloc.free(loaded.payload);
                 if (loaded.obj_type != .blob) return error.InvalidWalChunkObject;
-                try wal_mod.replayBytes(self.alloc, loaded.payload, ctx);
+                const captured_len = @min(loaded.payload.len, @as(usize, @intCast(entry.captured_bytes)));
+                try wal_mod.replayBytes(self.alloc, loaded.payload[0..captured_len], ctx);
             } else if (entry.name.len != 0) {
                 const single = [_][]const u8{entry.name};
                 try self.wal.replayFiles(self.alloc, single[0..], ctx);
@@ -840,7 +877,33 @@ pub const Engine = struct {
         const live = try wal_mod.listWalFiles(self.alloc, self.data_dir);
         defer wal_mod.freeWalFiles(self.alloc, live);
         for (live) |name| {
-            if (!std.mem.eql(u8, name, "current.wal") and containsWalName(index.snapshot.wal_index.entries, name)) continue;
+            if (findWalEntry(index.snapshot.wal_index.entries, name)) |entry| {
+                if (!entry.mutable) continue;
+
+                const path = try std.fmt.allocPrint(self.alloc, "wal/{s}", .{name});
+                defer self.alloc.free(path);
+                const stat = self.data_dir.statFile(path) catch |err| switch (err) {
+                    error.FileNotFound => continue,
+                    else => return err,
+                };
+
+                if (entry.content_id) |content_id| {
+                    const loaded = try cas.store.get(self.alloc, content_id);
+                    defer self.alloc.free(loaded.payload);
+                    if (loaded.obj_type != .blob) return error.InvalidWalChunkObject;
+
+                    if (stat.size > entry.captured_bytes and try wal_mod.filePrefixMatches(self.data_dir, path, loaded.payload)) {
+                        try self.wal.replayFileFromOffset(self.alloc, name, entry.captured_bytes, ctx);
+                        continue;
+                    }
+
+                    if (stat.size == entry.captured_bytes and try wal_mod.filePrefixMatches(self.data_dir, path, loaded.payload)) {
+                        continue;
+                    }
+                }
+            } else if (!std.mem.eql(u8, name, "current.wal") and containsWalName(index.snapshot.wal_index.entries, name)) {
+                continue;
+            }
             const single = [_][]const u8{name};
             try self.wal.replayFiles(self.alloc, single[0..], ctx);
         }
@@ -875,6 +938,185 @@ fn containsWalName(entries: []const cas_mod.WalChunkDescriptor, needle: []const 
         if (std.mem.eql(u8, entry.name, needle)) return true;
     }
     return false;
+}
+
+fn findWalEntry(entries: []const cas_mod.WalChunkDescriptor, needle: []const u8) ?cas_mod.WalChunkDescriptor {
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry.name, needle)) return entry;
+    }
+    return null;
+}
+
+const CompactibleDescriptorGroup = struct {
+    series_id: types.SeriesId,
+    hour_bucket: i64,
+    indices: []usize,
+};
+
+fn compactCasBackedSegments(engine: *Engine) !bool {
+    const snapshot_index = engine.metadata.cas_index orelse return false;
+    const store = &(engine.cas orelse return false).store;
+    var changed_any = false;
+
+    const groups = try collectCompactibleDescriptorGroups(engine.alloc, snapshot_index.snapshot.segment_descriptors);
+    defer {
+        for (groups) |group| engine.alloc.free(group.indices);
+        engine.alloc.free(groups);
+    }
+
+    for (groups) |group| {
+        try compactDescriptorGroup(engine, store, snapshot_index.snapshot.segment_descriptors, group);
+        changed_any = true;
+    }
+
+    if (changed_any) {
+        try engine.metadata.manifest.rewriteCheckpoint(engine.data_dir);
+    }
+    return changed_any;
+}
+
+fn collectCompactibleDescriptorGroups(
+    alloc: std.mem.Allocator,
+    descriptors: []const cas_mod.SegmentDescriptor,
+) ![]CompactibleDescriptorGroup {
+    var groups = std.array_list.Managed(CompactibleDescriptorGroup).init(alloc);
+    errdefer {
+        for (groups.items) |group| alloc.free(group.indices);
+        groups.deinit();
+    }
+
+    descriptor_loop: for (descriptors, 0..) |descriptor, idx| {
+        for (descriptors[0..idx]) |prior| {
+            if (prior.series_id == descriptor.series_id and prior.hour_bucket == descriptor.hour_bucket) {
+                continue :descriptor_loop;
+            }
+        }
+
+        var indices = std.array_list.Managed(usize).init(alloc);
+        errdefer indices.deinit();
+        try indices.append(idx);
+
+        var j = idx + 1;
+        while (j < descriptors.len) : (j += 1) {
+            const other = descriptors[j];
+            if (other.series_id == descriptor.series_id and other.hour_bucket == descriptor.hour_bucket) {
+                try indices.append(j);
+            }
+        }
+
+        if (indices.items.len > 1) {
+            try groups.append(.{
+                .series_id = descriptor.series_id,
+                .hour_bucket = descriptor.hour_bucket,
+                .indices = try indices.toOwnedSlice(),
+            });
+            continue;
+        }
+        indices.deinit();
+    }
+    return try groups.toOwnedSlice();
+}
+
+fn compactDescriptorGroup(
+    engine: *Engine,
+    store: *object_store.ObjectStore,
+    descriptors: []const cas_mod.SegmentDescriptor,
+    group: CompactibleDescriptorGroup,
+) !void {
+    var all = std.array_list.Managed(types.Point).init(engine.alloc);
+    defer all.deinit();
+
+    for (group.indices) |descriptor_index| {
+        const descriptor = descriptors[descriptor_index];
+        const points = try segment_mod.readAllDescriptor(engine.alloc, engine.data_dir, store, descriptor);
+        defer engine.alloc.free(points);
+        try all.appendSlice(points);
+    }
+
+    std.sort.block(types.Point, all.items, {}, struct {
+        fn lessThan(_: void, lhs: types.Point, rhs: types.Point) bool {
+            return lhs.ts < rhs.ts;
+        }
+    }.lessThan);
+
+    var dedup = try engine.alloc.alloc(types.Point, all.items.len);
+    defer engine.alloc.free(dedup);
+
+    var dedup_len: usize = 0;
+    for (all.items) |point| {
+        if (dedup_len == 0 or dedup[dedup_len - 1].ts != point.ts) {
+            dedup[dedup_len] = point;
+            dedup_len += 1;
+        } else {
+            dedup[dedup_len - 1] = point;
+        }
+    }
+
+    const compacted = dedup[0..dedup_len];
+    const selector_resolution = engine.metadata.series_catalog.resolveBySeriesId(group.series_id);
+    const selector_metadata = switch (selector_resolution.status) {
+        .resolved, .exact_match => segment_mod.SelectorMetadataView{
+            .series = selector_resolution.series.?,
+            .canonical_tags = selector_resolution.canonical_tags.?,
+        },
+        .not_found, .ambiguous => null,
+    };
+    const new_path = try segment_mod.writeSegmentWithMetadata(engine.alloc, engine.data_dir, group.series_id, group.hour_bucket, compacted, selector_metadata);
+    defer engine.alloc.free(new_path);
+
+    for (group.indices) |descriptor_index| {
+        const descriptor = descriptors[descriptor_index];
+        if (descriptor.path.len != 0) {
+            engine.data_dir.deleteFile(descriptor.path) catch {};
+        }
+    }
+
+    var rebuilt = std.ArrayListUnmanaged(manifest_mod.Entry){};
+    errdefer rebuilt.deinit(engine.alloc);
+
+    var matched_descriptor_count: usize = 0;
+    for (engine.metadata.manifest.entries.items) |entry| {
+        if (findMatchingDescriptorIndex(descriptors, group.indices, entry) != null) {
+            matched_descriptor_count += 1;
+            engine.alloc.free(entry.path);
+            continue;
+        }
+        try rebuilt.append(engine.alloc, entry);
+    }
+
+    if (matched_descriptor_count != group.indices.len) {
+        return error.CasCompactionManifestMismatch;
+    }
+
+    try rebuilt.append(engine.alloc, .{
+        .series_id = group.series_id,
+        .hour_bucket = group.hour_bucket,
+        .start_ts = compacted[0].ts,
+        .end_ts = compacted[compacted.len - 1].ts,
+        .count = @intCast(compacted.len),
+        .path = try engine.alloc.dupe(u8, new_path),
+    });
+
+    engine.metadata.manifest.entries.deinit(engine.alloc);
+    engine.metadata.manifest.entries = rebuilt;
+}
+
+fn findMatchingDescriptorIndex(
+    descriptors: []const cas_mod.SegmentDescriptor,
+    candidate_indices: []const usize,
+    entry: manifest_mod.Entry,
+) ?usize {
+    for (candidate_indices) |descriptor_index| {
+        const descriptor = descriptors[descriptor_index];
+        if (descriptor.series_id != entry.series_id) continue;
+        if (descriptor.hour_bucket != entry.hour_bucket) continue;
+        if (descriptor.start_ts != entry.start_ts) continue;
+        if (descriptor.end_ts != entry.end_ts) continue;
+        if (descriptor.count != entry.count) continue;
+        if (!std.mem.eql(u8, descriptor.path, entry.path)) continue;
+        return descriptor_index;
+    }
+    return null;
 }
 
 fn manifestFromSnapshot(alloc: std.mem.Allocator, descriptors: []const cas_mod.SegmentDescriptor) !manifest_mod.Manifest {
@@ -1134,8 +1376,15 @@ const waitError = error{Timeout};
 fn waitForFlush(engine: *Engine, expected_entries: usize, timeout_ms: u64) waitError!void {
     const deadline: i64 = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
     while (std.time.milliTimestamp() < deadline) {
-        if (engine.metadata.manifest.entries.items.len >= expected_entries and engine.mem.bytes.load(.monotonic) == 0)
+        if (engine.metadata.manifest.entries.items.len >= expected_entries and engine.mem.bytes.load(.monotonic) == 0 and engine.queue.len() == 0) {
+            if (engine.cas != null) {
+                engine.verifyCasState() catch {
+                    sleepMs(10);
+                    continue;
+                };
+            }
             return;
+        }
         sleepMs(10);
     }
     return waitError.Timeout;
@@ -1244,6 +1493,66 @@ test "engine replays wal on startup" {
     try engine.verifyCasState();
 }
 
+test "engine replays only the uncaptured current wal tail after CAS snapshot recovery" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/wal-tail-recovery", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const sid = types.hash64("wal.tail.series");
+
+    try std.fs.cwd().makePath(data_path);
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var wal = try wal_mod.WAL.open(talloc, data_dir, .none);
+    defer wal.close();
+    _ = try wal.append(sid, 1_000, 10.0);
+
+    var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
+    defer series_catalog.deinit();
+
+    var cas_manager = try cas_mod.CasManager.init(talloc, data_path, .none);
+    defer cas_manager.deinit();
+    _ = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+
+    _ = try wal.append(sid, 2_000, 20.0);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .dual_write,
+        .metadata_read_mode = .primary,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    var results = std.array_list.Managed(types.Point).init(talloc);
+    defer results.deinit();
+    try engine.queryRange(sid, 0, 10_000, &results);
+    try std.testing.expectEqual(@as(usize, 2), results.items.len);
+    try std.testing.expectEqual(@as(i64, 1_000), results.items[0].ts);
+    try std.testing.expectApproxEqAbs(@as(f64, 10.0), results.items[0].value, 1e-9);
+    try std.testing.expectEqual(@as(i64, 2_000), results.items[1].ts);
+    try std.testing.expectApproxEqAbs(@as(f64, 20.0), results.items[1].value, 1e-9);
+}
+
 test "engine metrics track ingest and flush" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -1289,7 +1598,7 @@ test "engine metrics track ingest and flush" {
     try std.testing.expect(flush_ns > 0);
 }
 
-test "engine snapshotTo captures a restorable point-in-time copy" {
+test "engine snapshotTo captures a restorable CAS bundle" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -1332,9 +1641,13 @@ test "engine snapshotTo captures a restorable point-in-time copy" {
 
     {
         try std.fs.cwd().makePath(restore_path);
+        try @import("snapshot.zig").restore(talloc, restore_path, snapshot_path, .none);
+
         var restore_dir = try std.fs.cwd().openDir(restore_path, .{ .iterate = true });
         defer restore_dir.close();
-        try @import("snapshot.zig").restore(talloc, restore_dir, snapshot_path);
+        try std.testing.expectError(error.FileNotFound, restore_dir.statFile("MANIFEST"));
+        try std.testing.expectError(error.FileNotFound, restore_dir.statFile("tags.json"));
+        try std.testing.expectError(error.FileNotFound, restore_dir.statFile("series_catalog.jsonl"));
 
         const restored_cfg = cfg.Config{
             .data_dir = try talloc.dupe(u8, restore_path),
@@ -1348,6 +1661,7 @@ test "engine snapshotTo captures a restorable point-in-time copy" {
             .enable_prom = false,
             .mem_limit_bytes = 1024 * 1024,
             .cas_mode = .dual_write,
+            .metadata_read_mode = .primary,
             .retention_ns = std.StringHashMap(u32).init(talloc),
         };
 
@@ -1369,7 +1683,6 @@ test "engine snapshotTo captures a restorable point-in-time copy" {
             .resolved => |resolved| try std.testing.expectEqual(sid, resolved),
             else => return error.TestUnexpectedResult,
         }
-        try restored.verifyCasState();
     }
 }
 
@@ -1534,6 +1847,83 @@ test "engine primary mode can query from CAS-owned segment content without mirro
         try std.testing.expectEqual(@as(usize, 1), results.items.len);
         try std.testing.expectEqual(@as(i64, 2_000), results.items[0].ts);
         try std.testing.expectApproxEqAbs(@as(f64, 9.5), results.items[0].value, 1e-9);
+    }
+}
+
+test "engine primary mode compacts from CAS-backed segment descriptors without source mirrors" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/cas-compact-data", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    const sid = types.hash64("cas.compact.series");
+
+    {
+        const config = cfg.Config{
+            .data_dir = try talloc.dupe(u8, data_path),
+            .http_port = 0,
+            .fsync = .none,
+            .flush_interval_ms = 5,
+            .memtable_max_bytes = 512,
+            .retention_days = 0,
+            .auth_token = try talloc.dupe(u8, ""),
+            .enable_influx = false,
+            .enable_prom = false,
+            .mem_limit_bytes = 1024 * 1024,
+            .cas_mode = .dual_write,
+            .retention_ns = std.StringHashMap(u32).init(talloc),
+        };
+
+        var engine = try Engine.init(talloc, config);
+        defer engine.deinit();
+
+        try engine.registerSeries("cas.compact.series", "{}", sid);
+        try engine.ingest(.{ .series_id = sid, .ts = 1_000, .value = 1.0, .tags_json = "{}" });
+        try waitForFlush(engine, 1, 1_000);
+        try engine.ingest(.{ .series_id = sid, .ts = 1_500, .value = 2.0, .tags_json = "{}" });
+        try waitForFlush(engine, 2, 1_000);
+        try engine.verifyCasState();
+    }
+
+    {
+        var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+        defer data_dir.close();
+        data_dir.deleteTree("segments") catch {};
+        data_dir.deleteFile("MANIFEST") catch {};
+        data_dir.deleteFile("tags.json") catch {};
+        data_dir.deleteFile("series_catalog.jsonl") catch {};
+    }
+
+    {
+        const config = cfg.Config{
+            .data_dir = try talloc.dupe(u8, data_path),
+            .http_port = 0,
+            .fsync = .none,
+            .flush_interval_ms = 5,
+            .memtable_max_bytes = 512,
+            .retention_days = 0,
+            .auth_token = try talloc.dupe(u8, ""),
+            .enable_influx = false,
+            .enable_prom = false,
+            .mem_limit_bytes = 1024 * 1024,
+            .cas_mode = .dual_write,
+            .metadata_read_mode = .primary,
+            .retention_ns = std.StringHashMap(u32).init(talloc),
+        };
+
+        var engine = try Engine.init(talloc, config);
+        defer engine.deinit();
+
+        try std.testing.expect(try engine.compactNow());
+        try std.testing.expectEqual(@as(usize, 1), engine.metadata.manifest.entries.items.len);
+
+        var results = std.array_list.Managed(types.Point).init(talloc);
+        defer results.deinit();
+        try engine.queryRange(sid, 0, 10_000, &results);
+        try std.testing.expectEqual(@as(usize, 2), results.items.len);
+        try std.testing.expectEqual(@as(i64, 1_000), results.items[0].ts);
+        try std.testing.expectApproxEqAbs(@as(f64, 2.0), results.items[1].value, 1e-9);
     }
 }
 

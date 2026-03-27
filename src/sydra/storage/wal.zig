@@ -102,6 +102,24 @@ pub const WAL = struct {
             try replayFile(alloc, wal_dir, name, ctx_ptr);
         }
     }
+
+    pub fn replayFileFromOffset(self: *WAL, alloc: std.mem.Allocator, file_name: []const u8, offset: u64, ctx: anytype) !void {
+        var wal_dir = self.dir.openDir("wal", .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer wal_dir.close();
+
+        var file = try wal_dir.openFile(file_name, .{});
+        defer file.close();
+        try file.seekTo(offset);
+
+        var read_buf: [4096]u8 = undefined;
+        var reader_state = file.reader(&read_buf);
+        const reader = std.Io.Reader.adaptToOldInterface(&reader_state.interface);
+        const ctx_ptr = @constCast(ctx);
+        try replayReader(alloc, reader, ctx_ptr);
+    }
 };
 
 pub const WalFileInfo = struct {
@@ -195,6 +213,25 @@ fn replayFile(alloc: std.mem.Allocator, wal_dir: std.fs.Dir, file_name: []const 
 pub fn replayBytes(alloc: std.mem.Allocator, bytes: []const u8, ctx: anytype) !void {
     var stream = std.io.fixedBufferStream(bytes);
     try replayReader(alloc, stream.reader().any(), ctx);
+}
+
+pub fn filePrefixMatches(data_dir: std.fs.Dir, path: []const u8, expected_prefix: []const u8) !bool {
+    var file = data_dir.openFile(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer file.close();
+
+    var remaining = expected_prefix;
+    var scratch: [4096]u8 = undefined;
+    while (remaining.len > 0) {
+        const chunk_len = @min(remaining.len, scratch.len);
+        const read_len = try file.readAll(scratch[0..chunk_len]);
+        if (read_len != chunk_len) return false;
+        if (!std.mem.eql(u8, scratch[0..chunk_len], remaining[0..chunk_len])) return false;
+        remaining = remaining[chunk_len..];
+    }
+    return true;
 }
 
 fn replayReader(alloc: std.mem.Allocator, reader: anytype, ctx: anytype) !void {
@@ -301,6 +338,7 @@ test "wal replays series registrations before point records" {
     _ = try wal.append(77, 1_000, 3.5);
 
     var ctx = struct {
+        alloc: std.mem.Allocator,
         registered: bool = false,
         seen_series_id: ?u64 = null,
         seen_series: ?[]const u8 = null,
@@ -310,8 +348,10 @@ test "wal replays series registrations before point records" {
         pub fn onSeriesRegistration(self: *@This(), series_id: u64, series: []const u8, canonical_tags: []const u8) !void {
             self.registered = true;
             self.seen_series_id = series_id;
-            self.seen_series = series;
-            self.seen_tags = canonical_tags;
+            if (self.seen_series) |existing| self.alloc.free(existing);
+            if (self.seen_tags) |existing| self.alloc.free(existing);
+            self.seen_series = try self.alloc.dupe(u8, series);
+            self.seen_tags = try self.alloc.dupe(u8, canonical_tags);
         }
 
         pub fn onRecord(self: *@This(), series_id: u64, ts: i64, value: f64) !void {
@@ -321,7 +361,11 @@ test "wal replays series registrations before point records" {
             try std.testing.expectApproxEqAbs(@as(f64, 3.5), value, 1e-9);
             self.point_count += 1;
         }
-    }{};
+    }{ .alloc = alloc };
+    defer {
+        if (ctx.seen_series) |series| alloc.free(series);
+        if (ctx.seen_tags) |tags| alloc.free(tags);
+    }
 
     try wal.replay(alloc, &ctx);
 
