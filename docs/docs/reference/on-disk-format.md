@@ -32,6 +32,7 @@ Under `data_dir`, the engine uses:
 - `objects/packs/*.pack` – immutable packed object containers
 - `objects/packs/*.idx` – fanout-based pack indexes for packed objects
 - `objects/info/store-format` – repository-wide storage format marker and feature defaults
+- `objects/info/multi-pack-index` – optional pack-set fanout index across all active packs
 - `objects/info/commit-graph` – optional commit ancestry side index written by CAS maintenance
 - `objects/cruft/<timestamp>/...` – quarantined unreachable CAS content retained until the GC grace window expires
 - `refs/` – mutable plaintext refs and reflogs for the CAS head/branches/tags/checkpoints
@@ -101,8 +102,9 @@ The CAS layer stores immutable objects addressed by a BLAKE3 hash of `(type, pay
 
 - Loose objects live under `objects/<prefix>/<hex>`.
 - Packed objects live in `objects/packs/*.pack` and are indexed by `objects/packs/*.idx`.
+- `objects/info/multi-pack-index` provides an optional cross-pack fanout table so lookups can resolve mixed pack sets without scanning every individual `.idx` file first.
 - The current implementation stores whole objects in packs; it does not use delta compression.
-- `cas pack` writes a new pack/index pair, prunes older pack files, and removes redundant loose copies for the packed reachable set.
+- `cas pack` writes an additional pack/index pair for the currently reachable loose object set, refreshes `objects/info/multi-pack-index`, and removes redundant loose copies for the newly packed objects without pruning older active packs.
 - `cas gc --apply` preserves unreachable content by first copying active pack files and moving loose unreachable objects into `objects/cruft/<timestamp>/`, then pruning older cruft directories after the configured grace window.
 
 Current typed metadata payloads include:

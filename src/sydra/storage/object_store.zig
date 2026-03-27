@@ -296,8 +296,7 @@ pub const ObjectStore = struct {
         if (shouldSync(self.fsync)) {
             try syncDir(&self.root);
         }
-
-        try self.pruneOlderPackFiles(pack_rel, idx_rel);
+        try self.rebuildMultiPackIndex(allocator);
 
         for (sorted_ids) |id| {
             self.delete(id) catch |err| switch (err) {
@@ -311,6 +310,16 @@ pub const ObjectStore = struct {
             .idx_path = idx_rel,
             .object_count = sorted_ids.len,
         };
+    }
+
+    pub fn hasLooseObject(self: *ObjectStore, id: ObjectId) !bool {
+        if (self.getLoose(self.allocator, id)) |loaded| {
+            self.allocator.free(loaded.payload);
+            return true;
+        } else |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        }
     }
 
     fn containsId(self: *ObjectStore, id: ObjectId) !bool {
@@ -355,6 +364,19 @@ pub const ObjectStore = struct {
     }
 
     fn findPackedLocation(self: *ObjectStore, id: ObjectId) !?PackLocation {
+        if (self.loadMultiPackIndex(self.allocator)) |midx| {
+            defer midx.deinit(self.allocator);
+            if (midx.lookup(id)) |location| {
+                return .{
+                    .pack_path = try self.allocator.dupe(u8, location.pack_path),
+                    .offset = location.offset,
+                };
+            }
+        } else |err| switch (err) {
+            error.FileNotFound, error.CorruptMultiPackIndex, error.UnsupportedMultiPackIndexVersion => {},
+            else => return err,
+        }
+
         const idx_paths = try self.listPackIndexPaths(self.allocator);
         defer freeOwnedStrings(self.allocator, idx_paths);
 
@@ -372,15 +394,31 @@ pub const ObjectStore = struct {
     }
 
     fn listPackedIds(self: *ObjectStore, allocator: std.mem.Allocator) ![]ObjectId {
+        if (self.loadMultiPackIndex(allocator)) |midx| {
+            defer midx.deinit(allocator);
+            const ids = try allocator.alloc(ObjectId, midx.records.len);
+            for (midx.records, 0..) |record, idx| ids[idx] = record.id;
+            return ids;
+        } else |err| switch (err) {
+            error.FileNotFound, error.CorruptMultiPackIndex, error.UnsupportedMultiPackIndexVersion => {},
+            else => return err,
+        }
+
         const idx_paths = try self.listPackIndexPaths(allocator);
         defer freeOwnedStrings(allocator, idx_paths);
 
         var ids = std.array_list.Managed(ObjectId).init(allocator);
         errdefer ids.deinit();
+        var seen = std.AutoHashMap(ObjectId, void).init(allocator);
+        defer seen.deinit();
         for (idx_paths) |idx_path| {
             var index = try loadPackIndex(allocator, self.root, idx_path);
             defer index.deinit(allocator);
-            try ids.appendSlice(index.object_ids);
+            for (index.object_ids) |id| {
+                const gop = try seen.getOrPut(id);
+                if (gop.found_existing) continue;
+                try ids.append(id);
+            }
         }
         return try ids.toOwnedSlice();
     }
@@ -414,34 +452,75 @@ pub const ObjectStore = struct {
         return try out.toOwnedSlice();
     }
 
-    fn pruneOlderPackFiles(self: *ObjectStore, keep_pack_rel: []const u8, keep_idx_rel: []const u8) !void {
-        var pack_dir = self.root.openDir("objects/packs", .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return,
+    fn rebuildMultiPackIndex(self: *ObjectStore, allocator: std.mem.Allocator) !void {
+        const idx_paths = try self.listPackIndexPaths(allocator);
+        defer freeOwnedStrings(allocator, idx_paths);
+
+        if (idx_paths.len == 0) {
+            self.root.deleteFile(midxPath) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+            return;
+        }
+
+        const pack_paths = try allocator.alloc([]u8, idx_paths.len);
+        defer {
+            for (pack_paths) |path| allocator.free(path);
+            allocator.free(pack_paths);
+        }
+
+        var records = std.array_list.Managed(MultiPackRecord).init(allocator);
+        defer records.deinit();
+        var seen = std.AutoHashMap(ObjectId, void).init(allocator);
+        defer seen.deinit();
+
+        for (idx_paths, 0..) |idx_path, pack_idx| {
+            var index = try loadPackIndex(allocator, self.root, idx_path);
+            defer index.deinit(allocator);
+            pack_paths[pack_idx] = try allocator.dupe(u8, index.pack_path);
+            for (index.object_ids, index.offsets) |id, offset| {
+                const gop = try seen.getOrPut(id);
+                if (gop.found_existing) continue;
+                try records.append(.{
+                    .id = id,
+                    .pack_path_index = @intCast(pack_idx),
+                    .offset = offset,
+                });
+            }
+        }
+
+        std.sort.block(MultiPackRecord, records.items, {}, struct {
+            fn lessThan(_: void, lhs: MultiPackRecord, rhs: MultiPackRecord) bool {
+                return std.mem.lessThan(u8, lhs.id.hash[0..], rhs.id.hash[0..]);
+            }
+        }.lessThan);
+
+        const bytes = try encodeMultiPackIndex(allocator, pack_paths, records.items);
+        defer allocator.free(bytes);
+
+        const temp_path = midxPath ++ ".tmp";
+        var file = try self.root.createFile(temp_path, .{ .truncate = true, .read = true });
+        defer file.close();
+        errdefer self.root.deleteFile(temp_path) catch {};
+        try file.writeAll(bytes);
+        if (shouldSync(self.fsync)) {
+            try file.sync();
+        }
+        self.root.rename(temp_path, midxPath) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                self.root.deleteFile(midxPath) catch {};
+                try self.root.rename(temp_path, midxPath);
+            },
             else => return err,
         };
-        defer pack_dir.close();
-
-        var stale = std.array_list.Managed([]u8).init(self.allocator);
-        defer {
-            for (stale.items) |path| self.allocator.free(path);
-            stale.deinit();
+        if (shouldSync(self.fsync)) {
+            try syncDir(&self.root);
         }
+    }
 
-        var it = pack_dir.iterate();
-        while (try it.next()) |entry| {
-            if (entry.kind != .file) continue;
-            if (std.mem.endsWith(u8, entry.name, ".tmp")) continue;
-            const rel = try std.fmt.allocPrint(self.allocator, "objects/packs/{s}", .{entry.name});
-            if (std.mem.eql(u8, rel, keep_pack_rel) or std.mem.eql(u8, rel, keep_idx_rel)) {
-                self.allocator.free(rel);
-                continue;
-            }
-            try stale.append(rel);
-        }
-
-        for (stale.items) |rel| {
-            self.root.deleteFile(rel) catch {};
-        }
+    fn loadMultiPackIndex(self: *ObjectStore, allocator: std.mem.Allocator) !MultiPackIndex {
+        return try readMultiPackIndex(allocator, self.root);
     }
 };
 
@@ -470,6 +549,8 @@ fn syncDir(dir: *std.fs.Dir) !void {
 
 const packMagic = "SYDPACK1";
 const idxMagic = "SYDIDX1\x00";
+const midxMagic = "SYDMIDX1";
+const midxPath = "objects/info/multi-pack-index";
 
 const PackLocation = struct {
     pack_path: []u8,
@@ -477,6 +558,55 @@ const PackLocation = struct {
 
     fn deinit(self: *PackLocation, alloc: std.mem.Allocator) void {
         alloc.free(self.pack_path);
+    }
+};
+
+const MultiPackRecord = struct {
+    id: ObjectId,
+    pack_path_index: u32,
+    offset: u64,
+};
+
+const MultiPackLocation = struct {
+    pack_path: []const u8,
+    offset: u64,
+};
+
+const MultiPackIndex = struct {
+    pack_paths: [][]u8,
+    fanout: [256]u64,
+    records: []MultiPackRecord,
+
+    fn deinit(self: *MultiPackIndex, alloc: std.mem.Allocator) void {
+        for (self.pack_paths) |path| alloc.free(path);
+        alloc.free(self.pack_paths);
+        alloc.free(self.records);
+    }
+
+    fn lookup(self: *const MultiPackIndex, id: ObjectId) ?MultiPackLocation {
+        const prefix = id.hash[0];
+        const start = if (prefix == 0) 0 else self.fanout[prefix - 1];
+        const end = self.fanout[prefix];
+        var lo: usize = @intCast(start);
+        var hi: usize = @intCast(end);
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const candidate = self.records[mid];
+            if (candidate.id.eql(id)) {
+                const pack_idx: usize = @intCast(candidate.pack_path_index);
+                if (pack_idx >= self.pack_paths.len) return null;
+                return .{
+                    .pack_path = self.pack_paths[pack_idx],
+                    .offset = candidate.offset,
+                };
+            }
+            if (std.mem.lessThan(u8, candidate.id.hash[0..], id.hash[0..])) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        return null;
     }
 };
 
@@ -550,6 +680,44 @@ fn encodePackIndex(
     return try bytes.toOwnedSlice();
 }
 
+fn encodeMultiPackIndex(
+    alloc: std.mem.Allocator,
+    pack_paths: []const []const u8,
+    records: []const MultiPackRecord,
+) ![]u8 {
+    var fanout: [256]u64 = [_]u64{0} ** 256;
+    for (records) |record| {
+        fanout[record.id.hash[0]] += 1;
+    }
+    var i: usize = 1;
+    while (i < fanout.len) : (i += 1) {
+        fanout[i] += fanout[i - 1];
+    }
+
+    var bytes = std.array_list.Managed(u8).init(alloc);
+    errdefer bytes.deinit();
+
+    try bytes.appendSlice(midxMagic[0..]);
+    try appendInt(&bytes, u16, 1);
+    try appendInt(&bytes, u64, @intCast(records.len));
+    try appendInt(&bytes, u64, @intCast(pack_paths.len));
+    for (fanout) |count| try appendInt(&bytes, u64, count);
+    for (pack_paths) |pack_path| {
+        try appendInt(&bytes, u16, @intCast(pack_path.len));
+        try bytes.appendSlice(pack_path);
+    }
+    for (records) |record| try bytes.appendSlice(record.id.hash[0..]);
+    for (records) |record| try appendInt(&bytes, u32, record.pack_path_index);
+    for (records) |record| try appendInt(&bytes, u64, record.offset);
+
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(bytes.items);
+    var checksum: [32]u8 = undefined;
+    hasher.final(checksum[0..]);
+    try bytes.appendSlice(checksum[0..]);
+    return try bytes.toOwnedSlice();
+}
+
 fn loadPackIndex(alloc: std.mem.Allocator, root: std.fs.Dir, idx_path: []const u8) !PackIndex {
     const bytes = try root.readFileAlloc(alloc, idx_path, 256 * 1024 * 1024);
     defer alloc.free(bytes);
@@ -601,6 +769,63 @@ fn loadPackIndex(alloc: std.mem.Allocator, root: std.fs.Dir, idx_path: []const u
     };
 }
 
+fn readMultiPackIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !MultiPackIndex {
+    const bytes = try root.readFileAlloc(alloc, midxPath, 256 * 1024 * 1024);
+    defer alloc.free(bytes);
+    if (bytes.len < midxMagic.len + @sizeOf(u16) + @sizeOf(u64) * 2 + (256 * @sizeOf(u64)) + 32) {
+        return error.CorruptMultiPackIndex;
+    }
+    if (!std.mem.eql(u8, bytes[0..midxMagic.len], midxMagic[0..])) return error.CorruptMultiPackIndex;
+
+    const checksum_start = bytes.len - 32;
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(bytes[0..checksum_start]);
+    var expected_checksum: [32]u8 = undefined;
+    hasher.final(expected_checksum[0..]);
+    if (!std.mem.eql(u8, expected_checksum[0..], bytes[checksum_start..])) return error.CorruptMultiPackIndex;
+
+    var cursor: usize = midxMagic.len;
+    const version = readIntAt(bytes, &cursor, u16);
+    if (version != 1) return error.UnsupportedMultiPackIndexVersion;
+    const object_count = readIntAt(bytes, &cursor, u64);
+    const pack_count = readIntAt(bytes, &cursor, u64);
+
+    var fanout: [256]u64 = undefined;
+    for (&fanout) |*entry| entry.* = readIntAt(bytes, &cursor, u64);
+
+    const pack_paths = try alloc.alloc([]u8, @intCast(pack_count));
+    errdefer {
+        for (pack_paths) |path| alloc.free(path);
+        alloc.free(pack_paths);
+    }
+    for (pack_paths) |*pack_path| {
+        const path_len = readIntAt(bytes, &cursor, u16);
+        if (cursor + path_len > checksum_start) return error.CorruptMultiPackIndex;
+        pack_path.* = try alloc.dupe(u8, bytes[cursor .. cursor + path_len]);
+        cursor += path_len;
+    }
+
+    const records = try alloc.alloc(MultiPackRecord, @intCast(object_count));
+    errdefer alloc.free(records);
+    for (records) |*record| {
+        record.id = .{ .hash = try readHashAt(bytes, &cursor, checksum_start) };
+    }
+    for (records) |*record| {
+        record.pack_path_index = readIntAt(bytes, &cursor, u32);
+    }
+    for (records) |*record| {
+        record.offset = readIntAt(bytes, &cursor, u64);
+        if (record.pack_path_index >= pack_paths.len) return error.CorruptMultiPackIndex;
+    }
+    if (cursor != checksum_start) return error.CorruptMultiPackIndex;
+
+    return .{
+        .pack_paths = pack_paths,
+        .fanout = fanout,
+        .records = records,
+    };
+}
+
 fn packPathForIndex(alloc: std.mem.Allocator, idx_path: []const u8) ![]u8 {
     if (!std.mem.endsWith(u8, idx_path, ".idx")) return error.InvalidPackIndexPath;
     return try std.fmt.allocPrint(alloc, "{s}.pack", .{idx_path[0 .. idx_path.len - 4]});
@@ -617,6 +842,14 @@ fn readIntAt(bytes: []const u8, cursor: *usize, comptime T: type) T {
     var raw: [@sizeOf(T)]u8 = undefined;
     @memcpy(raw[0..], bytes[cursor.* .. cursor.* + @sizeOf(T)]);
     return std.mem.readInt(T, &raw, .little);
+}
+
+fn readHashAt(bytes: []const u8, cursor: *usize, limit: usize) ![32]u8 {
+    if (cursor.* + 32 > limit) return error.CorruptMultiPackIndex;
+    var hash_bytes: [32]u8 = undefined;
+    @memcpy(hash_bytes[0..], bytes[cursor.* .. cursor.* + 32]);
+    cursor.* += 32;
+    return hash_bytes;
 }
 
 fn hashRelativeFile(root: std.fs.Dir, alloc: std.mem.Allocator, path: []const u8) ![32]u8 {
@@ -744,4 +977,78 @@ test "object store rejects corrupt pack indexes" {
     try idx_file.writeAll("BROKEN!!");
 
     try std.testing.expectError(error.CorruptPackIndex, store.get(std.testing.allocator, id));
+}
+
+test "object store resolves objects across multiple packs with a multi-pack index" {
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    const store_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/object-store-midx", .{tmp_dir.sub_path});
+    defer std.testing.allocator.free(store_path);
+    var store = try ObjectStore.init(std.testing.allocator, store_path, .none);
+    defer store.deinit();
+
+    const first = try store.put(.blob, "first-pack");
+    var first_pack = try store.writePack(std.testing.allocator, &[_]ObjectId{first});
+    defer first_pack.deinit(std.testing.allocator);
+
+    const second = try store.put(.blob, "second-pack");
+    var second_pack = try store.writePack(std.testing.allocator, &[_]ObjectId{second});
+    defer second_pack.deinit(std.testing.allocator);
+
+    const midx_bytes = try store.root.readFileAlloc(std.testing.allocator, midxPath, 1024 * 1024);
+    defer std.testing.allocator.free(midx_bytes);
+    try std.testing.expect(midx_bytes.len > 0);
+
+    const loaded_first = try store.get(std.testing.allocator, first);
+    defer std.testing.allocator.free(loaded_first.payload);
+    try std.testing.expectEqualStrings("first-pack", loaded_first.payload);
+
+    const loaded_second = try store.get(std.testing.allocator, second);
+    defer std.testing.allocator.free(loaded_second.payload);
+    try std.testing.expectEqualStrings("second-pack", loaded_second.payload);
+
+    var pack_dir = try store.root.openDir("objects/packs", .{ .iterate = true });
+    defer pack_dir.close();
+    var idx_count: usize = 0;
+    var pack_count: usize = 0;
+    var it = pack_dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.endsWith(u8, entry.name, ".idx")) idx_count += 1;
+        if (std.mem.endsWith(u8, entry.name, ".pack")) pack_count += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), idx_count);
+    try std.testing.expectEqual(@as(usize, 2), pack_count);
+}
+
+test "object store falls back to pack indexes when the multi-pack index is corrupt" {
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    const store_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/object-store-midx-corrupt", .{tmp_dir.sub_path});
+    defer std.testing.allocator.free(store_path);
+    var store = try ObjectStore.init(std.testing.allocator, store_path, .none);
+    defer store.deinit();
+
+    const first = try store.put(.blob, "first-pack");
+    var first_pack = try store.writePack(std.testing.allocator, &[_]ObjectId{first});
+    defer first_pack.deinit(std.testing.allocator);
+
+    const second = try store.put(.blob, "second-pack");
+    var second_pack = try store.writePack(std.testing.allocator, &[_]ObjectId{second});
+    defer second_pack.deinit(std.testing.allocator);
+
+    var midx_file = try store.root.openFile(midxPath, .{ .mode = .read_write });
+    defer midx_file.close();
+    try midx_file.seekTo(0);
+    try midx_file.writeAll("BROKEN!!");
+
+    const loaded_first = try store.get(std.testing.allocator, first);
+    defer std.testing.allocator.free(loaded_first.payload);
+    try std.testing.expectEqualStrings("first-pack", loaded_first.payload);
+
+    const loaded_second = try store.get(std.testing.allocator, second);
+    defer std.testing.allocator.free(loaded_second.payload);
+    try std.testing.expectEqualStrings("second-pack", loaded_second.payload);
 }

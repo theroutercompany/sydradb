@@ -1675,7 +1675,9 @@ pub const CasManager = struct {
         defer ids.deinit();
         var it = reachable.keyIterator();
         while (it.next()) |id_ptr| {
-            try ids.append(id_ptr.*);
+            if (try self.store.hasLooseObject(id_ptr.*)) {
+                try ids.append(id_ptr.*);
+            }
         }
 
         var rewritten_objects: usize = 0;
@@ -1683,10 +1685,6 @@ pub const CasManager = struct {
             var pack_write = try self.store.writePack(self.alloc, ids.items);
             defer pack_write.deinit(self.alloc);
             rewritten_objects = pack_write.object_count;
-        } else {
-            const existing_pack_paths = try listFilesRecursive(self.alloc, self.store.root, "objects/packs");
-            defer freeOwnedStrings(self.alloc, existing_pack_paths);
-            try deleteActivePackFiles(self.store.root, existing_pack_paths);
         }
 
         for (all_ids) |id| {
@@ -4449,6 +4447,68 @@ test "fsck and pack preserve the reachable CAS head" {
     try std.testing.expectEqual(fsck.reachable_objects, all_ids.len);
     try std.testing.expect(containsObjectId(all_ids, initial));
     try std.testing.expect(!containsObjectId(all_ids, orphan));
+}
+
+test "cas pack preserves older packs while sealing newly reachable loose objects" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/pack-set", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    try std.fs.cwd().makePath(data_path);
+
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
+    defer series_catalog.deinit();
+
+    const sid = types.hash64("pack.set.series");
+    _ = try series_catalog.register("pack.set.series", "{}", sid);
+
+    const first_points = [_]types.Point{.{ .ts = 1_000, .value = 1.0 }};
+    const first_path = try segment_mod.writeSegment(talloc, data_dir, sid, 0, first_points[0..]);
+    defer talloc.free(first_path);
+    try manifest.add(data_dir, sid, 0, 1_000, 1_000, 1, first_path);
+
+    var cas_manager = try CasManager.init(talloc, data_path, .none);
+    defer cas_manager.deinit();
+
+    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    const first_pack = try cas_manager.pack();
+    try std.testing.expect(first_pack.rewritten_objects > 0);
+
+    const second_points = [_]types.Point{.{ .ts = 2_000, .value = 2.0 }};
+    const second_path = try segment_mod.writeSegment(talloc, data_dir, sid, 0, second_points[0..]);
+    defer talloc.free(second_path);
+    try manifest.add(data_dir, sid, 0, 2_000, 2_000, 1, second_path);
+
+    const advanced = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, "advance-pack-set");
+    try std.testing.expect(!advanced.eql(initial));
+
+    const second_pack = try cas_manager.pack();
+    try std.testing.expect(second_pack.rewritten_objects > 0);
+
+    var pack_dir = try cas_manager.store.root.openDir("objects/packs", .{ .iterate = true });
+    defer pack_dir.close();
+    var pack_count: usize = 0;
+    var idx_count: usize = 0;
+    var it = pack_dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.endsWith(u8, entry.name, ".pack")) pack_count += 1;
+        if (std.mem.endsWith(u8, entry.name, ".idx")) idx_count += 1;
+    }
+    try std.testing.expect(pack_count >= 2);
+    try std.testing.expect(idx_count >= 2);
+
+    const head = try cas_manager.refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(head.eql(advanced));
 }
 
 test "gc and fsck protect reflog-referenced commits by default" {
