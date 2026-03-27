@@ -1388,6 +1388,12 @@ test "engine primary metadata mode boots from CAS metadata alone" {
         var engine = try Engine.init(talloc, config);
         defer engine.deinit();
 
+        var boot_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+        defer boot_dir.close();
+        try std.testing.expectError(error.FileNotFound, boot_dir.statFile("MANIFEST"));
+        try std.testing.expectError(error.FileNotFound, boot_dir.statFile("tags.json"));
+        try std.testing.expectError(error.FileNotFound, boot_dir.statFile("series_catalog.jsonl"));
+
         var results = std.array_list.Managed(types.Point).init(talloc);
         defer results.deinit();
         try engine.queryRange(sid, 0, 10_000, &results);
@@ -1404,6 +1410,10 @@ test "engine primary metadata mode boots from CAS metadata alone" {
             .resolved => |resolved| try std.testing.expectEqual(sid, resolved),
             else => return error.TestUnexpectedResult,
         }
+
+        try std.testing.expectError(error.FileNotFound, boot_dir.statFile("MANIFEST"));
+        try std.testing.expectError(error.FileNotFound, boot_dir.statFile("tags.json"));
+        try std.testing.expectError(error.FileNotFound, boot_dir.statFile("series_catalog.jsonl"));
     }
 }
 

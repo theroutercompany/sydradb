@@ -85,7 +85,10 @@ pub const Manifest = struct {
             OpenFlags{ .write = true, .read = true }
         else
             OpenFlags{ .mode = .read_write };
-        var file = try data_dir.openFile("MANIFEST", open_opts);
+        var file = data_dir.openFile("MANIFEST", open_opts) catch |err| switch (err) {
+            error.FileNotFound => try data_dir.createFile("MANIFEST", .{ .read = true }),
+            else => return err,
+        };
         defer file.close();
         try file.seekFromEnd(0);
         var write_buf: [4096]u8 = undefined;

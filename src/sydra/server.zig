@@ -137,26 +137,9 @@ fn cmdQuery(alloc: std.mem.Allocator, args: [][:0]u8) !void {
 fn cmdCompact(alloc: std.mem.Allocator, _: [][:0]u8) !void {
     var cfg = try loadConfigOrDefault(alloc);
     defer cfg.deinit(alloc);
-    var data_dir = try std.fs.cwd().openDir(cfg.data_dir, .{ .iterate = true });
-    defer data_dir.close();
-    var manifest = try @import("storage/manifest.zig").Manifest.loadOrInit(alloc, data_dir);
-    defer manifest.deinit();
-    var tags = try @import("storage/tags.zig").TagIndex.loadOrInit(alloc, data_dir);
-    defer tags.deinit();
-    var series_catalog = try @import("storage/series_catalog.zig").SeriesCatalog.loadOrInit(alloc, data_dir, cfg.fsync);
-    defer series_catalog.deinit();
-
-    var cas_manager: ?cas_mod.CasManager = null;
-    defer if (cas_manager) |*cas| cas.deinit();
-    if (cfg.cas_mode == .dual_write) {
-        cas_manager = try cas_mod.CasManager.init(alloc, cfg.data_dir, cfg.fsync);
-        _ = try cas_manager.?.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
-    }
-
-    const changed = try @import("storage/compact.zig").compactAllWithResult(alloc, data_dir, &manifest);
-    if (changed and cas_manager != null) {
-        _ = try cas_manager.?.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, "compaction");
-    }
+    var eng = try engine_mod.Engine.init(alloc, cfg);
+    defer eng.deinit();
+    _ = try eng.compactNow();
 }
 
 fn cmdStats(handle: *alloc_mod.AllocatorHandle, alloc: std.mem.Allocator, _: [][:0]u8) !void {

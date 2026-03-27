@@ -59,15 +59,19 @@ pub const SeriesCatalog = struct {
     name_index: std.StringHashMap(SidList),
     series_id_index: std.AutoHashMap(types.SeriesId, usize),
 
-    pub fn loadOrInit(alloc: std.mem.Allocator, data_dir: std.fs.Dir, fsync: cfg.FsyncPolicy) !SeriesCatalog {
-        var catalog = SeriesCatalog{
+    pub fn initEmpty(alloc: std.mem.Allocator, fsync: cfg.FsyncPolicy) SeriesCatalog {
+        return .{
             .alloc = alloc,
             .fsync = fsync,
-            .file = undefined,
+            .file = null,
             .selector_index = std.StringHashMap(SidList).init(alloc),
             .name_index = std.StringHashMap(SidList).init(alloc),
             .series_id_index = std.AutoHashMap(types.SeriesId, usize).init(alloc),
         };
+    }
+
+    pub fn loadOrInit(alloc: std.mem.Allocator, data_dir: std.fs.Dir, fsync: cfg.FsyncPolicy) !SeriesCatalog {
+        var catalog = SeriesCatalog.initEmpty(alloc, fsync);
         errdefer catalog.deinit();
 
         const body = data_dir.readFileAlloc(alloc, catalog_file_name, 8 * 1024 * 1024) catch |err| switch (err) {
@@ -211,6 +215,24 @@ pub const SeriesCatalog = struct {
         try data_dir.rename(temp_name, catalog_file_name);
     }
 
+    pub fn checkpointTo(self: *SeriesCatalog, data_dir: std.fs.Dir) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var entries = try self.alloc.alloc(RebuildEntry, self.entries.items.len);
+        defer self.alloc.free(entries);
+
+        for (self.entries.items, 0..) |entry, idx| {
+            entries[idx] = .{
+                .series = entry.series,
+                .canonical_tags = entry.canonical_tags,
+                .series_id = entry.series_id,
+            };
+        }
+
+        try rebuild(self.alloc, data_dir, self.fsync, entries);
+    }
+
     fn loadLine(self: *SeriesCatalog, line: []const u8) !void {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, line, .{});
         defer parsed.deinit();
@@ -278,6 +300,8 @@ pub const SeriesCatalog = struct {
     }
 
     fn appendLine(self: *SeriesCatalog, series: []const u8, canonical_tags: []const u8, series_id: types.SeriesId) !void {
+        if (self.file == null) return;
+
         var buffer = std.array_list.Managed(u8).init(self.alloc);
         defer buffer.deinit();
 
