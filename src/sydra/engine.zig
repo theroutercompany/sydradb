@@ -486,6 +486,11 @@ pub const Engine = struct {
                     break :blk false;
                 };
                 if (flushed or retention_changed) {
+                    if (retention_changed) {
+                        self.createMaintenanceCheckpoint("retention") catch |err| {
+                            std.log.warn("retention checkpoint failed: {s}", .{@errorName(err)});
+                        };
+                    }
                     const reason = if (flushed and retention_changed)
                         "flush+retention"
                     else if (flushed)
@@ -734,6 +739,7 @@ pub const Engine = struct {
     pub fn compactNow(self: *Engine) !bool {
         const changed = try @import("storage/compact.zig").compactAllWithResult(self.alloc, self.data_dir, &self.metadata.manifest);
         if (changed) {
+            try self.createMaintenanceCheckpoint("compaction");
             try self.syncCasSnapshot("compaction");
         }
         return changed;
@@ -743,6 +749,13 @@ pub const Engine = struct {
         if (self.cas) |*cas| {
             _ = try cas.syncLegacySnapshot(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog, reason);
             try self.metadata.refreshCasIndex(cas);
+        }
+    }
+
+    fn createMaintenanceCheckpoint(self: *Engine, prefix: []const u8) !void {
+        if (self.cas) |*cas| {
+            const ref_name = try cas.createCheckpoint(prefix) orelse return;
+            self.alloc.free(ref_name);
         }
     }
 
@@ -1522,6 +1535,57 @@ test "engine primary mode can query from CAS-owned segment content without mirro
         try std.testing.expectEqual(@as(i64, 2_000), results.items[0].ts);
         try std.testing.expectApproxEqAbs(@as(f64, 9.5), results.items[0].value, 1e-9);
     }
+}
+
+test "engine compaction creates a maintenance checkpoint ref" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/compaction-checkpoint", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    const sid = types.hash64("compaction.checkpoint.series");
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .dual_write,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    try engine.registerSeries("compaction.checkpoint.series", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 1_000, .value = 1.0, .tags_json = "{}" });
+    try waitForFlush(engine, 1, 1_000);
+    try engine.ingest(.{ .series_id = sid, .ts = 1_500, .value = 2.0, .tags_json = "{}" });
+    try waitForFlush(engine, 2, 1_000);
+
+    try std.testing.expect(try engine.compactNow());
+
+    const refs = try engine.cas.?.listRefs();
+    defer {
+        for (refs) |*entry| entry.deinit(talloc);
+        talloc.free(refs);
+    }
+
+    var saw_checkpoint = false;
+    for (refs) |entry| {
+        if (std.mem.startsWith(u8, entry.name, "checkpoints/compaction-")) {
+            saw_checkpoint = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_checkpoint);
 }
 
 test "engine resolveSelector surfaces metadata for by-id and exact lookups" {

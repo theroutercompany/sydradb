@@ -280,14 +280,46 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         try cas.createRef(ref_name, spec);
         return;
     }
+    if (std.mem.eql(u8, sub, "diff")) {
+        if (args.len < 5) return error.Invalid;
+        const lhs = std.mem.sliceTo(args[3], 0);
+        const rhs = std.mem.sliceTo(args[4], 0);
+        const diff = try cas.diffSnapshots(lhs, rhs);
+        std.debug.print(
+            "cas diff {s}..{s} segments_added={d} segments_removed={d} tags_changed={d} series_entries_changed={d} wal_added={d} wal_removed={d}\n",
+            .{
+                lhs,
+                rhs,
+                diff.segments_added,
+                diff.segments_removed,
+                diff.tags_changed,
+                diff.series_entries_changed,
+                diff.wal_chunks_added,
+                diff.wal_chunks_removed,
+            },
+        );
+        return;
+    }
+    if (std.mem.eql(u8, sub, "rollback")) {
+        if (args.len < 4) return error.Invalid;
+        const spec = std.mem.sliceTo(args[3], 0);
+        try cas.rollbackMainTo(spec);
+        return;
+    }
     if (std.mem.eql(u8, sub, "gc")) {
         const dry_run = !(args.len >= 4 and std.mem.eql(u8, std.mem.sliceTo(args[3], 0), "--apply"));
         const result = try cas.gc(dry_run);
         std.debug.print("cas gc dry_run={} reachable={d} unreachable={d} deleted={d}\n", .{ dry_run, result.reachable, result.unreachable_count, result.deleted });
         return;
     }
+    if (std.mem.eql(u8, sub, "checkout")) {
+        if (args.len < 4) return error.Invalid;
+        try cas.exportSpecToLegacy(std.mem.sliceTo(args[3], 0), data_dir);
+        return;
+    }
     if (std.mem.eql(u8, sub, "export-legacy")) {
-        try cas.exportHeadToLegacy(data_dir);
+        const spec = if (args.len >= 4) std.mem.sliceTo(args[3], 0) else cas_mod.main_ref;
+        try cas.exportSpecToLegacy(spec, data_dir);
         return;
     }
     return error.Invalid;

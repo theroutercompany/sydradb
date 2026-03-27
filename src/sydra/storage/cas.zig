@@ -903,6 +903,15 @@ pub const LogEntry = struct {
     }
 };
 
+pub const SnapshotDiff = struct {
+    segments_added: usize,
+    segments_removed: usize,
+    tags_changed: usize,
+    series_entries_changed: usize,
+    wal_chunks_added: usize,
+    wal_chunks_removed: usize,
+};
+
 pub const GcResult = struct {
     reachable: usize,
     unreachable_count: usize,
@@ -937,7 +946,7 @@ pub const CasManager = struct {
         if (try self.refs.readHead(main_ref)) |head| return head;
         var writer = CommitWriter{ .alloc = self.alloc, .store = &self.store };
         const commit_id = try writer.writeSnapshot(data_dir, manifest, tags, series_catalog, null, "bootstrap");
-        try self.refs.updateHeadAtomic(main_ref, commit_id);
+        try self.refs.compareAndSwapRef(main_ref, null, commit_id, "bootstrap");
         return commit_id;
     }
 
@@ -952,7 +961,7 @@ pub const CasManager = struct {
         const parent = try self.refs.readHead(main_ref);
         var writer = CommitWriter{ .alloc = self.alloc, .store = &self.store };
         const commit_id = try writer.writeSnapshot(data_dir, manifest, tags, series_catalog, parent, reason);
-        try self.refs.updateHeadAtomic(main_ref, commit_id);
+        try self.refs.compareAndSwapRef(main_ref, parent, commit_id, reason);
         return commit_id;
     }
 
@@ -1026,16 +1035,64 @@ pub const CasManager = struct {
 
     pub fn createRef(self: *CasManager, ref_name: []const u8, spec: []const u8) !void {
         const commit_id = try self.resolveCommitSpec(spec);
-        try self.refs.updateRefAtomic(ref_name, commit_id);
+        try self.refs.updateRefTxn(&[_]RefTxnUpdate{.{
+            .ref_name = ref_name,
+            .new_id = commit_id,
+        }}, "create-ref");
+    }
+
+    pub fn createCheckpoint(self: *CasManager, prefix: []const u8) !?[]u8 {
+        const head = try self.refs.readHead(main_ref) orelse return null;
+        const ref_name = try std.fmt.allocPrint(self.alloc, "checkpoints/{s}-{d}", .{ prefix, std.time.milliTimestamp() });
+        errdefer self.alloc.free(ref_name);
+        try self.refs.updateRefTxn(&[_]RefTxnUpdate{.{
+            .ref_name = ref_name,
+            .new_id = head,
+        }}, prefix);
+        return ref_name;
+    }
+
+    pub fn rollbackMainTo(self: *CasManager, spec: []const u8) !void {
+        const target = try self.resolveCommitSpec(spec);
+        const current = try self.refs.readHead(main_ref);
+        const reason = try std.fmt.allocPrint(self.alloc, "rollback:{s}", .{spec});
+        defer self.alloc.free(reason);
+        try self.refs.compareAndSwapRef(main_ref, current, target, reason);
+    }
+
+    pub fn loadSnapshotForSpec(self: *CasManager, spec: []const u8) !Snapshot {
+        const commit_id = try self.resolveCommitSpec(spec);
+        var reader = CommitReader{ .alloc = self.alloc, .store = &self.store, .refs = &self.refs };
+        return try reader.loadSnapshot(commit_id);
+    }
+
+    pub fn diffSnapshots(self: *CasManager, lhs_spec: []const u8, rhs_spec: []const u8) !SnapshotDiff {
+        var lhs = try self.loadSnapshotForSpec(lhs_spec);
+        defer lhs.deinit(self.alloc);
+        var rhs = try self.loadSnapshotForSpec(rhs_spec);
+        defer rhs.deinit(self.alloc);
+
+        return .{
+            .segments_added = countDescriptorsNotIn(rhs.segment_descriptors, lhs.segment_descriptors),
+            .segments_removed = countDescriptorsNotIn(lhs.segment_descriptors, rhs.segment_descriptors),
+            .tags_changed = countTagEntriesChanged(lhs.tag_snapshot.entries, rhs.tag_snapshot.entries),
+            .series_entries_changed = countSeriesEntriesChanged(lhs.series_catalog_snapshot.entries, rhs.series_catalog_snapshot.entries),
+            .wal_chunks_added = countWalChunksNotIn(rhs.wal_index.entries, lhs.wal_index.entries),
+            .wal_chunks_removed = countWalChunksNotIn(lhs.wal_index.entries, rhs.wal_index.entries),
+        };
     }
 
     pub fn exportHeadToLegacy(self: *CasManager, data_dir: std.fs.Dir) !void {
-        var snapshot_index = try self.loadHeadIndex();
-        defer snapshot_index.deinit();
+        try self.exportSpecToLegacy(main_ref, data_dir);
+    }
 
-        try writeManifestFile(self.alloc, data_dir, snapshot_index.snapshot.segment_descriptors);
-        try writeTagsFile(self.alloc, data_dir, snapshot_index.snapshot.tag_snapshot);
-        try writeSeriesCatalogFile(self.alloc, data_dir, snapshot_index.snapshot.series_catalog_snapshot);
+    pub fn exportSpecToLegacy(self: *CasManager, spec: []const u8, data_dir: std.fs.Dir) !void {
+        var snapshot = try self.loadSnapshotForSpec(spec);
+        defer snapshot.deinit(self.alloc);
+
+        try writeManifestFile(self.alloc, data_dir, snapshot.segment_descriptors);
+        try writeTagsFile(self.alloc, data_dir, snapshot.tag_snapshot);
+        try writeSeriesCatalogFile(self.alloc, data_dir, snapshot.series_catalog_snapshot);
     }
 
     pub fn gc(self: *CasManager, dry_run: bool) !GcResult {
@@ -1690,6 +1747,69 @@ fn optionalObjectIdEql(lhs: ?object_store.ObjectId, rhs: ?object_store.ObjectId)
     return lhs.?.eql(rhs.?);
 }
 
+fn countDescriptorsNotIn(lhs: []const SegmentDescriptor, rhs: []const SegmentDescriptor) usize {
+    var count: usize = 0;
+    for (lhs) |entry| {
+        var found = false;
+        for (rhs) |other| {
+            if (entry.eql(other)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) count += 1;
+    }
+    return count;
+}
+
+fn countWalChunksNotIn(lhs: []const WalChunkDescriptor, rhs: []const WalChunkDescriptor) usize {
+    var count: usize = 0;
+    for (lhs) |entry| {
+        var found = false;
+        for (rhs) |other| {
+            if (entry.eql(other)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) count += 1;
+    }
+    return count;
+}
+
+fn countTagEntriesChanged(lhs: []const TagSnapshotEntry, rhs: []const TagSnapshotEntry) usize {
+    var count: usize = 0;
+    for (lhs) |entry| {
+        const rhs_idx = binarySearchTagEntry(rhs, entry.key) orelse {
+            count += 1;
+            continue;
+        };
+        if (!entry.eql(rhs[rhs_idx])) count += 1;
+    }
+    for (rhs) |entry| {
+        if (binarySearchTagEntry(lhs, entry.key) == null) count += 1;
+    }
+    return count;
+}
+
+fn countSeriesEntriesChanged(lhs: []const SeriesCatalogSnapshotEntry, rhs: []const SeriesCatalogSnapshotEntry) usize {
+    var count: usize = 0;
+    for (lhs) |entry| {
+        if (!containsSeriesEntry(rhs, entry)) count += 1;
+    }
+    for (rhs) |entry| {
+        if (!containsSeriesEntry(lhs, entry)) count += 1;
+    }
+    return count;
+}
+
+fn containsSeriesEntry(entries: []const SeriesCatalogSnapshotEntry, needle: SeriesCatalogSnapshotEntry) bool {
+    for (entries) |entry| {
+        if (entry.eql(needle)) return true;
+    }
+    return false;
+}
+
 fn sortDescriptors(descriptors: []SegmentDescriptor) void {
     std.sort.block(SegmentDescriptor, descriptors, {}, struct {
         fn lessThan(_: void, lhs: SegmentDescriptor, rhs: SegmentDescriptor) bool {
@@ -2126,6 +2246,55 @@ test "ref transactions enforce compare-and-swap and append reflogs" {
     const reflog = try refs.root.readFileAlloc(std.testing.allocator, "logs/refs/heads/main", 4096);
     defer std.testing.allocator.free(reflog);
     try std.testing.expect(std.mem.indexOf(u8, reflog, "advance-main") != null);
+}
+
+test "checkpoints support diffing and rollback" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/checkpoint", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    try std.fs.cwd().makePath(data_path);
+
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
+    defer series_catalog.deinit();
+
+    const sid = types.hash64("checkpoint.series");
+    _ = try series_catalog.register("checkpoint.series", "{}", sid);
+
+    const first_points = [_]types.Point{.{ .ts = 1_000, .value = 1.0 }};
+    const first_path = try segment_mod.writeSegment(talloc, data_dir, sid, 0, first_points[0..]);
+    defer talloc.free(first_path);
+    try manifest.add(data_dir, sid, 0, 1_000, 1_000, 1, first_path);
+
+    var cas_manager = try CasManager.init(talloc, data_path, .none);
+    defer cas_manager.deinit();
+    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    const checkpoint_ref = (try cas_manager.createCheckpoint("manual")) orelse return error.MissingCasHead;
+    defer talloc.free(checkpoint_ref);
+
+    const second_points = [_]types.Point{.{ .ts = 2_000, .value = 2.0 }};
+    const second_path = try segment_mod.writeSegment(talloc, data_dir, sid, 0, second_points[0..]);
+    defer talloc.free(second_path);
+    try manifest.add(data_dir, sid, 0, 2_000, 2_000, 1, second_path);
+
+    const advanced = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, "advance");
+    try std.testing.expect(!advanced.eql(initial));
+
+    const diff = try cas_manager.diffSnapshots(checkpoint_ref, main_ref);
+    try std.testing.expect(diff.segments_added > 0);
+
+    try cas_manager.rollbackMainTo(checkpoint_ref);
+    const head = try cas_manager.refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(head.eql(initial));
 }
 
 test "gc prunes unreachable commits" {
