@@ -6,11 +6,14 @@ const grammar = @import("grammar.zig");
 const lexer = @import("../lexer.zig");
 const legacy_parser = @import("../parser.zig");
 const parsergen = @import("parsergen.zig");
+const stmt_mod = @import("stmt.zig");
 const sydraql_core = @import("grammars/sydraql_core.zig");
+const sydraql_semantics = @import("sydraql_semantics.zig");
 
 pub const ShadowParseResult = struct {
     allocator: std.mem.Allocator,
     statement: ast.Statement,
+    generated_stmt: ?stmt_mod.FrontendStmt = null,
     diagnostics: []const diagnostics.Diagnostic,
     emitted: parsergen.EmissionArtifact,
     token_count: usize,
@@ -56,12 +59,13 @@ pub fn parseSydraqlShadow(allocator: std.mem.Allocator, source: []const u8) !Sha
     errdefer diags.deinit();
 
     try validateTokens(&diags, tokens, sydraql_core.spec);
-    const generated_kind = try parseWithGeneratedRuntime(allocator, &diags, tokens, &tables);
-    try validateStatementShape(&diags, tokens, statement, generated_kind);
+    const generated_stmt = try parseWithGeneratedRuntime(allocator, arena_ptr.allocator(), &diags, tokens, &tables);
+    try validateStatementShape(&diags, tokens, statement, generated_stmt);
 
     return .{
         .allocator = allocator,
         .statement = statement,
+        .generated_stmt = generated_stmt,
         .diagnostics = try diags.toOwnedSlice(),
         .emitted = emitted,
         .token_count = tokens.len,
@@ -96,11 +100,11 @@ fn validateStatementShape(
     list: *std.array_list.Managed(diagnostics.Diagnostic),
     tokens: []const lexer.Token,
     statement: ast.Statement,
-    generated_kind: ?std.meta.Tag(ast.Statement),
+    generated_stmt: ?stmt_mod.FrontendStmt,
 ) !void {
     if (tokens.len == 0) return;
     const first = tokens[0];
-    const expected_tag = generated_kind orelse classifyByFirstToken(first);
+    const expected_tag = if (generated_stmt) |stmt| toLegacyStatementTag(stmt.kind()) else classifyByFirstToken(first);
 
     if (std.meta.activeTag(statement) != expected_tag) {
         try list.append(.{
@@ -109,15 +113,28 @@ fn validateStatementShape(
             .span = first.span,
             .phase = .parse,
         });
+        return;
+    }
+
+    if (generated_stmt) |stmt| {
+        if (!generatedMatchesLegacy(stmt, statement)) {
+            try list.append(.{
+                .code = .parser_mismatch,
+                .message = "generated frontend statement shape diverged from handwritten parser output",
+                .span = stmt.span(),
+                .phase = .parse,
+            });
+        }
     }
 }
 
 fn parseWithGeneratedRuntime(
     allocator: std.mem.Allocator,
+    arena: std.mem.Allocator,
     list: *std.array_list.Managed(diagnostics.Diagnostic),
     tokens: []const lexer.Token,
     tables: *const parsergen.ParserTables,
-) !?std.meta.Tag(ast.Statement) {
+) !?stmt_mod.FrontendStmt {
     const terminal_ids = try collectGeneratedTerminalIds(allocator, tokens, tables);
     if (terminal_ids == null) return null;
     defer allocator.free(terminal_ids.?);
@@ -125,23 +142,23 @@ fn parseWithGeneratedRuntime(
     var generated = try parsergen.GeneratedParser.init(allocator, tables, .{});
     defer generated.deinit();
 
-    var result = generated.parse(terminal_ids.?) catch |err| switch (err) {
-        error.ParseError, error.DisabledRule => {
-            const failure = generated.failureInfo();
-            try list.append(.{
-                .code = .parser_mismatch,
-                .message = "generated sydraql parser runtime could not accept the shared token stream",
-                .span = failureSpan(tokens, failure),
-                .phase = .parse,
-            });
-            return null;
-        },
-        else => return err,
-    };
-    defer result.deinit(allocator);
+    var artifact = try generated.parseArtifact(terminal_ids.?);
+    errdefer artifact.deinit(allocator);
 
-    if (!result.accepted) return null;
-    return generatedStatementKind(tables.*, result.reductions);
+    if (!artifact.accepted) {
+        defer artifact.deinit(allocator);
+        try list.append(.{
+            .code = .parser_mismatch,
+            .message = "generated sydraql parser runtime could not accept the shared token stream",
+            .span = failureSpan(tokens, artifact.failure),
+            .phase = .parse,
+        });
+        return null;
+    }
+
+    var semantic = try sydraql_semantics.buildStmt(allocator, arena, tokens, tables, artifact);
+    defer semantic.parse.deinit(allocator);
+    return semantic.stmt;
 }
 
 fn failureSpan(tokens: []const lexer.Token, failure: ?parsergen.FailureInfo) ?@import("../common.zig").Span {
@@ -167,32 +184,6 @@ fn collectGeneratedTerminalIds(
     }
 
     return try ids.toOwnedSlice();
-}
-
-fn generatedStatementKind(
-    tables: parsergen.ParserTables,
-    reductions: []const u16,
-) ?std.meta.Tag(ast.Statement) {
-    var idx = reductions.len;
-    while (idx > 0) {
-        idx -= 1;
-        const rule_index = reductions[idx];
-        const rule = tables.rules[rule_index];
-        if (rule.lhs_nonterminal >= tables.nonterminals.len) continue;
-        if (!std.mem.eql(u8, tables.nonterminals[rule.lhs_nonterminal], "stmt")) continue;
-
-        const rhs = tables.rhs_symbols[rule.rhs_start .. rule.rhs_start + rule.rhs_len];
-        if (rhs.len == 1 and rhs[0].kind == .nonterminal and rhs[0].index < tables.nonterminals.len) {
-            if (std.mem.eql(u8, tables.nonterminals[rhs[0].index], "select_stmt")) return .select;
-        }
-
-        if (rhs.len == 0 or rhs[0].kind != .terminal) continue;
-        const terminal = tables.terminalName(rhs[0].index);
-        if (std.mem.eql(u8, terminal, "insert")) return .insert;
-        if (std.mem.eql(u8, terminal, "delete")) return .delete;
-        if (std.mem.eql(u8, terminal, "explain")) return .explain;
-    }
-    return null;
 }
 
 fn runtimeTerminalNameForToken(token: lexer.Token) []const u8 {
@@ -239,6 +230,60 @@ fn classifyByFirstToken(token: lexer.Token) std.meta.Tag(ast.Statement) {
         },
         else => .invalid,
     };
+}
+
+fn toLegacyStatementTag(kind: stmt_mod.StatementKind) std.meta.Tag(ast.Statement) {
+    return switch (kind) {
+        .select => .select,
+        .insert => .insert,
+        .delete => .delete,
+        .explain => .explain,
+    };
+}
+
+fn generatedMatchesLegacy(generated_stmt: stmt_mod.FrontendStmt, legacy_stmt: ast.Statement) bool {
+    switch (generated_stmt) {
+        .select => |generated_select| {
+            if (legacy_stmt != .select) return false;
+            const legacy_select = legacy_stmt.select.*;
+            return generated_select.projections.len == legacy_select.projections.len and
+                (generated_select.selector != null) == (legacy_select.selector != null) and
+                (generated_select.predicate != null) == (legacy_select.predicate != null) and
+                spansEqual(generated_select.span, legacy_select.span);
+        },
+        .insert => |generated_insert| {
+            if (legacy_stmt != .insert) return false;
+            const legacy_insert = legacy_stmt.insert.*;
+            return std.mem.eql(u8, generated_insert.target.value, legacy_insert.series.value) and
+                spansEqual(generated_insert.span, legacy_insert.span);
+        },
+        .delete => |generated_delete| {
+            if (legacy_stmt != .delete) return false;
+            const legacy_delete = legacy_stmt.delete.*;
+            return switch (legacy_delete.selector.series) {
+                .name => |name| std.mem.eql(u8, generated_delete.target.value, name.value) and spansEqual(generated_delete.span, legacy_delete.span),
+                .by_id => false,
+            };
+        },
+        .explain => |generated_explain| {
+            if (legacy_stmt != .explain) return false;
+            const legacy_explain = legacy_stmt.explain.*;
+            return generated_explain.mode == toFrontendExplainMode(legacy_explain.mode) and
+                spansEqual(generated_explain.span, legacy_explain.span) and
+                generatedMatchesLegacy(generated_explain.target.*, legacy_explain.target.*);
+        },
+    }
+}
+
+fn toFrontendExplainMode(mode: ast.ExplainMode) stmt_mod.ExplainMode {
+    return switch (mode) {
+        .standard => .standard,
+        .bytecode => .bytecode,
+    };
+}
+
+fn spansEqual(lhs: @import("../common.zig").Span, rhs: @import("../common.zig").Span) bool {
+    return lhs.start == rhs.start and lhs.end == rhs.end;
 }
 
 fn terminalNameForToken(token: lexer.Token) []const u8 {
@@ -325,6 +370,7 @@ test "shadow sydraql parser covers explain bytecode" {
 
     try std.testing.expect(result.statement == .explain);
     try std.testing.expect(!result.hasMismatch());
+    try std.testing.expect(result.generated_stmt != null);
 }
 
 test "shadow sydraql parser uses generated runtime on covered selects" {
@@ -337,6 +383,8 @@ test "shadow sydraql parser uses generated runtime on covered selects" {
 
     try std.testing.expect(result.statement == .select);
     try std.testing.expect(!result.hasMismatch());
+    try std.testing.expect(result.generated_stmt != null);
+    try std.testing.expectEqual(stmt_mod.StatementKind.select, result.generated_stmt.?.kind());
 }
 
 test "shadow sydraql parser matches fixture cases" {
