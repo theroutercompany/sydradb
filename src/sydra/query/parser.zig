@@ -2,6 +2,7 @@ const std = @import("std");
 const lexer = @import("lexer.zig");
 const ast = @import("ast.zig");
 const common = @import("common.zig");
+const frontend = @import("frontend.zig");
 
 const ManagedArrayList = std.array_list.Managed;
 
@@ -877,4 +878,13 @@ test "parse select with group fill order" {
 
     const order_clause = select_stmt.ordering[0];
     try std.testing.expect(order_clause.direction == .desc);
+}
+
+test "frontend scaffolding compiles alongside handwritten parser" {
+    const alloc = std.testing.allocator;
+    var gen = frontend.parsergen.ParserGenerator.init(alloc);
+    const artifact = try gen.emit(frontend.sydraql_core.spec);
+    defer alloc.free(artifact.emitted_source);
+
+    try std.testing.expectEqualStrings("sydraql_core", artifact.grammar_name);
 }
