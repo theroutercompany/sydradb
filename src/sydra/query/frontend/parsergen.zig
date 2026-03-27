@@ -137,6 +137,50 @@ pub const ParseResult = struct {
     }
 };
 
+pub const ParseTraceEvent = union(enum) {
+    shift: struct {
+        state: u16,
+        next_state: u16,
+        terminal: u16,
+        token_index: usize,
+    },
+    reduce: struct {
+        state: u16,
+        parent_state: u16,
+        next_state: u16,
+        rule_index: u16,
+    },
+    accept: struct {
+        state: u16,
+    },
+    fallback: struct {
+        state: u16,
+        from: u16,
+        to: u16,
+        token_index: usize,
+    },
+};
+
+pub const CoverageRecord = struct {
+    state: u16,
+    event: CoverageEvent,
+};
+
+pub const ParseArtifact = struct {
+    accepted: bool,
+    reductions: []u16,
+    trace: []ParseTraceEvent,
+    coverage: []CoverageRecord,
+    fallback_count: usize,
+    failure: ?FailureInfo = null,
+
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        allocator.free(self.reductions);
+        allocator.free(self.trace);
+        allocator.free(self.coverage);
+    }
+};
+
 pub const ParseRuntimeError = std.mem.Allocator.Error || error{
     ParseError,
     DisabledRule,
@@ -153,6 +197,8 @@ pub const FailureInfo = struct {
     state: u16,
     lookahead_terminal: u16,
     rule_index: ?u16 = null,
+    disabled_rule_action: ?[]const u8 = null,
+    disabled_rule_condition: ?[]const u8 = null,
 };
 
 pub const GeneratedParser = struct {
@@ -161,6 +207,8 @@ pub const GeneratedParser = struct {
     hooks: RuntimeHooks,
     stack: std.array_list.Managed(u16),
     reductions: std.array_list.Managed(u16),
+    trace: std.array_list.Managed(ParseTraceEvent),
+    coverage_log: std.array_list.Managed(CoverageRecord),
     fallback_count: usize,
     last_failure: ?FailureInfo,
 
@@ -171,12 +219,16 @@ pub const GeneratedParser = struct {
             .hooks = hooks,
             .stack = std.array_list.Managed(u16).init(allocator),
             .reductions = std.array_list.Managed(u16).init(allocator),
+            .trace = std.array_list.Managed(ParseTraceEvent).init(allocator),
+            .coverage_log = std.array_list.Managed(CoverageRecord).init(allocator),
             .fallback_count = 0,
             .last_failure = null,
         };
         errdefer {
             parser.stack.deinit();
             parser.reductions.deinit();
+            parser.trace.deinit();
+            parser.coverage_log.deinit();
         }
         try parser.stack.append(0);
         return parser;
@@ -185,11 +237,15 @@ pub const GeneratedParser = struct {
     pub fn deinit(self: *@This()) void {
         self.stack.deinit();
         self.reductions.deinit();
+        self.trace.deinit();
+        self.coverage_log.deinit();
     }
 
     pub fn reset(self: *@This()) !void {
         self.stack.clearRetainingCapacity();
         self.reductions.clearRetainingCapacity();
+        self.trace.clearRetainingCapacity();
+        self.coverage_log.clearRetainingCapacity();
         self.fallback_count = 0;
         self.last_failure = null;
         try self.stack.append(0);
@@ -200,6 +256,22 @@ pub const GeneratedParser = struct {
     }
 
     pub fn parse(self: *@This(), terminals: []const u16) ParseRuntimeError!ParseResult {
+        var artifact = try self.parseArtifact(terminals);
+        defer artifact.deinit(self.allocator);
+        if (!artifact.accepted) {
+            return switch ((artifact.failure orelse return error.ParseError).reason) {
+                .unexpected_token => error.ParseError,
+                .disabled_rule => error.DisabledRule,
+            };
+        }
+        return .{
+            .accepted = true,
+            .reductions = try self.allocator.dupe(u16, artifact.reductions),
+            .fallback_count = artifact.fallback_count,
+        };
+    }
+
+    pub fn parseArtifact(self: *@This(), terminals: []const u16) ParseRuntimeError!ParseArtifact {
         try self.reset();
 
         var cursor: usize = 0;
@@ -211,6 +283,12 @@ pub const GeneratedParser = struct {
                 if (self.tables.fallbackForTerminal(lookahead)) |fallback_terminal| {
                     if (self.tables.actionFor(state, fallback_terminal)) |fallback_action| {
                         self.fallback_count += 1;
+                        try self.trace.append(.{ .fallback = .{
+                            .state = state,
+                            .from = lookahead,
+                            .to = fallback_terminal,
+                            .token_index = cursor,
+                        } });
                         self.emitCoverage(state, .{ .fallback = .{
                             .from = lookahead,
                             .to = fallback_terminal,
@@ -227,45 +305,94 @@ pub const GeneratedParser = struct {
                     .state = state,
                     .lookahead_terminal = lookahead,
                 };
-                return error.ParseError;
+                return try self.finishArtifact(false);
             }) {
                 .shift => |next_state| {
-                    if (cursor >= terminals.len) return error.ParseError;
+                    if (cursor >= terminals.len) {
+                        self.last_failure = .{
+                            .reason = .unexpected_token,
+                            .token_index = cursor,
+                            .state = state,
+                            .lookahead_terminal = lookahead,
+                        };
+                        return try self.finishArtifact(false);
+                    }
                     try self.stack.append(next_state);
+                    try self.trace.append(.{ .shift = .{
+                        .state = state,
+                        .next_state = next_state,
+                        .terminal = lookahead,
+                        .token_index = cursor,
+                    } });
                     cursor += 1;
                     self.emitCoverage(state, .{ .shift = next_state });
                 },
                 .reduce => |rule_index| {
                     if (!self.ruleEnabled(rule_index)) {
+                        const rule = self.tables.rules[rule_index];
                         self.last_failure = .{
                             .reason = .disabled_rule,
                             .token_index = cursor,
                             .state = state,
                             .lookahead_terminal = lookahead,
                             .rule_index = rule_index,
+                            .disabled_rule_action = rule.action,
+                            .disabled_rule_condition = rule.condition,
                         };
-                        return error.DisabledRule;
+                        return try self.finishArtifact(false);
                     }
                     const rule = self.tables.rules[rule_index];
-                    if (self.stack.items.len <= rule.rhs_len) return error.ParseError;
+                    if (self.stack.items.len <= rule.rhs_len) {
+                        self.last_failure = .{
+                            .reason = .unexpected_token,
+                            .token_index = cursor,
+                            .state = state,
+                            .lookahead_terminal = lookahead,
+                            .rule_index = rule_index,
+                        };
+                        return try self.finishArtifact(false);
+                    }
                     self.stack.items.len -= rule.rhs_len;
 
                     const parent_state = self.stack.items[self.stack.items.len - 1];
-                    const next_state = self.tables.gotoFor(parent_state, rule.lhs_nonterminal) orelse return error.ParseError;
+                    const next_state = self.tables.gotoFor(parent_state, rule.lhs_nonterminal) orelse {
+                        self.last_failure = .{
+                            .reason = .unexpected_token,
+                            .token_index = cursor,
+                            .state = state,
+                            .lookahead_terminal = lookahead,
+                            .rule_index = rule_index,
+                        };
+                        return try self.finishArtifact(false);
+                    };
                     try self.stack.append(next_state);
                     try self.reductions.append(rule_index);
+                    try self.trace.append(.{ .reduce = .{
+                        .state = state,
+                        .parent_state = parent_state,
+                        .next_state = next_state,
+                        .rule_index = rule_index,
+                    } });
                     self.emitCoverage(parent_state, .{ .reduce = rule_index });
                 },
                 .accept => {
+                    try self.trace.append(.{ .accept = .{ .state = state } });
                     self.emitCoverage(state, .accept);
-                    return .{
-                        .accepted = true,
-                        .reductions = try self.allocator.dupe(u16, self.reductions.items),
-                        .fallback_count = self.fallback_count,
-                    };
+                    return try self.finishArtifact(true);
                 },
             }
         }
+    }
+
+    fn finishArtifact(self: *@This(), accepted: bool) !ParseArtifact {
+        return .{
+            .accepted = accepted,
+            .reductions = try self.allocator.dupe(u16, self.reductions.items),
+            .trace = try self.allocator.dupe(ParseTraceEvent, self.trace.items),
+            .coverage = try self.allocator.dupe(CoverageRecord, self.coverage_log.items),
+            .fallback_count = self.fallback_count,
+            .failure = self.last_failure,
+        };
     }
 
     fn ruleEnabled(self: @This(), rule_index: u16) bool {
@@ -273,13 +400,14 @@ pub const GeneratedParser = struct {
         return callback(self.hooks.context, rule_index, self.tables.rules[rule_index].condition);
     }
 
-    fn emitCoverage(self: @This(), state: u16, event: CoverageEvent) void {
+    fn emitCoverage(self: *@This(), state: u16, event: CoverageEvent) void {
+        self.coverage_log.append(.{ .state = state, .event = event }) catch {};
         const callback = self.hooks.coverage orelse return;
         callback(self.hooks.context, state, event);
     }
 };
 
-pub const ParseArtifact = struct {
+pub const EmissionArtifact = struct {
     grammar_name: []const u8,
     parser_name: []const u8,
     emitted_source: []u8,
@@ -389,7 +517,7 @@ pub const ParserGenerator = struct {
         };
     }
 
-    pub fn emit(self: *ParserGenerator, spec: grammar.GrammarSpec) !ParseArtifact {
+    pub fn emit(self: *ParserGenerator, spec: grammar.GrammarSpec) !EmissionArtifact {
         var tables = try self.buildTables(spec);
         defer tables.deinit(self.allocator);
 
@@ -473,6 +601,102 @@ pub const ParserGenerator = struct {
         };
     }
 };
+
+pub fn SemanticArtifact(comptime T: type) type {
+    return struct {
+        parse: ParseArtifact,
+        stmt: T,
+
+        pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+            self.parse.deinit(allocator);
+        }
+    };
+}
+
+pub const SemanticReplayError = anyerror;
+
+pub fn replaySemanticActions(
+    comptime Value: type,
+    allocator: std.mem.Allocator,
+    tables: *const ParserTables,
+    token_values: []const Value,
+    artifact: ParseArtifact,
+    dispatcher: anytype,
+) SemanticReplayError!Value {
+    var stack = std.array_list.Managed(Value).init(allocator);
+    defer stack.deinit();
+
+    var token_cursor: usize = 0;
+    for (artifact.trace) |event| {
+        switch (event) {
+            .fallback => {},
+            .shift => |shift| {
+                if (token_cursor >= token_values.len) return error.InvalidTrace;
+                const value = try semanticShift(Value, allocator, dispatcher, shift.terminal, shift.token_index, token_values[token_cursor]);
+                try stack.append(value);
+                token_cursor += 1;
+            },
+            .reduce => |reduce| {
+                const rule = tables.rules[reduce.rule_index];
+                if (stack.items.len < rule.rhs_len) return error.InvalidTrace;
+                const rhs_start = stack.items.len - rule.rhs_len;
+                const next = try semanticReduce(Value, allocator, dispatcher, reduce.rule_index, rule.action, stack.items[rhs_start..]);
+                stack.items.len = rhs_start;
+                try stack.append(next);
+            },
+            .accept => {},
+        }
+    }
+
+    if (stack.items.len == 0) return error.MissingSemanticValue;
+    return try semanticAccept(Value, allocator, dispatcher, stack.items[stack.items.len - 1]);
+}
+
+fn semanticShift(
+    comptime Value: type,
+    allocator: std.mem.Allocator,
+    dispatcher: anytype,
+    terminal_id: u16,
+    token_index: usize,
+    token_value: Value,
+) SemanticReplayError!Value {
+    const Dispatcher = dispatcherBaseType(@TypeOf(dispatcher));
+    if (@hasDecl(Dispatcher, "shift")) {
+        return try dispatcher.shift(allocator, terminal_id, token_index, token_value);
+    }
+    return token_value;
+}
+
+fn semanticReduce(
+    comptime Value: type,
+    allocator: std.mem.Allocator,
+    dispatcher: anytype,
+    rule_index: u16,
+    action: ?[]const u8,
+    rhs: []const Value,
+) SemanticReplayError!Value {
+    return try dispatcher.reduce(allocator, rule_index, action, rhs);
+}
+
+fn semanticAccept(
+    comptime Value: type,
+    allocator: std.mem.Allocator,
+    dispatcher: anytype,
+    value: Value,
+) SemanticReplayError!Value {
+    const Dispatcher = dispatcherBaseType(@TypeOf(dispatcher));
+    if (@hasDecl(Dispatcher, "accept")) {
+        return try dispatcher.accept(allocator, value);
+    }
+    return value;
+}
+
+fn dispatcherBaseType(comptime Dispatcher: type) type {
+    return switch (@typeInfo(Dispatcher)) {
+        .pointer => |pointer| pointer.child,
+        else => Dispatcher,
+    };
+}
 
 const Transition = struct {
     symbol: SymbolRef,
@@ -1003,6 +1227,30 @@ test "generated parser runtime accepts simple sydraql select" {
     try std.testing.expect(result.reductions.len != 0);
 }
 
+test "generated parser runtime emits parse artifacts with trace and coverage" {
+    const alloc = std.testing.allocator;
+    const sydraql = @import("grammars/sydraql_core.zig").spec;
+    var gen = ParserGenerator.init(alloc);
+    var tables = try gen.buildTables(sydraql);
+    defer tables.deinit(alloc);
+
+    var parser = try GeneratedParser.init(alloc, &tables, .{});
+    defer parser.deinit();
+
+    const terminals = [_]u16{
+        tables.terminalId("select") orelse return error.InvalidCharacter,
+        tables.terminalId("number") orelse return error.InvalidCharacter,
+        tables.terminalId("eof") orelse return error.InvalidCharacter,
+    };
+    var artifact = try parser.parseArtifact(terminals[0..]);
+    defer artifact.deinit(alloc);
+
+    try std.testing.expect(artifact.accepted);
+    try std.testing.expect(artifact.trace.len >= artifact.reductions.len);
+    try std.testing.expect(artifact.coverage.len >= artifact.reductions.len);
+    try std.testing.expectEqual(@as(?FailureInfo, null), artifact.failure);
+}
+
 test "generated parser runtime applies fallback terminals" {
     const alloc = std.testing.allocator;
     const sydraql = @import("grammars/sydraql_core.zig").spec;
@@ -1023,6 +1271,55 @@ test "generated parser runtime applies fallback terminals" {
 
     try std.testing.expect(result.accepted);
     try std.testing.expect(result.fallback_count > 0);
+}
+
+test "generated parser semantic replay dispatches rule actions over trace" {
+    const alloc = std.testing.allocator;
+    const test_spec = grammar.GrammarSpec{
+        .name = "semantic_test",
+        .parser_name = "SemanticParser",
+        .start_symbol = "stmt",
+        .tokens = &.{
+            .{ .name = "select" },
+            .{ .name = "number" },
+            .{ .name = "eof" },
+        },
+        .nonterminals = &.{"stmt"},
+        .rules = &.{
+            .{ .lhs = "stmt", .rhs = &.{ "select", "number" }, .action = "emitSelectNumber()" },
+        },
+    };
+
+    var gen = ParserGenerator.init(alloc);
+    var tables = try gen.buildTables(test_spec);
+    defer tables.deinit(alloc);
+
+    var parser = try GeneratedParser.init(alloc, &tables, .{});
+    defer parser.deinit();
+
+    const terminals = [_]u16{
+        tables.terminalId("select") orelse return error.InvalidCharacter,
+        tables.terminalId("number") orelse return error.InvalidCharacter,
+        tables.end_terminal,
+    };
+    const token_values = [_][]const u8{ "select", "41", "$end" };
+
+    var artifact = try parser.parseArtifact(terminals[0..]);
+    defer artifact.deinit(alloc);
+
+    const Dispatcher = struct {
+        fn reduce(_: @This(), allocator: std.mem.Allocator, _: u16, action: ?[]const u8, rhs: []const []const u8) ![]const u8 {
+            _ = allocator;
+            try std.testing.expectEqualStrings("emitSelectNumber()", action orelse "");
+            try std.testing.expectEqual(@as(usize, 2), rhs.len);
+            try std.testing.expectEqualStrings("select", rhs[0]);
+            try std.testing.expectEqualStrings("41", rhs[1]);
+            return "select-number";
+        }
+    };
+
+    const stmt = try replaySemanticActions([]const u8, alloc, &tables, token_values[0..], artifact, Dispatcher{});
+    try std.testing.expectEqualStrings("select-number", stmt);
 }
 
 test "generated parser runtime accepts SQL core select" {
@@ -1065,8 +1362,10 @@ test "generated parser runtime records parse failure location" {
         tables.terminalId("identifier") orelse return error.InvalidCharacter,
         tables.terminalId("eof") orelse return error.InvalidCharacter,
     };
-    try std.testing.expectError(error.ParseError, parser.parse(terminals[0..]));
-    const failure = parser.failureInfo() orelse return error.TestUnexpectedResult;
+    var artifact = try parser.parseArtifact(terminals[0..]);
+    defer artifact.deinit(alloc);
+    try std.testing.expect(!artifact.accepted);
+    const failure = artifact.failure orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(FailureReason.unexpected_token, failure.reason);
     try std.testing.expectEqual(@as(usize, 1), failure.token_index);
 }
@@ -1124,9 +1423,12 @@ test "generated parser runtime honors conditional rules and emits coverage event
         .coverage = HooksCtx.coverage,
     });
     defer blocked.deinit();
-    try std.testing.expectError(error.DisabledRule, blocked.parse(terminals[0..]));
-    const blocked_failure = blocked.failureInfo() orelse return error.TestUnexpectedResult;
+    var blocked_artifact = try blocked.parseArtifact(terminals[0..]);
+    defer blocked_artifact.deinit(alloc);
+    try std.testing.expect(!blocked_artifact.accepted);
+    const blocked_failure = blocked_artifact.failure orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(FailureReason.disabled_rule, blocked_failure.reason);
+    try std.testing.expectEqualStrings("allow_select", blocked_failure.disabled_rule_condition orelse "");
 
     var allowed_ctx = HooksCtx{ .allow_rule = true };
     var allowed = try GeneratedParser.init(alloc, &tables, .{
@@ -1135,8 +1437,8 @@ test "generated parser runtime honors conditional rules and emits coverage event
         .coverage = HooksCtx.coverage,
     });
     defer allowed.deinit();
-    var result = try allowed.parse(terminals[0..]);
-    defer result.deinit(alloc);
-    try std.testing.expect(result.accepted);
+    var artifact = try allowed.parseArtifact(terminals[0..]);
+    defer artifact.deinit(alloc);
+    try std.testing.expect(artifact.accepted);
     try std.testing.expect(allowed_ctx.coverage_events > 0);
 }

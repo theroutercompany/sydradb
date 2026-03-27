@@ -12,7 +12,7 @@ pub const ShadowParseResult = struct {
     allocator: std.mem.Allocator,
     statement: ast.Statement,
     diagnostics: []const diagnostics.Diagnostic,
-    emitted: parsergen.ParseArtifact,
+    emitted: parsergen.EmissionArtifact,
     token_count: usize,
     arena_ptr: *std.heap.ArenaAllocator,
 
