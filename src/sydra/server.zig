@@ -341,6 +341,11 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         try cas.rollbackMainTo(spec);
         return;
     }
+    if (std.mem.eql(u8, sub, "migrate-reftable")) {
+        try cas.migrateToReftable(data_dir);
+        std.debug.print("cas migrate-reftable backend=reftable\n", .{});
+        return;
+    }
     if (std.mem.eql(u8, sub, "gc")) {
         var options = cas_mod.GcOptions{};
         var idx: usize = 3;

@@ -330,7 +330,11 @@ pub const ObjectStore = struct {
             error.FileNotFound => {},
             else => return err,
         }
-        return (try self.findPackedLocation(id)) != null;
+        if (try self.findPackedLocation(id)) |location| {
+            defer location.deinit(self.allocator);
+            return true;
+        }
+        return false;
     }
 
     fn getPacked(self: *ObjectStore, allocator: std.mem.Allocator, id: ObjectId) !LoadedObject {
@@ -364,7 +368,8 @@ pub const ObjectStore = struct {
     }
 
     fn findPackedLocation(self: *ObjectStore, id: ObjectId) !?PackLocation {
-        if (self.loadMultiPackIndex(self.allocator)) |midx| {
+        if (self.loadMultiPackIndex(self.allocator)) |loaded_midx| {
+            var midx = loaded_midx;
             defer midx.deinit(self.allocator);
             if (midx.lookup(id)) |location| {
                 return .{
@@ -394,7 +399,8 @@ pub const ObjectStore = struct {
     }
 
     fn listPackedIds(self: *ObjectStore, allocator: std.mem.Allocator) ![]ObjectId {
-        if (self.loadMultiPackIndex(allocator)) |midx| {
+        if (self.loadMultiPackIndex(allocator)) |loaded_midx| {
+            var midx = loaded_midx;
             defer midx.deinit(allocator);
             const ids = try allocator.alloc(ObjectId, midx.records.len);
             for (midx.records, 0..) |record, idx| ids[idx] = record.id;
@@ -556,7 +562,7 @@ const PackLocation = struct {
     pack_path: []u8,
     offset: u64,
 
-    fn deinit(self: *PackLocation, alloc: std.mem.Allocator) void {
+    fn deinit(self: *const PackLocation, alloc: std.mem.Allocator) void {
         alloc.free(self.pack_path);
     }
 };
@@ -977,6 +983,11 @@ test "object store rejects corrupt pack indexes" {
     defer idx_file.close();
     try idx_file.seekTo(0);
     try idx_file.writeAll("BROKEN!!");
+
+    store.root.deleteFile(midxPath) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
 
     try std.testing.expectError(error.CorruptPackIndex, store.get(std.testing.allocator, id));
 }

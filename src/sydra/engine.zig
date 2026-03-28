@@ -1505,6 +1505,7 @@ test "engine replays wal on startup" {
         .enable_prom = false,
         .mem_limit_bytes = 1024 * 1024,
         .cas_mode = .dual_write,
+        .metadata_read_mode = .primary,
         .retention_ns = std.StringHashMap(u32).init(talloc),
     };
 
