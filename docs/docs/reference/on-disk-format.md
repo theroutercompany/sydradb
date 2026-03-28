@@ -116,7 +116,8 @@ Current typed metadata payloads include:
 - segment descriptors with a canonical `segment_root` tree id, compatibility `ContentRef`, and optional mirror paths for exported `.seg` files
 - tag snapshots
 - series catalog snapshots
-- WAL indexes with a canonical `ContentRef`, optional mirror names, and captured byte counts for mutable `current.wal`
+- WAL indexes with a canonical `journal_root` tree id, compatibility `ContentRef`, optional mirror names, and captured byte counts for mutable `current.wal`
+- checkpoint-state blobs with per-series replay high-water and the ordered WAL capture set for the commit
 - tree objects and commit objects that link the metadata DAG together
 
 Native segment roots now store:
@@ -125,6 +126,12 @@ Native segment roots now store:
 - a `blocks/` tree keyed by logical block number
 - per-block trees containing `stats`, `ts`, and `values` entries
 - `ts` and `values` payloads chunked into extent trees with 64 KiB leaf blobs by default
+
+Native journal roots now store:
+
+- a `meta` blob with file size and frame count
+- a `frame_index` blob that records WAL frame offsets and lengths
+- a `frames/` tree of immutable blob-backed WAL frames in replay order
 
 `ContentRef` currently supports:
 

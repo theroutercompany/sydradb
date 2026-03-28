@@ -1,9 +1,41 @@
 const std = @import("std");
 const cfg = @import("../config.zig");
+const object_store = @import("object_store.zig");
 
 // WAL v0:
 // Type 1 = Put: [u32 len][u8 type][u64 series_id][i64 ts][f64 value][u32 crc32]
 // Type 2 = SeriesRegistration: [u32 len][u8 type][u64 series_id][u32 series_len][u32 tags_len][series bytes][canonical tags bytes][u32 crc32]
+
+pub const JournalFrameIndexEntry = struct {
+    offset: u64,
+    size_bytes: u32,
+};
+
+pub const JournalFrameIndex = struct {
+    entries: []JournalFrameIndexEntry,
+
+    pub fn deinit(self: *JournalFrameIndex, alloc: std.mem.Allocator) void {
+        alloc.free(self.entries);
+    }
+};
+
+pub const JournalMeta = struct {
+    file_size: u64,
+    frame_count: u32,
+};
+
+const journal_meta_version: u8 = 1;
+const journal_frame_index_version: u8 = 1;
+
+const TreeEntry = struct {
+    name: []u8,
+    object_type: object_store.ObjectType,
+    object_id: object_store.ObjectId,
+
+    fn deinit(self: *TreeEntry, alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+    }
+};
 
 pub const WAL = struct {
     alloc: std.mem.Allocator,
@@ -234,6 +266,128 @@ pub fn filePrefixMatches(data_dir: std.fs.Dir, path: []const u8, expected_prefix
     return true;
 }
 
+pub fn writeJournalRootForWalFile(
+    alloc: std.mem.Allocator,
+    data_dir: std.fs.Dir,
+    store: *object_store.ObjectStore,
+    wal_name: []const u8,
+) !object_store.ObjectId {
+    const path = try std.fmt.allocPrint(alloc, "wal/{s}", .{wal_name});
+    defer alloc.free(path);
+    const bytes = try data_dir.readFileAlloc(alloc, path, 128 * 1024 * 1024);
+    defer alloc.free(bytes);
+    return try writeJournalRootFromBytes(alloc, store, bytes);
+}
+
+pub fn writeJournalRootFromBytes(
+    alloc: std.mem.Allocator,
+    store: *object_store.ObjectStore,
+    bytes: []const u8,
+) !object_store.ObjectId {
+    var frame_entries = std.array_list.Managed(TreeEntry).init(alloc);
+    defer {
+        for (frame_entries.items) |*entry| entry.deinit(alloc);
+        frame_entries.deinit();
+    }
+
+    var index_entries = std.array_list.Managed(JournalFrameIndexEntry).init(alloc);
+    defer index_entries.deinit();
+
+    var offset: usize = 0;
+    var frame_idx: usize = 0;
+    while (offset < bytes.len) : (frame_idx += 1) {
+        if (offset + 4 > bytes.len) return error.CorruptWal;
+        const payload_len = std.mem.readInt(u32, @as(*const [4]u8, @ptrCast(bytes[offset .. offset + 4].ptr)), .little);
+        if (payload_len == 0 or payload_len > (1 << 20)) return error.CorruptWal;
+        const frame_len: usize = 4 + payload_len + 4;
+        if (offset + frame_len > bytes.len) return error.CorruptWal;
+
+        const frame_id = try store.put(.blob, bytes[offset .. offset + frame_len]);
+        try frame_entries.append(.{
+            .name = try std.fmt.allocPrint(alloc, "{d:0>16}", .{frame_idx}),
+            .object_type = .blob,
+            .object_id = frame_id,
+        });
+        try index_entries.append(.{
+            .offset = offset,
+            .size_bytes = @intCast(frame_len),
+        });
+        offset += frame_len;
+    }
+
+    const meta_payload = try encodeJournalMeta(alloc, .{
+        .file_size = bytes.len,
+        .frame_count = @intCast(index_entries.items.len),
+    });
+    defer alloc.free(meta_payload);
+    const meta_id = try store.put(.blob, meta_payload);
+
+    const frame_index_payload = try encodeJournalFrameIndex(alloc, index_entries.items);
+    defer alloc.free(frame_index_payload);
+    const frame_index_id = try store.put(.blob, frame_index_payload);
+
+    const frames_tree_id = try putTree(alloc, store, frame_entries.items);
+
+    var root_entries = [_]TreeEntry{
+        .{
+            .name = try alloc.dupe(u8, "frame_index"),
+            .object_type = .blob,
+            .object_id = frame_index_id,
+        },
+        .{
+            .name = try alloc.dupe(u8, "frames"),
+            .object_type = .tree,
+            .object_id = frames_tree_id,
+        },
+        .{
+            .name = try alloc.dupe(u8, "meta"),
+            .object_type = .blob,
+            .object_id = meta_id,
+        },
+    };
+    defer {
+        for (&root_entries) |*entry| entry.deinit(alloc);
+    }
+    return try putTree(alloc, store, root_entries[0..]);
+}
+
+pub fn replayJournalRoot(
+    alloc: std.mem.Allocator,
+    store: *object_store.ObjectStore,
+    root_id: object_store.ObjectId,
+    captured_bytes: u64,
+    ctx: anytype,
+) !void {
+    var root_tree = try loadTreeObject(alloc, store, root_id);
+    defer root_tree.deinit(alloc);
+
+    const meta_id = findTreeEntry(root_tree.entries, "meta", .blob) orelse return error.MissingJournalMeta;
+    const frame_index_id = findTreeEntry(root_tree.entries, "frame_index", .blob) orelse return error.MissingJournalFrameIndex;
+    const frames_id = findTreeEntry(root_tree.entries, "frames", .tree) orelse return error.MissingJournalFrames;
+
+    const meta_payload = try loadBlobObject(alloc, store, meta_id);
+    defer alloc.free(meta_payload);
+    const meta = try decodeJournalMeta(meta_payload);
+    if (captured_bytes > meta.file_size) return error.CorruptJournalRoot;
+
+    const frame_index_payload = try loadBlobObject(alloc, store, frame_index_id);
+    defer alloc.free(frame_index_payload);
+    var frame_index = try decodeJournalFrameIndex(alloc, frame_index_payload);
+    defer frame_index.deinit(alloc);
+
+    var frames_tree = try loadTreeObject(alloc, store, frames_id);
+    defer frames_tree.deinit(alloc);
+    if (frames_tree.entries.len != frame_index.entries.len) return error.CorruptJournalRoot;
+
+    for (frame_index.entries, frames_tree.entries) |entry, frame_tree_entry| {
+        if (entry.offset + entry.size_bytes > captured_bytes) break;
+        if (frame_tree_entry.object_type != .blob) return error.InvalidJournalFrameObject;
+        const frame_payload = try loadBlobObject(alloc, store, frame_tree_entry.object_id);
+        defer alloc.free(frame_payload);
+        try replayBytes(alloc, frame_payload, ctx);
+    }
+}
+
 fn replayReader(alloc: std.mem.Allocator, reader: anytype, ctx: anytype) !void {
     while (true) {
         var len_buf: [4]u8 = undefined;
@@ -374,4 +528,225 @@ test "wal replays series registrations before point records" {
     try std.testing.expectEqualStrings("weather.room4", ctx.seen_series.?);
     try std.testing.expectEqualStrings("{\"host\":\"b\"}", ctx.seen_tags.?);
     try std.testing.expectEqual(@as(usize, 1), ctx.point_count);
+}
+
+test "journal roots replay captured wal frames in order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/wal-journal-store", .{tmp.sub_path});
+    defer alloc.free(store_path);
+    var store = try object_store.ObjectStore.init(alloc, store_path, .none);
+    defer store.deinit();
+
+    var wal = try WAL.open(alloc, tmp.dir, .none);
+    defer wal.close();
+    const registration_bytes = try wal.appendSeriesRegistration(77, "metric.room7", "{\"host\":\"b\"}");
+    const first_bytes = try wal.append(77, 1_000, 3.5);
+    _ = try wal.append(77, 1_005, 4.5);
+
+    const root_id = try writeJournalRootForWalFile(alloc, tmp.dir, &store, "current.wal");
+
+    var ctx = struct {
+        registered: bool = false,
+        point_count: usize = 0,
+
+        pub fn onSeriesRegistration(self: *@This(), series_id: u64, series: []const u8, canonical_tags: []const u8) !void {
+            try std.testing.expectEqual(@as(u64, 77), series_id);
+            try std.testing.expectEqualStrings("metric.room7", series);
+            try std.testing.expectEqualStrings("{\"host\":\"b\"}", canonical_tags);
+            self.registered = true;
+        }
+
+        pub fn onRecord(self: *@This(), series_id: u64, ts: i64, value: f64) !void {
+            try std.testing.expect(self.registered);
+            try std.testing.expectEqual(@as(u64, 77), series_id);
+            try std.testing.expect(ts == 1_000 or ts == 1_005);
+            _ = value;
+            self.point_count += 1;
+        }
+    }{};
+
+    try replayJournalRoot(alloc, &store, root_id, registration_bytes + first_bytes, &ctx);
+    try std.testing.expect(ctx.registered);
+    try std.testing.expectEqual(@as(usize, 1), ctx.point_count);
+}
+
+fn encodeJournalMeta(alloc: std.mem.Allocator, meta: JournalMeta) ![]u8 {
+    var bytes = std.array_list.Managed(u8).init(alloc);
+    errdefer bytes.deinit();
+    try bytes.append(journal_meta_version);
+    try appendInt(&bytes, u64, meta.file_size);
+    try appendInt(&bytes, u32, meta.frame_count);
+    return try bytes.toOwnedSlice();
+}
+
+fn decodeJournalMeta(payload: []const u8) !JournalMeta {
+    var cursor: usize = 0;
+    if (try readByteAt(payload, &cursor) != journal_meta_version) return error.UnsupportedJournalMetaVersion;
+    const meta = JournalMeta{
+        .file_size = try readIntAt(payload, &cursor, u64),
+        .frame_count = try readIntAt(payload, &cursor, u32),
+    };
+    if (cursor != payload.len) return error.ExtraJournalMetaBytes;
+    return meta;
+}
+
+fn encodeJournalFrameIndex(alloc: std.mem.Allocator, entries: []const JournalFrameIndexEntry) ![]u8 {
+    var bytes = std.array_list.Managed(u8).init(alloc);
+    errdefer bytes.deinit();
+    try bytes.append(journal_frame_index_version);
+    try appendInt(&bytes, u32, @intCast(entries.len));
+    for (entries) |entry| {
+        try appendInt(&bytes, u64, entry.offset);
+        try appendInt(&bytes, u32, entry.size_bytes);
+    }
+    return try bytes.toOwnedSlice();
+}
+
+fn decodeJournalFrameIndex(alloc: std.mem.Allocator, payload: []const u8) !JournalFrameIndex {
+    var cursor: usize = 0;
+    if (try readByteAt(payload, &cursor) != journal_frame_index_version) return error.UnsupportedJournalFrameIndexVersion;
+    const entry_count = try readIntAt(payload, &cursor, u32);
+    const entries = try alloc.alloc(JournalFrameIndexEntry, entry_count);
+    for (entries, 0..) |*entry, idx| {
+        _ = idx;
+        entry.* = .{
+            .offset = try readIntAt(payload, &cursor, u64),
+            .size_bytes = try readIntAt(payload, &cursor, u32),
+        };
+    }
+    if (cursor != payload.len) return error.ExtraJournalFrameIndexBytes;
+    return .{ .entries = entries };
+}
+
+fn putTree(alloc: std.mem.Allocator, store: *object_store.ObjectStore, entries: []const TreeEntry) !object_store.ObjectId {
+    const payload = try encodeTree(alloc, entries);
+    defer alloc.free(payload);
+    return try store.put(.tree, payload);
+}
+
+fn loadTreeObject(alloc: std.mem.Allocator, store: *object_store.ObjectStore, id: object_store.ObjectId) !struct {
+    entries: []TreeEntry,
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        for (self.entries) |*entry| entry.deinit(allocator);
+        allocator.free(self.entries);
+    }
+} {
+    const loaded = try store.get(alloc, id);
+    defer alloc.free(loaded.payload);
+    if (loaded.obj_type != .tree) return error.InvalidJournalTree;
+    return .{ .entries = try decodeTree(alloc, loaded.payload) };
+}
+
+fn loadBlobObject(alloc: std.mem.Allocator, store: *object_store.ObjectStore, id: object_store.ObjectId) ![]u8 {
+    const loaded = try store.get(alloc, id);
+    errdefer alloc.free(loaded.payload);
+    if (loaded.obj_type != .blob) return error.InvalidJournalBlob;
+    return loaded.payload;
+}
+
+fn findTreeEntry(entries: []const TreeEntry, name: []const u8, object_type: object_store.ObjectType) ?object_store.ObjectId {
+    for (entries) |entry| {
+        if (entry.object_type != object_type) continue;
+        if (std.mem.eql(u8, entry.name, name)) return entry.object_id;
+    }
+    return null;
+}
+
+fn encodeTree(alloc: std.mem.Allocator, entries: []const TreeEntry) ![]u8 {
+    var copy_entries = try alloc.alloc(TreeEntry, entries.len);
+    defer {
+        for (copy_entries) |*entry| entry.deinit(alloc);
+        alloc.free(copy_entries);
+    }
+    for (entries, 0..) |entry, idx| {
+        copy_entries[idx] = .{
+            .name = try alloc.dupe(u8, entry.name),
+            .object_type = entry.object_type,
+            .object_id = entry.object_id,
+        };
+    }
+    std.sort.block(TreeEntry, copy_entries, {}, struct {
+        fn lessThan(_: void, lhs: TreeEntry, rhs: TreeEntry) bool {
+            return std.mem.lessThan(u8, lhs.name, rhs.name);
+        }
+    }.lessThan);
+
+    var bytes = std.array_list.Managed(u8).init(alloc);
+    errdefer bytes.deinit();
+    try bytes.append(1);
+    try appendInt(&bytes, u32, @intCast(copy_entries.len));
+    for (copy_entries) |entry| {
+        try appendString(&bytes, entry.name);
+        try bytes.append(@intFromEnum(entry.object_type));
+        try bytes.appendSlice(entry.object_id.hash[0..]);
+    }
+    return try bytes.toOwnedSlice();
+}
+
+fn decodeTree(alloc: std.mem.Allocator, payload: []const u8) ![]TreeEntry {
+    var cursor: usize = 0;
+    if (try readByteAt(payload, &cursor) != 1) return error.UnsupportedJournalTreeVersion;
+    const entry_count = try readIntAt(payload, &cursor, u32);
+    var entries = try alloc.alloc(TreeEntry, entry_count);
+    var decoded_count: usize = 0;
+    errdefer {
+        for (entries[0..decoded_count]) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+    while (decoded_count < entry_count) : (decoded_count += 1) {
+        const name = try readOwnedStringAt(alloc, payload, &cursor);
+        errdefer alloc.free(name);
+        entries[decoded_count] = .{
+            .name = name,
+            .object_type = std.meta.intToEnum(object_store.ObjectType, try readByteAt(payload, &cursor)) catch return error.UnknownTreeObjectType,
+            .object_id = .{ .hash = try readHashAt(payload, &cursor) },
+        };
+    }
+    if (cursor != payload.len) return error.ExtraJournalTreeBytes;
+    return entries;
+}
+
+fn appendString(bytes: *std.array_list.Managed(u8), value: []const u8) !void {
+    try appendInt(bytes, u32, @intCast(value.len));
+    try bytes.appendSlice(value);
+}
+
+fn appendInt(bytes: *std.array_list.Managed(u8), comptime T: type, value: T) !void {
+    var tmp: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, tmp[0..], value, .little);
+    try bytes.appendSlice(tmp[0..]);
+}
+
+fn readByteAt(payload: []const u8, cursor: *usize) !u8 {
+    if (cursor.* >= payload.len) return error.TruncatedJournalObject;
+    const out = payload[cursor.*];
+    cursor.* += 1;
+    return out;
+}
+
+fn readIntAt(payload: []const u8, cursor: *usize, comptime T: type) !T {
+    const size = @sizeOf(T);
+    if (cursor.* + size > payload.len) return error.TruncatedJournalObject;
+    const out = std.mem.readInt(T, @as(*const [size]u8, @ptrCast(payload[cursor.* .. cursor.* + size].ptr)), .little);
+    cursor.* += size;
+    return out;
+}
+
+fn readHashAt(payload: []const u8, cursor: *usize) ![32]u8 {
+    if (cursor.* + 32 > payload.len) return error.TruncatedJournalObject;
+    var out: [32]u8 = undefined;
+    @memcpy(out[0..], payload[cursor.* .. cursor.* + 32]);
+    cursor.* += 32;
+    return out;
+}
+
+fn readOwnedStringAt(alloc: std.mem.Allocator, payload: []const u8, cursor: *usize) ![]u8 {
+    const len = try readIntAt(payload, cursor, u32);
+    if (cursor.* + len > payload.len) return error.TruncatedJournalObject;
+    const out = try alloc.dupe(u8, payload[cursor.* .. cursor.* + len]);
+    cursor.* += len;
+    return out;
 }

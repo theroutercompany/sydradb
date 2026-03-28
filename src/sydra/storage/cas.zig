@@ -188,9 +188,54 @@ pub const SeriesCatalogSnapshot = struct {
     }
 };
 
+pub const CheckpointSeriesHighwater = struct {
+    series_id: types.SeriesId,
+    highwater_ts: i64,
+
+    pub fn eql(self: CheckpointSeriesHighwater, other: CheckpointSeriesHighwater) bool {
+        return self.series_id == other.series_id and self.highwater_ts == other.highwater_ts;
+    }
+};
+
+pub const CheckpointWalEntry = struct {
+    name: []u8,
+    journal_root: ?object_store.ObjectId = null,
+    mutable: bool,
+    captured_bytes: u64,
+
+    pub fn deinit(self: *CheckpointWalEntry, alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+    }
+
+    pub fn eql(self: CheckpointWalEntry, other: CheckpointWalEntry) bool {
+        return std.mem.eql(u8, self.name, other.name) and
+            self.mutable == other.mutable and
+            self.captured_bytes == other.captured_bytes;
+    }
+};
+
+pub const CheckpointState = struct {
+    highwaters: []CheckpointSeriesHighwater,
+    wal_entries: []CheckpointWalEntry,
+
+    pub fn empty(alloc: std.mem.Allocator) !CheckpointState {
+        return .{
+            .highwaters = try alloc.alloc(CheckpointSeriesHighwater, 0),
+            .wal_entries = try alloc.alloc(CheckpointWalEntry, 0),
+        };
+    }
+
+    pub fn deinit(self: *CheckpointState, alloc: std.mem.Allocator) void {
+        alloc.free(self.highwaters);
+        for (self.wal_entries) |*entry| entry.deinit(alloc);
+        alloc.free(self.wal_entries);
+    }
+};
+
 pub const WalChunkDescriptor = struct {
     name: []u8,
     mirror_name: []u8 = &[_]u8{},
+    journal_root: ?object_store.ObjectId = null,
     content_id: ?object_store.ObjectId = null,
     content: ?ContentRef = null,
     file_size: u64,
@@ -206,6 +251,10 @@ pub const WalChunkDescriptor = struct {
         if (self.content) |content| return content;
         if (self.content_id) |content_id| return .{ .blob = content_id };
         return null;
+    }
+
+    pub fn journalRoot(self: WalChunkDescriptor) ?object_store.ObjectId {
+        return self.journal_root;
     }
 
     pub fn mirrorName(self: WalChunkDescriptor) []const u8 {
@@ -272,6 +321,7 @@ pub const LegacySnapshot = struct {
     tag_snapshot: TagSnapshot,
     series_catalog_snapshot: SeriesCatalogSnapshot,
     wal_index: WalIndex,
+    checkpoint_state: CheckpointState,
 
     pub fn deinit(self: *LegacySnapshot, alloc: std.mem.Allocator) void {
         for (self.segment_descriptors) |*descriptor| descriptor.deinit(alloc);
@@ -279,6 +329,7 @@ pub const LegacySnapshot = struct {
         self.tag_snapshot.deinit(alloc);
         self.series_catalog_snapshot.deinit(alloc);
         self.wal_index.deinit(alloc);
+        self.checkpoint_state.deinit(alloc);
     }
 };
 
@@ -290,6 +341,7 @@ pub const Snapshot = struct {
     tag_snapshot: TagSnapshot,
     series_catalog_snapshot: SeriesCatalogSnapshot,
     wal_index: WalIndex,
+    checkpoint_state: CheckpointState,
 
     pub fn deinit(self: *Snapshot, alloc: std.mem.Allocator) void {
         self.commit.deinit(alloc);
@@ -298,6 +350,7 @@ pub const Snapshot = struct {
         self.tag_snapshot.deinit(alloc);
         self.series_catalog_snapshot.deinit(alloc);
         self.wal_index.deinit(alloc);
+        self.checkpoint_state.deinit(alloc);
     }
 };
 
@@ -929,6 +982,10 @@ pub const CommitWriter = struct {
         defer self.alloc.free(wal_payload);
         const wal_blob_id = try self.store.put(.blob, wal_payload);
 
+        const checkpoint_payload = try encodeCheckpointState(self.alloc, snapshot.checkpoint_state);
+        defer self.alloc.free(checkpoint_payload);
+        const checkpoint_blob_id = try self.store.put(.blob, checkpoint_payload);
+
         const segments_tree_id = try self.writeSegmentTree(snapshot.segment_descriptors);
 
         var metadata_entries = std.array_list.Managed(TreeEntry).init(self.alloc);
@@ -961,11 +1018,27 @@ pub const CommitWriter = struct {
         var wal_chunk_ids = std.AutoHashMap(object_store.ObjectId, void).init(self.alloc);
         defer wal_chunk_ids.deinit();
         try wal_entries.append(.{
+            .name = try self.alloc.dupe(u8, "checkpoint"),
+            .object_type = .blob,
+            .object_id = checkpoint_blob_id,
+        });
+        try wal_entries.append(.{
             .name = try self.alloc.dupe(u8, "index"),
             .object_type = .blob,
             .object_id = wal_blob_id,
         });
         for (snapshot.wal_index.entries) |entry| {
+            if (entry.journalRoot()) |journal_root| {
+                const gop = try wal_chunk_ids.getOrPut(journal_root);
+                if (!gop.found_existing) {
+                    const chunk_hex = journal_root.toHex();
+                    try wal_entries.append(.{
+                        .name = try std.fmt.allocPrint(self.alloc, "journal-{s}", .{chunk_hex[0..]}),
+                        .object_type = .tree,
+                        .object_id = journal_root,
+                    });
+                }
+            }
             const content = entry.contentRef() orelse continue;
             const content_root_id = content.rootObjectId();
             const gop = try wal_chunk_ids.getOrPut(content_root_id);
@@ -1185,6 +1258,8 @@ pub const CommitReader = struct {
         errdefer series_catalog_snapshot.deinit(self.alloc);
         var wal_index = try WalIndex.empty(self.alloc);
         errdefer wal_index.deinit(self.alloc);
+        var checkpoint_state = try CheckpointState.empty(self.alloc);
+        errdefer checkpoint_state.deinit(self.alloc);
 
         var descriptors = std.array_list.Managed(SegmentDescriptor).init(self.alloc);
         errdefer {
@@ -1228,6 +1303,17 @@ pub const CommitReader = struct {
                 wal_index.deinit(self.alloc);
                 wal_index = try decodeWalIndex(self.alloc, loaded.payload);
             }
+
+            if (findBlobEntry(wal_tree.entries, "checkpoint")) |checkpoint_blob_id| {
+                const loaded = try self.store.get(self.alloc, checkpoint_blob_id);
+                defer self.alloc.free(loaded.payload);
+                if (loaded.obj_type != .blob) return error.InvalidCheckpointStateObject;
+                checkpoint_state.deinit(self.alloc);
+                checkpoint_state = try decodeCheckpointState(self.alloc, loaded.payload);
+            } else {
+                checkpoint_state.deinit(self.alloc);
+                checkpoint_state = try buildCheckpointState(self.alloc, descriptors.items, wal_index.entries);
+            }
         }
 
         sortDescriptors(descriptors.items);
@@ -1241,6 +1327,7 @@ pub const CommitReader = struct {
             .tag_snapshot = tag_snapshot,
             .series_catalog_snapshot = series_catalog_snapshot,
             .wal_index = wal_index,
+            .checkpoint_state = checkpoint_state,
         };
     }
 
@@ -2325,12 +2412,23 @@ fn appendWalIndexBlob(
     var idx: usize = 0;
     const version = payload[idx];
     idx += 1;
-    if (version != 1 and version != 2 and version != 3 and version != 4) return false;
+    if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5) return false;
 
     const entry_count = try readIntAt(payload, &idx, u32);
     var entry_idx: u32 = 0;
     while (entry_idx < entry_count) : (entry_idx += 1) {
         _ = try readStringAt(payload, &idx);
+
+        if (version == 5) {
+            if (idx >= payload.len) return false;
+            const flag = payload[idx];
+            idx += 1;
+            switch (flag) {
+                0 => {},
+                1 => try stack.append(.{ .hash = try readHashAt(payload, &idx) }),
+                else => return false,
+            }
+        }
 
         switch (version) {
             1 => {},
@@ -2345,7 +2443,7 @@ fn appendWalIndexBlob(
                 }
             },
             3 => try stack.append(.{ .hash = try readHashAt(payload, &idx) }),
-            4 => {
+            4, 5 => {
                 const kind = try readByteAt(payload, &idx);
                 switch (kind) {
                     0 => {},
@@ -3777,11 +3875,15 @@ pub fn buildLegacySnapshot(
     var wal_index = try buildWalIndex(alloc, data_dir, store, extent_chunk_bytes);
     errdefer wal_index.deinit(alloc);
 
+    var checkpoint_state = try buildCheckpointState(alloc, segment_descriptors, wal_index.entries);
+    errdefer checkpoint_state.deinit(alloc);
+
     return .{
         .segment_descriptors = segment_descriptors,
         .tag_snapshot = tag_snapshot,
         .series_catalog_snapshot = series_catalog_snapshot,
         .wal_index = wal_index,
+        .checkpoint_state = checkpoint_state,
     };
 }
 
@@ -3872,10 +3974,15 @@ fn buildWalIndex(alloc: std.mem.Allocator, data_dir: std.fs.Dir, store: ?*object
     }
 
     for (infos) |info| {
+        const journal_root = if (store) |object_store_ref|
+            try wal_mod.writeJournalRootForWalFile(alloc, data_dir, object_store_ref, info.name)
+        else
+            null;
         const content = try ensureContentRefForWalFile(alloc, store, data_dir, info.name, extent_chunk_bytes);
         try entries.append(.{
             .name = try alloc.dupe(u8, info.name),
             .mirror_name = &[_]u8{},
+            .journal_root = journal_root,
             .content_id = if (content) |ref| switch (ref) {
                 .blob => |id| id,
                 .extent_tree => null,
@@ -3888,6 +3995,47 @@ fn buildWalIndex(alloc: std.mem.Allocator, data_dir: std.fs.Dir, store: ?*object
         });
     }
     return .{ .entries = try entries.toOwnedSlice() };
+}
+
+fn buildCheckpointState(
+    alloc: std.mem.Allocator,
+    descriptors: []const SegmentDescriptor,
+    wal_entries: []const WalChunkDescriptor,
+) !CheckpointState {
+    var highwaters = std.array_list.Managed(CheckpointSeriesHighwater).init(alloc);
+    errdefer highwaters.deinit();
+
+    for (descriptors) |descriptor| {
+        if (highwaters.items.len != 0 and highwaters.items[highwaters.items.len - 1].series_id == descriptor.series_id) {
+            if (descriptor.end_ts > highwaters.items[highwaters.items.len - 1].highwater_ts) {
+                highwaters.items[highwaters.items.len - 1].highwater_ts = descriptor.end_ts;
+            }
+            continue;
+        }
+        try highwaters.append(.{
+            .series_id = descriptor.series_id,
+            .highwater_ts = descriptor.end_ts,
+        });
+    }
+
+    var checkpoint_wal_entries = std.array_list.Managed(CheckpointWalEntry).init(alloc);
+    errdefer {
+        for (checkpoint_wal_entries.items) |*entry| entry.deinit(alloc);
+        checkpoint_wal_entries.deinit();
+    }
+    for (wal_entries) |entry| {
+        try checkpoint_wal_entries.append(.{
+            .name = try alloc.dupe(u8, entry.mirrorName()),
+            .journal_root = entry.journalRoot(),
+            .mutable = entry.mutable,
+            .captured_bytes = entry.captured_bytes,
+        });
+    }
+
+    return .{
+        .highwaters = try highwaters.toOwnedSlice(),
+        .wal_entries = try checkpoint_wal_entries.toOwnedSlice(),
+    };
 }
 
 fn verifyWalFiles(alloc: std.mem.Allocator, wal_index: WalIndex, data_dir: std.fs.Dir, store: *object_store.ObjectStore) !void {
@@ -3993,7 +4141,11 @@ fn encodeSegmentDescriptor(alloc: std.mem.Allocator, descriptor: SegmentDescript
 
     try bytes.append(5);
     try appendOptionalObjectId(&bytes, descriptor.segmentRoot());
-    try encodeContentRef(&bytes, descriptor.contentRef());
+    if (descriptor.contentRef()) |content| {
+        try encodeContentRef(&bytes, content);
+    } else {
+        try bytes.append(0);
+    }
     try appendString(&bytes, descriptor.mirrorPath());
     try bytes.appendSlice(descriptor.file_hash[0..]);
     try appendInt(&bytes, u64, descriptor.file_size);
@@ -4151,15 +4303,75 @@ fn decodeSeriesCatalogSnapshot(alloc: std.mem.Allocator, payload: []const u8) !S
     return .{ .entries = entries };
 }
 
+fn encodeCheckpointState(alloc: std.mem.Allocator, checkpoint: CheckpointState) ![]u8 {
+    var bytes = std.array_list.Managed(u8).init(alloc);
+    errdefer bytes.deinit();
+
+    try bytes.append(1);
+    try appendInt(&bytes, u32, @intCast(checkpoint.highwaters.len));
+    for (checkpoint.highwaters) |entry| {
+        try appendInt(&bytes, u64, entry.series_id);
+        try appendInt(&bytes, i64, entry.highwater_ts);
+    }
+    try appendInt(&bytes, u32, @intCast(checkpoint.wal_entries.len));
+    for (checkpoint.wal_entries) |entry| {
+        try appendString(&bytes, entry.name);
+        try appendOptionalObjectId(&bytes, entry.journal_root);
+        try bytes.append(if (entry.mutable) 1 else 0);
+        try appendInt(&bytes, u64, entry.captured_bytes);
+    }
+    return try bytes.toOwnedSlice();
+}
+
+fn decodeCheckpointState(alloc: std.mem.Allocator, payload: []const u8) !CheckpointState {
+    var cursor = Cursor{ .bytes = payload };
+    const version = try cursor.readByte();
+    if (version != 1) return error.UnsupportedCheckpointStateVersion;
+
+    const highwater_count = try cursor.readInt(u32);
+    const highwaters = try alloc.alloc(CheckpointSeriesHighwater, highwater_count);
+    errdefer alloc.free(highwaters);
+    for (highwaters) |*entry| {
+        entry.* = .{
+            .series_id = try cursor.readInt(u64),
+            .highwater_ts = try cursor.readInt(i64),
+        };
+    }
+
+    const wal_entry_count = try cursor.readInt(u32);
+    var wal_entries = try alloc.alloc(CheckpointWalEntry, wal_entry_count);
+    errdefer {
+        for (wal_entries[0..@min(wal_entries.len, cursor.objects_read)]) |*entry| entry.deinit(alloc);
+        alloc.free(wal_entries);
+    }
+    var decoded_wal_entries: usize = 0;
+    while (decoded_wal_entries < wal_entry_count) : (decoded_wal_entries += 1) {
+        wal_entries[decoded_wal_entries] = .{
+            .name = try cursor.readOwnedString(alloc),
+            .journal_root = try cursor.readOptionalObjectId(),
+            .mutable = (try cursor.readByte()) != 0,
+            .captured_bytes = try cursor.readInt(u64),
+        };
+        cursor.objects_read += 1;
+    }
+    try cursor.finish();
+
+    return .{
+        .highwaters = highwaters,
+        .wal_entries = wal_entries,
+    };
+}
+
 fn encodeWalIndex(alloc: std.mem.Allocator, wal_index: WalIndex) ![]u8 {
     var bytes = std.array_list.Managed(u8).init(alloc);
     errdefer bytes.deinit();
 
-    try bytes.append(4);
+    try bytes.append(5);
     try appendInt(&bytes, u32, @intCast(wal_index.entries.len));
     for (wal_index.entries) |entry| {
         const content = entry.contentRef() orelse return error.MissingWalContentId;
         try appendString(&bytes, entry.mirrorName());
+        try appendOptionalObjectId(&bytes, entry.journalRoot());
         try encodeContentRef(&bytes, content);
         try appendInt(&bytes, u64, entry.file_size);
         try bytes.appendSlice(entry.file_hash[0..]);
@@ -4172,7 +4384,7 @@ fn encodeWalIndex(alloc: std.mem.Allocator, wal_index: WalIndex) ![]u8 {
 fn decodeWalIndex(alloc: std.mem.Allocator, payload: []const u8) !WalIndex {
     var cursor = Cursor{ .bytes = payload };
     const version = try cursor.readByte();
-    if (version != 1 and version != 2 and version != 3 and version != 4) return error.UnsupportedWalIndexVersion;
+    if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5) return error.UnsupportedWalIndexVersion;
 
     const entry_count = try cursor.readInt(u32);
     var entries = try alloc.alloc(WalChunkDescriptor, entry_count);
@@ -4185,7 +4397,8 @@ fn decodeWalIndex(alloc: std.mem.Allocator, payload: []const u8) !WalIndex {
     while (i < entry_count) : (i += 1) {
         const name = try cursor.readOwnedString(alloc);
         errdefer alloc.free(name);
-        const content = if (version == 4)
+        const journal_root = if (version == 5) try cursor.readOptionalObjectId() else null;
+        const content = if (version == 5 or version == 4)
             try decodeContentRef(&cursor)
         else if (version == 1)
             null
@@ -4200,6 +4413,7 @@ fn decodeWalIndex(alloc: std.mem.Allocator, payload: []const u8) !WalIndex {
         entries[i] = .{
             .name = name,
             .mirror_name = &[_]u8{},
+            .journal_root = journal_root,
             .content_id = if (content) |ref| switch (ref) {
                 .blob => |id| id,
                 .extent_tree => null,
