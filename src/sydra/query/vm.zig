@@ -7,6 +7,7 @@ const engine_mod = @import("../engine.zig");
 const expression = @import("expression.zig");
 const plan = @import("plan.zig");
 const types = @import("../types.zig");
+const vdbe = @import("vdbe.zig");
 const value_mod = @import("value.zig");
 
 const QueryRangeError = @typeInfo(@typeInfo(@TypeOf(engine_mod.Engine.queryRange)).@"fn".return_type.?).error_union.error_set;
@@ -24,141 +25,14 @@ pub const VmStep = union(enum) {
 };
 
 pub const VirtualMachine = struct {
-    const SeriesCursorState = struct {
-        points: std.array_list.Managed(types.Point),
-        index: usize = 0,
-        current: ?types.Point = null,
-
-        fn init(allocator: std.mem.Allocator) SeriesCursorState {
-            return .{ .points = std.array_list.Managed(types.Point).init(allocator) };
-        }
-
-        fn deinit(self: *SeriesCursorState) void {
-            self.points.deinit();
-            self.* = undefined;
-        }
-
-        fn reset(self: *SeriesCursorState) void {
-            self.points.clearRetainingCapacity();
-            self.index = 0;
-            self.current = null;
-        }
-    };
-
-    const SorterRow = struct {
-        values: []value_mod.Value,
-        keys: []value_mod.Value,
-        sequence: usize,
-    };
-
-    const SorterState = struct {
-        rows: std.array_list.Managed(SorterRow),
-        index: usize = 0,
-        next_sequence: usize = 0,
-        offset: usize = 0,
-        take: ?usize = null,
-        ordering_id: ?usize = null,
-        sorted: bool = false,
-
-        fn init(allocator: std.mem.Allocator) SorterState {
-            return .{ .rows = std.array_list.Managed(SorterRow).init(allocator) };
-        }
-
-        fn deinit(self: *SorterState, allocator: std.mem.Allocator) void {
-            self.clear(allocator);
-            self.rows.deinit();
-            self.* = undefined;
-        }
-
-        fn clear(self: *SorterState, allocator: std.mem.Allocator) void {
-            for (self.rows.items) |row| {
-                allocator.free(row.values);
-                allocator.free(row.keys);
-            }
-            self.rows.clearRetainingCapacity();
-            self.index = 0;
-            self.next_sequence = 0;
-            self.offset = 0;
-            self.take = null;
-            self.ordering_id = null;
-            self.sorted = false;
-        }
-    };
-
-    const AvgState = struct {
-        total: f64 = 0,
-        count: u64 = 0,
-    };
-
-    const OptionalValue = struct {
-        seen: bool = false,
-        value: value_mod.Value = .null,
-    };
-
-    const AggregateState = union(enum) {
-        avg: AvgState,
-        sum: f64,
-        count: u64,
-        min: OptionalValue,
-        max: OptionalValue,
-        first: OptionalValue,
-        last: OptionalValue,
-    };
-
-    const AggregateGroup = struct {
-        keys: []value_mod.Value,
-        states: []AggregateState,
-    };
-
-    const AggregateTableState = struct {
-        groups: std.array_list.Managed(AggregateGroup),
-        rows: std.array_list.Managed([]value_mod.Value),
-        index: usize = 0,
-        finalized: bool = false,
-        group_expr_start: usize = 0,
-        group_expr_count: usize = 0,
-        aggregate_start: usize = 0,
-        aggregate_count: usize = 0,
-
-        fn init(allocator: std.mem.Allocator) AggregateTableState {
-            return .{
-                .groups = std.array_list.Managed(AggregateGroup).init(allocator),
-                .rows = std.array_list.Managed([]value_mod.Value).init(allocator),
-            };
-        }
-
-        fn deinit(self: *AggregateTableState, allocator: std.mem.Allocator) void {
-            self.clear(allocator);
-            self.groups.deinit();
-            self.rows.deinit();
-            self.* = undefined;
-        }
-
-        fn clear(self: *AggregateTableState, allocator: std.mem.Allocator) void {
-            for (self.groups.items) |group| {
-                allocator.free(group.keys);
-                allocator.free(group.states);
-            }
-            self.groups.clearRetainingCapacity();
-            for (self.rows.items) |row| allocator.free(row);
-            self.rows.clearRetainingCapacity();
-            self.index = 0;
-            self.finalized = false;
-            self.group_expr_start = 0;
-            self.group_expr_count = 0;
-            self.aggregate_start = 0;
-            self.aggregate_count = 0;
-        }
-    };
-
     allocator: std.mem.Allocator,
     engine: *engine_mod.Engine,
     program: bytecode.Program,
     registers: []value_mod.Value,
     row_buffer: []value_mod.Value,
-    series_cursors: []SeriesCursorState,
-    sorters: []SorterState,
-    aggregate_tables: []AggregateTableState,
+    series_cursors: []vdbe.SeriesCursor,
+    sorters: []vdbe.TempSorter,
+    aggregate_tables: []vdbe.AggTable,
     pc: usize = 0,
     halted: bool = false,
 
@@ -173,19 +47,19 @@ pub const VirtualMachine = struct {
         for (row_buffer) |*slot| slot.* = .null;
 
         const cursor_count = @max(program.cursors.len, 1);
-        const series_cursors = try allocator.alloc(SeriesCursorState, cursor_count);
+        const series_cursors = try allocator.alloc(vdbe.SeriesCursor, cursor_count);
         errdefer allocator.free(series_cursors);
-        for (series_cursors) |*cursor| cursor.* = SeriesCursorState.init(allocator);
+        for (series_cursors) |*cursor| cursor.* = vdbe.SeriesCursor.init(allocator);
 
         const sorter_count = @max(program.temp_stores.len, 1);
-        const sorters = try allocator.alloc(SorterState, sorter_count);
+        const sorters = try allocator.alloc(vdbe.TempSorter, sorter_count);
         errdefer allocator.free(sorters);
-        for (sorters) |*sorter| sorter.* = SorterState.init(allocator);
+        for (sorters) |*sorter| sorter.* = vdbe.TempSorter.init(allocator);
 
         const aggregate_table_count = @max(if (program.aggregates.len != 0) @as(usize, 1) else @as(usize, 0), 1);
-        const aggregate_tables = try allocator.alloc(AggregateTableState, aggregate_table_count);
+        const aggregate_tables = try allocator.alloc(vdbe.AggTable, aggregate_table_count);
         errdefer allocator.free(aggregate_tables);
-        for (aggregate_tables) |*table| table.* = AggregateTableState.init(allocator);
+        for (aggregate_tables) |*table| table.* = vdbe.AggTable.init(allocator);
 
         return .{
             .allocator = allocator,
@@ -503,12 +377,12 @@ pub const VirtualMachine = struct {
         return keys;
     }
 
-    fn ensureSorterReady(self: *VirtualMachine, sorter: *SorterState) VmError!void {
+    fn ensureSorterReady(self: *VirtualMachine, sorter: *vdbe.TempSorter) VmError!void {
         if (sorter.sorted) return;
         const SortContext = struct {
             ordering: []const ast.OrderExpr,
 
-            fn lessThan(ctx: @This(), a: SorterRow, b: SorterRow) bool {
+            fn lessThan(ctx: @This(), a: vdbe.SorterRow, b: vdbe.SorterRow) bool {
                 return compareSorterRows(ctx.ordering, a, b) == .lt;
             }
         };
@@ -517,7 +391,7 @@ pub const VirtualMachine = struct {
             if (ordering_id < self.program.orderings.len) self.program.orderings[ordering_id] else return error.InvalidConstant
         else
             &.{};
-        std.sort.pdq(SorterRow, sorter.rows.items, SortContext{ .ordering = ordering }, SortContext.lessThan);
+        std.sort.pdq(vdbe.SorterRow, sorter.rows.items, SortContext{ .ordering = ordering }, SortContext.lessThan);
         sorter.sorted = true;
     }
 
@@ -532,7 +406,7 @@ pub const VirtualMachine = struct {
         return values;
     }
 
-    fn findOrCreateAggregateGroup(self: *VirtualMachine, table: *AggregateTableState, key_values: []value_mod.Value) VmError!*AggregateGroup {
+    fn findOrCreateAggregateGroup(self: *VirtualMachine, table: *vdbe.AggTable, key_values: []value_mod.Value) VmError!*vdbe.AggregateGroup {
         errdefer self.allocator.free(key_values);
         for (table.groups.items) |*group| {
             if (valuesSliceEqual(group.keys, key_values)) {
@@ -541,7 +415,7 @@ pub const VirtualMachine = struct {
             }
         }
 
-        const states = try self.allocator.alloc(AggregateState, table.aggregate_count);
+        const states = try self.allocator.alloc(vdbe.AggregateState, table.aggregate_count);
         errdefer self.allocator.free(states);
         for (0..table.aggregate_count) |idx| {
             states[idx] = initAggregateState(self.program.aggregates[table.aggregate_start + idx].kind);
@@ -553,12 +427,12 @@ pub const VirtualMachine = struct {
         return &table.groups.items[table.groups.items.len - 1];
     }
 
-    fn finalizeAggregateTable(self: *VirtualMachine, table: *AggregateTableState) VmError!void {
+    fn finalizeAggregateTable(self: *VirtualMachine, table: *vdbe.AggTable) VmError!void {
         if (table.finalized) return;
         if (table.group_expr_count == 0 and table.groups.items.len == 0) {
             const empty_keys = try self.allocator.alloc(value_mod.Value, 0);
             errdefer self.allocator.free(empty_keys);
-            const states = try self.allocator.alloc(AggregateState, table.aggregate_count);
+            const states = try self.allocator.alloc(vdbe.AggregateState, table.aggregate_count);
             errdefer self.allocator.free(states);
             for (0..table.aggregate_count) |idx| {
                 states[idx] = initAggregateState(self.program.aggregates[table.aggregate_start + idx].kind);
@@ -588,7 +462,7 @@ pub const VirtualMachine = struct {
     }
 };
 
-fn compareSorterRows(ordering: []const ast.OrderExpr, a: VirtualMachine.SorterRow, b: VirtualMachine.SorterRow) std.math.Order {
+fn compareSorterRows(ordering: []const ast.OrderExpr, a: vdbe.SorterRow, b: vdbe.SorterRow) std.math.Order {
     if (ordering.len != 0) {
         for (ordering, 0..) |order_expr, idx| {
             const order = compareValuesForSort(a.keys[idx], b.keys[idx]);
@@ -661,7 +535,7 @@ fn valuesSliceEqual(lhs: []const value_mod.Value, rhs: []const value_mod.Value) 
     return true;
 }
 
-fn initAggregateState(kind: compiler_ir.AggregateKind) VirtualMachine.AggregateState {
+fn initAggregateState(kind: compiler_ir.AggregateKind) vdbe.AggregateState {
     return switch (kind) {
         .avg => .{ .avg = .{} },
         .sum => .{ .sum = 0 },
@@ -675,7 +549,7 @@ fn initAggregateState(kind: compiler_ir.AggregateKind) VirtualMachine.AggregateS
 }
 
 fn updateAggregateState(
-    state: *VirtualMachine.AggregateState,
+    state: *vdbe.AggregateState,
     kind: compiler_ir.AggregateKind,
     maybe_value: ?value_mod.Value,
 ) VmError!void {
@@ -732,7 +606,7 @@ fn updateAggregateState(
 }
 
 fn finalizeAggregateState(
-    state: VirtualMachine.AggregateState,
+    state: vdbe.AggregateState,
     kind: compiler_ir.AggregateKind,
 ) value_mod.Value {
     return switch (kind) {
