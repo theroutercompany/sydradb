@@ -16,6 +16,11 @@ const log = std.log.scoped(.pgwire);
 
 const max_message_size: usize = 16 * 1024 * 1024;
 
+const PreparedQueryOutcome = union(enum) {
+    handled,
+    fallback: []const u8,
+};
+
 const DescribedColumnState = struct {
     name: []u8,
 };
@@ -430,8 +435,13 @@ fn handleSimpleQuery(
 
     log.debug("simple query received: {s}", .{trimmed});
 
-    if (try handleSqlCorePreparedQuery(alloc, writer, engine, trimmed)) {
-        return;
+    switch (try handleSqlCorePreparedQuery(alloc, writer, engine, trimmed)) {
+        .handled => return,
+        .fallback => |reason| {
+            const notice = try std.fmt.allocPrint(alloc, "sql_prepare_fallback=translator reason={s}", .{reason});
+            defer alloc.free(notice);
+            try protocol.writeNoticeResponse(writer, notice);
+        },
     }
 
     const translation = translator.translate(alloc, trimmed) catch |err| switch (err) {
@@ -679,7 +689,7 @@ fn handleDescribeMessage(
                 return;
             };
             try protocol.writeParameterDescription(writer, parsed.parameter_oids);
-            if (parsed.statement_kind == .select and parsed.columns.len != 0) {
+            if (statementKindProducesRows(parsed.statement_kind) and parsed.columns.len != 0) {
                 try writeDescribedRowDescription(writer, parsed.columns);
             } else {
                 try protocol.writeNoData(writer);
@@ -725,6 +735,27 @@ fn handleExecuteMessage(
         return;
     };
 
+    if (!statementKindProducesRows(portal.stmt.statementKind())) {
+        while (true) {
+            const step = portal.stmt.step() catch |err| {
+                try protocol.writeErrorResponse(writer, "ERROR", "XX000", @errorName(err));
+                return;
+            };
+            switch (step) {
+                .row => {
+                    try protocol.writeErrorResponse(writer, "ERROR", "XX000", "write portal produced an unexpected row");
+                    return;
+                },
+                .done => {
+                    const tag = try formatCommandTag(alloc, portal.stmt.statementKind(), portal.stmt.rowsAffected());
+                    defer alloc.free(tag);
+                    try protocol.writeCommandComplete(writer, tag);
+                    return;
+                },
+            }
+        }
+    }
+
     var row_buffer = std.array_list.Managed(u8).init(alloc);
     defer row_buffer.deinit();
     var value_buffer = ManagedArrayList(u8).init(alloc);
@@ -761,7 +792,7 @@ fn handleExecuteMessage(
                 }
             },
             .done => {
-                const tag = try formatSelectTag(alloc, portal.emitted_rows);
+                const tag = try formatCommandTag(alloc, portal.stmt.statementKind(), portal.emitted_rows);
                 defer alloc.free(tag);
                 try protocol.writeCommandComplete(writer, tag);
                 return;
@@ -783,7 +814,7 @@ fn prefetchOrCompletePortal(
     };
     switch (next_step) {
         .done => {
-            const tag = try formatSelectTag(alloc, portal.emitted_rows);
+            const tag = try formatCommandTag(alloc, portal.stmt.statementKind(), portal.emitted_rows);
             defer alloc.free(tag);
             try protocol.writeCommandComplete(writer, tag);
             return true;
@@ -833,17 +864,24 @@ fn handleSqlCorePreparedQuery(
     writer: std.Io.AnyWriter,
     engine: *engine_mod.Engine,
     sql: []const u8,
-) !bool {
+) !PreparedQueryOutcome {
     var stmt = prepared_query.prepareSqlCore(alloc, engine, sql, .{}) catch |err| switch (err) {
         error.OutOfMemory => return err,
-        else => {
+        error.NotImplemented => {
             log.debug("sql_core prepared path falling back for {s}: {s}", .{ sql, @errorName(err) });
-            return false;
+            return .{ .fallback = @errorName(err) };
+        },
+        else => {
+            try protocol.writeErrorResponse(writer, "ERROR", "42601", @errorName(err));
+            try protocol.writeReadyForQuery(writer, 'I');
+            return .handled;
         },
     };
     defer stmt.finalize();
 
-    try writeRowDescription(writer, stmt.columns);
+    if (statementKindProducesRows(stmt.statementKind())) {
+        try writeRowDescription(writer, stmt.columns);
+    }
 
     var row_buffer = std.array_list.Managed(u8).init(alloc);
     defer row_buffer.deinit();
@@ -855,14 +893,19 @@ fn handleSqlCorePreparedQuery(
         const step = stmt.step() catch |err| {
             try protocol.writeErrorResponse(writer, "ERROR", "XX000", @errorName(err));
             try protocol.writeReadyForQuery(writer, 'I');
-            return true;
+            return .handled;
         };
         switch (step) {
             .row => |values| {
+                if (!statementKindProducesRows(stmt.statementKind())) {
+                    try protocol.writeErrorResponse(writer, "ERROR", "XX000", "write statement produced an unexpected row");
+                    try protocol.writeReadyForQuery(writer, 'I');
+                    return .handled;
+                }
                 writeDataRow(writer, values, &row_buffer, &value_buffer) catch |err| {
                     try protocol.writeErrorResponse(writer, "ERROR", "XX000", @errorName(err));
                     try protocol.writeReadyForQuery(writer, 'I');
-                    return true;
+                    return .handled;
                 };
                 row_count += 1;
             },
@@ -870,18 +913,22 @@ fn handleSqlCorePreparedQuery(
         }
     }
 
-    if (stmt.columns.len != 0) {
+    if (statementKindProducesRows(stmt.statementKind()) and stmt.columns.len != 0) {
         const schema_notice = try formatSchemaNotice(alloc, stmt.columns);
         defer alloc.free(schema_notice);
         try protocol.writeNoticeResponse(writer, schema_notice);
     }
     try protocol.writeNoticeResponse(writer, "execution_mode=sql_core_vm legacy_fallback=false");
 
-    const tag = try formatSelectTag(alloc, row_count);
+    const tag = try formatCommandTag(
+        alloc,
+        stmt.statementKind(),
+        if (statementKindProducesRows(stmt.statementKind())) row_count else stmt.rowsAffected(),
+    );
     defer alloc.free(tag);
     try protocol.writeCommandComplete(writer, tag);
     try protocol.writeReadyForQuery(writer, 'I');
-    return true;
+    return .handled;
 }
 
 fn handleSydraqlQuery(
@@ -1165,11 +1212,43 @@ fn formatSelectTag(
     return try std.fmt.allocPrint(alloc, "SELECT {d}", .{rows_emitted});
 }
 
+fn statementKindProducesRows(kind: frontend.stmt.StatementKind) bool {
+    return switch (kind) {
+        .select, .explain => true,
+        .insert, .delete => false,
+    };
+}
+
+fn formatCommandTag(
+    alloc: std.mem.Allocator,
+    kind: frontend.stmt.StatementKind,
+    rows_affected: usize,
+) ![]const u8 {
+    return switch (kind) {
+        .select => try formatSelectTag(alloc, rows_affected),
+        .insert => try std.fmt.allocPrint(alloc, "INSERT 0 {d}", .{rows_affected}),
+        .delete => try std.fmt.allocPrint(alloc, "DELETE {d}", .{rows_affected}),
+        .explain => try alloc.dupe(u8, "EXPLAIN"),
+    };
+}
+
 test "formatSelectTag uses standard select tag" {
     const alloc = std.testing.allocator;
     const tag = try formatSelectTag(alloc, 5);
     defer alloc.free(tag);
     try std.testing.expectEqualStrings("SELECT 5", tag);
+}
+
+test "formatCommandTag renders direct write tags" {
+    const alloc = std.testing.allocator;
+
+    const insert_tag = try formatCommandTag(alloc, .insert, 2);
+    defer alloc.free(insert_tag);
+    try std.testing.expectEqualStrings("INSERT 0 2", insert_tag);
+
+    const delete_tag = try formatCommandTag(alloc, .delete, 3);
+    defer alloc.free(delete_tag);
+    try std.testing.expectEqualStrings("DELETE 3", delete_tag);
 }
 
 test "formatMetricsNotice renders metrics" {
@@ -1216,9 +1295,47 @@ test "sql core prepared path handles simple select queries" {
     defer allocating_writer.deinit();
 
     const handled = try handleSqlCorePreparedQuery(alloc, anyWriter(&allocating_writer.writer), engine, "SELECT 1");
-    try std.testing.expect(handled);
+    try std.testing.expect(handled == .handled);
     try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "execution_mode=sql_core_vm") != null);
     try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "SELECT 1") != null);
+}
+
+test "sql core prepared path handles simple insert queries" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/pgwire-sql-core-insert", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .compiled,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    var allocating_writer: std.Io.Writer.Allocating = .init(alloc);
+    defer allocating_writer.deinit();
+
+    const handled = try handleSqlCorePreparedQuery(alloc, anyWriter(&allocating_writer.writer), engine, "INSERT INTO writes.simple(time, value) VALUES (10, 4)");
+    try std.testing.expect(handled == .handled);
+    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "INSERT 0 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "execution_mode=sql_core_vm") != null);
+
+    const sid = @import("../../types.zig").seriesIdFrom("writes.simple", "{}");
+    try waitForQueryablePoints(alloc, engine, sid, 1, 1_000);
 }
 
 test "extended protocol executes direct SQL prepared statements" {
@@ -1276,6 +1393,105 @@ test "extended protocol executes direct SQL prepared statements" {
     defer alloc.free(message_types);
     try std.testing.expectEqualSlices(u8, &.{ '1', 't', 'T', '2', 'T', 'D', 'C', 'Z' }, message_types);
     try std.testing.expect(std.mem.indexOf(u8, written, "SELECT 1") != null);
+}
+
+test "extended protocol executes direct SQL prepared inserts" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/pgwire-extended-insert", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .compiled,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    var input = std.array_list.Managed(u8).init(alloc);
+    defer input.deinit();
+    try appendParseMessage(&input, "stmt1", "INSERT INTO ext.inserted(time, value) VALUES ($1, $2)", 2);
+    try appendDescribeMessage(&input, 'S', "stmt1");
+    try appendBindMessage(&input, "portal1", "stmt1", &.{"10", "4.5"});
+    try appendDescribeMessage(&input, 'P', "portal1");
+    try appendExecuteMessage(&input, "portal1", 0);
+    try appendFrontendMessage(&input, 'S', &.{});
+
+    var read_stream = std.io.fixedBufferStream(input.items);
+    var read_state = read_stream.reader();
+    const reader = read_state.any();
+
+    var allocating_writer: std.Io.Writer.Allocating = .init(alloc);
+    defer allocating_writer.deinit();
+
+    try messageLoop(alloc, reader, anyWriter(&allocating_writer.writer), &allocating_writer.writer, engine);
+
+    const written = allocating_writer.written();
+    const message_types = try collectBackendMessageTypes(alloc, written);
+    defer alloc.free(message_types);
+    try std.testing.expectEqualSlices(u8, &.{ '1', 't', 'n', '2', 'n', 'C', 'Z' }, message_types);
+    try std.testing.expect(std.mem.indexOf(u8, written, "INSERT 0 1") != null);
+
+    const sid = @import("../../types.zig").seriesIdFrom("ext.inserted", "{}");
+    try waitForQueryablePoints(alloc, engine, sid, 1, 1_000);
+}
+
+test "simple query writes explicit translator fallback notice for uncovered SQL" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/pgwire-sql-fallback-notice", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .compiled,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    const sid = @import("../../types.zig").seriesIdFrom("fallback.regex", "{}");
+    try engine.registerSeries("fallback.regex", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.0, .tags_json = "{}" });
+    try waitForQueryablePoints(alloc, engine, sid, 1, 1_000);
+
+    var payload = std.array_list.Managed(u8).init(alloc);
+    defer payload.deinit();
+    try payload.appendSlice("SELECT value FROM fallback.regex WHERE value =~ '1'");
+    try payload.append(0);
+
+    var allocating_writer: std.Io.Writer.Allocating = .init(alloc);
+    defer allocating_writer.deinit();
+
+    try handleSimpleQuery(alloc, anyWriter(&allocating_writer.writer), payload.items, engine);
+
+    const written = allocating_writer.written();
+    try std.testing.expect(std.mem.indexOf(u8, written, "sql_prepare_fallback=translator reason=NotImplemented") != null);
 }
 
 test "extended protocol suspends and resumes portals" {
