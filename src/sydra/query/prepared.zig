@@ -645,6 +645,60 @@ test "prepared VM supports scalar ordering and limit offset" {
     try std.testing.expect((try offset_stmt.step()) == .done);
 }
 
+test "prepared VM supports aggregate reads and grouped time buckets" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-aggregates", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .legacy,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    const sid = @import("../types.zig").seriesIdFrom("stage3.agg", "{}");
+    try engine.registerSeries("stage3.agg", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.5, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 20, .value = 2.0, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 70, .value = 3.5, .tags_json = "{}" });
+    try waitForQueryablePoints(alloc, engine, sid, 3, 1_000);
+
+    var aggregate_stmt = try prepareSydraQL(alloc, engine, "select first(value) as first_value, last(value) as last_value from stage3.agg where time >= 0", .{});
+    defer aggregate_stmt.finalize();
+    const aggregate_row = try aggregate_stmt.step();
+    try std.testing.expect(aggregate_row == .row);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), try aggregate_row.row[0].asFloat(), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.5), try aggregate_row.row[1].asFloat(), 1e-9);
+    try std.testing.expect((try aggregate_stmt.step()) == .done);
+
+    var grouped_stmt = try prepareSydraQL(alloc, engine, "select time_bucket(60, time) as bucket, max(value) as max_value from stage3.agg where time >= 0 group by time_bucket(60, time)", .{});
+    defer grouped_stmt.finalize();
+    const first_group = (try grouped_stmt.step());
+    try std.testing.expect(first_group == .row);
+    try std.testing.expectEqual(@as(i64, 0), first_group.row[0].integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), try first_group.row[1].asFloat(), 1e-9);
+    const second_group = (try grouped_stmt.step());
+    try std.testing.expect(second_group == .row);
+    try std.testing.expectEqual(@as(i64, 60), second_group.row[0].integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.5), try second_group.row[1].asFloat(), 1e-9);
+    try std.testing.expect((try grouped_stmt.step()) == .done);
+}
+
 test "prepared bytecode snapshots stay stable for constant and scan plans" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });

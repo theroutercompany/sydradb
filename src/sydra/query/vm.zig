@@ -2,6 +2,7 @@ const std = @import("std");
 
 const ast = @import("ast.zig");
 const bytecode = @import("bytecode.zig");
+const compiler_ir = @import("compiler/ir.zig");
 const engine_mod = @import("../engine.zig");
 const expression = @import("expression.zig");
 const plan = @import("plan.zig");
@@ -84,6 +85,72 @@ pub const VirtualMachine = struct {
         }
     };
 
+    const AvgState = struct {
+        total: f64 = 0,
+        count: u64 = 0,
+    };
+
+    const OptionalValue = struct {
+        seen: bool = false,
+        value: value_mod.Value = .null,
+    };
+
+    const AggregateState = union(enum) {
+        avg: AvgState,
+        sum: f64,
+        count: u64,
+        min: OptionalValue,
+        max: OptionalValue,
+        first: OptionalValue,
+        last: OptionalValue,
+    };
+
+    const AggregateGroup = struct {
+        keys: []value_mod.Value,
+        states: []AggregateState,
+    };
+
+    const AggregateTableState = struct {
+        groups: std.array_list.Managed(AggregateGroup),
+        rows: std.array_list.Managed([]value_mod.Value),
+        index: usize = 0,
+        finalized: bool = false,
+        group_expr_start: usize = 0,
+        group_expr_count: usize = 0,
+        aggregate_start: usize = 0,
+        aggregate_count: usize = 0,
+
+        fn init(allocator: std.mem.Allocator) AggregateTableState {
+            return .{
+                .groups = std.array_list.Managed(AggregateGroup).init(allocator),
+                .rows = std.array_list.Managed([]value_mod.Value).init(allocator),
+            };
+        }
+
+        fn deinit(self: *AggregateTableState, allocator: std.mem.Allocator) void {
+            self.clear(allocator);
+            self.groups.deinit();
+            self.rows.deinit();
+            self.* = undefined;
+        }
+
+        fn clear(self: *AggregateTableState, allocator: std.mem.Allocator) void {
+            for (self.groups.items) |group| {
+                allocator.free(group.keys);
+                allocator.free(group.states);
+            }
+            self.groups.clearRetainingCapacity();
+            for (self.rows.items) |row| allocator.free(row);
+            self.rows.clearRetainingCapacity();
+            self.index = 0;
+            self.finalized = false;
+            self.group_expr_start = 0;
+            self.group_expr_count = 0;
+            self.aggregate_start = 0;
+            self.aggregate_count = 0;
+        }
+    };
+
     allocator: std.mem.Allocator,
     engine: *engine_mod.Engine,
     program: bytecode.Program,
@@ -91,6 +158,7 @@ pub const VirtualMachine = struct {
     row_buffer: []value_mod.Value,
     series_cursors: []SeriesCursorState,
     sorters: []SorterState,
+    aggregate_tables: []AggregateTableState,
     pc: usize = 0,
     halted: bool = false,
 
@@ -114,6 +182,11 @@ pub const VirtualMachine = struct {
         errdefer allocator.free(sorters);
         for (sorters) |*sorter| sorter.* = SorterState.init(allocator);
 
+        const aggregate_table_count = @max(if (program.aggregates.len != 0) @as(usize, 1) else @as(usize, 0), 1);
+        const aggregate_tables = try allocator.alloc(AggregateTableState, aggregate_table_count);
+        errdefer allocator.free(aggregate_tables);
+        for (aggregate_tables) |*table| table.* = AggregateTableState.init(allocator);
+
         return .{
             .allocator = allocator,
             .engine = engine,
@@ -122,12 +195,15 @@ pub const VirtualMachine = struct {
             .row_buffer = row_buffer,
             .series_cursors = series_cursors,
             .sorters = sorters,
+            .aggregate_tables = aggregate_tables,
         };
     }
 
     pub fn deinit(self: *VirtualMachine) void {
         for (self.series_cursors) |*cursor| cursor.deinit();
         for (self.sorters) |*sorter| sorter.deinit(self.allocator);
+        for (self.aggregate_tables) |*table| table.deinit(self.allocator);
+        self.allocator.free(self.aggregate_tables);
         self.allocator.free(self.sorters);
         self.allocator.free(self.series_cursors);
         self.allocator.free(self.registers);
@@ -142,6 +218,7 @@ pub const VirtualMachine = struct {
         for (self.row_buffer) |*slot| slot.* = .null;
         for (self.series_cursors) |*cursor| cursor.reset();
         for (self.sorters) |*sorter| sorter.clear(self.allocator);
+        for (self.aggregate_tables) |*table| table.clear(self.allocator);
     }
 
     pub fn step(self: *VirtualMachine) VmError!VmStep {
@@ -163,6 +240,8 @@ pub const VirtualMachine = struct {
                 .compare => try self.executeCompare(instruction),
                 .jump => try self.executeJump(instruction.p2),
                 .jump_if_false => try self.executeJumpIfFalse(instruction),
+                .agg_step => try self.executeAggregateStep(instruction),
+                .agg_final => try self.executeAggregateFinal(instruction),
                 .sorter_open => try self.executeSorterOpen(instruction),
                 .sorter_insert => try self.executeSorterInsert(instruction),
                 .sorter_next => try self.executeSorterNext(instruction),
@@ -266,6 +345,48 @@ pub const VirtualMachine = struct {
             else => return error.InvalidOpcode,
         };
         if (!condition) try self.executeJump(instruction.p2);
+    }
+
+    fn executeAggregateStep(self: *VirtualMachine, instruction: bytecode.Instruction) VmError!void {
+        const table_id: usize = @intCast(instruction.p1);
+        if (table_id >= self.aggregate_tables.len) return error.InvalidRegister;
+        var table = &self.aggregate_tables[table_id];
+        if (!table.finalized and table.aggregate_count == 0) {
+            table.group_expr_start = @intCast(instruction.p2);
+            table.group_expr_count = @intCast(instruction.p3);
+            table.aggregate_start = switch (instruction.p4) {
+                .aggregate => |id| id,
+                else => return error.InvalidConstant,
+            };
+            table.aggregate_count = instruction.p5;
+        }
+
+        const key_values = try self.evaluateGroupingKeys(table.group_expr_start, table.group_expr_count);
+        const group = try self.findOrCreateAggregateGroup(table, key_values);
+        for (0..table.aggregate_count) |idx| {
+            const spec = self.program.aggregates[table.aggregate_start + idx];
+            const maybe_value = if (spec.args.len == 0) null else try self.evaluateCurrentExpr(spec.args[0].expr);
+            try updateAggregateState(&group.states[idx], spec.kind, maybe_value);
+        }
+    }
+
+    fn executeAggregateFinal(self: *VirtualMachine, instruction: bytecode.Instruction) VmError!void {
+        const table_id: usize = @intCast(instruction.p1);
+        if (table_id >= self.aggregate_tables.len) return error.InvalidRegister;
+        var table = &self.aggregate_tables[table_id];
+        if (!table.finalized) try self.finalizeAggregateTable(table);
+        if (table.index >= table.rows.items.len) {
+            try self.executeJump(instruction.p2);
+            return;
+        }
+
+        const start: usize = @intCast(instruction.p3);
+        const row = table.rows.items[table.index];
+        if (start + row.len > self.registers.len) return error.InvalidRegister;
+        for (row, 0..) |value, idx| {
+            self.registers[start + idx] = value;
+        }
+        table.index += 1;
     }
 
     fn executeSorterOpen(self: *VirtualMachine, instruction: bytecode.Instruction) VmError!void {
@@ -399,6 +520,72 @@ pub const VirtualMachine = struct {
         std.sort.pdq(SorterRow, sorter.rows.items, SortContext{ .ordering = ordering }, SortContext.lessThan);
         sorter.sorted = true;
     }
+
+    fn evaluateGroupingKeys(self: *VirtualMachine, start: usize, count: usize) VmError![]value_mod.Value {
+        const values = try self.allocator.alloc(value_mod.Value, count);
+        errdefer self.allocator.free(values);
+        for (0..count) |idx| {
+            const expr_index = start + idx;
+            if (expr_index >= self.program.exprs.len) return error.InvalidConstant;
+            values[idx] = try self.evaluateCurrentExpr(self.program.exprs[expr_index]);
+        }
+        return values;
+    }
+
+    fn findOrCreateAggregateGroup(self: *VirtualMachine, table: *AggregateTableState, key_values: []value_mod.Value) VmError!*AggregateGroup {
+        errdefer self.allocator.free(key_values);
+        for (table.groups.items) |*group| {
+            if (valuesSliceEqual(group.keys, key_values)) {
+                self.allocator.free(key_values);
+                return group;
+            }
+        }
+
+        const states = try self.allocator.alloc(AggregateState, table.aggregate_count);
+        errdefer self.allocator.free(states);
+        for (0..table.aggregate_count) |idx| {
+            states[idx] = initAggregateState(self.program.aggregates[table.aggregate_start + idx].kind);
+        }
+        try table.groups.append(.{
+            .keys = key_values,
+            .states = states,
+        });
+        return &table.groups.items[table.groups.items.len - 1];
+    }
+
+    fn finalizeAggregateTable(self: *VirtualMachine, table: *AggregateTableState) VmError!void {
+        if (table.finalized) return;
+        if (table.group_expr_count == 0 and table.groups.items.len == 0) {
+            const empty_keys = try self.allocator.alloc(value_mod.Value, 0);
+            errdefer self.allocator.free(empty_keys);
+            const states = try self.allocator.alloc(AggregateState, table.aggregate_count);
+            errdefer self.allocator.free(states);
+            for (0..table.aggregate_count) |idx| {
+                states[idx] = initAggregateState(self.program.aggregates[table.aggregate_start + idx].kind);
+            }
+            try table.groups.append(.{
+                .keys = empty_keys,
+                .states = states,
+            });
+        }
+
+        const schema = if (self.program.schemas.len != 0) self.program.schemas[0] else return error.InvalidConstant;
+        for (table.groups.items) |group| {
+            const row = try self.allocator.alloc(value_mod.Value, schema.len);
+            errdefer self.allocator.free(row);
+            for (schema, 0..) |column, idx| {
+                row[idx] = if (findGroupExprIndex(self.program.exprs[table.group_expr_start .. table.group_expr_start + table.group_expr_count], column.expr)) |group_idx|
+                    group.keys[group_idx]
+                else if (findAggregateExprIndex(self.program.aggregates[table.aggregate_start .. table.aggregate_start + table.aggregate_count], column.expr)) |agg_idx|
+                    finalizeAggregateState(group.states[agg_idx], self.program.aggregates[table.aggregate_start + agg_idx].kind)
+                else
+                    value_mod.Value.null;
+            }
+            try table.rows.append(row);
+        }
+        table.finalized = true;
+        table.index = 0;
+    }
 };
 
 fn compareSorterRows(ordering: []const ast.OrderExpr, a: VirtualMachine.SorterRow, b: VirtualMachine.SorterRow) std.math.Order {
@@ -464,6 +651,135 @@ fn invertOrder(order: std.math.Order) std.math.Order {
         .gt => .lt,
         .eq => .eq,
     };
+}
+
+fn valuesSliceEqual(lhs: []const value_mod.Value, rhs: []const value_mod.Value) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        if (!value_mod.Value.equals(left, right)) return false;
+    }
+    return true;
+}
+
+fn initAggregateState(kind: compiler_ir.AggregateKind) VirtualMachine.AggregateState {
+    return switch (kind) {
+        .avg => .{ .avg = .{} },
+        .sum => .{ .sum = 0 },
+        .count => .{ .count = 0 },
+        .min => .{ .min = .{} },
+        .max => .{ .max = .{} },
+        .first => .{ .first = .{} },
+        .last => .{ .last = .{} },
+        else => .{ .count = 0 },
+    };
+}
+
+fn updateAggregateState(
+    state: *VirtualMachine.AggregateState,
+    kind: compiler_ir.AggregateKind,
+    maybe_value: ?value_mod.Value,
+) VmError!void {
+    switch (kind) {
+        .avg => if (maybe_value) |value| switch (state.*) {
+            .avg => |*avg_state| {
+                avg_state.total += try value.asFloat();
+                avg_state.count += 1;
+            },
+            else => unreachable,
+        },
+        .sum => if (maybe_value) |value| switch (state.*) {
+            .sum => |*sum_state| sum_state.* += try value.asFloat(),
+            else => unreachable,
+        },
+        .count => switch (state.*) {
+            .count => |*count_state| {
+                if (maybe_value) |value| {
+                    if (!value.isNull()) count_state.* += 1;
+                } else {
+                    count_state.* += 1;
+                }
+            },
+            else => unreachable,
+        },
+        .min => if (maybe_value) |value| if (!value.isNull()) switch (state.*) {
+            .min => |*min_state| {
+                if (!min_state.seen or compareValuesForSort(value, min_state.value) == .lt) {
+                    min_state.* = .{ .seen = true, .value = value };
+                }
+            },
+            else => unreachable,
+        },
+        .max => if (maybe_value) |value| if (!value.isNull()) switch (state.*) {
+            .max => |*max_state| {
+                if (!max_state.seen or compareValuesForSort(value, max_state.value) == .gt) {
+                    max_state.* = .{ .seen = true, .value = value };
+                }
+            },
+            else => unreachable,
+        },
+        .first => if (maybe_value) |value| if (!value.isNull()) switch (state.*) {
+            .first => |*first_state| {
+                if (!first_state.seen) first_state.* = .{ .seen = true, .value = value };
+            },
+            else => unreachable,
+        },
+        .last => if (maybe_value) |value| if (!value.isNull()) switch (state.*) {
+            .last => |*last_state| last_state.* = .{ .seen = true, .value = value },
+            else => unreachable,
+        },
+        else => return error.InvalidOpcode,
+    }
+}
+
+fn finalizeAggregateState(
+    state: VirtualMachine.AggregateState,
+    kind: compiler_ir.AggregateKind,
+) value_mod.Value {
+    return switch (kind) {
+        .avg => switch (state) {
+            .avg => |avg_state| if (avg_state.count == 0) value_mod.Value.null else .{ .float = avg_state.total / @as(f64, @floatFromInt(avg_state.count)) },
+            else => unreachable,
+        },
+        .sum => switch (state) {
+            .sum => |sum_state| .{ .float = sum_state },
+            else => unreachable,
+        },
+        .count => switch (state) {
+            .count => |count_state| .{ .integer = @intCast(count_state) },
+            else => unreachable,
+        },
+        .min => switch (state) {
+            .min => |min_state| if (min_state.seen) min_state.value else value_mod.Value.null,
+            else => unreachable,
+        },
+        .max => switch (state) {
+            .max => |max_state| if (max_state.seen) max_state.value else value_mod.Value.null,
+            else => unreachable,
+        },
+        .first => switch (state) {
+            .first => |first_state| if (first_state.seen) first_state.value else value_mod.Value.null,
+            else => unreachable,
+        },
+        .last => switch (state) {
+            .last => |last_state| if (last_state.seen) last_state.value else value_mod.Value.null,
+            else => unreachable,
+        },
+        else => value_mod.Value.null,
+    };
+}
+
+fn findGroupExprIndex(group_exprs: []const *const ast.Expr, expr: *const ast.Expr) ?usize {
+    for (group_exprs, 0..) |group_expr, idx| {
+        if (expression.expressionsEqual(group_expr, expr)) return idx;
+    }
+    return null;
+}
+
+fn findAggregateExprIndex(aggregates: []const compiler_ir.AggregateSpec, expr: *const ast.Expr) ?usize {
+    for (aggregates, 0..) |aggregate, idx| {
+        if (expression.expressionsEqual(aggregate.expr, expr)) return idx;
+    }
+    return null;
 }
 
 test "virtual machine yields a row and halts" {

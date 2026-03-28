@@ -19,7 +19,11 @@ pub const CodegenResult = struct {
 };
 
 pub fn buildProgram(allocator: std.mem.Allocator, compiled: compiler.CompiledSelect) CodegenError!CodegenResult {
-    if (compiled.typed_query.is_aggregate_query) return error.UnsupportedPreparedQuery;
+    if (compiled.typed_query.is_aggregate_query) {
+        if (compiled.typed_query.ordering.len != 0) return error.UnsupportedPreparedQuery;
+        if (compiled.typed_query.select.limit != null) return error.UnsupportedPreparedQuery;
+        return try buildAggregateProgram(allocator, compiled);
+    }
 
     if (compiled.typed_query.bound_selector == null) {
         return try buildConstantProgram(allocator, compiled);
@@ -164,6 +168,87 @@ fn buildScanProgram(allocator: std.mem.Allocator, compiled: compiler.CompiledSel
                 &.{},
             .register_count = @max(typed.projections.len, 3),
             .source_name = "prepared_series_scan",
+        },
+        .columns = columns,
+    };
+}
+
+fn buildAggregateProgram(allocator: std.mem.Allocator, compiled: compiler.CompiledSelect) CodegenError!CodegenResult {
+    const typed = compiled.typed_query;
+    const selector = typed.bound_selector orelse return error.UnsupportedPreparedQuery;
+    const columns = try buildColumns(allocator, typed.projections);
+    errdefer allocator.free(columns);
+
+    var instructions = std.array_list.Managed(bytecode.Instruction).init(allocator);
+    errdefer instructions.deinit();
+
+    var constants = std.array_list.Managed(value_mod.Value).init(allocator);
+    errdefer constants.deinit();
+
+    var exprs = std.array_list.Managed(*const ast.Expr).init(allocator);
+    errdefer exprs.deinit();
+
+    const start_ts = if (typed.time_range.start) |bound| bound.value else std.math.minInt(i64);
+    const end_ts = if (typed.time_range.end) |bound| bound.value else std.math.maxInt(i64);
+    try instructions.append(.{
+        .opcode = .open_series,
+        .p1 = 0,
+        .p2 = start_ts,
+        .p3 = end_ts,
+        .p4 = .{ .selector = 0 },
+    });
+
+    const loop_pc = instructions.items.len;
+    try instructions.append(.{ .opcode = .next_point, .p1 = 0, .p2 = 0 });
+    try emitPredicate(allocator, &instructions, &constants, typed.predicate, loop_pc);
+
+    const grouping_expr_start: usize = exprs.items.len;
+    for (typed.groupings) |grouping| {
+        try exprs.append(grouping.expr.expr);
+    }
+    try instructions.append(.{
+        .opcode = .agg_step,
+        .p1 = 0,
+        .p2 = @intCast(grouping_expr_start),
+        .p3 = @intCast(typed.groupings.len),
+        .p4 = .{ .aggregate = 0 },
+        .p5 = @intCast(typed.aggregates.len),
+    });
+    try instructions.append(.{ .opcode = .jump, .p2 = @intCast(loop_pc) });
+
+    const done_pc = instructions.items.len;
+    instructions.items[loop_pc].p2 = @intCast(done_pc);
+
+    const final_pc = instructions.items.len;
+    try instructions.append(.{
+        .opcode = .agg_final,
+        .p1 = 0,
+        .p2 = 0,
+        .p3 = 0,
+    });
+    try instructions.append(.{
+        .opcode = .result_row,
+        .p1 = 0,
+        .p2 = @intCast(typed.projections.len),
+        .p4 = .{ .schema = 0 },
+    });
+    try instructions.append(.{ .opcode = .jump, .p2 = @intCast(final_pc) });
+    instructions.items[final_pc].p2 = @intCast(instructions.items.len);
+    try instructions.append(.{ .opcode = .halt });
+
+    return .{
+        .program = .{
+            .allocator = allocator,
+            .instructions = try instructions.toOwnedSlice(),
+            .constants = try constants.toOwnedSlice(),
+            .exprs = try exprs.toOwnedSlice(),
+            .selectors = try allocator.dupe(compiler.BoundSelector, &.{selector}),
+            .schemas = try allocator.dupe([]const plan.ColumnInfo, &.{columns}),
+            .aggregates = try allocator.dupe(compiler.AggregateSpec, typed.aggregates),
+            .cursors = try allocator.dupe(bytecode.CursorDecl, &.{.{ .id = 0, .name = "series0" }}),
+            .temp_stores = try allocator.dupe(bytecode.TempStoreDecl, &.{.{ .id = 0, .name = "aggregate0" }}),
+            .register_count = @max(typed.projections.len, 3),
+            .source_name = "prepared_series_aggregate",
         },
         .columns = columns,
     };
