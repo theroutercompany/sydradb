@@ -39,6 +39,8 @@ const ParsedStatementState = struct {
 const BoundPortalState = struct {
     name: []u8,
     stmt: prepared_query.PreparedStmt,
+    pending_row: ?[]value_mod.Value = null,
+    emitted_rows: usize = 0,
 };
 
 const ExtendedQueryState = struct {
@@ -64,6 +66,7 @@ const ExtendedQueryState = struct {
         self.parsed_statements.deinit();
         for (self.bound_portals.items) |*entry| {
             self.alloc.free(entry.name);
+            freeOwnedRowValues(self.alloc, entry.pending_row);
             entry.stmt.finalize();
         }
         self.bound_portals.deinit();
@@ -127,16 +130,21 @@ const ExtendedQueryState = struct {
     fn upsertPortal(self: *ExtendedQueryState, name: []const u8, stmt: prepared_query.PreparedStmt) !void {
         if (self.findPortalIndex(name)) |idx| {
             self.alloc.free(self.bound_portals.items[idx].name);
+            freeOwnedRowValues(self.alloc, self.bound_portals.items[idx].pending_row);
             self.bound_portals.items[idx].stmt.finalize();
             self.bound_portals.items[idx] = .{
                 .name = try self.alloc.dupe(u8, name),
                 .stmt = stmt,
+                .pending_row = null,
+                .emitted_rows = 0,
             };
             return;
         }
         try self.bound_portals.append(.{
             .name = try self.alloc.dupe(u8, name),
             .stmt = stmt,
+            .pending_row = null,
+            .emitted_rows = 0,
         });
     }
 
@@ -149,6 +157,7 @@ const ExtendedQueryState = struct {
         const idx = self.findPortalIndex(name) orelse return false;
         var entry = self.bound_portals.swapRemove(idx);
         self.alloc.free(entry.name);
+        freeOwnedRowValues(self.alloc, entry.pending_row);
         entry.stmt.finalize();
         return true;
     }
@@ -342,6 +351,27 @@ fn freeDescribedColumns(alloc: std.mem.Allocator, columns: []DescribedColumnStat
         alloc.free(column.name);
     }
     alloc.free(columns);
+}
+
+fn cloneOwnedRowValues(alloc: std.mem.Allocator, values: []const value_mod.Value) ![]value_mod.Value {
+    const owned = try alloc.alloc(value_mod.Value, values.len);
+    errdefer alloc.free(owned);
+    for (values, 0..) |value, idx| {
+        owned[idx] = switch (value) {
+            .string => |text| .{ .string = try alloc.dupe(u8, text) },
+            else => value,
+        };
+    }
+    return owned;
+}
+
+fn freeOwnedRowValues(alloc: std.mem.Allocator, values: ?[]value_mod.Value) void {
+    const slice = values orelse return;
+    for (slice) |value| switch (value) {
+        .string => |text| alloc.free(text),
+        else => {},
+    };
+    alloc.free(slice);
 }
 
 fn readPayloadBytes(payload: []const u8, cursor: *usize, len: usize) ![]const u8 {
@@ -701,6 +731,19 @@ fn handleExecuteMessage(
     defer value_buffer.deinit();
 
     var row_count: usize = 0;
+    if (portal.pending_row) |pending| {
+        portal.pending_row = null;
+        defer freeOwnedRowValues(alloc, pending);
+        try writeDataRow(writer, pending, &row_buffer, &value_buffer);
+        row_count += 1;
+        portal.emitted_rows += 1;
+        if (max_rows > 0 and row_count >= @as(usize, @intCast(max_rows))) {
+            if (try prefetchOrCompletePortal(alloc, writer, portal)) return;
+            try protocol.writePortalSuspended(writer);
+            return;
+        }
+    }
+
     while (max_rows <= 0 or row_count < @as(usize, @intCast(max_rows))) {
         const step = portal.stmt.step() catch |err| {
             try protocol.writeErrorResponse(writer, "ERROR", "XX000", @errorName(err));
@@ -710,9 +753,15 @@ fn handleExecuteMessage(
             .row => |values| {
                 try writeDataRow(writer, values, &row_buffer, &value_buffer);
                 row_count += 1;
+                portal.emitted_rows += 1;
+                if (max_rows > 0 and row_count >= @as(usize, @intCast(max_rows))) {
+                    if (try prefetchOrCompletePortal(alloc, writer, portal)) return;
+                    try protocol.writePortalSuspended(writer);
+                    return;
+                }
             },
             .done => {
-                const tag = try formatSelectTag(alloc, row_count);
+                const tag = try formatSelectTag(alloc, portal.emitted_rows);
                 defer alloc.free(tag);
                 try protocol.writeCommandComplete(writer, tag);
                 return;
@@ -721,6 +770,30 @@ fn handleExecuteMessage(
     }
 
     try protocol.writePortalSuspended(writer);
+}
+
+fn prefetchOrCompletePortal(
+    alloc: std.mem.Allocator,
+    writer: std.Io.AnyWriter,
+    portal: *BoundPortalState,
+) !bool {
+    const next_step = portal.stmt.step() catch |err| {
+        try protocol.writeErrorResponse(writer, "ERROR", "XX000", @errorName(err));
+        return true;
+    };
+    switch (next_step) {
+        .done => {
+            const tag = try formatSelectTag(alloc, portal.emitted_rows);
+            defer alloc.free(tag);
+            try protocol.writeCommandComplete(writer, tag);
+            return true;
+        },
+        .row => |values| {
+            freeOwnedRowValues(alloc, portal.pending_row);
+            portal.pending_row = try cloneOwnedRowValues(alloc, values);
+            return false;
+        },
+    }
 }
 
 fn handleCloseMessage(
@@ -1243,7 +1316,6 @@ test "extended protocol suspends and resumes portals" {
     try appendBindMessage(&input, "portal1", "stmt1", &.{});
     try appendExecuteMessage(&input, "portal1", 1);
     try appendExecuteMessage(&input, "portal1", 1);
-    try appendExecuteMessage(&input, "portal1", 1);
     try appendFrontendMessage(&input, 'S', &.{});
 
     var read_stream = std.io.fixedBufferStream(input.items);
@@ -1258,7 +1330,8 @@ test "extended protocol suspends and resumes portals" {
     const written = allocating_writer.written();
     const message_types = try collectBackendMessageTypes(alloc, written);
     defer alloc.free(message_types);
-    try std.testing.expectEqualSlices(u8, &.{ '1', '2', 'D', 's', 'D', 's', 'C', 'Z' }, message_types);
+    try std.testing.expectEqualSlices(u8, &.{ '1', '2', 'D', 's', 'D', 'C', 'Z' }, message_types);
+    try std.testing.expect(std.mem.indexOf(u8, written, "SELECT 2") != null);
 }
 
 test "extended protocol rejects binary result formats" {
