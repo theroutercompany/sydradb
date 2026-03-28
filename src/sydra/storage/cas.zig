@@ -2841,15 +2841,27 @@ const BundleRef = struct {
 
 const BundleManifest = struct {
     format_version: u16,
+    repository_format_version: u16 = legacy_repository_format_version,
+    ref_backend: RefBackend = .loose,
     incremental: bool,
     refs: []BundleRef,
     prerequisites: []object_store.ObjectId,
     object_count: usize,
+    pack_files: [][]u8,
+    info_files: [][]u8,
+    reftable_files: [][]u8,
+    loose_ref_files: [][]u8,
+    reflog_files: [][]u8,
 
     fn deinit(self: *BundleManifest, alloc: std.mem.Allocator) void {
         for (self.refs) |*entry| entry.deinit(alloc);
         alloc.free(self.refs);
         alloc.free(self.prerequisites);
+        freeOwnedStrings(alloc, self.pack_files);
+        freeOwnedStrings(alloc, self.info_files);
+        freeOwnedStrings(alloc, self.reftable_files);
+        freeOwnedStrings(alloc, self.loose_ref_files);
+        freeOwnedStrings(alloc, self.reflog_files);
     }
 };
 
@@ -2857,6 +2869,8 @@ pub const BundleResult = struct {
     ref_count: usize,
     prerequisite_count: usize,
     object_count: usize,
+    pack_count: usize = 0,
+    reftable_file_count: usize = 0,
 };
 
 const bundle_manifest_name = "bundle.manifest";
@@ -2881,6 +2895,21 @@ fn cloneBundleRefs(alloc: std.mem.Allocator, refs: []const RefEntry) ![]BundleRe
     return cloned;
 }
 
+fn cloneOwnedStringsSlice(alloc: std.mem.Allocator, values: []const []const u8) ![][]u8 {
+    const cloned = try alloc.alloc([]u8, values.len);
+    errdefer {
+        for (cloned[0..]) |value| {
+            if (value.len != 0) alloc.free(value);
+        }
+        alloc.free(cloned);
+    }
+    for (cloned) |*entry| entry.* = &[_]u8{};
+    for (values, 0..) |value, idx| {
+        cloned[idx] = try alloc.dupe(u8, value);
+    }
+    return cloned;
+}
+
 fn writeBundleManifest(alloc: std.mem.Allocator, dst_path: []const u8, manifest: BundleManifest) !void {
     _ = alloc;
     var root = try std.fs.cwd().openDir(dst_path, .{ .iterate = true });
@@ -2897,8 +2926,24 @@ fn writeBundleManifest(alloc: std.mem.Allocator, dst_path: []const u8, manifest:
 
     try writer.print("{s}\n", .{bundle_manifest_magic});
     try writer.print("format_version {d}\n", .{manifest.format_version});
+    if (manifest.format_version >= 2) {
+        try writer.print("repository_format_version {d}\n", .{manifest.repository_format_version});
+        try writer.print("ref_backend {d}\n", .{@intFromEnum(manifest.ref_backend)});
+    }
     try writer.print("incremental {d}\n", .{@intFromBool(manifest.incremental)});
     try writer.print("object_count {d}\n", .{manifest.object_count});
+    if (manifest.format_version >= 2) {
+        try writer.print("packs {d}\n", .{manifest.pack_files.len});
+        for (manifest.pack_files) |path| try writer.print("{s}\n", .{path});
+        try writer.print("info_files {d}\n", .{manifest.info_files.len});
+        for (manifest.info_files) |path| try writer.print("{s}\n", .{path});
+        try writer.print("reftable_files {d}\n", .{manifest.reftable_files.len});
+        for (manifest.reftable_files) |path| try writer.print("{s}\n", .{path});
+        try writer.print("loose_ref_files {d}\n", .{manifest.loose_ref_files.len});
+        for (manifest.loose_ref_files) |path| try writer.print("{s}\n", .{path});
+        try writer.print("reflog_files {d}\n", .{manifest.reflog_files.len});
+        for (manifest.reflog_files) |path| try writer.print("{s}\n", .{path});
+    }
     try writer.print("prerequisites {d}\n", .{manifest.prerequisites.len});
     for (manifest.prerequisites) |prerequisite| {
         const hex = prerequisite.toHex();
@@ -2926,9 +2971,44 @@ fn readBundleManifest(alloc: std.mem.Allocator, bundle_path: []const u8) !Bundle
     if (!std.mem.eql(u8, magic, bundle_manifest_magic)) return error.InvalidBundle;
 
     const format_version = try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "format_version");
-    if (format_version != 1) return error.UnsupportedBundleFormatVersion;
+    if (format_version != 1 and format_version != 2) return error.UnsupportedBundleFormatVersion;
+    const repository_format_version = if (format_version >= 2)
+        try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "repository_format_version")
+    else
+        legacy_repository_format_version;
+    const ref_backend = if (format_version >= 2)
+        std.meta.intToEnum(RefBackend, @intCast(try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "ref_backend"))) catch return error.InvalidBundle
+    else
+        RefBackend.loose;
     const incremental_value = try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "incremental");
     const object_count = try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "object_count");
+
+    const pack_files = if (format_version >= 2)
+        try readBundlePathList(alloc, &line_it, "packs")
+    else
+        try alloc.alloc([]u8, 0);
+    errdefer freeOwnedStrings(alloc, pack_files);
+    const info_files = if (format_version >= 2)
+        try readBundlePathList(alloc, &line_it, "info_files")
+    else
+        try alloc.alloc([]u8, 0);
+    errdefer freeOwnedStrings(alloc, info_files);
+    const reftable_files = if (format_version >= 2)
+        try readBundlePathList(alloc, &line_it, "reftable_files")
+    else
+        try alloc.alloc([]u8, 0);
+    errdefer freeOwnedStrings(alloc, reftable_files);
+    const loose_ref_files = if (format_version >= 2)
+        try readBundlePathList(alloc, &line_it, "loose_ref_files")
+    else
+        try alloc.alloc([]u8, 0);
+    errdefer freeOwnedStrings(alloc, loose_ref_files);
+    const reflog_files = if (format_version >= 2)
+        try readBundlePathList(alloc, &line_it, "reflog_files")
+    else
+        try alloc.alloc([]u8, 0);
+    errdefer freeOwnedStrings(alloc, reflog_files);
+
     const prerequisite_count = try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "prerequisites");
 
     const prerequisites = try alloc.alloc(object_store.ObjectId, prerequisite_count);
@@ -2958,10 +3038,17 @@ fn readBundleManifest(alloc: std.mem.Allocator, bundle_path: []const u8) !Bundle
 
     return .{
         .format_version = @intCast(format_version),
+        .repository_format_version = @intCast(repository_format_version),
+        .ref_backend = ref_backend,
         .incremental = incremental_value != 0,
         .refs = refs,
         .prerequisites = prerequisites,
         .object_count = object_count,
+        .pack_files = pack_files,
+        .info_files = info_files,
+        .reftable_files = reftable_files,
+        .loose_ref_files = loose_ref_files,
+        .reflog_files = reflog_files,
     };
 }
 
@@ -2970,6 +3057,52 @@ fn parseBundleCountLine(line: []const u8, key: []const u8) !usize {
         return error.InvalidBundle;
     }
     return try std.fmt.parseInt(usize, line[key.len + 1 ..], 10);
+}
+
+fn readBundlePathList(alloc: std.mem.Allocator, line_it: *std.mem.TokenIterator(u8, .any), key: []const u8) ![][]u8 {
+    const count = try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, key);
+    const paths = try alloc.alloc([]u8, count);
+    errdefer {
+        for (paths[0..]) |path| {
+            if (path.len != 0) alloc.free(path);
+        }
+        alloc.free(paths);
+    }
+    for (paths) |*path| path.* = &[_]u8{};
+    for (paths) |*path| {
+        const line = line_it.next() orelse return error.InvalidBundle;
+        path.* = try alloc.dupe(u8, line);
+    }
+    return paths;
+}
+
+fn copyRelativeFile(src_root: std.fs.Dir, dst_root: std.fs.Dir, rel_path: []const u8) !void {
+    if (std.fs.path.dirname(rel_path)) |dirname| try dst_root.makePath(dirname);
+    dst_root.deleteFile(rel_path) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    try src_root.copyFile(rel_path, dst_root, rel_path, .{});
+}
+
+fn copyRelativeFiles(src_root: std.fs.Dir, dst_root: std.fs.Dir, rel_paths: []const []const u8) !void {
+    for (rel_paths) |path| try copyRelativeFile(src_root, dst_root, path);
+}
+
+fn looseObjectPath(alloc: std.mem.Allocator, id: object_store.ObjectId) ![]u8 {
+    const hex = id.toHex();
+    return try std.fmt.allocPrint(alloc, "objects/{s}/{s}", .{ hex[0..2], hex[0..] });
+}
+
+fn copyPackCompanionFiles(alloc: std.mem.Allocator, src_root: std.fs.Dir, dst_root: std.fs.Dir, pack_path: []const u8) !void {
+    try copyRelativeFile(src_root, dst_root, pack_path);
+    const base = pack_path[0 .. pack_path.len - ".pack".len];
+    const idx_path = try std.fmt.allocPrint(alloc, "{s}.idx", .{base});
+    defer alloc.free(idx_path);
+    const manifest_path = try std.fmt.allocPrint(alloc, "{s}.manifest", .{base});
+    defer alloc.free(manifest_path);
+    try copyRelativeFile(src_root, dst_root, idx_path);
+    try copyRelativeFile(src_root, dst_root, manifest_path);
 }
 
 pub fn createBundle(alloc: std.mem.Allocator, src_path: []const u8, dst_path: []const u8, fsync: cfg.FsyncPolicy, since_spec: ?[]const u8) !BundleResult {
@@ -3003,6 +3136,58 @@ pub fn createBundle(alloc: std.mem.Allocator, src_path: []const u8, dst_path: []
     var bundle_store = try object_store.ObjectStore.init(alloc, dst_path, .none);
     defer bundle_store.deinit();
 
+    const pack_files = try listFilesRecursive(alloc, source.store.root, "objects/packs");
+    defer freeOwnedStrings(alloc, pack_files);
+    var copied_pack_files = std.array_list.Managed([]u8).init(alloc);
+    defer {
+        for (copied_pack_files.items) |path| alloc.free(path);
+        copied_pack_files.deinit();
+    }
+    for (pack_files) |path| {
+        if (!std.mem.endsWith(u8, path, ".pack")) continue;
+        try copyPackCompanionFiles(alloc, source.store.root, bundle_store.root, path);
+        try copied_pack_files.append(try alloc.dupe(u8, path));
+    }
+
+    const info_candidates = [_][]const u8{
+        store_format_path,
+        "objects/info/multi-pack-index",
+        commit_graph_path,
+        reachability_bitmap_path,
+        object_refs_index_path,
+    };
+    var copied_info_files = std.array_list.Managed([]u8).init(alloc);
+    defer {
+        for (copied_info_files.items) |path| alloc.free(path);
+        copied_info_files.deinit();
+    }
+    for (info_candidates) |path| {
+        if (!(try pathExists(source.store.root, path))) continue;
+        try copyRelativeFile(source.store.root, bundle_store.root, path);
+        try copied_info_files.append(try alloc.dupe(u8, path));
+    }
+
+    const reftable_files = try listFilesRecursive(alloc, source.refs.root, "reftable");
+    defer freeOwnedStrings(alloc, reftable_files);
+    try copyRelativeFiles(source.refs.root, bundle_store.root, reftable_files);
+
+    const loose_ref_files_all = try listFilesRecursive(alloc, source.refs.root, "refs");
+    defer freeOwnedStrings(alloc, loose_ref_files_all);
+    var copied_loose_ref_files = std.array_list.Managed([]u8).init(alloc);
+    defer {
+        for (copied_loose_ref_files.items) |path| alloc.free(path);
+        copied_loose_ref_files.deinit();
+    }
+    for (loose_ref_files_all) |path| {
+        if (std.mem.startsWith(u8, path, "refs/txn/")) continue;
+        try copyRelativeFile(source.refs.root, bundle_store.root, path);
+        try copied_loose_ref_files.append(try alloc.dupe(u8, path));
+    }
+
+    const reflog_files = try listFilesRecursive(alloc, source.refs.root, "logs/refs");
+    defer freeOwnedStrings(alloc, reflog_files);
+    try copyRelativeFiles(source.refs.root, bundle_store.root, reflog_files);
+
     var selected = std.array_list.Managed(object_store.ObjectId).init(alloc);
     defer selected.deinit();
     var it = reachable.keyIterator();
@@ -3010,21 +3195,29 @@ pub fn createBundle(alloc: std.mem.Allocator, src_path: []const u8, dst_path: []
         if (base_reachable) |*base| {
             if (base.contains(id_ptr.*)) continue;
         }
-        const loaded = try source.store.get(alloc, id_ptr.*);
-        defer alloc.free(loaded.payload);
-        const stored_id = try bundle_store.put(loaded.obj_type, loaded.payload);
-        try selected.append(stored_id);
+        if (try source.store.hasLooseObject(id_ptr.*)) {
+            const path = try looseObjectPath(alloc, id_ptr.*);
+            defer alloc.free(path);
+            try copyRelativeFile(source.store.root, bundle_store.root, path);
+        }
+        try selected.append(id_ptr.*);
     }
-
-    var pack_write = try bundle_store.writePack(alloc, selected.items);
-    defer pack_write.deinit(alloc);
+    const bundle_ids = try bundle_store.listIds(alloc);
+    defer alloc.free(bundle_ids);
 
     const manifest = BundleManifest{
-        .format_version = 1,
+        .format_version = 2,
+        .repository_format_version = source.format.version,
+        .ref_backend = source.format.ref_backend,
         .incremental = since_spec != null,
         .refs = try cloneBundleRefs(alloc, refs),
         .prerequisites = try alloc.dupe(object_store.ObjectId, prerequisite_ids.items),
-        .object_count = selected.items.len,
+        .object_count = bundle_ids.len,
+        .pack_files = try cloneOwnedStringsSlice(alloc, copied_pack_files.items),
+        .info_files = try cloneOwnedStringsSlice(alloc, copied_info_files.items),
+        .reftable_files = try cloneOwnedStringsSlice(alloc, reftable_files),
+        .loose_ref_files = try cloneOwnedStringsSlice(alloc, copied_loose_ref_files.items),
+        .reflog_files = try cloneOwnedStringsSlice(alloc, reflog_files),
     };
     defer {
         var owned = manifest;
@@ -3034,7 +3227,9 @@ pub fn createBundle(alloc: std.mem.Allocator, src_path: []const u8, dst_path: []
     return .{
         .ref_count = refs.len,
         .prerequisite_count = prerequisite_ids.items.len,
-        .object_count = selected.items.len,
+        .object_count = bundle_ids.len,
+        .pack_count = copied_pack_files.items.len,
+        .reftable_file_count = reftable_files.len,
     };
 }
 
@@ -3049,6 +3244,21 @@ pub fn verifyBundle(alloc: std.mem.Allocator, bundle_path: []const u8) !BundleRe
     const ids = try store.listIds(alloc);
     defer alloc.free(ids);
     if (ids.len != manifest.object_count) return error.InvalidBundle;
+
+    for (manifest.pack_files) |path| {
+        _ = try root.statFile(path);
+        const base = path[0 .. path.len - ".pack".len];
+        const idx_path = try std.fmt.allocPrint(alloc, "{s}.idx", .{base});
+        defer alloc.free(idx_path);
+        const manifest_path = try std.fmt.allocPrint(alloc, "{s}.manifest", .{base});
+        defer alloc.free(manifest_path);
+        _ = try root.statFile(idx_path);
+        _ = try root.statFile(manifest_path);
+    }
+    for (manifest.info_files) |path| _ = try root.statFile(path);
+    for (manifest.reftable_files) |path| _ = try root.statFile(path);
+    for (manifest.loose_ref_files) |path| _ = try root.statFile(path);
+    for (manifest.reflog_files) |path| _ = try root.statFile(path);
 
     for (ids) |id| {
         const loaded = try store.get(alloc, id);
@@ -3065,6 +3275,8 @@ pub fn verifyBundle(alloc: std.mem.Allocator, bundle_path: []const u8) !BundleRe
         .ref_count = manifest.refs.len,
         .prerequisite_count = manifest.prerequisites.len,
         .object_count = ids.len,
+        .pack_count = manifest.pack_files.len,
+        .reftable_file_count = manifest.reftable_files.len,
     };
 }
 
@@ -3087,23 +3299,62 @@ pub fn applyBundle(alloc: std.mem.Allocator, bundle_path: []const u8, dst_path: 
         alloc.free(loaded.payload);
     }
 
+    for (manifest.pack_files) |path| try copyPackCompanionFiles(alloc, bundle_root, dest.store.root, path);
+    for (manifest.info_files) |path| try copyRelativeFile(bundle_root, dest.store.root, path);
+
     const ids = try bundle_store.listIds(alloc);
     defer alloc.free(ids);
     for (ids) |id| {
-        const loaded = try bundle_store.get(alloc, id);
-        defer alloc.free(loaded.payload);
-        _ = try dest.store.put(loaded.obj_type, loaded.payload);
+        if (!try bundle_store.hasLooseObject(id)) continue;
+        const path = try looseObjectPath(alloc, id);
+        defer alloc.free(path);
+        try copyRelativeFile(bundle_root, dest.store.root, path);
     }
 
-    var updates = try alloc.alloc(RefTxnUpdate, manifest.refs.len);
-    defer alloc.free(updates);
-    for (manifest.refs, 0..) |entry, idx| {
-        updates[idx] = .{
-            .ref_name = entry.name,
-            .new_id = entry.id,
+    if (manifest.reftable_files.len > 0) {
+        dest.refs.root.deleteTree("reftable") catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
         };
+        try dest.refs.root.makePath("reftable");
+        try copyRelativeFiles(bundle_root, dest.refs.root, manifest.reftable_files);
     }
-    if (updates.len > 0) {
+    if (manifest.loose_ref_files.len > 0) {
+        dest.refs.root.deleteTree("refs") catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        try dest.refs.root.makePath("refs");
+        try dest.refs.root.makePath("refs/heads");
+        try dest.refs.root.makePath("refs/txn");
+        try copyRelativeFiles(bundle_root, dest.refs.root, manifest.loose_ref_files);
+    }
+    if (manifest.reflog_files.len > 0) {
+        dest.refs.root.deleteTree("logs/refs") catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+        try dest.refs.root.makePath("logs/refs");
+        try dest.refs.root.makePath("logs/refs/heads");
+        try copyRelativeFiles(bundle_root, dest.refs.root, manifest.reflog_files);
+    }
+
+    if (manifest.format_version >= 2) {
+        dest.format.version = manifest.repository_format_version;
+        dest.format.ref_backend = manifest.ref_backend;
+        try writeRepositoryFormat(alloc, dest.store.root, dest.format, dest.store.fsync);
+        dest.refs.setBackend(manifest.ref_backend);
+    }
+
+    if (manifest.reftable_files.len == 0 and manifest.loose_ref_files.len == 0 and manifest.refs.len > 0) {
+        var updates = try alloc.alloc(RefTxnUpdate, manifest.refs.len);
+        defer alloc.free(updates);
+        for (manifest.refs, 0..) |entry, idx| {
+            updates[idx] = .{
+                .ref_name = entry.name,
+                .new_id = entry.id,
+            };
+        }
         try dest.refs.updateRefTxn(updates, "bundle-apply");
     }
     try dest.refreshCommitGraph();
@@ -3112,7 +3363,19 @@ pub fn applyBundle(alloc: std.mem.Allocator, bundle_path: []const u8, dst_path: 
         .ref_count = manifest.refs.len,
         .prerequisite_count = manifest.prerequisites.len,
         .object_count = ids.len,
+        .pack_count = manifest.pack_files.len,
+        .reftable_file_count = manifest.reftable_files.len,
     };
+}
+
+pub fn cloneLocalRepository(alloc: std.mem.Allocator, src_path: []const u8, dst_path: []const u8, fsync: cfg.FsyncPolicy) !BundleResult {
+    const temp_bundle_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/local-clone-{d}", .{std.time.nanoTimestamp()});
+    defer alloc.free(temp_bundle_path);
+    std.fs.cwd().deleteTree(temp_bundle_path) catch {};
+    defer std.fs.cwd().deleteTree(temp_bundle_path) catch {};
+
+    _ = try createBundle(alloc, src_path, temp_bundle_path, fsync, null);
+    return try applyBundle(alloc, temp_bundle_path, dst_path, fsync);
 }
 
 const MirrorGcResult = struct {
@@ -6760,17 +7023,24 @@ test "bundle create, verify, and apply round-trip the CAS head" {
     var cas_manager = try CasManager.init(talloc, data_path, .none);
     defer cas_manager.deinit();
     const head = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    const pack_result = try cas_manager.pack();
+    try std.testing.expect(pack_result.rewritten_objects > 0);
 
     const created = try createBundle(talloc, data_path, bundle_path, .none, null);
     try std.testing.expect(created.ref_count > 0);
     try std.testing.expect(created.object_count > 0);
+    try std.testing.expect(created.pack_count > 0);
+    try std.testing.expect(created.reftable_file_count > 0);
 
     const verified = try verifyBundle(talloc, bundle_path);
     try std.testing.expectEqual(created.ref_count, verified.ref_count);
     try std.testing.expectEqual(created.object_count, verified.object_count);
+    try std.testing.expectEqual(created.pack_count, verified.pack_count);
+    try std.testing.expectEqual(created.reftable_file_count, verified.reftable_file_count);
 
     const applied = try applyBundle(talloc, bundle_path, restore_path, .none);
     try std.testing.expectEqual(verified.object_count, applied.object_count);
+    try std.testing.expectEqual(verified.pack_count, applied.pack_count);
 
     var restored = try CasManager.init(talloc, restore_path, .none);
     defer restored.deinit();
@@ -6782,6 +7052,58 @@ test "bundle create, verify, and apply round-trip the CAS head" {
     try std.testing.expectEqual(@as(usize, 1), restored_snapshot.snapshot.segment_descriptors.len);
     try std.testing.expectEqual(@as(usize, 1), restored_snapshot.snapshot.tag_snapshot.entries.len);
     try std.testing.expectEqual(@as(usize, 1), restored_snapshot.snapshot.series_catalog_snapshot.entries.len);
+}
+
+test "local clone preserves pack files and reftable state" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/clone-src", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    const clone_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/clone-dst", .{tmp.sub_path});
+    defer talloc.free(clone_path);
+    try std.fs.cwd().makePath(data_path);
+
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
+    defer series_catalog.deinit();
+
+    const sid = types.hash64("clone.series");
+    _ = try series_catalog.register("clone.series", "{}", sid);
+    const points = [_]types.Point{.{ .ts = 1_000, .value = 6.0 }};
+    const seg_path = try segment_mod.writeSegment(talloc, data_dir, sid, 0, points[0..]);
+    defer talloc.free(seg_path);
+    try manifest.add(data_dir, sid, 0, 1_000, 1_000, 1, seg_path);
+
+    var source = try CasManager.init(talloc, data_path, .none);
+    defer source.deinit();
+    const head = try source.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    _ = try source.pack();
+
+    const cloned = try cloneLocalRepository(talloc, data_path, clone_path, .none);
+    try std.testing.expect(cloned.pack_count > 0);
+    try std.testing.expect(cloned.reftable_file_count > 0);
+
+    var clone = try CasManager.init(talloc, clone_path, .none);
+    defer clone.deinit();
+    try std.testing.expectEqual(source.format.ref_backend, clone.format.ref_backend);
+    const cloned_head = try clone.refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(cloned_head.eql(head));
+
+    const pack_paths = try listFilesRecursive(talloc, clone.store.root, "objects/packs");
+    defer freeOwnedStrings(talloc, pack_paths);
+    var pack_count: usize = 0;
+    for (pack_paths) |path| {
+        if (std.mem.endsWith(u8, path, ".pack")) pack_count += 1;
+    }
+    try std.testing.expect(pack_count > 0);
 }
 
 test "incremental bundle apply requires its prerequisite head" {

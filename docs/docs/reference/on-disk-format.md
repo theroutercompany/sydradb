@@ -151,16 +151,19 @@ See [`src/sydra/storage/manifest.zig`](./source/sydra/storage/manifest.md) for t
 
 A bundle directory currently contains:
 
-- `bundle.manifest` – versioned bundle manifest with exported refs, prerequisite commits for incremental bundles, and object counts
-- `objects/` – bundle-local loose and/or packed CAS objects
-- `objects/packs/*.pack` and `objects/packs/*.idx` – immutable pack payloads plus fanout indexes
-- `refs/` – created by the object-store bootstrap, but ref updates are sourced from `bundle.manifest` during apply
+- `bundle.manifest` – versioned bundle manifest with exported refs, prerequisite commits, repository-format metadata, preserved pack paths, and copied ref metadata files
+- `objects/` – bundle-local reachable loose objects plus preserved active pack/index/manifest files
+- `objects/packs/*.pack`, `*.idx`, `*.manifest` – immutable active-pack payloads plus indexes and manifests copied directly from the source repository
+- `objects/info/*` – copied store-format and side-index files when present
+- `reftable/` – copied reftable stack snapshot for migrated repositories
+- `refs/` and `logs/refs/` – copied loose refs/reflogs for compatibility repositories
 
 Operational notes:
 
 - `snapshot` is a thin wrapper over `cas bundle create <dst_dir>`.
 - `restore` is a thin wrapper over `cas bundle apply <src_dir>`.
-- Applying a bundle restores `objects/` and `refs/` only; it does not recreate `MANIFEST`, `tags.json`, or `series_catalog.jsonl` unless an explicit CAS export command is run afterward.
+- Applying a bundle now preserves pack files and ref metadata directly instead of re-inserting every object through the loose-object path.
+- Restoring a bundle reapplies `objects/`, `objects/info/*`, and whichever ref backend snapshot (`reftable/` or loose `refs/`) the bundle was created from; it still does not recreate `MANIFEST`, `tags.json`, or `series_catalog.jsonl` unless an explicit CAS export command is run afterward.
 - Incremental bundles list prerequisite commits in `bundle.manifest`; `cas bundle apply` rejects them unless the destination store already contains those prerequisite objects.
 
 ## Integrity and cleanup
