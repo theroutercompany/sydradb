@@ -169,6 +169,12 @@ pub const PreparedStmt = struct {
         return try bytecode.disassemble(allocator, self.program);
     }
 
+    pub fn describeColumns(self: *PreparedStmt) ExplainError![]const plan.ColumnInfo {
+        if (self.finalized) return error.Finalized;
+        try self.ensureCompiled();
+        return self.columns;
+    }
+
     pub fn tablesUsed(self: *const PreparedStmt, allocator: std.mem.Allocator) ![]TableUse {
         var uses = std.array_list.Managed(TableUse).init(allocator);
         errdefer for (uses.items) |use| allocator.free(use.name);

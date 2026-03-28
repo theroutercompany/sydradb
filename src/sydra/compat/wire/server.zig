@@ -22,6 +22,118 @@ pub const ServerConfig = struct {
     engine: *engine_mod.Engine,
 };
 
+const ParsedStatementState = struct {
+    name: []u8,
+    sql: []u8,
+    parameter_slots: usize,
+};
+
+const BoundPortalState = struct {
+    name: []u8,
+    stmt: prepared_query.PreparedStmt,
+};
+
+const ExtendedQueryState = struct {
+    alloc: std.mem.Allocator,
+    parsed_statements: std.array_list.Managed(ParsedStatementState),
+    bound_portals: std.array_list.Managed(BoundPortalState),
+
+    fn init(alloc: std.mem.Allocator) ExtendedQueryState {
+        return .{
+            .alloc = alloc,
+            .parsed_statements = std.array_list.Managed(ParsedStatementState).init(alloc),
+            .bound_portals = std.array_list.Managed(BoundPortalState).init(alloc),
+        };
+    }
+
+    fn deinit(self: *ExtendedQueryState) void {
+        for (self.parsed_statements.items) |entry| {
+            self.alloc.free(entry.name);
+            self.alloc.free(entry.sql);
+        }
+        self.parsed_statements.deinit();
+        for (self.bound_portals.items) |*entry| {
+            self.alloc.free(entry.name);
+            entry.stmt.finalize();
+        }
+        self.bound_portals.deinit();
+    }
+
+    fn upsertParsedStatement(self: *ExtendedQueryState, name: []const u8, sql: []const u8, parameter_slots: usize) !void {
+        if (self.findParsedIndex(name)) |idx| {
+            self.alloc.free(self.parsed_statements.items[idx].name);
+            self.alloc.free(self.parsed_statements.items[idx].sql);
+            self.parsed_statements.items[idx] = .{
+                .name = try self.alloc.dupe(u8, name),
+                .sql = try self.alloc.dupe(u8, sql),
+                .parameter_slots = parameter_slots,
+            };
+            return;
+        }
+        try self.parsed_statements.append(.{
+            .name = try self.alloc.dupe(u8, name),
+            .sql = try self.alloc.dupe(u8, sql),
+            .parameter_slots = parameter_slots,
+        });
+    }
+
+    fn getParsedStatement(self: *ExtendedQueryState, name: []const u8) ?*ParsedStatementState {
+        const idx = self.findParsedIndex(name) orelse return null;
+        return &self.parsed_statements.items[idx];
+    }
+
+    fn closeParsedStatement(self: *ExtendedQueryState, name: []const u8) bool {
+        const idx = self.findParsedIndex(name) orelse return false;
+        const entry = self.parsed_statements.swapRemove(idx);
+        self.alloc.free(entry.name);
+        self.alloc.free(entry.sql);
+        return true;
+    }
+
+    fn upsertPortal(self: *ExtendedQueryState, name: []const u8, stmt: prepared_query.PreparedStmt) !void {
+        if (self.findPortalIndex(name)) |idx| {
+            self.alloc.free(self.bound_portals.items[idx].name);
+            self.bound_portals.items[idx].stmt.finalize();
+            self.bound_portals.items[idx] = .{
+                .name = try self.alloc.dupe(u8, name),
+                .stmt = stmt,
+            };
+            return;
+        }
+        try self.bound_portals.append(.{
+            .name = try self.alloc.dupe(u8, name),
+            .stmt = stmt,
+        });
+    }
+
+    fn getPortal(self: *ExtendedQueryState, name: []const u8) ?*BoundPortalState {
+        const idx = self.findPortalIndex(name) orelse return null;
+        return &self.bound_portals.items[idx];
+    }
+
+    fn closePortal(self: *ExtendedQueryState, name: []const u8) bool {
+        const idx = self.findPortalIndex(name) orelse return false;
+        var entry = self.bound_portals.swapRemove(idx);
+        self.alloc.free(entry.name);
+        entry.stmt.finalize();
+        return true;
+    }
+
+    fn findParsedIndex(self: *ExtendedQueryState, name: []const u8) ?usize {
+        for (self.parsed_statements.items, 0..) |entry, idx| {
+            if (std.mem.eql(u8, entry.name, name)) return idx;
+        }
+        return null;
+    }
+
+    fn findPortalIndex(self: *ExtendedQueryState, name: []const u8) ?usize {
+        for (self.bound_portals.items, 0..) |entry, idx| {
+            if (std.mem.eql(u8, entry.name, name)) return idx;
+        }
+        return null;
+    }
+};
+
 pub fn run(alloc: std.mem.Allocator, config: ServerConfig) !void {
     const listen_addr = try parseAddress(config.address, config.port);
     var server = try listen_addr.listen(.{ .reuse_address = true });
@@ -87,6 +199,9 @@ fn messageLoop(
     flush_writer: *std.Io.Writer,
     engine: *engine_mod.Engine,
 ) !void {
+    var extended_state = ExtendedQueryState.init(alloc);
+    defer extended_state.deinit();
+
     while (true) {
         const type_byte = reader.readByte() catch |err| switch (err) {
             error.EndOfStream => return,
@@ -108,7 +223,22 @@ fn messageLoop(
                 try handleSimpleQuery(alloc, writer, payload_storage, engine);
             },
             'P' => {
-                try handleParseMessage(alloc, writer, payload_storage);
+                try handleParseMessage(alloc, writer, payload_storage, engine, &extended_state);
+            },
+            'B' => {
+                try handleBindMessage(alloc, writer, payload_storage, engine, &extended_state);
+            },
+            'D' => {
+                try handleDescribeMessage(alloc, writer, payload_storage, &extended_state);
+            },
+            'E' => {
+                try handleExecuteMessage(alloc, writer, payload_storage, &extended_state);
+            },
+            'C' => {
+                try handleCloseMessage(writer, payload_storage, &extended_state);
+            },
+            'H' => {
+                // Flush requests only ask the backend to drain buffered output.
             },
             'S' => {
                 try protocol.writeReadyForQuery(writer, 'I');
@@ -135,6 +265,61 @@ fn readU32(reader: std.Io.AnyReader) !u32 {
     var buf: [4]u8 = undefined;
     try reader.readNoEof(&buf);
     return std.mem.readInt(u32, &buf, .big);
+}
+
+fn readPayloadU16(payload: []const u8, cursor: *usize) !u16 {
+    if (payload.len < cursor.* + 2) return error.InvalidMessageLength;
+    const bytes = payload[cursor.* .. cursor.* + 2];
+    cursor.* += 2;
+    return std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(bytes.ptr)), .big);
+}
+
+fn readPayloadI32(payload: []const u8, cursor: *usize) !i32 {
+    if (payload.len < cursor.* + 4) return error.InvalidMessageLength;
+    const bytes = payload[cursor.* .. cursor.* + 4];
+    cursor.* += 4;
+    return std.mem.readInt(i32, @as(*const [4]u8, @ptrCast(bytes.ptr)), .big);
+}
+
+fn readFormatCodes(alloc: std.mem.Allocator, payload: []const u8, cursor: *usize, count: u16) ![]u16 {
+    const start = cursor.*;
+    const bytes = @as(usize, count) * 2;
+    if (payload.len < start + bytes) return error.InvalidMessageLength;
+    cursor.* += bytes;
+    if (count == 0) return &.{};
+
+    const codes = try alloc.alloc(u16, count);
+    for (0..count) |idx| {
+        const offset = start + idx * 2;
+        codes[idx] = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(payload[offset .. offset + 2].ptr)), .big);
+    }
+    return codes;
+}
+
+fn parameterFormatCode(codes: []const u16, param_idx: usize) u16 {
+    if (codes.len == 0) return 0;
+    if (codes.len == 1) return codes[0];
+    return if (param_idx < codes.len) codes[param_idx] else 0;
+}
+
+fn readPayloadBytes(payload: []const u8, cursor: *usize, len: usize) ![]const u8 {
+    if (payload.len < cursor.* + len) return error.InvalidMessageLength;
+    const out = payload[cursor.* .. cursor.* + len];
+    cursor.* += len;
+    return out;
+}
+
+fn parseBindTextValue(text: []const u8) !value_mod.Value {
+    if (std.ascii.eqlIgnoreCase(text, "null")) return .null;
+    if (std.ascii.eqlIgnoreCase(text, "t") or std.ascii.eqlIgnoreCase(text, "true")) return .{ .boolean = true };
+    if (std.ascii.eqlIgnoreCase(text, "f") or std.ascii.eqlIgnoreCase(text, "false")) return .{ .boolean = false };
+    if (std.fmt.parseInt(i64, text, 10)) |value| {
+        return .{ .integer = value };
+    } else |_| {}
+    if (std.fmt.parseFloat(f64, text)) |value| {
+        return .{ .float = value };
+    } else |_| {}
+    return .{ .string = text };
 }
 
 fn handleSimpleQuery(
@@ -190,23 +375,22 @@ fn handleParseMessage(
     alloc: std.mem.Allocator,
     writer: std.Io.AnyWriter,
     payload: []u8,
+    engine: *engine_mod.Engine,
+    state: *ExtendedQueryState,
 ) !void {
     var cursor: usize = 0;
     const statement_name = readCString(payload, &cursor) catch {
         try protocol.writeErrorResponse(writer, "ERROR", "08P01", "malformed parse message");
-        try protocol.writeReadyForQuery(writer, 'I');
         return;
     };
 
     const query_bytes = readCString(payload, &cursor) catch {
         try protocol.writeErrorResponse(writer, "ERROR", "08P01", "malformed parse message");
-        try protocol.writeReadyForQuery(writer, 'I');
         return;
     };
 
     if (payload.len < cursor + 2) {
         try protocol.writeErrorResponse(writer, "ERROR", "08P01", "parse message truncated");
-        try protocol.writeReadyForQuery(writer, 'I');
         return;
     }
 
@@ -216,7 +400,6 @@ fn handleParseMessage(
     const expected_bytes = @as(usize, parameter_count) * 4;
     if (payload.len < cursor + expected_bytes) {
         try protocol.writeErrorResponse(writer, "ERROR", "08P01", "parse message truncated");
-        try protocol.writeReadyForQuery(writer, 'I');
         return;
     }
 
@@ -226,29 +409,245 @@ fn handleParseMessage(
         .{ statement_name, trimmed },
     );
 
-    const translation = translator.translate(alloc, trimmed) catch |err| switch (err) {
-        error.OutOfMemory => {
-            try protocol.writeErrorResponse(writer, "FATAL", "53100", "out of memory during translation");
-            try protocol.writeReadyForQuery(writer, 'I');
+    var stmt = prepared_query.prepareSqlCore(alloc, engine, trimmed, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.NotImplemented => {
+            try protocol.writeErrorResponse(writer, "ERROR", "0A000", "SQL parse unsupported by direct prepare");
+            return;
+        },
+        else => {
+            try protocol.writeErrorResponse(writer, "ERROR", "42601", @errorName(err));
             return;
         },
     };
+    defer stmt.finalize();
 
-    switch (translation) {
-        .success => |success| {
-            defer alloc.free(success.sydraql);
-            try protocol.writeErrorResponse(writer, "ERROR", "0A000", "extended protocol not implemented yet");
-        },
-        .failure => |failure| {
-            const msg = if (failure.message.len == 0)
-                "translation failed"
-            else
-                failure.message;
-            try protocol.writeErrorResponse(writer, "ERROR", failure.sqlstate, msg);
-        },
+    if (parameter_count != 0 and parameter_count != stmt.binding.maxParameterSlot()) {
+        try protocol.writeErrorResponse(writer, "ERROR", "08P01", "parse parameter count does not match statement");
+        return;
     }
 
-    try protocol.writeReadyForQuery(writer, 'I');
+    try state.upsertParsedStatement(statement_name, trimmed, stmt.binding.maxParameterSlot());
+    try protocol.writeParseComplete(writer);
+}
+
+fn handleBindMessage(
+    alloc: std.mem.Allocator,
+    writer: std.Io.AnyWriter,
+    payload: []u8,
+    engine: *engine_mod.Engine,
+    state: *ExtendedQueryState,
+) !void {
+    var cursor: usize = 0;
+    const portal_name = readCString(payload, &cursor) catch {
+        try protocol.writeErrorResponse(writer, "ERROR", "08P01", "malformed bind message");
+        return;
+    };
+    const statement_name = readCString(payload, &cursor) catch {
+        try protocol.writeErrorResponse(writer, "ERROR", "08P01", "malformed bind message");
+        return;
+    };
+
+    const format_count = readPayloadU16(payload, &cursor) catch {
+        try protocol.writeErrorResponse(writer, "ERROR", "08P01", "bind message truncated");
+        return;
+    };
+    const format_codes = readFormatCodes(alloc, payload, &cursor, format_count) catch {
+        try protocol.writeErrorResponse(writer, "ERROR", "08P01", "bind format codes truncated");
+        return;
+    };
+    defer if (format_codes.len != 0) alloc.free(format_codes);
+
+    const parsed = state.getParsedStatement(statement_name) orelse {
+        try protocol.writeErrorResponse(writer, "ERROR", "26000", "unknown prepared statement");
+        return;
+    };
+
+    const parameter_count = readPayloadU16(payload, &cursor) catch {
+        try protocol.writeErrorResponse(writer, "ERROR", "08P01", "bind parameter count missing");
+        return;
+    };
+    if (parameter_count != parsed.parameter_slots) {
+        try protocol.writeErrorResponse(writer, "ERROR", "08P01", "bind parameter count does not match prepared statement");
+        return;
+    }
+
+    var stmt = prepared_query.prepareSqlCore(alloc, engine, parsed.sql, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        error.NotImplemented => {
+            try protocol.writeErrorResponse(writer, "ERROR", "0A000", "SQL bind unsupported by direct prepare");
+            return;
+        },
+        else => {
+            try protocol.writeErrorResponse(writer, "ERROR", "42601", @errorName(err));
+            return;
+        },
+    };
+    errdefer stmt.finalize();
+
+    for (0..parameter_count) |param_idx| {
+        const param_length = readPayloadI32(payload, &cursor) catch {
+            try protocol.writeErrorResponse(writer, "ERROR", "08P01", "bind parameter value truncated");
+            return;
+        };
+        const format_code = parameterFormatCode(format_codes, param_idx);
+        if (format_code != 0) {
+            try protocol.writeErrorResponse(writer, "ERROR", "0A000", "binary bind parameters are not supported");
+            return;
+        }
+        if (param_length < 0) {
+            try stmt.bindPositional(param_idx + 1, .null);
+            continue;
+        }
+        const text = readPayloadBytes(payload, &cursor, @intCast(param_length)) catch {
+            try protocol.writeErrorResponse(writer, "ERROR", "08P01", "bind parameter value truncated");
+            return;
+        };
+        try stmt.bindPositional(param_idx + 1, try parseBindTextValue(text));
+    }
+
+    const result_format_count = readPayloadU16(payload, &cursor) catch {
+        try protocol.writeErrorResponse(writer, "ERROR", "08P01", "bind result formats missing");
+        return;
+    };
+    const result_format_codes = readFormatCodes(alloc, payload, &cursor, result_format_count) catch {
+        try protocol.writeErrorResponse(writer, "ERROR", "08P01", "bind result formats truncated");
+        return;
+    };
+    defer if (result_format_codes.len != 0) alloc.free(result_format_codes);
+
+    try state.upsertPortal(portal_name, stmt);
+    try protocol.writeBindComplete(writer);
+}
+
+fn handleDescribeMessage(
+    alloc: std.mem.Allocator,
+    writer: std.Io.AnyWriter,
+    payload: []u8,
+    state: *ExtendedQueryState,
+) !void {
+    if (payload.len < 2) {
+        try protocol.writeErrorResponse(writer, "ERROR", "08P01", "describe message truncated");
+        return;
+    }
+
+    var cursor: usize = 1;
+    const target = payload[0];
+    const name = readCString(payload, &cursor) catch {
+        try protocol.writeErrorResponse(writer, "ERROR", "08P01", "malformed describe message");
+        return;
+    };
+
+    switch (target) {
+        'S' => {
+            const parsed = state.getParsedStatement(name) orelse {
+                try protocol.writeErrorResponse(writer, "ERROR", "26000", "unknown prepared statement");
+                return;
+            };
+            const parameter_oids = try alloc.alloc(u32, parsed.parameter_slots);
+            defer alloc.free(parameter_oids);
+            @memset(parameter_oids, 0);
+            try protocol.writeParameterDescription(writer, parameter_oids);
+            try protocol.writeNoData(writer);
+        },
+        'P' => {
+            const portal = state.getPortal(name) orelse {
+                try protocol.writeErrorResponse(writer, "ERROR", "34000", "unknown portal");
+                return;
+            };
+            const columns = portal.stmt.describeColumns() catch |err| {
+                try protocol.writeErrorResponse(writer, "ERROR", "XX000", @errorName(err));
+                return;
+            };
+            if (columns.len == 0) {
+                try protocol.writeNoData(writer);
+            } else {
+                try writeRowDescription(writer, columns);
+            }
+        },
+        else => try protocol.writeErrorResponse(writer, "ERROR", "08P01", "unknown describe target"),
+    }
+}
+
+fn handleExecuteMessage(
+    alloc: std.mem.Allocator,
+    writer: std.Io.AnyWriter,
+    payload: []u8,
+    state: *ExtendedQueryState,
+) !void {
+    var cursor: usize = 0;
+    const portal_name = readCString(payload, &cursor) catch {
+        try protocol.writeErrorResponse(writer, "ERROR", "08P01", "malformed execute message");
+        return;
+    };
+    const max_rows = readPayloadI32(payload, &cursor) catch {
+        try protocol.writeErrorResponse(writer, "ERROR", "08P01", "execute message truncated");
+        return;
+    };
+
+    const portal = state.getPortal(portal_name) orelse {
+        try protocol.writeErrorResponse(writer, "ERROR", "34000", "unknown portal");
+        return;
+    };
+
+    var row_buffer = std.array_list.Managed(u8).init(alloc);
+    defer row_buffer.deinit();
+    var value_buffer = ManagedArrayList(u8).init(alloc);
+    defer value_buffer.deinit();
+
+    var row_count: usize = 0;
+    while (max_rows <= 0 or row_count < @as(usize, @intCast(max_rows))) {
+        const step = portal.stmt.step() catch |err| {
+            try protocol.writeErrorResponse(writer, "ERROR", "XX000", @errorName(err));
+            return;
+        };
+        switch (step) {
+            .row => |values| {
+                try writeDataRow(writer, values, &row_buffer, &value_buffer);
+                row_count += 1;
+            },
+            .done => {
+                const tag = try formatSelectTag(alloc, row_count);
+                defer alloc.free(tag);
+                try protocol.writeCommandComplete(writer, tag);
+                return;
+            },
+        }
+    }
+
+    try protocol.writePortalSuspended(writer);
+}
+
+fn handleCloseMessage(
+    writer: std.Io.AnyWriter,
+    payload: []u8,
+    state: *ExtendedQueryState,
+) !void {
+    if (payload.len < 2) {
+        try protocol.writeErrorResponse(writer, "ERROR", "08P01", "close message truncated");
+        return;
+    }
+
+    var cursor: usize = 1;
+    const target = payload[0];
+    const name = readCString(payload, &cursor) catch {
+        try protocol.writeErrorResponse(writer, "ERROR", "08P01", "malformed close message");
+        return;
+    };
+
+    const closed = switch (target) {
+        'S' => state.closeParsedStatement(name),
+        'P' => state.closePortal(name),
+        else => {
+            try protocol.writeErrorResponse(writer, "ERROR", "08P01", "unknown close target");
+            return;
+        },
+    };
+    if (!closed) {
+        try protocol.writeErrorResponse(writer, "ERROR", if (target == 'S') "26000" else "34000", "named object does not exist");
+        return;
+    }
+    try protocol.writeCloseComplete(writer);
 }
 
 fn handleSqlCorePreparedQuery(
@@ -607,4 +1006,165 @@ test "sql core prepared path handles simple select queries" {
     try std.testing.expect(handled);
     try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "execution_mode=sql_core_vm") != null);
     try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "SELECT 1") != null);
+}
+
+test "extended protocol executes direct SQL prepared statements" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/pgwire-extended-sql-core", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .compiled,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    const sid = @import("../../types.zig").seriesIdFrom("ext.room1", "{}");
+    try engine.registerSeries("ext.room1", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.0, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 20, .value = 2.0, .tags_json = "{}" });
+    try waitForQueryablePoints(alloc, engine, sid, 2, 1_000);
+
+    var input = std.array_list.Managed(u8).init(alloc);
+    defer input.deinit();
+    try appendParseMessage(&input, "stmt1", "SELECT time, value FROM ext.room1 WHERE time >= $1 ORDER BY time ASC LIMIT 1", 1);
+    try appendDescribeMessage(&input, 'S', "stmt1");
+    try appendBindMessage(&input, "portal1", "stmt1", &.{"15"});
+    try appendDescribeMessage(&input, 'P', "portal1");
+    try appendExecuteMessage(&input, "portal1", 0);
+    try appendFrontendMessage(&input, 'S', &.{});
+
+    var read_stream = std.io.fixedBufferStream(input.items);
+    var read_state = read_stream.reader();
+    const reader = read_state.any();
+
+    var allocating_writer: std.Io.Writer.Allocating = .init(alloc);
+    defer allocating_writer.deinit();
+
+    try messageLoop(alloc, reader, anyWriter(&allocating_writer.writer), &allocating_writer.writer, engine);
+
+    const written = allocating_writer.written();
+    const message_types = try collectBackendMessageTypes(alloc, written);
+    defer alloc.free(message_types);
+    try std.testing.expectEqualSlices(u8, &.{ '1', 't', 'n', '2', 'T', 'D', 'C', 'Z' }, message_types);
+    try std.testing.expect(std.mem.indexOf(u8, written, "SELECT 1") != null);
+}
+
+fn appendFrontendMessage(buffer: *std.array_list.Managed(u8), msg_type: u8, payload: []const u8) !void {
+    try buffer.append(msg_type);
+    var len_buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, len_buf[0..4], @as(u32, @intCast(payload.len + 4)), .big);
+    try buffer.appendSlice(len_buf[0..4]);
+    try buffer.appendSlice(payload);
+}
+
+fn appendParseMessage(buffer: *std.array_list.Managed(u8), statement_name: []const u8, sql: []const u8, parameter_slots: u16) !void {
+    var payload = std.array_list.Managed(u8).init(buffer.allocator);
+    defer payload.deinit();
+    try payload.appendSlice(statement_name);
+    try payload.append(0);
+    try payload.appendSlice(sql);
+    try payload.append(0);
+    var buf2: [2]u8 = undefined;
+    std.mem.writeInt(u16, buf2[0..2], parameter_slots, .big);
+    try payload.appendSlice(buf2[0..2]);
+    var buf4: [4]u8 = undefined;
+    for (0..parameter_slots) |_| {
+        std.mem.writeInt(u32, buf4[0..4], 0, .big);
+        try payload.appendSlice(buf4[0..4]);
+    }
+    try appendFrontendMessage(buffer, 'P', payload.items);
+}
+
+fn appendBindMessage(buffer: *std.array_list.Managed(u8), portal_name: []const u8, statement_name: []const u8, parameters: []const []const u8) !void {
+    var payload = std.array_list.Managed(u8).init(buffer.allocator);
+    defer payload.deinit();
+    try payload.appendSlice(portal_name);
+    try payload.append(0);
+    try payload.appendSlice(statement_name);
+    try payload.append(0);
+    var buf2: [2]u8 = undefined;
+    std.mem.writeInt(u16, buf2[0..2], 0, .big);
+    try payload.appendSlice(buf2[0..2]);
+    std.mem.writeInt(u16, buf2[0..2], @as(u16, @intCast(parameters.len)), .big);
+    try payload.appendSlice(buf2[0..2]);
+    var buf4: [4]u8 = undefined;
+    for (parameters) |parameter| {
+        std.mem.writeInt(i32, buf4[0..4], @as(i32, @intCast(parameter.len)), .big);
+        try payload.appendSlice(buf4[0..4]);
+        try payload.appendSlice(parameter);
+    }
+    std.mem.writeInt(u16, buf2[0..2], 0, .big);
+    try payload.appendSlice(buf2[0..2]);
+    try appendFrontendMessage(buffer, 'B', payload.items);
+}
+
+fn appendDescribeMessage(buffer: *std.array_list.Managed(u8), target: u8, name: []const u8) !void {
+    var payload = std.array_list.Managed(u8).init(buffer.allocator);
+    defer payload.deinit();
+    try payload.append(target);
+    try payload.appendSlice(name);
+    try payload.append(0);
+    try appendFrontendMessage(buffer, 'D', payload.items);
+}
+
+fn appendExecuteMessage(buffer: *std.array_list.Managed(u8), portal_name: []const u8, max_rows: i32) !void {
+    var payload = std.array_list.Managed(u8).init(buffer.allocator);
+    defer payload.deinit();
+    try payload.appendSlice(portal_name);
+    try payload.append(0);
+    var buf4: [4]u8 = undefined;
+    std.mem.writeInt(i32, buf4[0..4], max_rows, .big);
+    try payload.appendSlice(buf4[0..4]);
+    try appendFrontendMessage(buffer, 'E', payload.items);
+}
+
+fn collectBackendMessageTypes(alloc: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var out = std.array_list.Managed(u8).init(alloc);
+    errdefer out.deinit();
+    var cursor: usize = 0;
+    while (cursor < bytes.len) {
+        try out.append(bytes[cursor]);
+        cursor += 1;
+        if (bytes.len < cursor + 4) return error.InvalidMessageLength;
+        const length = std.mem.readInt(u32, @as(*const [4]u8, @ptrCast(bytes[cursor .. cursor + 4].ptr)), .big);
+        cursor += 4;
+        if (length < 4) return error.InvalidMessageLength;
+        cursor += length - 4;
+    }
+    return try out.toOwnedSlice();
+}
+
+fn waitForQueryablePoints(
+    allocator: std.mem.Allocator,
+    engine: *engine_mod.Engine,
+    series_id: @import("../../types.zig").SeriesId,
+    expected_count: usize,
+    timeout_ms: u64,
+) !void {
+    const deadline_ns = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ms)) * std.time.ns_per_ms;
+    while (std.time.nanoTimestamp() <= deadline_ns) {
+        var points = std.array_list.Managed(@import("../../types.zig").Point).init(allocator);
+        defer points.deinit();
+
+        try engine.queryRange(series_id, std.math.minInt(i64), std.math.maxInt(i64), &points);
+        if (points.items.len >= expected_count) return;
+        std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+    return error.NotImplemented;
 }

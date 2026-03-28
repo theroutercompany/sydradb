@@ -164,6 +164,56 @@ pub fn writeReadyForQuery(writer: anytype, status: u8) !void {
     try writer.writeAll(buf[0..6]);
 }
 
+pub fn writeParseComplete(writer: anytype) !void {
+    try writer.writeByte('1');
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], 4, .big);
+    try writer.writeAll(buf[0..4]);
+}
+
+pub fn writeBindComplete(writer: anytype) !void {
+    try writer.writeByte('2');
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], 4, .big);
+    try writer.writeAll(buf[0..4]);
+}
+
+pub fn writeCloseComplete(writer: anytype) !void {
+    try writer.writeByte('3');
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], 4, .big);
+    try writer.writeAll(buf[0..4]);
+}
+
+pub fn writeNoData(writer: anytype) !void {
+    try writer.writeByte('n');
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], 4, .big);
+    try writer.writeAll(buf[0..4]);
+}
+
+pub fn writePortalSuspended(writer: anytype) !void {
+    try writer.writeByte('s');
+    var buf: [4]u8 = undefined;
+    std.mem.writeInt(u32, buf[0..4], 4, .big);
+    try writer.writeAll(buf[0..4]);
+}
+
+pub fn writeParameterDescription(writer: anytype, oids: []const u32) !void {
+    try writer.writeByte('t');
+    var len_buf: [4]u8 = undefined;
+    var count_buf: [2]u8 = undefined;
+    const length: u32 = 4 + 2 + @as(u32, @intCast(oids.len * 4));
+    std.mem.writeInt(u32, len_buf[0..4], length, .big);
+    try writer.writeAll(len_buf[0..4]);
+    std.mem.writeInt(u16, count_buf[0..2], @as(u16, @intCast(oids.len)), .big);
+    try writer.writeAll(count_buf[0..2]);
+    for (oids) |oid| {
+        std.mem.writeInt(u32, len_buf[0..4], oid, .big);
+        try writer.writeAll(len_buf[0..4]);
+    }
+}
+
 pub fn writeCommandComplete(writer: anytype, tag: []const u8) !void {
     try writer.writeByte('C');
     var length_buf: [4]u8 = undefined;
