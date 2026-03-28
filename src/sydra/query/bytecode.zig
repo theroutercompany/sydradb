@@ -3,6 +3,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const ir = @import("compiler/ir.zig");
 const plan = @import("plan.zig");
+const types = @import("../types.zig");
 const value_mod = @import("value.zig");
 
 pub const RegisterId = u16;
@@ -15,6 +16,7 @@ pub const SelectorId = u8;
 pub const SchemaId = u8;
 pub const OrderingId = u8;
 pub const AggregateId = u8;
+pub const WriteTargetId = u8;
 
 pub const CompareKind = enum(u8) {
     eq = 1,
@@ -41,6 +43,7 @@ pub const Opcode = enum {
     sorter_open,
     sorter_insert,
     sorter_next,
+    insert_point,
     result_row,
     halt,
 };
@@ -53,6 +56,7 @@ pub const OperandRef = union(enum) {
     schema: SchemaId,
     ordering: OrderingId,
     aggregate: AggregateId,
+    write_target: WriteTargetId,
     text: []const u8,
 };
 
@@ -76,6 +80,12 @@ pub const TempStoreDecl = struct {
     name: []const u8,
 };
 
+pub const WriteTarget = struct {
+    series_id: types.SeriesId,
+    series_name: []const u8,
+    tags_json: []const u8,
+};
+
 pub const Program = struct {
     allocator: std.mem.Allocator,
     instructions: []Instruction,
@@ -87,6 +97,7 @@ pub const Program = struct {
     aggregates: []const ir.AggregateSpec = &.{},
     cursors: []const CursorDecl = &.{},
     temp_stores: []const TempStoreDecl = &.{},
+    write_targets: []const WriteTarget = &.{},
     register_count: usize = 0,
     source_name: []const u8 = "anonymous",
     version: u16 = 1,
@@ -101,6 +112,7 @@ pub const Program = struct {
         if (self.aggregates.len != 0) self.allocator.free(self.aggregates);
         if (self.cursors.len != 0) self.allocator.free(self.cursors);
         if (self.temp_stores.len != 0) self.allocator.free(self.temp_stores);
+        if (self.write_targets.len != 0) self.allocator.free(self.write_targets);
         self.* = undefined;
     }
 };
@@ -149,6 +161,7 @@ fn formatOperandRef(allocator: std.mem.Allocator, operand: OperandRef) ![]const 
         .schema => |id| try std.fmt.allocPrint(allocator, "schema[{d}]", .{id}),
         .ordering => |id| try std.fmt.allocPrint(allocator, "ordering[{d}]", .{id}),
         .aggregate => |id| try std.fmt.allocPrint(allocator, "aggregate[{d}]", .{id}),
+        .write_target => |id| try std.fmt.allocPrint(allocator, "write_target[{d}]", .{id}),
         .text => |text| try allocator.dupe(u8, text),
     };
 }

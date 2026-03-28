@@ -12,7 +12,7 @@ const value_mod = @import("value.zig");
 
 const QueryRangeError = @typeInfo(@typeInfo(@TypeOf(engine_mod.Engine.queryRange)).@"fn".return_type.?).error_union.error_set;
 
-pub const VmError = value_mod.ConvertError || QueryRangeError || error{
+pub const VmError = value_mod.ConvertError || expression.EvalError || QueryRangeError || error{
     InvalidOpcode,
     InvalidRegister,
     InvalidConstant,
@@ -33,6 +33,7 @@ pub const VirtualMachine = struct {
     series_cursors: []vdbe.SeriesCursor,
     sorters: []vdbe.TempSorter,
     aggregate_tables: []vdbe.AggTable,
+    rows_affected: usize = 0,
     pc: usize = 0,
     halted: bool = false,
 
@@ -88,6 +89,7 @@ pub const VirtualMachine = struct {
     pub fn reset(self: *VirtualMachine) void {
         self.pc = 0;
         self.halted = false;
+        self.rows_affected = 0;
         for (self.registers) |*slot| slot.* = .null;
         for (self.row_buffer) |*slot| slot.* = .null;
         for (self.series_cursors) |*cursor| cursor.reset();
@@ -96,7 +98,6 @@ pub const VirtualMachine = struct {
     }
 
     pub fn step(self: *VirtualMachine) VmError!VmStep {
-        _ = self.engine;
         while (!self.halted) {
             if (self.pc >= self.program.instructions.len) {
                 self.halted = true;
@@ -119,6 +120,7 @@ pub const VirtualMachine = struct {
                 .sorter_open => try self.executeSorterOpen(instruction),
                 .sorter_insert => try self.executeSorterInsert(instruction),
                 .sorter_next => try self.executeSorterNext(instruction),
+                .insert_point => try self.executeInsertPoint(instruction),
                 .result_row => return .{ .row = try self.executeResultRow(instruction) },
                 .halt => {
                     self.halted = true;
@@ -334,6 +336,31 @@ pub const VirtualMachine = struct {
         return self.row_buffer[0..count];
     }
 
+    fn executeInsertPoint(self: *VirtualMachine, instruction: bytecode.Instruction) VmError!void {
+        const target_id = switch (instruction.p4) {
+            .write_target => |id| id,
+            else => return error.InvalidConstant,
+        };
+        if (target_id >= self.program.write_targets.len) return error.InvalidConstant;
+        const target = self.program.write_targets[target_id];
+
+        const time_expr_id: usize = @intCast(instruction.p1);
+        const value_expr_id: usize = @intCast(instruction.p2);
+        if (time_expr_id >= self.program.exprs.len or value_expr_id >= self.program.exprs.len) return error.InvalidConstant;
+
+        const ts_value = try expression.evaluateConstant(self.program.exprs[time_expr_id]);
+        const point_value = try expression.evaluateConstant(self.program.exprs[value_expr_id]);
+
+        try self.engine.registerSeries(target.series_name, target.tags_json, target.series_id);
+        try self.engine.ingest(.{
+            .series_id = target.series_id,
+            .ts = try valueAsTimestamp(ts_value),
+            .value = try point_value.asFloat(),
+            .tags_json = target.tags_json,
+        });
+        self.rows_affected += 1;
+    }
+
     fn registerPtr(self: *VirtualMachine, id: bytecode.RegisterId) VmError!*value_mod.Value {
         if (id >= self.registers.len) return error.InvalidRegister;
         return &self.registers[id];
@@ -342,6 +369,10 @@ pub const VirtualMachine = struct {
     fn registerValue(self: *VirtualMachine, id: bytecode.RegisterId) VmError!value_mod.Value {
         if (id >= self.registers.len) return error.InvalidRegister;
         return self.registers[id];
+    }
+
+    pub fn rowsAffected(self: *const VirtualMachine) usize {
+        return self.rows_affected;
     }
 
     fn evaluateCurrentExpr(self: *VirtualMachine, expr: *const ast.Expr) VmError!value_mod.Value {
@@ -473,6 +504,14 @@ fn compareSorterRows(ordering: []const ast.OrderExpr, a: vdbe.SorterRow, b: vdbe
     if (a.sequence < b.sequence) return .lt;
     if (a.sequence > b.sequence) return .gt;
     return .eq;
+}
+
+fn valueAsTimestamp(value: value_mod.Value) VmError!i64 {
+    return switch (value) {
+        .integer => |timestamp| timestamp,
+        .float => |timestamp| @intFromFloat(timestamp),
+        else => error.InvalidOpcode,
+    };
 }
 
 fn compareValuesForSort(a: value_mod.Value, b: value_mod.Value) std.math.Order {

@@ -78,6 +78,7 @@ const Dispatcher = struct {
         if (std.mem.eql(u8, action_name, "emitSelect()")) return try self.emitSelect(rhs);
         if (std.mem.eql(u8, action_name, "emitInsert()")) return try self.emitInsert(rhs);
         if (std.mem.eql(u8, action_name, "emitInsertValues()")) return try self.emitInsertValues(rhs);
+        if (std.mem.eql(u8, action_name, "emitInsertBareValues()")) return try self.emitInsertBareValues(rhs);
         if (std.mem.eql(u8, action_name, "emitDelete()")) return try self.emitDelete(rhs);
         if (std.mem.eql(u8, action_name, "emitQualifiedNameStart()")) return try self.emitQualifiedNameStart(rhs);
         if (std.mem.eql(u8, action_name, "appendQualifiedName()")) return try self.appendQualifiedName(rhs);
@@ -174,6 +175,17 @@ const Dispatcher = struct {
                 .target = target,
                 .columns = try exprListFromValue(rhs[4]),
                 .values = try exprListFromValue(rhs[8]),
+                .span = combinedSpan(rhs),
+            },
+        } };
+    }
+
+    fn emitInsertBareValues(_: *@This(), rhs: []const SemanticValue) !SemanticValue {
+        const target = try identifierFromValue(rhs[2]);
+        return .{ .stmt = .{
+            .insert = .{
+                .target = target,
+                .values = try exprListFromValue(rhs[5]),
                 .span = combinedSpan(rhs),
             },
         } };

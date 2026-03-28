@@ -216,6 +216,15 @@ pub const PreparedStmt = struct {
         return self.binding.parameter_descriptions;
     }
 
+    pub fn statementKind(self: *const PreparedStmt) frontend.stmt.StatementKind {
+        return self.binding.statement_kind;
+    }
+
+    pub fn rowsAffected(self: *const PreparedStmt) usize {
+        if (self.machine) |machine| return machine.rowsAffected();
+        return 0;
+    }
+
     pub fn tablesUsed(self: *const PreparedStmt, allocator: std.mem.Allocator) ![]TableUse {
         var uses = std.array_list.Managed(TableUse).init(allocator);
         errdefer for (uses.items) |use| allocator.free(use.name);
@@ -516,7 +525,7 @@ fn prepareNormalizedStatement(
 const CompiledPreparedExecutable = struct {
     program: bytecode.Program,
     columns: []const plan.ColumnInfo,
-    typed_query: compiler.TypedQuery,
+    typed_query: ?compiler.TypedQuery = null,
     compile_arena_ptr: *std.heap.ArenaAllocator,
 };
 
@@ -532,16 +541,100 @@ fn compilePreparedExecutable(
     errdefer compile_arena_ptr.deinit();
 
     var statement = try frontend.normalize.toAstStatementWithBindings(compile_arena_ptr.allocator(), normalized, bindings);
-    const compiled = try compiler.compileSelect(compile_arena_ptr.allocator(), engine, &statement);
-    var lowered = try codegen.buildProgram(allocator, compiled);
-    errdefer lowered.program.deinit();
-    errdefer if (lowered.columns.len != 0) allocator.free(lowered.columns);
+    switch (statement) {
+        .select => {
+            const compiled = try compiler.compileSelect(compile_arena_ptr.allocator(), engine, &statement);
+            var lowered = try codegen.buildProgram(allocator, compiled);
+            errdefer lowered.program.deinit();
+            errdefer if (lowered.columns.len != 0) allocator.free(lowered.columns);
+
+            return .{
+                .program = lowered.program,
+                .columns = lowered.columns,
+                .typed_query = compiled.typed_query,
+                .compile_arena_ptr = compile_arena_ptr,
+            };
+        },
+        .insert => |insert_stmt| return try buildInsertPreparedExecutable(allocator, compile_arena_ptr, insert_stmt),
+        else => return error.NotImplemented,
+    }
+}
+
+fn buildInsertPreparedExecutable(
+    allocator: std.mem.Allocator,
+    compile_arena_ptr: *std.heap.ArenaAllocator,
+    insert_stmt: *const ast.Insert,
+) PrepareError!CompiledPreparedExecutable {
+    const mapped = try resolveInsertColumnExprs(insert_stmt);
+    const series_id = types.seriesIdFrom(insert_stmt.series.value, "{}");
+
+    const instructions = try allocator.dupe(bytecode.Instruction, &.{
+        .{
+            .opcode = .insert_point,
+            .p1 = 0,
+            .p2 = 1,
+            .p4 = .{ .write_target = 0 },
+            .comment = insert_stmt.series.value,
+        },
+        .{ .opcode = .halt },
+    });
+    errdefer allocator.free(instructions);
+
+    const exprs = try allocator.dupe(*const ast.Expr, &.{ mapped.time_expr, mapped.value_expr });
+    errdefer allocator.free(exprs);
+
+    const write_targets = try allocator.dupe(bytecode.WriteTarget, &.{.{
+        .series_id = series_id,
+        .series_name = insert_stmt.series.value,
+        .tags_json = "{}",
+    }});
+    errdefer allocator.free(write_targets);
 
     return .{
-        .program = lowered.program,
-        .columns = lowered.columns,
-        .typed_query = compiled.typed_query,
+        .program = .{
+            .allocator = allocator,
+            .instructions = instructions,
+            .exprs = exprs,
+            .write_targets = write_targets,
+            .register_count = 1,
+            .source_name = "prepared_insert",
+        },
+        .columns = &.{},
+        .typed_query = null,
         .compile_arena_ptr = compile_arena_ptr,
+    };
+}
+
+const InsertExprMapping = struct {
+    time_expr: *const ast.Expr,
+    value_expr: *const ast.Expr,
+};
+
+fn resolveInsertColumnExprs(insert_stmt: *const ast.Insert) PrepareError!InsertExprMapping {
+    if (insert_stmt.values.len != 2) return error.NotImplemented;
+    if (insert_stmt.columns.len == 0) {
+        return .{
+            .time_expr = insert_stmt.values[0],
+            .value_expr = insert_stmt.values[1],
+        };
+    }
+    if (insert_stmt.columns.len != insert_stmt.values.len) return error.NotImplemented;
+
+    var time_expr: ?*const ast.Expr = null;
+    var value_expr: ?*const ast.Expr = null;
+    for (insert_stmt.columns, insert_stmt.values) |column, expr| {
+        const tail = trailingSegment(column.value);
+        if (std.ascii.eqlIgnoreCase(tail, "time")) {
+            time_expr = expr;
+        } else if (std.ascii.eqlIgnoreCase(tail, "value")) {
+            value_expr = expr;
+        } else {
+            return error.NotImplemented;
+        }
+    }
+    return .{
+        .time_expr = time_expr orelse return error.NotImplemented,
+        .value_expr = value_expr orelse return error.NotImplemented,
     };
 }
 
@@ -1472,6 +1565,57 @@ test "prepareSqlCore handles logical predicates through generated frontend cover
     try std.testing.expectEqual(@as(i64, 20), row.row[0].integer);
     try std.testing.expectApproxEqAbs(@as(f64, 3.0), try row.row[1].asFloat(), 1e-9);
     try std.testing.expect((try stmt.step()) == .done);
+}
+
+test "prepared statement executes parameterized inserts through the VM" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-insert", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .legacy,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    var stmt = try prepareSqlCore(alloc, engine, "INSERT INTO writes.room1(time, value) VALUES ($1, $2)", .{});
+    defer stmt.finalize();
+
+    try std.testing.expectEqual(frontend.stmt.StatementKind.insert, stmt.statementKind());
+    try std.testing.expectEqual(@as(usize, 0), (try stmt.describeColumns()).len);
+    try std.testing.expectEqual(@as(usize, 2), (try stmt.describeParameters()).len);
+    try std.testing.expectEqual(@as(usize, 0), stmt.rowsAffected());
+    try std.testing.expectError(error.UnboundParameter, stmt.step());
+
+    try stmt.bindPositional(1, .{ .integer = 10 });
+    try stmt.bindPositional(2, .{ .float = 4.5 });
+    try std.testing.expect((try stmt.step()) == .done);
+    try std.testing.expectEqual(@as(usize, 1), stmt.rowsAffected());
+
+    const sid = @import("../types.zig").seriesIdFrom("writes.room1", "{}");
+    try waitForQueryablePoints(alloc, engine, sid, 1, 1_000);
+
+    var points = std.array_list.Managed(@import("../types.zig").Point).init(alloc);
+    defer points.deinit();
+    try engine.queryRange(sid, std.math.minInt(i64), std.math.maxInt(i64), &points);
+    try std.testing.expectEqual(@as(usize, 1), points.items.len);
+    try std.testing.expectEqual(@as(i64, 10), points.items[0].ts);
+    try std.testing.expectApproxEqAbs(@as(f64, 4.5), points.items[0].value, 1e-9);
 }
 
 test "binding context tracks named parameter slots" {

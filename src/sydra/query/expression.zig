@@ -53,11 +53,26 @@ pub fn evaluateRowBoolean(expr: *const ast.Expr, ctx: *const RowContext) EvalErr
     return evaluateBoolean(expr, &resolver);
 }
 
+pub fn evaluateConstant(expr: *const ast.Expr) EvalError!Value {
+    const resolver = constantResolver();
+    return evaluate(expr, &resolver);
+}
+
 pub fn rowResolver(ctx: *const RowContext) Resolver {
     return Resolver{
         .context = ctx,
         .getIdentifier = rowGetIdentifier,
         .evalCall = rowEvalCall,
+    };
+}
+
+const constant_context: u8 = 0;
+
+pub fn constantResolver() Resolver {
+    return Resolver{
+        .context = &constant_context,
+        .getIdentifier = constantGetIdentifier,
+        .evalCall = constantEvalCall,
     };
 }
 
@@ -81,6 +96,14 @@ fn rowGetIdentifier(ctx_ptr: *const anyopaque, ident: ast.Identifier) EvalError!
 
 fn rowEvalCall(ctx_ptr: *const anyopaque, call: ast.Call, resolver: *const Resolver) EvalError!Value {
     _ = ctx_ptr;
+    return evaluateScalarCall(call, resolver);
+}
+
+fn constantGetIdentifier(_: *const anyopaque, _: ast.Identifier) EvalError!Value {
+    return EvalError.UnsupportedExpression;
+}
+
+fn constantEvalCall(_: *const anyopaque, call: ast.Call, resolver: *const Resolver) EvalError!Value {
     return evaluateScalarCall(call, resolver);
 }
 
@@ -133,6 +156,10 @@ fn evaluateBinary(binary: ast.Binary, resolver: *const Resolver) EvalError!Value
 }
 
 fn evaluateScalarCall(call: ast.Call, resolver: *const Resolver) EvalError!Value {
+    if (std.ascii.eqlIgnoreCase(call.callee.value, "now")) {
+        if (call.args.len != 0) return EvalError.UnsupportedExpression;
+        return Value{ .integer = std.time.timestamp() };
+    }
     if (std.ascii.eqlIgnoreCase(call.callee.value, "time_bucket")) {
         return evalTimeBucket(call, resolver);
     }
