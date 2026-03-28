@@ -890,7 +890,11 @@ pub const Engine = struct {
             self.metadata.cas_index_mu.lock();
             defer self.metadata.cas_index_mu.unlock();
             if (self.metadata.cas_index) |*index| {
-                try collectSegmentHighwater(&highwater, index.snapshot.segment_descriptors);
+                if (index.snapshot.checkpoint_state.highwaters.len != 0) {
+                    try collectCheckpointHighwater(&highwater, index.snapshot.checkpoint_state.highwaters);
+                } else {
+                    try collectSegmentHighwater(&highwater, index.snapshot.segment_descriptors);
+                }
             } else {
                 try collectSegmentHighwater(&highwater, self.metadata.manifest.entries.items);
             }
@@ -948,32 +952,29 @@ pub const Engine = struct {
         }
     }
 
+    fn collectCheckpointHighwater(highwater: *std.AutoHashMap(types.SeriesId, i64), entries: []const cas_mod.CheckpointSeriesHighwater) !void {
+        for (entries) |entry| {
+            const gop = try highwater.getOrPut(entry.series_id);
+            if (!gop.found_existing or entry.highwater_ts > gop.value_ptr.*) {
+                gop.value_ptr.* = entry.highwater_ts;
+            }
+        }
+    }
+
     fn replayRecoveryWalFromCas(self: *Engine, ctx: anytype) !bool {
         self.metadata.cas_index_mu.lock();
         defer self.metadata.cas_index_mu.unlock();
         const index = if (self.metadata.cas_index) |*snapshot_index| snapshot_index else return false;
         const cas = if (self.cas) |*cas_manager| cas_manager else return false;
 
-        for (index.snapshot.wal_index.entries) |entry| {
-            if (entry.contentRef()) |content| {
-                switch (content) {
-                    .blob => |content_id| {
-                        const loaded = try cas.store.get(self.alloc, content_id);
-                        defer self.alloc.free(loaded.payload);
-                        if (loaded.obj_type != .blob) return error.InvalidWalChunkObject;
-                        const captured_len = @min(loaded.payload.len, @as(usize, @intCast(entry.captured_bytes)));
-                        try wal_mod.replayBytes(self.alloc, loaded.payload[0..captured_len], ctx);
-                    },
-                    .extent_tree => |tree| {
-                        const bytes = try extents.readAll(self.alloc, &cas.store, tree);
-                        defer self.alloc.free(bytes);
-                        const captured_len = @min(bytes.len, @as(usize, @intCast(entry.captured_bytes)));
-                        try wal_mod.replayBytes(self.alloc, bytes[0..captured_len], ctx);
-                    },
-                }
-            } else if (entry.mirrorName().len != 0) {
-                const single = [_][]const u8{entry.mirrorName()};
-                try self.wal.replayFiles(self.alloc, single[0..], ctx);
+        if (index.snapshot.checkpoint_state.wal_entries.len != 0) {
+            for (index.snapshot.checkpoint_state.wal_entries) |checkpoint_entry| {
+                const entry = findWalEntry(index.snapshot.wal_index.entries, checkpoint_entry.name) orelse continue;
+                try self.replayCapturedWalEntry(&cas.store, entry, checkpoint_entry.captured_bytes, ctx);
+            }
+        } else {
+            for (index.snapshot.wal_index.entries) |entry| {
+                try self.replayCapturedWalEntry(&cas.store, entry, entry.captured_bytes, ctx);
             }
         }
 
@@ -989,6 +990,16 @@ pub const Engine = struct {
                     error.FileNotFound => continue,
                     else => return err,
                 };
+
+                if (entry.journalRoot()) |journal_root| {
+                    if (stat.size > entry.captured_bytes and try wal_mod.journalPrefixMatchesFile(self.alloc, self.data_dir, &cas.store, path, journal_root, entry.captured_bytes)) {
+                        try self.wal.replayFileFromOffset(self.alloc, name, entry.captured_bytes, ctx);
+                        continue;
+                    }
+                    if (stat.size == entry.captured_bytes and try wal_mod.journalPrefixMatchesFile(self.alloc, self.data_dir, &cas.store, path, journal_root, entry.captured_bytes)) {
+                        continue;
+                    }
+                }
 
                 if (entry.contentRef()) |content| {
                     switch (content) {
@@ -1026,6 +1037,37 @@ pub const Engine = struct {
             try self.wal.replayFiles(self.alloc, single[0..], ctx);
         }
         return true;
+    }
+
+    fn replayCapturedWalEntry(self: *Engine, store: *object_store.ObjectStore, entry: cas_mod.WalChunkDescriptor, captured_bytes: u64, ctx: anytype) !void {
+        if (entry.journalRoot()) |journal_root| {
+            try wal_mod.replayJournalRoot(self.alloc, store, journal_root, captured_bytes, ctx);
+            return;
+        }
+
+        if (entry.contentRef()) |content| {
+            switch (content) {
+                .blob => |content_id| {
+                    const loaded = try store.get(self.alloc, content_id);
+                    defer self.alloc.free(loaded.payload);
+                    if (loaded.obj_type != .blob) return error.InvalidWalChunkObject;
+                    const captured_len = @min(loaded.payload.len, @as(usize, @intCast(captured_bytes)));
+                    try wal_mod.replayBytes(self.alloc, loaded.payload[0..captured_len], ctx);
+                },
+                .extent_tree => |tree| {
+                    const bytes = try extents.readAll(self.alloc, store, tree);
+                    defer self.alloc.free(bytes);
+                    const captured_len = @min(bytes.len, @as(usize, @intCast(captured_bytes)));
+                    try wal_mod.replayBytes(self.alloc, bytes[0..captured_len], ctx);
+                },
+            }
+            return;
+        }
+
+        if (entry.mirrorName().len != 0) {
+            const single = [_][]const u8{entry.mirrorName()};
+            try self.wal.replayFiles(self.alloc, single[0..], ctx);
+        }
     }
 
     fn recoveryWalFiles(self: *Engine) !?[][]u8 {

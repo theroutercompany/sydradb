@@ -358,6 +358,30 @@ pub fn replayJournalRoot(
     captured_bytes: u64,
     ctx: anytype,
 ) !void {
+    const journal_bytes = try readJournalBytes(alloc, store, root_id, captured_bytes);
+    defer alloc.free(journal_bytes);
+    try replayBytes(alloc, journal_bytes, ctx);
+}
+
+pub fn journalPrefixMatchesFile(
+    alloc: std.mem.Allocator,
+    data_dir: std.fs.Dir,
+    store: *object_store.ObjectStore,
+    path: []const u8,
+    root_id: object_store.ObjectId,
+    captured_bytes: u64,
+) !bool {
+    const journal_bytes = try readJournalBytes(alloc, store, root_id, captured_bytes);
+    defer alloc.free(journal_bytes);
+    return try filePrefixMatches(data_dir, path, journal_bytes);
+}
+
+fn readJournalBytes(
+    alloc: std.mem.Allocator,
+    store: *object_store.ObjectStore,
+    root_id: object_store.ObjectId,
+    captured_bytes: u64,
+) ![]u8 {
     var root_tree = try loadTreeObject(alloc, store, root_id);
     defer root_tree.deinit(alloc);
 
@@ -379,13 +403,20 @@ pub fn replayJournalRoot(
     defer frames_tree.deinit(alloc);
     if (frames_tree.entries.len != frame_index.entries.len) return error.CorruptJournalRoot;
 
+    var bytes = std.array_list.Managed(u8).init(alloc);
+    errdefer bytes.deinit();
+
+    var appended_bytes: u64 = 0;
     for (frame_index.entries, frames_tree.entries) |entry, frame_tree_entry| {
         if (entry.offset + entry.size_bytes > captured_bytes) break;
         if (frame_tree_entry.object_type != .blob) return error.InvalidJournalFrameObject;
         const frame_payload = try loadBlobObject(alloc, store, frame_tree_entry.object_id);
         defer alloc.free(frame_payload);
-        try replayBytes(alloc, frame_payload, ctx);
+        try bytes.appendSlice(frame_payload);
+        appended_bytes += frame_payload.len;
     }
+    if (appended_bytes != captured_bytes) return error.CorruptJournalRoot;
+    return try bytes.toOwnedSlice();
 }
 
 fn replayReader(alloc: std.mem.Allocator, reader: anytype, ctx: anytype) !void {
