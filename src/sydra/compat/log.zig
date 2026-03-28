@@ -1,10 +1,11 @@
 const std = @import("std");
 const stats = @import("stats.zig");
+const AtomicU64 = @import("../atomic_util.zig").AtomicU64;
 
 pub const Recorder = struct {
     enabled: bool = true,
     sample_every: u32 = 1,
-    counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    counter: AtomicU64 = AtomicU64.init(0),
 
     pub fn shouldRecord(self: *Recorder) bool {
         if (!self.enabled) return false;

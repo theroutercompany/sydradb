@@ -1,4 +1,5 @@
 const std = @import("std");
+const AtomicU64 = @import("../atomic_util.zig").AtomicU64;
 
 pub const Snapshot = struct {
     translations: u64,
@@ -7,9 +8,9 @@ pub const Snapshot = struct {
 };
 
 pub const Stats = struct {
-    translation_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    fallback_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
-    cache_hit_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    translation_count: AtomicU64 = AtomicU64.init(0),
+    fallback_count: AtomicU64 = AtomicU64.init(0),
+    cache_hit_count: AtomicU64 = AtomicU64.init(0),
 
     pub fn noteTranslation(self: *Stats) void {
         _ = self.translation_count.fetchAdd(1, .seq_cst);
