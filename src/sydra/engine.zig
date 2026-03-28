@@ -77,6 +77,20 @@ pub const Engine = struct {
             self.cas_index = try cas.loadHeadIndex();
         }
 
+        pub fn refreshCasIndexIfStale(self: *MetadataState, cas: *cas_mod.CasManager) !void {
+            const head = try cas.refs.readHead(cas_mod.main_ref) orelse {
+                if (self.cas_index) |*index| {
+                    index.deinit();
+                    self.cas_index = null;
+                }
+                return;
+            };
+            if (self.cas_index) |*index| {
+                if (index.snapshot.commit_id.eql(head)) return;
+            }
+            try self.refreshCasIndex(cas);
+        }
+
         fn legacyView(self: *MetadataState) MetadataView {
             return .{ .legacy = self };
         }
@@ -752,6 +766,9 @@ pub const Engine = struct {
     }
 
     pub fn compactNow(self: *Engine) !bool {
+        if (self.cas) |*cas| {
+            try self.metadata.refreshCasIndexIfStale(cas);
+        }
         const changed = if (self.metadata.cas_index != null and self.cas != null)
             try compactCasBackedSegments(self)
         else
