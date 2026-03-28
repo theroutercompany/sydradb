@@ -45,6 +45,21 @@ pub const BindingContext = struct {
         return self.parameters.len;
     }
 
+    pub fn maxParameterSlot(self: @This()) ParameterSlot {
+        var max_slot: ParameterSlot = 0;
+        for (self.parameters) |binding| {
+            if (binding.slot > max_slot) max_slot = binding.slot;
+        }
+        return max_slot;
+    }
+
+    pub fn hasSlot(self: @This(), slot: ParameterSlot) bool {
+        for (self.parameters) |binding| {
+            if (binding.slot == slot) return true;
+        }
+        return false;
+    }
+
     pub fn slotForNamed(self: @This(), name: []const u8) ?ParameterSlot {
         for (self.named_parameters) |binding| {
             if (std.mem.eql(u8, binding.name, name)) return binding.slot;
@@ -88,11 +103,15 @@ pub const PreparedStmt = struct {
     typed_query: ?compiler.TypedQuery = null,
     owned_columns: bool = false,
     arena_ptr: ?*std.heap.ArenaAllocator = null,
+    compile_arena_ptr: ?*std.heap.ArenaAllocator = null,
+    bound_values: []?value_mod.Value = &.{},
+    needs_compile: bool = false,
     machine: ?vm.VirtualMachine = null,
     finalized: bool = false,
 
     pub fn step(self: *PreparedStmt) StepError!StepResult {
         if (self.finalized) return error.Finalized;
+        try self.ensureCompiled();
         if (self.machine) |*machine| {
             return switch (try machine.step()) {
                 .row => |row| .{ .row = row },
@@ -106,22 +125,47 @@ pub const PreparedStmt = struct {
         if (self.machine) |*machine| machine.reset();
     }
 
+    pub fn bindPositional(self: *PreparedStmt, slot: ParameterSlot, value: value_mod.Value) BindError!void {
+        if (self.finalized) return error.Finalized;
+        if (slot == 0 or slot > self.bound_values.len) return error.InvalidSlot;
+        if (!self.binding.hasSlot(slot)) return error.InvalidSlot;
+        try self.replaceBoundValue(slot - 1, value);
+        self.invalidateCompiledState();
+    }
+
+    pub fn bindNamed(self: *PreparedStmt, name: []const u8, value: value_mod.Value) BindError!void {
+        if (self.finalized) return error.Finalized;
+        const slot = self.binding.slotForNamed(name) orelse return error.UnknownParameter;
+        try self.replaceBoundValue(slot - 1, value);
+        self.invalidateCompiledState();
+    }
+
+    pub fn clearBindings(self: *PreparedStmt) void {
+        for (self.bound_values) |*slot| {
+            freeBoundValueStorage(self.allocator, slot.*);
+            slot.* = null;
+        }
+        self.invalidateCompiledState();
+    }
+
     pub fn finalize(self: *PreparedStmt) void {
         if (self.finalized) return;
-        if (self.machine) |*machine| machine.deinit();
-        self.program.deinit();
-        if (self.owned_columns and self.columns.len != 0) {
-            self.allocator.free(self.columns);
-        }
+        self.clearCompiledState();
         if (self.arena_ptr) |arena_ptr| {
             arena_ptr.deinit();
             self.allocator.destroy(arena_ptr);
+        }
+        if (self.bound_values.len != 0) {
+            for (self.bound_values) |value| freeBoundValueStorage(self.allocator, value);
+            self.allocator.free(self.bound_values);
         }
         if (self.binding.diagnostics.len != 0) self.allocator.free(self.binding.diagnostics);
         self.finalized = true;
     }
 
-    pub fn explainBytecode(self: *PreparedStmt, allocator: std.mem.Allocator) ![]bytecode.DisassemblyLine {
+    pub fn explainBytecode(self: *PreparedStmt, allocator: std.mem.Allocator) ExplainError![]bytecode.DisassemblyLine {
+        if (self.finalized) return error.Finalized;
+        try self.ensureCompiled();
         return try bytecode.disassemble(allocator, self.program);
     }
 
@@ -142,6 +186,62 @@ pub const PreparedStmt = struct {
 
         return try uses.toOwnedSlice();
     }
+
+    fn ensureCompiled(self: *PreparedStmt) PrepareError!void {
+        if (!self.needs_compile and self.machine != null) return;
+        var compiled = try compilePreparedExecutable(
+            self.allocator,
+            self.engine,
+            self.normalized,
+            self.bound_values,
+        );
+        errdefer {
+            compiled.program.deinit();
+            if (compiled.columns.len != 0) self.allocator.free(compiled.columns);
+            compiled.compile_arena_ptr.deinit();
+            self.allocator.destroy(compiled.compile_arena_ptr);
+        }
+
+        var machine = try vm.VirtualMachine.init(self.allocator, self.engine, &compiled.program);
+        errdefer machine.deinit();
+
+        self.clearCompiledState();
+        self.program = compiled.program;
+        self.columns = compiled.columns;
+        self.typed_query = compiled.typed_query;
+        self.owned_columns = true;
+        self.compile_arena_ptr = compiled.compile_arena_ptr;
+        self.machine = machine;
+        self.needs_compile = false;
+    }
+
+    fn replaceBoundValue(self: *PreparedStmt, slot_idx: usize, value: value_mod.Value) BindError!void {
+        freeBoundValueStorage(self.allocator, self.bound_values[slot_idx]);
+        self.bound_values[slot_idx] = try cloneBoundValue(self.allocator, value);
+    }
+
+    fn invalidateCompiledState(self: *PreparedStmt) void {
+        self.clearCompiledState();
+        self.needs_compile = self.binding.parameterCount() != 0;
+    }
+
+    fn clearCompiledState(self: *PreparedStmt) void {
+        if (self.machine) |*machine| machine.deinit();
+        self.machine = null;
+        self.program.deinit();
+        self.program = emptyProgram(self.allocator);
+        if (self.owned_columns and self.columns.len != 0) {
+            self.allocator.free(self.columns);
+        }
+        self.columns = &.{};
+        self.owned_columns = false;
+        if (self.compile_arena_ptr) |arena_ptr| {
+            arena_ptr.deinit();
+            self.allocator.destroy(arena_ptr);
+        }
+        self.compile_arena_ptr = null;
+        self.typed_query = null;
+    }
 };
 
 pub const PrepareError = std.mem.Allocator.Error || lexer.LexError || parser.ParseError || compiler.CompileError || frontend.normalize.NormalizeError || error{
@@ -150,9 +250,19 @@ pub const PrepareError = std.mem.Allocator.Error || lexer.LexError || parser.Par
     InvalidTrace,
 } || codegen.CodegenError;
 
-pub const StepError = vm.VmError || error{
+pub const StepError = vm.VmError || PrepareError || error{
     NotImplemented,
     Finalized,
+};
+
+pub const ExplainError = PrepareError || error{
+    Finalized,
+};
+
+pub const BindError = std.mem.Allocator.Error || error{
+    Finalized,
+    InvalidSlot,
+    UnknownParameter,
 };
 
 pub fn freeTableUses(allocator: std.mem.Allocator, uses: []TableUse) void {
@@ -297,11 +407,13 @@ fn prepareNormalizedStatement(
     normalized: NormalizedStmt,
     arena_ptr: *std.heap.ArenaAllocator,
 ) PrepareError!PreparedStmt {
-    var statement = try frontend.normalize.toAstStatement(arena_ptr.allocator(), normalized);
-    const compiled = try compiler.compileSelect(arena_ptr.allocator(), engine, &statement);
-    var lowered = try codegen.buildProgram(allocator, compiled);
-    errdefer lowered.program.deinit();
-    errdefer if (lowered.columns.len != 0) allocator.free(lowered.columns);
+    const max_slot = binding.maxParameterSlot();
+    var bound_values: []?value_mod.Value = &.{};
+    if (max_slot != 0) {
+        bound_values = try allocator.alloc(?value_mod.Value, max_slot);
+        for (bound_values) |*slot| slot.* = null;
+    }
+    errdefer if (max_slot != 0) allocator.free(bound_values);
 
     var stmt = PreparedStmt{
         .allocator = allocator,
@@ -310,15 +422,70 @@ fn prepareNormalizedStatement(
         .source_text = binding.source_text,
         .flags = flags,
         .binding = binding,
+        .program = emptyProgram(allocator),
+        .columns = &.{},
+        .normalized = normalized,
+        .arena_ptr = arena_ptr,
+        .bound_values = bound_values,
+        .needs_compile = binding.parameterCount() != 0,
+    };
+    if (!stmt.needs_compile) {
+        try stmt.ensureCompiled();
+    }
+    return stmt;
+}
+
+const CompiledPreparedExecutable = struct {
+    program: bytecode.Program,
+    columns: []const plan.ColumnInfo,
+    typed_query: compiler.TypedQuery,
+    compile_arena_ptr: *std.heap.ArenaAllocator,
+};
+
+fn compilePreparedExecutable(
+    allocator: std.mem.Allocator,
+    engine: *engine_mod.Engine,
+    normalized: NormalizedStmt,
+    bindings: []const ?value_mod.Value,
+) PrepareError!CompiledPreparedExecutable {
+    const compile_arena_ptr = try allocator.create(std.heap.ArenaAllocator);
+    errdefer allocator.destroy(compile_arena_ptr);
+    compile_arena_ptr.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer compile_arena_ptr.deinit();
+
+    var statement = try frontend.normalize.toAstStatementWithBindings(compile_arena_ptr.allocator(), normalized, bindings);
+    const compiled = try compiler.compileSelect(compile_arena_ptr.allocator(), engine, &statement);
+    var lowered = try codegen.buildProgram(allocator, compiled);
+    errdefer lowered.program.deinit();
+    errdefer if (lowered.columns.len != 0) allocator.free(lowered.columns);
+
+    return .{
         .program = lowered.program,
         .columns = lowered.columns,
-        .normalized = normalized,
         .typed_query = compiled.typed_query,
-        .owned_columns = true,
-        .arena_ptr = arena_ptr,
+        .compile_arena_ptr = compile_arena_ptr,
     };
-    stmt.machine = try vm.VirtualMachine.init(allocator, engine, &stmt.program);
-    return stmt;
+}
+
+fn emptyProgram(allocator: std.mem.Allocator) bytecode.Program {
+    return .{
+        .allocator = allocator,
+        .instructions = &.{},
+    };
+}
+
+fn cloneBoundValue(allocator: std.mem.Allocator, value: value_mod.Value) std.mem.Allocator.Error!value_mod.Value {
+    return switch (value) {
+        .string => |text| .{ .string = try allocator.dupe(u8, text) },
+        else => value,
+    };
+}
+
+fn freeBoundValueStorage(allocator: std.mem.Allocator, value: ?value_mod.Value) void {
+    if (value) |bound| switch (bound) {
+        .string => |text| allocator.free(text),
+        else => {},
+    };
 }
 
 fn appendFrontendStatementTableUses(
@@ -906,6 +1073,99 @@ test "binding context tracks named parameter slots" {
     try std.testing.expectEqual(@as(usize, 2), binding.parameterCount());
     try std.testing.expectEqual(@as(?ParameterSlot, 2), binding.slotForNamed("cap"));
     try std.testing.expectEqual(@as(?ParameterSlot, null), binding.slotForNamed("missing"));
+}
+
+test "prepared statement binds positional parameters before lazy compilation" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-positional-bind", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .legacy,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    const sid = @import("../types.zig").seriesIdFrom("bind.room1", "{}");
+    try engine.registerSeries("bind.room1", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.0, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 20, .value = 2.0, .tags_json = "{}" });
+    try waitForQueryablePoints(alloc, engine, sid, 2, 1_000);
+
+    var stmt = try prepareSqlCore(alloc, engine, "SELECT time, value FROM bind.room1 WHERE time >= $1 ORDER BY time ASC LIMIT 1", .{});
+    defer stmt.finalize();
+    try std.testing.expectEqual(@as(usize, 1), stmt.binding.parameterCount());
+    try std.testing.expectError(error.UnboundParameter, stmt.step());
+
+    try stmt.bindPositional(1, .{ .integer = 15 });
+    const row = try stmt.step();
+    try std.testing.expect(row == .row);
+    try std.testing.expectEqual(@as(i64, 20), row.row[0].integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), try row.row[1].asFloat(), 1e-9);
+    try std.testing.expect((try stmt.step()) == .done);
+}
+
+test "prepared statement binds named parameters and clears bindings" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-named-bind", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .legacy,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    const sid = @import("../types.zig").seriesIdFrom("bind.named", "{}");
+    try engine.registerSeries("bind.named", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.0, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 20, .value = 3.0, .tags_json = "{}" });
+    try waitForQueryablePoints(alloc, engine, sid, 2, 1_000);
+
+    var stmt = try prepareSqlCore(alloc, engine, "SELECT time, value FROM bind.named WHERE value >= :min ORDER BY time ASC LIMIT 1", .{});
+    defer stmt.finalize();
+    try std.testing.expectEqual(@as(?ParameterSlot, 1), stmt.binding.slotForNamed("min"));
+    try stmt.bindNamed("min", .{ .float = 2.0 });
+
+    const row = try stmt.step();
+    try std.testing.expect(row == .row);
+    try std.testing.expectEqual(@as(i64, 20), row.row[0].integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), try row.row[1].asFloat(), 1e-9);
+    try std.testing.expect((try stmt.step()) == .done);
+
+    stmt.reset();
+    stmt.clearBindings();
+    try std.testing.expectError(error.UnboundParameter, stmt.step());
 }
 
 test "covered SQL and sydraql normalize to the same canonical statement shape" {

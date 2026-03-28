@@ -3,6 +3,7 @@ const std = @import("std");
 const ast = @import("../ast.zig");
 const common = @import("../common.zig");
 const stmt_mod = @import("stmt.zig");
+const value_mod = @import("../value.zig");
 
 pub const ParameterSlot = usize;
 
@@ -163,6 +164,7 @@ pub const NormalizedStmt = struct {
 
 pub const NormalizeError = std.mem.Allocator.Error || error{
     UnsupportedParameter,
+    UnboundParameter,
     InvalidInsertColumn,
     UnsupportedAstStatement,
     UnsupportedAstExpression,
@@ -205,11 +207,19 @@ pub fn frontendStmtFromAstStatement(allocator: std.mem.Allocator, statement: *co
 }
 
 pub fn toAstStatement(allocator: std.mem.Allocator, normalized: NormalizedStmt) NormalizeError!ast.Statement {
+    return toAstStatementWithBindings(allocator, normalized, &[_]?value_mod.Value{});
+}
+
+pub fn toAstStatementWithBindings(
+    allocator: std.mem.Allocator,
+    normalized: NormalizedStmt,
+    bindings: []const ?value_mod.Value,
+) NormalizeError!ast.Statement {
     return switch (normalized.statement) {
-        .select => |select| .{ .select = try lowerSelect(allocator, select) },
-        .insert => |insert| .{ .insert = try lowerInsert(allocator, insert) },
-        .delete => |delete| .{ .delete = try lowerDelete(allocator, delete) },
-        .explain => |explain| .{ .explain = try lowerExplain(allocator, explain) },
+        .select => |select| .{ .select = try lowerSelect(allocator, select, normalized.parameters, normalized.named_parameters, bindings) },
+        .insert => |insert| .{ .insert = try lowerInsert(allocator, insert, normalized.parameters, normalized.named_parameters, bindings) },
+        .delete => |delete| .{ .delete = try lowerDelete(allocator, delete, normalized.parameters, normalized.named_parameters, bindings) },
+        .explain => |explain| .{ .explain = try lowerExplain(allocator, explain, normalized.parameters, normalized.named_parameters, bindings) },
     };
 }
 
@@ -648,11 +658,17 @@ fn parseExplicitIndex(raw: []const u8) ?u32 {
     return std.fmt.parseUnsigned(u32, payload, 10) catch null;
 }
 
-fn lowerSelect(allocator: std.mem.Allocator, select: Select) NormalizeError!*const ast.Select {
+fn lowerSelect(
+    allocator: std.mem.Allocator,
+    select: Select,
+    parameters: []const ParameterBinding,
+    named_parameters: []const NamedParameterBinding,
+    bindings: []const ?value_mod.Value,
+) NormalizeError!*const ast.Select {
     const projections = try allocator.alloc(ast.Projection, select.projections.len);
     for (select.projections, 0..) |projection, idx| {
         projections[idx] = .{
-            .expr = try lowerExpr(allocator, projection.expr),
+            .expr = try lowerExpr(allocator, projection.expr, parameters, named_parameters, bindings),
             .alias = if (projection.alias) |alias| lowerIdentifier(alias) else null,
             .span = projection.span,
         };
@@ -661,7 +677,7 @@ fn lowerSelect(allocator: std.mem.Allocator, select: Select) NormalizeError!*con
     const groupings = try allocator.alloc(ast.GroupExpr, select.groupings.len);
     for (select.groupings, 0..) |grouping, idx| {
         groupings[idx] = .{
-            .expr = try lowerExpr(allocator, grouping.expr),
+            .expr = try lowerExpr(allocator, grouping.expr, parameters, named_parameters, bindings),
             .span = grouping.span,
         };
     }
@@ -669,7 +685,7 @@ fn lowerSelect(allocator: std.mem.Allocator, select: Select) NormalizeError!*con
     const ordering = try allocator.alloc(ast.OrderExpr, select.ordering.len);
     for (select.ordering, 0..) |item, idx| {
         ordering[idx] = .{
-            .expr = try lowerExpr(allocator, item.expr),
+            .expr = try lowerExpr(allocator, item.expr, parameters, named_parameters, bindings),
             .direction = switch (item.direction) {
                 .asc => .asc,
                 .desc => .desc,
@@ -682,7 +698,7 @@ fn lowerSelect(allocator: std.mem.Allocator, select: Select) NormalizeError!*con
     node.* = .{
         .projections = projections,
         .selector = if (select.selector) |selector| try lowerSelector(selector) else null,
-        .predicate = if (select.predicate) |predicate| try lowerExpr(allocator, predicate) else null,
+        .predicate = if (select.predicate) |predicate| try lowerExpr(allocator, predicate, parameters, named_parameters, bindings) else null,
         .groupings = groupings,
         .fill = null,
         .ordering = ordering,
@@ -696,7 +712,13 @@ fn lowerSelect(allocator: std.mem.Allocator, select: Select) NormalizeError!*con
     return node;
 }
 
-fn lowerInsert(allocator: std.mem.Allocator, insert: Insert) NormalizeError!*const ast.Insert {
+fn lowerInsert(
+    allocator: std.mem.Allocator,
+    insert: Insert,
+    parameters: []const ParameterBinding,
+    named_parameters: []const NamedParameterBinding,
+    bindings: []const ?value_mod.Value,
+) NormalizeError!*const ast.Insert {
     const columns = try allocator.alloc(ast.Identifier, insert.columns.len);
     for (insert.columns, 0..) |column_expr, idx| {
         columns[idx] = try lowerInsertColumn(column_expr);
@@ -704,7 +726,7 @@ fn lowerInsert(allocator: std.mem.Allocator, insert: Insert) NormalizeError!*con
 
     const values = try allocator.alloc(*const ast.Expr, insert.values.len);
     for (insert.values, 0..) |expr, idx| {
-        values[idx] = try lowerExpr(allocator, expr);
+        values[idx] = try lowerExpr(allocator, expr, parameters, named_parameters, bindings);
     }
 
     const node = try allocator.create(ast.Insert);
@@ -717,7 +739,13 @@ fn lowerInsert(allocator: std.mem.Allocator, insert: Insert) NormalizeError!*con
     return node;
 }
 
-fn lowerDelete(allocator: std.mem.Allocator, delete: Delete) NormalizeError!*const ast.Delete {
+fn lowerDelete(
+    allocator: std.mem.Allocator,
+    delete: Delete,
+    parameters: []const ParameterBinding,
+    named_parameters: []const NamedParameterBinding,
+    bindings: []const ?value_mod.Value,
+) NormalizeError!*const ast.Delete {
     const node = try allocator.create(ast.Delete);
     node.* = .{
         .selector = .{
@@ -725,15 +753,25 @@ fn lowerDelete(allocator: std.mem.Allocator, delete: Delete) NormalizeError!*con
             .tag_filter = null,
             .span = delete.target.span,
         },
-        .predicate = if (delete.predicate) |predicate| try lowerExpr(allocator, predicate) else null,
+        .predicate = if (delete.predicate) |predicate| try lowerExpr(allocator, predicate, parameters, named_parameters, bindings) else null,
         .span = delete.span,
     };
     return node;
 }
 
-fn lowerExplain(allocator: std.mem.Allocator, explain: Explain) NormalizeError!*const ast.Explain {
+fn lowerExplain(
+    allocator: std.mem.Allocator,
+    explain: Explain,
+    parameters: []const ParameterBinding,
+    named_parameters: []const NamedParameterBinding,
+    bindings: []const ?value_mod.Value,
+) NormalizeError!*const ast.Explain {
     const target_stmt = try allocator.create(ast.Statement);
-    target_stmt.* = try toAstStatement(allocator, .{ .statement = explain.target.* });
+    target_stmt.* = try toAstStatementWithBindings(allocator, .{
+        .statement = explain.target.*,
+        .parameters = parameters,
+        .named_parameters = named_parameters,
+    }, bindings);
 
     const node = try allocator.create(ast.Explain);
     node.* = .{
@@ -761,7 +799,13 @@ fn lowerSelector(selector: Selector) NormalizeError!ast.Selector {
     };
 }
 
-fn lowerExpr(allocator: std.mem.Allocator, expr: *const Expr) NormalizeError!*const ast.Expr {
+fn lowerExpr(
+    allocator: std.mem.Allocator,
+    expr: *const Expr,
+    parameters: []const ParameterBinding,
+    named_parameters: []const NamedParameterBinding,
+    bindings: []const ?value_mod.Value,
+) NormalizeError!*const ast.Expr {
     const node = try allocator.create(ast.Expr);
     node.* = switch (expr.*) {
         .identifier => |identifier| .{ .identifier = lowerIdentifier(identifier) },
@@ -773,7 +817,7 @@ fn lowerExpr(allocator: std.mem.Allocator, expr: *const Expr) NormalizeError!*co
             .value = .{ .string = string.value },
             .span = string.span,
         } },
-        .parameter => return error.UnsupportedParameter,
+        .parameter => |parameter| .{ .literal = try literalFromBoundValue(parameters, named_parameters, bindings, parameter) },
         .comparison => |comparison| .{ .binary = .{
             .op = switch (comparison.op) {
                 .equal => .equal,
@@ -783,14 +827,14 @@ fn lowerExpr(allocator: std.mem.Allocator, expr: *const Expr) NormalizeError!*co
                 .greater => .greater,
                 .greater_equal => .greater_equal,
             },
-            .left = try lowerExpr(allocator, comparison.left),
-            .right = try lowerExpr(allocator, comparison.right),
+            .left = try lowerExpr(allocator, comparison.left, parameters, named_parameters, bindings),
+            .right = try lowerExpr(allocator, comparison.right, parameters, named_parameters, bindings),
             .span = comparison.span,
         } },
         .call => |call| blk: {
             const args = try allocator.alloc(*const ast.Expr, call.args.len);
             for (call.args, 0..) |arg, idx| {
-                args[idx] = try lowerExpr(allocator, arg);
+                args[idx] = try lowerExpr(allocator, arg, parameters, named_parameters, bindings);
             }
             break :blk .{ .call = .{
                 .callee = lowerIdentifier(call.callee),
@@ -815,6 +859,48 @@ fn lowerIdentifier(identifier: Identifier) ast.Identifier {
         .quoted = identifier.quoted,
         .span = identifier.span,
     };
+}
+
+fn literalFromBoundValue(
+    parameters: []const ParameterBinding,
+    named_parameters: []const NamedParameterBinding,
+    bindings: []const ?value_mod.Value,
+    parameter: Parameter,
+) NormalizeError!ast.Literal {
+    const slot = resolveParameterSlot(parameters, named_parameters, parameter) orelse return error.UnsupportedParameter;
+    if (slot == 0 or slot > bindings.len) return error.UnboundParameter;
+    const bound = bindings[slot - 1] orelse return error.UnboundParameter;
+    return .{
+        .value = switch (bound) {
+            .null => .null,
+            .boolean => |value| .{ .boolean = value },
+            .integer => |value| .{ .integer = value },
+            .float => |value| .{ .float = value },
+            .string => |value| .{ .string = value },
+        },
+        .span = parameter.span,
+    };
+}
+
+fn resolveParameterSlot(
+    parameters: []const ParameterBinding,
+    named_parameters: []const NamedParameterBinding,
+    parameter: Parameter,
+) ?usize {
+    if (parameter.kind == .positional) {
+        if (parseExplicitIndex(parameter.raw)) |explicit| return explicit;
+    } else {
+        const raw_name = if (parameter.raw.len > 0) parameter.raw[1..] else parameter.raw;
+        for (named_parameters) |binding| {
+            if (std.mem.eql(u8, binding.name, raw_name)) return binding.slot;
+        }
+    }
+
+    for (parameters) |binding| {
+        if (binding.kind != parameter.kind) continue;
+        if (std.mem.eql(u8, binding.raw, parameter.raw)) return binding.slot;
+    }
+    return null;
 }
 
 test "normalize frontend stmt preserves parameter inventory" {
