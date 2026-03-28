@@ -20,8 +20,6 @@ pub const CodegenResult = struct {
 
 pub fn buildProgram(allocator: std.mem.Allocator, compiled: compiler.CompiledSelect) CodegenError!CodegenResult {
     if (compiled.typed_query.is_aggregate_query) return error.UnsupportedPreparedQuery;
-    if (compiled.typed_query.ordering.len != 0) return error.UnsupportedPreparedQuery;
-    if (compiled.typed_query.select.limit != null) return error.UnsupportedPreparedQuery;
 
     if (compiled.typed_query.bound_selector == null) {
         return try buildConstantProgram(allocator, compiled);
@@ -79,9 +77,23 @@ fn buildScanProgram(allocator: std.mem.Allocator, compiled: compiler.CompiledSel
     var constants = std.array_list.Managed(value_mod.Value).init(allocator);
     errdefer constants.deinit();
 
+    var exprs = std.array_list.Managed(*const ast.Expr).init(allocator);
+    errdefer exprs.deinit();
+
     const selector = typed.bound_selector.?;
     const start_ts = if (typed.time_range.start) |bound| bound.value else std.math.minInt(i64);
     const end_ts = if (typed.time_range.end) |bound| bound.value else std.math.maxInt(i64);
+    const uses_sorter = typed.ordering.len != 0 or typed.select.limit != null;
+
+    if (uses_sorter) {
+        try instructions.append(.{
+            .opcode = .sorter_open,
+            .p1 = 0,
+            .p2 = if (typed.select.limit) |limit_clause| @intCast(limit_clause.offset orelse 0) else 0,
+            .p3 = if (typed.select.limit) |limit_clause| @intCast(limit_clause.limit) else -1,
+            .p4 = if (typed.ordering.len != 0) .{ .ordering = 0 } else .none,
+        });
+    }
     try instructions.append(.{
         .opcode = .open_series,
         .p1 = 0,
@@ -94,17 +106,43 @@ fn buildScanProgram(allocator: std.mem.Allocator, compiled: compiler.CompiledSel
     try instructions.append(.{ .opcode = .next_point, .p1 = 0, .p2 = 0 });
 
     try emitPredicate(allocator, &instructions, &constants, typed.predicate, loop_pc);
-    try emitProjectionLoads(allocator, &instructions, &constants, typed.projections);
-    try instructions.append(.{
-        .opcode = .result_row,
-        .p1 = 0,
-        .p2 = @intCast(typed.projections.len),
-        .p4 = .{ .schema = 0 },
-    });
+    try emitProjectionLoads(allocator, &instructions, &constants, &exprs, typed.projections);
+    if (uses_sorter) {
+        try instructions.append(.{
+            .opcode = .sorter_insert,
+            .p1 = 0,
+            .p2 = 0,
+            .p3 = @intCast(typed.projections.len),
+        });
+    } else {
+        try instructions.append(.{
+            .opcode = .result_row,
+            .p1 = 0,
+            .p2 = @intCast(typed.projections.len),
+            .p4 = .{ .schema = 0 },
+        });
+    }
     try instructions.append(.{ .opcode = .jump, .p2 = @intCast(loop_pc) });
 
     const done_pc = instructions.items.len;
     instructions.items[loop_pc].p2 = @intCast(done_pc);
+    if (uses_sorter) {
+        const sorter_pc = instructions.items.len;
+        try instructions.append(.{
+            .opcode = .sorter_next,
+            .p1 = 0,
+            .p2 = 0,
+            .p3 = 0,
+        });
+        try instructions.append(.{
+            .opcode = .result_row,
+            .p1 = 0,
+            .p2 = @intCast(typed.projections.len),
+            .p4 = .{ .schema = 0 },
+        });
+        try instructions.append(.{ .opcode = .jump, .p2 = @intCast(sorter_pc) });
+        instructions.items[sorter_pc].p2 = @intCast(instructions.items.len);
+    }
     try instructions.append(.{ .opcode = .halt });
 
     return .{
@@ -112,9 +150,18 @@ fn buildScanProgram(allocator: std.mem.Allocator, compiled: compiler.CompiledSel
             .allocator = allocator,
             .instructions = try instructions.toOwnedSlice(),
             .constants = try constants.toOwnedSlice(),
+            .exprs = try exprs.toOwnedSlice(),
             .selectors = try allocator.dupe(compiler.BoundSelector, &.{selector}),
             .schemas = try allocator.dupe([]const plan.ColumnInfo, &.{columns}),
+            .orderings = if (typed.ordering.len != 0)
+                try allocator.dupe([]const ast.OrderExpr, &.{typed.select.ordering})
+            else
+                &.{},
             .cursors = try allocator.dupe(bytecode.CursorDecl, &.{.{ .id = 0, .name = "series0" }}),
+            .temp_stores = if (uses_sorter)
+                try allocator.dupe(bytecode.TempStoreDecl, &.{.{ .id = 0, .name = "sorter0" }})
+            else
+                &.{},
             .register_count = @max(typed.projections.len, 3),
             .source_name = "prepared_series_scan",
         },
@@ -175,6 +222,7 @@ fn emitProjectionLoads(
     allocator: std.mem.Allocator,
     instructions: *std.array_list.Managed(bytecode.Instruction),
     constants: *std.array_list.Managed(value_mod.Value),
+    exprs: *std.array_list.Managed(*const ast.Expr),
     projections: []const compiler.TypedProjection,
 ) CodegenError!void {
     _ = allocator;
@@ -189,7 +237,15 @@ fn emitProjectionLoads(
                 try constants.append(try literalValue(projection.expr.expr));
                 try instructions.append(.{ .opcode = .load_const, .p1 = @intCast(idx), .p4 = .{ .constant = const_id } });
             },
-            else => return error.UnsupportedProjection,
+            else => {
+                const expr_id: u16 = @intCast(exprs.items.len);
+                try exprs.append(projection.expr.expr);
+                try instructions.append(.{
+                    .opcode = .function,
+                    .p1 = @intCast(idx),
+                    .p4 = .{ .expr = expr_id },
+                });
+            },
         }
     }
 }

@@ -597,6 +597,54 @@ test "prepareSydraQL compiles constant and scan statements to bytecode" {
     try std.testing.expectEqual(@as(i64, 10), first.row[0].integer);
 }
 
+test "prepared VM supports scalar ordering and limit offset" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-order-limit", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .legacy,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    const sid = @import("../types.zig").seriesIdFrom("stage3.room1", "{}");
+    try engine.registerSeries("stage3.room1", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.5, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 20, .value = 2.0, .tags_json = "{}" });
+    try waitForQueryablePoints(alloc, engine, sid, 2, 1_000);
+
+    var scalar_stmt = try prepareSydraQL(alloc, engine, "select pow(value, 2) as squared from stage3.room1 where time >= 0 order by squared desc limit 1", .{});
+    defer scalar_stmt.finalize();
+    const scalar_row = try scalar_stmt.step();
+    try std.testing.expect(scalar_row == .row);
+    try std.testing.expectApproxEqAbs(@as(f64, 4.0), try scalar_row.row[0].asFloat(), 1e-9);
+    try std.testing.expect((try scalar_stmt.step()) == .done);
+
+    var offset_stmt = try prepareSydraQL(alloc, engine, "select time, value from stage3.room1 where time >= 0 order by time asc limit 1 offset 1", .{});
+    defer offset_stmt.finalize();
+    const offset_row = try offset_stmt.step();
+    try std.testing.expect(offset_row == .row);
+    try std.testing.expectEqual(@as(i64, 20), offset_row.row[0].integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), try offset_row.row[1].asFloat(), 1e-9);
+    try std.testing.expect((try offset_stmt.step()) == .done);
+}
+
 test "prepared bytecode snapshots stay stable for constant and scan plans" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
