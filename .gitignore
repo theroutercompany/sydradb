@@ -16,3 +16,4 @@ result
 logs/
 
 bench-data-*/
+sqlcore-debug-*.zig
