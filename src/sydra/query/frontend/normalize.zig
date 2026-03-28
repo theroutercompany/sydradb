@@ -6,10 +6,136 @@ const stmt_mod = @import("stmt.zig");
 
 pub const ParameterSlot = usize;
 
+pub const Identifier = stmt_mod.Identifier;
+pub const ById = stmt_mod.ById;
+pub const LimitClause = stmt_mod.LimitClause;
+pub const OrderDirection = stmt_mod.OrderDirection;
+pub const IntegerLiteral = stmt_mod.IntegerLiteral;
+pub const StringLiteral = stmt_mod.StringLiteral;
+pub const ParameterKind = stmt_mod.ParameterKind;
+pub const Parameter = stmt_mod.Parameter;
+pub const ComparisonOp = stmt_mod.ComparisonOp;
+
+pub const Statement = union(enum) {
+    select: Select,
+    insert: Insert,
+    delete: Delete,
+    explain: Explain,
+
+    pub fn kind(self: @This()) stmt_mod.StatementKind {
+        return switch (self) {
+            .select => .select,
+            .insert => .insert,
+            .delete => .delete,
+            .explain => .explain,
+        };
+    }
+
+    pub fn span(self: @This()) common.Span {
+        return switch (self) {
+            .select => |select| select.span,
+            .insert => |insert| insert.span,
+            .delete => |delete| delete.span,
+            .explain => |explain| explain.span,
+        };
+    }
+};
+
+pub const ExplainMode = stmt_mod.ExplainMode;
+
+pub const Explain = struct {
+    mode: ExplainMode,
+    target: *const Statement,
+    span: common.Span,
+};
+
+pub const Select = struct {
+    projections: []const Projection,
+    selector: ?Selector = null,
+    predicate: ?*const Expr = null,
+    groupings: []const Grouping = &.{},
+    ordering: []const Ordering = &.{},
+    limit: ?LimitClause = null,
+    span: common.Span,
+};
+
+pub const Insert = struct {
+    target: Identifier,
+    columns: []const *const Expr = &.{},
+    values: []const *const Expr = &.{},
+    span: common.Span,
+};
+
+pub const Delete = struct {
+    target: Identifier,
+    predicate: ?*const Expr = null,
+    span: common.Span,
+};
+
+pub const Selector = struct {
+    series: SeriesRef,
+    span: common.Span,
+};
+
+pub const SeriesRef = union(enum) {
+    name: Identifier,
+    by_id: ById,
+};
+
+pub const Projection = struct {
+    expr: *const Expr,
+    alias: ?Identifier = null,
+    span: common.Span,
+};
+
+pub const Grouping = struct {
+    expr: *const Expr,
+    span: common.Span,
+};
+
+pub const Ordering = struct {
+    expr: *const Expr,
+    direction: OrderDirection = .asc,
+    span: common.Span,
+};
+
+pub const Expr = union(enum) {
+    identifier: Identifier,
+    integer: IntegerLiteral,
+    string: StringLiteral,
+    parameter: Parameter,
+    comparison: Comparison,
+    call: Call,
+
+    pub fn span(self: @This()) common.Span {
+        return switch (self) {
+            .identifier => |identifier| identifier.span,
+            .integer => |literal| literal.span,
+            .string => |literal| literal.span,
+            .parameter => |parameter| parameter.span,
+            .comparison => |comparison| comparison.span,
+            .call => |call| call.span,
+        };
+    }
+};
+
+pub const Comparison = struct {
+    op: ComparisonOp,
+    left: *const Expr,
+    right: *const Expr,
+    span: common.Span,
+};
+
+pub const Call = struct {
+    callee: Identifier,
+    args: []const *const Expr,
+    span: common.Span,
+};
+
 pub const ParameterBinding = struct {
     slot: ParameterSlot,
     raw: []const u8,
-    kind: stmt_mod.ParameterKind,
+    kind: ParameterKind,
     name: ?[]const u8 = null,
     explicit_index: ?u32 = null,
     span: common.Span,
@@ -22,7 +148,7 @@ pub const NamedParameterBinding = struct {
 };
 
 pub const NormalizedStmt = struct {
-    statement: stmt_mod.FrontendStmt,
+    statement: Statement,
     parameters: []const ParameterBinding = &.{},
     named_parameters: []const NamedParameterBinding = &.{},
 
@@ -46,18 +172,18 @@ pub const NormalizeError = std.mem.Allocator.Error || error{
 };
 
 pub fn normalizeFrontendStmt(allocator: std.mem.Allocator, stmt: stmt_mod.FrontendStmt) NormalizeError!NormalizedStmt {
-    const cloned = try cloneStatement(allocator, stmt);
+    const normalized_stmt = try normalizeStatement(allocator, stmt);
     var parameters = std.array_list.Managed(ParameterBinding).init(allocator);
     errdefer parameters.deinit();
     var named_parameters = std.array_list.Managed(NamedParameterBinding).init(allocator);
     errdefer named_parameters.deinit();
     var next_slot: usize = 1;
-    try collectStatementParameters(allocator, cloned, &parameters, &named_parameters, &next_slot);
+    try collectStatementParameters(allocator, normalized_stmt, &parameters, &named_parameters, &next_slot);
     const owned_parameters = try parameters.toOwnedSlice();
     errdefer allocator.free(owned_parameters);
     const owned_named_parameters = try named_parameters.toOwnedSlice();
     return .{
-        .statement = cloned,
+        .statement = normalized_stmt,
         .parameters = owned_parameters,
         .named_parameters = owned_named_parameters,
     };
@@ -261,37 +387,37 @@ fn foldUnaryInteger(
     } };
 }
 
-fn cloneStatement(allocator: std.mem.Allocator, stmt: stmt_mod.FrontendStmt) NormalizeError!stmt_mod.FrontendStmt {
+fn normalizeStatement(allocator: std.mem.Allocator, stmt: stmt_mod.FrontendStmt) NormalizeError!Statement {
     return switch (stmt) {
-        .select => |select| .{ .select = try cloneSelect(allocator, select) },
-        .insert => |insert| .{ .insert = try cloneInsert(allocator, insert) },
-        .delete => |delete| .{ .delete = try cloneDelete(allocator, delete) },
-        .explain => |explain| .{ .explain = try cloneExplain(allocator, explain) },
+        .select => |select| .{ .select = try normalizeSelect(allocator, select) },
+        .insert => |insert| .{ .insert = try normalizeInsert(allocator, insert) },
+        .delete => |delete| .{ .delete = try normalizeDelete(allocator, delete) },
+        .explain => |explain| .{ .explain = try normalizeExplain(allocator, explain) },
     };
 }
 
-fn cloneSelect(allocator: std.mem.Allocator, select: stmt_mod.Select) NormalizeError!stmt_mod.Select {
-    const projections = try allocator.alloc(stmt_mod.Projection, select.projections.len);
+fn normalizeSelect(allocator: std.mem.Allocator, select: stmt_mod.Select) NormalizeError!Select {
+    const projections = try allocator.alloc(Projection, select.projections.len);
     for (select.projections, 0..) |projection, idx| {
         projections[idx] = .{
-            .expr = try cloneExpr(allocator, projection.expr),
+            .expr = try normalizeExpr(allocator, projection.expr),
             .alias = if (projection.alias) |alias| try cloneIdentifier(allocator, alias) else null,
             .span = projection.span,
         };
     }
 
-    const groupings = try allocator.alloc(stmt_mod.Grouping, select.groupings.len);
+    const groupings = try allocator.alloc(Grouping, select.groupings.len);
     for (select.groupings, 0..) |grouping, idx| {
         groupings[idx] = .{
-            .expr = try cloneExpr(allocator, grouping.expr),
+            .expr = try normalizeExpr(allocator, grouping.expr),
             .span = grouping.span,
         };
     }
 
-    const ordering = try allocator.alloc(stmt_mod.Ordering, select.ordering.len);
+    const ordering = try allocator.alloc(Ordering, select.ordering.len);
     for (select.ordering, 0..) |item, idx| {
         ordering[idx] = .{
-            .expr = try cloneExpr(allocator, item.expr),
+            .expr = try normalizeExpr(allocator, item.expr),
             .direction = item.direction,
             .span = item.span,
         };
@@ -299,8 +425,8 @@ fn cloneSelect(allocator: std.mem.Allocator, select: stmt_mod.Select) NormalizeE
 
     return .{
         .projections = projections,
-        .selector = if (select.selector) |selector| try cloneSelector(allocator, selector) else null,
-        .predicate = if (select.predicate) |predicate| try cloneExpr(allocator, predicate) else null,
+        .selector = if (select.selector) |selector| try normalizeSelector(allocator, selector) else null,
+        .predicate = if (select.predicate) |predicate| try normalizeExpr(allocator, predicate) else null,
         .groupings = groupings,
         .ordering = ordering,
         .limit = select.limit,
@@ -308,12 +434,12 @@ fn cloneSelect(allocator: std.mem.Allocator, select: stmt_mod.Select) NormalizeE
     };
 }
 
-fn cloneInsert(allocator: std.mem.Allocator, insert: stmt_mod.Insert) NormalizeError!stmt_mod.Insert {
-    const columns = try allocator.alloc(*const stmt_mod.Expr, insert.columns.len);
-    for (insert.columns, 0..) |column, idx| columns[idx] = try cloneExpr(allocator, column);
+fn normalizeInsert(allocator: std.mem.Allocator, insert: stmt_mod.Insert) NormalizeError!Insert {
+    const columns = try allocator.alloc(*const Expr, insert.columns.len);
+    for (insert.columns, 0..) |column, idx| columns[idx] = try normalizeExpr(allocator, column);
 
-    const values = try allocator.alloc(*const stmt_mod.Expr, insert.values.len);
-    for (insert.values, 0..) |value, idx| values[idx] = try cloneExpr(allocator, value);
+    const values = try allocator.alloc(*const Expr, insert.values.len);
+    for (insert.values, 0..) |value, idx| values[idx] = try normalizeExpr(allocator, value);
 
     return .{
         .target = try cloneIdentifier(allocator, insert.target),
@@ -323,17 +449,17 @@ fn cloneInsert(allocator: std.mem.Allocator, insert: stmt_mod.Insert) NormalizeE
     };
 }
 
-fn cloneDelete(allocator: std.mem.Allocator, delete: stmt_mod.Delete) NormalizeError!stmt_mod.Delete {
+fn normalizeDelete(allocator: std.mem.Allocator, delete: stmt_mod.Delete) NormalizeError!Delete {
     return .{
         .target = try cloneIdentifier(allocator, delete.target),
-        .predicate = if (delete.predicate) |predicate| try cloneExpr(allocator, predicate) else null,
+        .predicate = if (delete.predicate) |predicate| try normalizeExpr(allocator, predicate) else null,
         .span = delete.span,
     };
 }
 
-fn cloneExplain(allocator: std.mem.Allocator, explain: stmt_mod.Explain) NormalizeError!stmt_mod.Explain {
-    const target = try allocator.create(stmt_mod.FrontendStmt);
-    target.* = try cloneStatement(allocator, explain.target.*);
+fn normalizeExplain(allocator: std.mem.Allocator, explain: stmt_mod.Explain) NormalizeError!Explain {
+    const target = try allocator.create(Statement);
+    target.* = try normalizeStatement(allocator, explain.target.*);
     return .{
         .mode = explain.mode,
         .target = target,
@@ -341,7 +467,7 @@ fn cloneExplain(allocator: std.mem.Allocator, explain: stmt_mod.Explain) Normali
     };
 }
 
-fn cloneSelector(allocator: std.mem.Allocator, selector: stmt_mod.Selector) NormalizeError!stmt_mod.Selector {
+fn normalizeSelector(allocator: std.mem.Allocator, selector: stmt_mod.Selector) NormalizeError!Selector {
     return .{
         .series = switch (selector.series) {
             .name => |name| .{ .name = try cloneIdentifier(allocator, name) },
@@ -351,7 +477,7 @@ fn cloneSelector(allocator: std.mem.Allocator, selector: stmt_mod.Selector) Norm
     };
 }
 
-fn cloneIdentifier(allocator: std.mem.Allocator, identifier: anytype) !stmt_mod.Identifier {
+fn cloneIdentifier(allocator: std.mem.Allocator, identifier: anytype) !Identifier {
     return .{
         .value = try allocator.dupe(u8, identifier.value),
         .quoted = identifier.quoted,
@@ -359,8 +485,8 @@ fn cloneIdentifier(allocator: std.mem.Allocator, identifier: anytype) !stmt_mod.
     };
 }
 
-fn cloneExpr(allocator: std.mem.Allocator, expr: *const stmt_mod.Expr) NormalizeError!*const stmt_mod.Expr {
-    const out = try allocator.create(stmt_mod.Expr);
+fn normalizeExpr(allocator: std.mem.Allocator, expr: *const stmt_mod.Expr) NormalizeError!*const Expr {
+    const out = try allocator.create(Expr);
     out.* = switch (expr.*) {
         .identifier => |identifier| .{ .identifier = try cloneIdentifier(allocator, identifier) },
         .integer => |integer| .{ .integer = .{
@@ -379,13 +505,13 @@ fn cloneExpr(allocator: std.mem.Allocator, expr: *const stmt_mod.Expr) Normalize
         } },
         .comparison => |comparison| .{ .comparison = .{
             .op = comparison.op,
-            .left = try cloneExpr(allocator, comparison.left),
-            .right = try cloneExpr(allocator, comparison.right),
+            .left = try normalizeExpr(allocator, comparison.left),
+            .right = try normalizeExpr(allocator, comparison.right),
             .span = comparison.span,
         } },
         .call => |call| blk: {
-            const args = try allocator.alloc(*const stmt_mod.Expr, call.args.len);
-            for (call.args, 0..) |arg, idx| args[idx] = try cloneExpr(allocator, arg);
+            const args = try allocator.alloc(*const Expr, call.args.len);
+            for (call.args, 0..) |arg, idx| args[idx] = try normalizeExpr(allocator, arg);
             break :blk .{ .call = .{
                 .callee = try cloneIdentifier(allocator, call.callee),
                 .args = args,
@@ -398,7 +524,7 @@ fn cloneExpr(allocator: std.mem.Allocator, expr: *const stmt_mod.Expr) Normalize
 
 fn collectStatementParameters(
     allocator: std.mem.Allocator,
-    stmt: stmt_mod.FrontendStmt,
+    stmt: Statement,
     parameters: *std.array_list.Managed(ParameterBinding),
     named_parameters: *std.array_list.Managed(NamedParameterBinding),
     next_slot: *usize,
@@ -423,7 +549,7 @@ fn collectStatementParameters(
 
 fn collectExprParameters(
     allocator: std.mem.Allocator,
-    expr: *const stmt_mod.Expr,
+    expr: *const Expr,
     parameters: *std.array_list.Managed(ParameterBinding),
     named_parameters: *std.array_list.Managed(NamedParameterBinding),
     next_slot: *usize,
@@ -444,7 +570,7 @@ fn collectExprParameters(
 
 fn appendParameterBinding(
     allocator: std.mem.Allocator,
-    parameter: stmt_mod.Parameter,
+    parameter: Parameter,
     parameters: *std.array_list.Managed(ParameterBinding),
     named_parameters: *std.array_list.Managed(NamedParameterBinding),
     next_slot: *usize,
@@ -490,7 +616,7 @@ fn appendParameterBinding(
 
 fn findExistingBinding(
     bindings: []ParameterBinding,
-    kind: stmt_mod.ParameterKind,
+    kind: ParameterKind,
     raw: []const u8,
     name: ?[]const u8,
     explicit_index: ?u32,
@@ -522,7 +648,7 @@ fn parseExplicitIndex(raw: []const u8) ?u32 {
     return std.fmt.parseUnsigned(u32, payload, 10) catch null;
 }
 
-fn lowerSelect(allocator: std.mem.Allocator, select: stmt_mod.Select) NormalizeError!*const ast.Select {
+fn lowerSelect(allocator: std.mem.Allocator, select: Select) NormalizeError!*const ast.Select {
     const projections = try allocator.alloc(ast.Projection, select.projections.len);
     for (select.projections, 0..) |projection, idx| {
         projections[idx] = .{
@@ -570,7 +696,7 @@ fn lowerSelect(allocator: std.mem.Allocator, select: stmt_mod.Select) NormalizeE
     return node;
 }
 
-fn lowerInsert(allocator: std.mem.Allocator, insert: stmt_mod.Insert) NormalizeError!*const ast.Insert {
+fn lowerInsert(allocator: std.mem.Allocator, insert: Insert) NormalizeError!*const ast.Insert {
     const columns = try allocator.alloc(ast.Identifier, insert.columns.len);
     for (insert.columns, 0..) |column_expr, idx| {
         columns[idx] = try lowerInsertColumn(column_expr);
@@ -591,7 +717,7 @@ fn lowerInsert(allocator: std.mem.Allocator, insert: stmt_mod.Insert) NormalizeE
     return node;
 }
 
-fn lowerDelete(allocator: std.mem.Allocator, delete: stmt_mod.Delete) NormalizeError!*const ast.Delete {
+fn lowerDelete(allocator: std.mem.Allocator, delete: Delete) NormalizeError!*const ast.Delete {
     const node = try allocator.create(ast.Delete);
     node.* = .{
         .selector = .{
@@ -605,7 +731,7 @@ fn lowerDelete(allocator: std.mem.Allocator, delete: stmt_mod.Delete) NormalizeE
     return node;
 }
 
-fn lowerExplain(allocator: std.mem.Allocator, explain: stmt_mod.Explain) NormalizeError!*const ast.Explain {
+fn lowerExplain(allocator: std.mem.Allocator, explain: Explain) NormalizeError!*const ast.Explain {
     const target_stmt = try allocator.create(ast.Statement);
     target_stmt.* = try toAstStatement(allocator, .{ .statement = explain.target.* });
 
@@ -621,7 +747,7 @@ fn lowerExplain(allocator: std.mem.Allocator, explain: stmt_mod.Explain) Normali
     return node;
 }
 
-fn lowerSelector(selector: stmt_mod.Selector) NormalizeError!ast.Selector {
+fn lowerSelector(selector: Selector) NormalizeError!ast.Selector {
     return .{
         .series = switch (selector.series) {
             .name => |identifier| .{ .name = lowerIdentifier(identifier) },
@@ -635,7 +761,7 @@ fn lowerSelector(selector: stmt_mod.Selector) NormalizeError!ast.Selector {
     };
 }
 
-fn lowerExpr(allocator: std.mem.Allocator, expr: *const stmt_mod.Expr) NormalizeError!*const ast.Expr {
+fn lowerExpr(allocator: std.mem.Allocator, expr: *const Expr) NormalizeError!*const ast.Expr {
     const node = try allocator.create(ast.Expr);
     node.* = switch (expr.*) {
         .identifier => |identifier| .{ .identifier = lowerIdentifier(identifier) },
@@ -676,14 +802,14 @@ fn lowerExpr(allocator: std.mem.Allocator, expr: *const stmt_mod.Expr) Normalize
     return node;
 }
 
-fn lowerInsertColumn(expr: *const stmt_mod.Expr) NormalizeError!ast.Identifier {
+fn lowerInsertColumn(expr: *const Expr) NormalizeError!ast.Identifier {
     return switch (expr.*) {
         .identifier => |identifier| lowerIdentifier(identifier),
         else => error.InvalidInsertColumn,
     };
 }
 
-fn lowerIdentifier(identifier: stmt_mod.Identifier) ast.Identifier {
+fn lowerIdentifier(identifier: Identifier) ast.Identifier {
     return .{
         .value = identifier.value,
         .quoted = identifier.quoted,

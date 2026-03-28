@@ -7,6 +7,7 @@ const compiler = @import("compiler.zig");
 const engine_mod = @import("../engine.zig");
 const exec = @import("exec.zig");
 const frontend = @import("frontend.zig");
+const common = @import("common.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const plan = @import("plan.zig");
@@ -34,6 +35,8 @@ pub const NormalizedStmt = frontend.normalize.NormalizedStmt;
 pub const BindingContext = struct {
     language: QueryLanguage,
     source_text: []const u8,
+    statement_kind: frontend.stmt.StatementKind,
+    statement_span: common.Span,
     diagnostics: []const frontend.diagnostics.Diagnostic = &.{},
     parameters: []const ParameterBinding = &.{},
     named_parameters: []const NamedParameterBinding = &.{},
@@ -184,6 +187,8 @@ pub fn prepareSydraQL(
         .{
             .language = .sydraql,
             .source_text = text,
+            .statement_kind = normalized.kind(),
+            .statement_span = normalized.span(),
             .diagnostics = shadow.diagnostics,
             .parameters = normalized.parameters,
             .named_parameters = normalized.named_parameters,
@@ -213,6 +218,8 @@ pub fn prepareSqlCore(
             .{
                 .language = .sql_core,
                 .source_text = text,
+                .statement_kind = normalized.kind(),
+                .statement_span = normalized.span(),
                 .diagnostics = skeleton.diagnostics,
                 .parameters = normalized.parameters,
                 .named_parameters = normalized.named_parameters,
@@ -243,6 +250,8 @@ pub fn prepareSqlCore(
         .{
             .language = .sql_core,
             .source_text = text,
+            .statement_kind = normalized.kind(),
+            .statement_span = normalized.span(),
             .diagnostics = skeleton.diagnostics,
             .parameters = normalized.parameters,
             .named_parameters = normalized.named_parameters,
@@ -355,7 +364,7 @@ fn prepareNormalizedStatement(
 fn appendFrontendStatementTableUses(
     allocator: std.mem.Allocator,
     uses: *std.array_list.Managed(TableUse),
-    statement: frontend.stmt.FrontendStmt,
+    statement: frontend.normalize.Statement,
 ) !void {
     switch (statement) {
         .select => |select| {
@@ -397,7 +406,7 @@ fn appendBoundSelectorTableUse(
 fn appendFrontendSelectorTableUse(
     allocator: std.mem.Allocator,
     uses: *std.array_list.Managed(TableUse),
-    selector: frontend.stmt.Selector,
+    selector: frontend.normalize.Selector,
 ) !void {
     switch (selector.series) {
         .name => |name| try appendTableUse(allocator, uses, .series, name.value, null),
@@ -512,6 +521,8 @@ test "prepared statement disassembles bytecode programs" {
         .binding = .{
             .language = .sydraql,
             .source_text = "select 1",
+            .statement_kind = .select,
+            .statement_span = .{ .start = 0, .end = 8 },
         },
         .normalized = .{
             .statement = .{
@@ -775,6 +786,8 @@ test "binding context tracks named parameter slots" {
     const binding: BindingContext = .{
         .language = .sql_core,
         .source_text = "SELECT value FROM weather.room1 WHERE time >= $1 AND value <= :cap",
+        .statement_kind = .select,
+        .statement_span = .{ .start = 0, .end = 61 },
         .parameters = &.{
             .{
                 .slot = 1,
@@ -799,12 +812,135 @@ test "binding context tracks named parameter slots" {
     try std.testing.expectEqual(@as(?ParameterSlot, null), binding.slotForNamed("missing"));
 }
 
+test "covered SQL and sydraql normalize to the same canonical statement shape" {
+    const alloc = std.testing.allocator;
+    const sydraql_text = "select value as reading from by_id(41) where time >= 1 limit 2 offset 1";
+    const sql_text = "SELECT value AS reading FROM by_id(41) WHERE time >= 1 LIMIT 2 OFFSET 1";
+
+    var shadow = try frontend.shadow.parseSydraqlShadow(alloc, sydraql_text);
+    defer shadow.deinit();
+
+    var skeleton = try frontend.sql_core.parseSqlCoreSkeleton(alloc, sql_text);
+    defer skeleton.deinit();
+    try std.testing.expect(skeleton.stmt != null);
+
+    const sydraql_normalized = try frontend.normalize.normalizeAstStatement(shadow.arena_ptr.allocator(), &shadow.statement);
+    const sql_normalized = try frontend.normalize.normalizeFrontendStmt(skeleton.arena_ptr.?.allocator(), skeleton.stmt.?);
+
+    try expectNormalizedStatementEqual(sydraql_normalized.statement, sql_normalized.statement);
+    try std.testing.expectEqual(@as(usize, 0), sydraql_normalized.parameters.len);
+    try std.testing.expectEqual(@as(usize, 0), sql_normalized.parameters.len);
+}
+
 fn valuesEqual(lhs: []const value_mod.Value, rhs: []const value_mod.Value) bool {
     if (lhs.len != rhs.len) return false;
     for (lhs, 0..) |value, idx| {
         if (!value_mod.Value.equals(value, rhs[idx])) return false;
     }
     return true;
+}
+
+fn expectNormalizedStatementEqual(expected: frontend.normalize.Statement, actual: frontend.normalize.Statement) !void {
+    try std.testing.expectEqual(expected.kind(), actual.kind());
+    switch (expected) {
+        .select => |lhs| {
+            try std.testing.expect(actual == .select);
+            const rhs = actual.select;
+            try std.testing.expectEqual(lhs.selector != null, rhs.selector != null);
+            if (lhs.selector) |selector| {
+                try std.testing.expect(rhs.selector != null);
+                try expectNormalizedSelectorEqual(selector, rhs.selector.?);
+            }
+            try std.testing.expectEqual(lhs.projections.len, rhs.projections.len);
+            for (lhs.projections, rhs.projections) |left, right| {
+                try expectNormalizedExprEqual(left.expr, right.expr);
+                try std.testing.expectEqual(left.alias != null, right.alias != null);
+                if (left.alias) |alias| {
+                    try std.testing.expect(right.alias != null);
+                    try std.testing.expectEqualStrings(alias.value, right.alias.?.value);
+                }
+            }
+            try std.testing.expectEqual(lhs.predicate != null, rhs.predicate != null);
+            if (lhs.predicate) |predicate| {
+                try std.testing.expect(rhs.predicate != null);
+                try expectNormalizedExprEqual(predicate, rhs.predicate.?);
+            }
+            try std.testing.expectEqual(lhs.limit != null, rhs.limit != null);
+            if (lhs.limit) |limit| {
+                try std.testing.expect(rhs.limit != null);
+                try std.testing.expectEqual(limit.limit, rhs.limit.?.limit);
+                try std.testing.expectEqual(limit.offset, rhs.limit.?.offset);
+            }
+        },
+        .insert => |lhs| {
+            try std.testing.expect(actual == .insert);
+            const rhs = actual.insert;
+            try std.testing.expectEqualStrings(lhs.target.value, rhs.target.value);
+            try std.testing.expectEqual(lhs.columns.len, rhs.columns.len);
+            try std.testing.expectEqual(lhs.values.len, rhs.values.len);
+        },
+        .delete => |lhs| {
+            try std.testing.expect(actual == .delete);
+            const rhs = actual.delete;
+            try std.testing.expectEqualStrings(lhs.target.value, rhs.target.value);
+            try std.testing.expectEqual(lhs.predicate != null, rhs.predicate != null);
+        },
+        .explain => |lhs| {
+            try std.testing.expect(actual == .explain);
+            const rhs = actual.explain;
+            try std.testing.expectEqual(lhs.mode, rhs.mode);
+            try expectNormalizedStatementEqual(lhs.target.*, rhs.target.*);
+        },
+    }
+}
+
+fn expectNormalizedSelectorEqual(expected: frontend.normalize.Selector, actual: frontend.normalize.Selector) !void {
+    switch (expected.series) {
+        .name => |name| {
+            try std.testing.expect(actual.series == .name);
+            try std.testing.expectEqualStrings(name.value, actual.series.name.value);
+        },
+        .by_id => |by_id| {
+            try std.testing.expect(actual.series == .by_id);
+            try std.testing.expectEqual(by_id.value, actual.series.by_id.value);
+        },
+    }
+}
+
+fn expectNormalizedExprEqual(expected: *const frontend.normalize.Expr, actual: *const frontend.normalize.Expr) !void {
+    switch (expected.*) {
+        .identifier => |identifier| {
+            try std.testing.expect(actual.* == .identifier);
+            try std.testing.expectEqualStrings(identifier.value, actual.identifier.value);
+        },
+        .integer => |integer| {
+            try std.testing.expect(actual.* == .integer);
+            try std.testing.expectEqual(integer.value, actual.integer.value);
+        },
+        .string => |string| {
+            try std.testing.expect(actual.* == .string);
+            try std.testing.expectEqualStrings(string.value, actual.string.value);
+        },
+        .parameter => |parameter| {
+            try std.testing.expect(actual.* == .parameter);
+            try std.testing.expectEqual(parameter.kind, actual.parameter.kind);
+            try std.testing.expectEqualStrings(parameter.raw, actual.parameter.raw);
+        },
+        .comparison => |comparison| {
+            try std.testing.expect(actual.* == .comparison);
+            try std.testing.expectEqual(comparison.op, actual.comparison.op);
+            try expectNormalizedExprEqual(comparison.left, actual.comparison.left);
+            try expectNormalizedExprEqual(comparison.right, actual.comparison.right);
+        },
+        .call => |call| {
+            try std.testing.expect(actual.* == .call);
+            try std.testing.expectEqualStrings(call.callee.value, actual.call.callee.value);
+            try std.testing.expectEqual(call.args.len, actual.call.args.len);
+            for (call.args, actual.call.args) |left, right| {
+                try expectNormalizedExprEqual(left, right);
+            }
+        },
+    }
 }
 
 fn waitForQueryablePoints(
