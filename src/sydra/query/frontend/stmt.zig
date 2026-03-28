@@ -164,6 +164,8 @@ pub const ComparisonOp = enum {
     less_equal,
     greater,
     greater_equal,
+    logical_and,
+    logical_or,
 };
 
 pub const Comparison = struct {

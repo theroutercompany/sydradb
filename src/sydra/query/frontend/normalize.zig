@@ -364,6 +364,8 @@ fn fromAstExpr(allocator: std.mem.Allocator, expr: *const ast.Expr) NormalizeErr
                 .less_equal => .less_equal,
                 .greater => .greater,
                 .greater_equal => .greater_equal,
+                .logical_and => .logical_and,
+                .logical_or => .logical_or,
                 else => return error.UnsupportedAstExpression,
             };
             break :blk .{ .comparison = .{
@@ -826,6 +828,8 @@ fn lowerExpr(
                 .less_equal => .less_equal,
                 .greater => .greater,
                 .greater_equal => .greater_equal,
+                .logical_and => .logical_and,
+                .logical_or => .logical_or,
             },
             .left = try lowerExpr(allocator, comparison.left, parameters, named_parameters, bindings),
             .right = try lowerExpr(allocator, comparison.right, parameters, named_parameters, bindings),

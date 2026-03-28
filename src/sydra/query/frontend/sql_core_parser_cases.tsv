@@ -1,6 +1,8 @@
 # kind|sql
 select|select value from metrics where time >= $1 order by time limit 10
+select|select time, value from metrics where time >= $1 and value <= $2 order by time asc limit 5 offset 1
 select|select time, value from weather.room1 where time >= 0
+select|select value from metrics where (time >= $1 and value <= $2) or value = $3
 select|select value as reading from by_id(41) where time >= $1 order by reading limit 10
 explain|explain select avg(value) from metrics
 insert|insert into metrics(time, value) values(1, 2)

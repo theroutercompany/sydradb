@@ -235,6 +235,8 @@ fn terminalNameForToken(token: lexer.Token) []const u8 {
             .as => "as",
             .asc => "asc",
             .desc => "desc",
+            .logical_and => "and",
+            .logical_or => "or",
             .time => "identifier",
             .tag => "identifier",
             else => "",

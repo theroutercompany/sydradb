@@ -97,11 +97,12 @@ const Dispatcher = struct {
         if (std.mem.eql(u8, action_name, "emitProjectionAlias()")) return try self.emitProjectionAlias(rhs);
         if (std.mem.eql(u8, action_name, "emitStar()")) return try self.emitStar(rhs);
         if (std.mem.eql(u8, action_name, "emitPrimaryExpr()")) return rhs[0];
-        if (std.mem.eql(u8, action_name, "emitComparison()")) return try self.emitComparison(rhs);
+        if (std.mem.eql(u8, action_name, "emitBinaryExpr()")) return try self.emitBinaryExpr(rhs);
         if (std.mem.eql(u8, action_name, "emitIdentifier()")) return try self.emitIdentifier(rhs);
         if (std.mem.eql(u8, action_name, "emitNumber()")) return try self.emitNumber(rhs);
         if (std.mem.eql(u8, action_name, "emitString()")) return try self.emitString(rhs);
         if (std.mem.eql(u8, action_name, "emitParameter()")) return try self.emitParameter(rhs);
+        if (std.mem.eql(u8, action_name, "emitParenthesizedExpr()")) return rhs[1];
         if (std.mem.eql(u8, action_name, "emitCall()")) return try self.emitCall(rhs);
         if (std.mem.eql(u8, action_name, "appendExpr()")) return try self.appendExpr(rhs);
         if (std.mem.eql(u8, action_name, "emitWhere()")) return try self.emitWhere(rhs);
@@ -274,7 +275,7 @@ const Dispatcher = struct {
         } };
     }
 
-    fn emitComparison(self: *@This(), rhs: []const SemanticValue) !SemanticValue {
+    fn emitBinaryExpr(self: *@This(), rhs: []const SemanticValue) !SemanticValue {
         const left = try exprFromValue(rhs[0]);
         const op_token = try tokenFromValue(rhs[1]);
         const right = try exprFromValue(rhs[2]);
@@ -552,6 +553,8 @@ fn comparisonOp(text: []const u8) !stmt_mod.ComparisonOp {
     if (std.mem.eql(u8, text, "<=")) return .less_equal;
     if (std.mem.eql(u8, text, ">")) return .greater;
     if (std.mem.eql(u8, text, ">=")) return .greater_equal;
+    if (std.ascii.eqlIgnoreCase(text, "and")) return .logical_and;
+    if (std.ascii.eqlIgnoreCase(text, "or")) return .logical_or;
     return error.InvalidTrace;
 }
 

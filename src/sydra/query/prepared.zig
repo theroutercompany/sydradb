@@ -1387,7 +1387,7 @@ test "prepareSqlCore translates SQL into prepared bytecode programs" {
     try std.testing.expectEqual(@as(i64, 10), scan_row.row[0].integer);
 }
 
-test "prepareSqlCore reports uncovered SQL instead of translating implicitly" {
+test "prepareSqlCore reports still-uncovered SQL instead of translating implicitly" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -1416,9 +1416,62 @@ test "prepareSqlCore reports uncovered SQL instead of translating implicitly" {
     try std.testing.expectError(error.NotImplemented, prepareSqlCore(
         alloc,
         engine,
-        "SELECT value FROM weather.room1 WHERE time >= 0 AND value <= 5",
+        "SELECT value FROM weather.room1 WHERE value =~ 'hot'",
         .{},
     ));
+}
+
+test "prepareSqlCore handles logical predicates through generated frontend coverage" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-sql-logical", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .legacy,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    const sid = @import("../types.zig").seriesIdFrom("weather.room1", "{}");
+    try engine.registerSeries("weather.room1", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.0, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 20, .value = 3.0, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 30, .value = 7.0, .tags_json = "{}" });
+    try waitForQueryablePoints(alloc, engine, sid, 3, 1_000);
+
+    var stmt = try prepareSqlCore(
+        alloc,
+        engine,
+        "SELECT time, value FROM weather.room1 WHERE time >= $1 AND value <= $2 ORDER BY time ASC LIMIT 1",
+        .{},
+    );
+    defer stmt.finalize();
+
+    const parameters = try stmt.describeParameters();
+    try std.testing.expectEqual(@as(usize, 2), parameters.len);
+    try stmt.bindPositional(1, .{ .integer = 15 });
+    try stmt.bindPositional(2, .{ .float = 5.0 });
+
+    const row = try stmt.step();
+    try std.testing.expect(row == .row);
+    try std.testing.expectEqual(@as(i64, 20), row.row[0].integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), try row.row[1].asFloat(), 1e-9);
+    try std.testing.expect((try stmt.step()) == .done);
 }
 
 test "binding context tracks named parameter slots" {
