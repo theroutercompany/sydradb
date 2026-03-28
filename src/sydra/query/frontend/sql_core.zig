@@ -240,6 +240,7 @@ fn terminalNameForToken(token: lexer.Token) []const u8 {
             else => "",
         },
         .comma => "comma",
+        .period => "period",
         .equal => "equal",
         .bang_equal => "bang_equal",
         .less => "less",
@@ -307,6 +308,25 @@ test "sql core parser skeleton preserves by_id sources and projection aliases" {
     try std.testing.expectEqual(@as(usize, 1), select.ordering.len);
     try std.testing.expect(select.ordering[0].expr.* == .identifier);
     try std.testing.expectEqualStrings("reading", select.ordering[0].expr.identifier.value);
+}
+
+test "sql core parser skeleton preserves dotted series sources" {
+    const alloc = std.testing.allocator;
+    var result = try parseSqlCoreSkeleton(alloc, "select time, value from weather.room1 where time >= 0");
+    defer result.deinit();
+
+    try std.testing.expectEqual(StatementKind.select, result.kind);
+    try std.testing.expectEqual(@as(usize, 0), result.diagnostics.len);
+    try std.testing.expect(result.used_generated_runtime);
+    try std.testing.expect(result.stmt != null);
+
+    const stmt = result.stmt.?;
+    try std.testing.expect(stmt == .select);
+    const select = stmt.select;
+    try std.testing.expect(select.selector != null);
+    try std.testing.expect(select.selector.?.series == .name);
+    try std.testing.expectEqualStrings("weather.room1", select.selector.?.series.name.value);
+    try std.testing.expectEqual(@as(usize, 2), select.projections.len);
 }
 
 test "sql core parser skeleton reports grammar coverage gaps" {

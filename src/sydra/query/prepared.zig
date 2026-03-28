@@ -11,7 +11,6 @@ const common = @import("common.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const plan = @import("plan.zig");
-const translator = @import("translator.zig");
 const types = @import("../types.zig");
 const value_mod = @import("value.zig");
 const vm = @import("vm.zig");
@@ -147,7 +146,6 @@ pub const PreparedStmt = struct {
 
 pub const PrepareError = std.mem.Allocator.Error || lexer.LexError || parser.ParseError || compiler.CompileError || frontend.normalize.NormalizeError || error{
     InvalidCharacter,
-    SqlTranslationFailed,
     NotImplemented,
     InvalidTrace,
 } || codegen.CodegenError;
@@ -230,37 +228,7 @@ pub fn prepareSqlCore(
             arena_ptr,
         );
     }
-
-    const translation = try translateSqlToSydraql(allocator, text);
-    defer allocator.free(translation);
-
-    var arena_ptr = try allocator.create(std.heap.ArenaAllocator);
-    arena_ptr.* = std.heap.ArenaAllocator.init(allocator);
-    errdefer {
-        arena_ptr.deinit();
-        allocator.destroy(arena_ptr);
-    }
-
-    var parser_inst = parser.Parser.init(arena_ptr.allocator(), translation);
-    var statement = try parser_inst.parse();
-    const normalized = try frontend.normalize.normalizeAstStatement(arena_ptr.allocator(), &statement);
-    return try prepareNormalizedStatement(
-        allocator,
-        engine,
-        .{
-            .language = .sql_core,
-            .source_text = text,
-            .statement_kind = normalized.kind(),
-            .statement_span = normalized.span(),
-            .diagnostics = skeleton.diagnostics,
-            .parameters = normalized.parameters,
-            .named_parameters = normalized.named_parameters,
-            .translation_fallback = true,
-        },
-        flags,
-        normalized,
-        arena_ptr,
-    );
+    return error.NotImplemented;
 }
 
 pub fn shadowCompareSydraQL(
@@ -319,14 +287,6 @@ pub fn formatBytecodeSnapshot(allocator: std.mem.Allocator, stmt: *PreparedStmt)
         });
     }
     return try out.toOwnedSlice();
-}
-
-fn translateSqlToSydraql(allocator: std.mem.Allocator, text: []const u8) PrepareError![]const u8 {
-    const translated = try translator.translate(allocator, text);
-    return switch (translated) {
-        .success => |payload| payload.sydraql,
-        .failure => error.SqlTranslationFailed,
-    };
 }
 
 fn prepareNormalizedStatement(
@@ -780,6 +740,40 @@ test "prepareSqlCore translates SQL into prepared bytecode programs" {
     const scan_row = try scan_stmt.step();
     try std.testing.expect(scan_row == .row);
     try std.testing.expectEqual(@as(i64, 10), scan_row.row[0].integer);
+}
+
+test "prepareSqlCore reports uncovered SQL instead of translating implicitly" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-sql-fallback", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .legacy,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    try std.testing.expectError(error.NotImplemented, prepareSqlCore(
+        alloc,
+        engine,
+        "SELECT value FROM weather.room1 WHERE time >= 0 AND value <= 5",
+        .{},
+    ));
 }
 
 test "binding context tracks named parameter slots" {

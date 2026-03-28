@@ -16,6 +16,7 @@ const SemanticValue = union(enum) {
     token: TokenValue,
     stmt: stmt_mod.FrontendStmt,
     selector: stmt_mod.Selector,
+    identifier_name: stmt_mod.Identifier,
     clauses: SelectClauses,
     projection: stmt_mod.Projection,
     projections: []const stmt_mod.Projection,
@@ -78,6 +79,8 @@ const Dispatcher = struct {
         if (std.mem.eql(u8, action_name, "emitInsert()")) return try self.emitInsert(rhs);
         if (std.mem.eql(u8, action_name, "emitInsertValues()")) return try self.emitInsertValues(rhs);
         if (std.mem.eql(u8, action_name, "emitDelete()")) return try self.emitDelete(rhs);
+        if (std.mem.eql(u8, action_name, "emitQualifiedNameStart()")) return try self.emitQualifiedNameStart(rhs);
+        if (std.mem.eql(u8, action_name, "appendQualifiedName()")) return try self.appendQualifiedName(rhs);
         if (std.mem.eql(u8, action_name, "emitSourceName()")) return try self.emitSourceName(rhs);
         if (std.mem.eql(u8, action_name, "emitSourceCall()")) return try self.emitSourceCall(rhs);
         if (std.mem.eql(u8, action_name, "emitEmptyClauses()")) return .{ .clauses = .{} };
@@ -184,6 +187,21 @@ const Dispatcher = struct {
                 .predicate = clauses.predicate,
                 .span = combinedSpan(rhs),
             },
+        } };
+    }
+
+    fn emitQualifiedNameStart(_: *@This(), rhs: []const SemanticValue) !SemanticValue {
+        return .{ .identifier_name = try identifierFromValue(rhs[0]) };
+    }
+
+    fn appendQualifiedName(self: *@This(), rhs: []const SemanticValue) !SemanticValue {
+        const prefix = try identifierFromValue(rhs[0]);
+        const suffix = try identifierFromValue(rhs[2]);
+        const value = try std.fmt.allocPrint(self.arena, "{s}.{s}", .{ prefix.value, suffix.value });
+        return .{ .identifier_name = .{
+            .value = value,
+            .quoted = prefix.quoted or suffix.quoted,
+            .span = combinedSpan(rhs),
         } };
     }
 
@@ -500,11 +518,16 @@ fn offsetFromValue(value: SemanticValue) !usize {
 }
 
 fn identifierFromValue(value: SemanticValue) !stmt_mod.Identifier {
-    const token = try tokenFromValue(value);
-    return .{
-        .value = token.lexeme,
-        .quoted = token.quoted,
-        .span = token.span,
+    return switch (value) {
+        .identifier_name => |identifier| identifier,
+        else => blk: {
+            const token = try tokenFromValue(value);
+            break :blk .{
+                .value = token.lexeme,
+                .quoted = token.quoted,
+                .span = token.span,
+            };
+        },
     };
 }
 
@@ -556,6 +579,7 @@ fn spanOf(value: SemanticValue) ?common.Span {
         .token => |token| token.span,
         .stmt => |stmt| stmt.span(),
         .selector => |selector| selector.span,
+        .identifier_name => |identifier| identifier.span,
         .clauses => |clauses| if (clauses.limit) |limit| limit.span else if (clauses.ordering.len != 0) common.Span.init(clauses.ordering[0].span.start, clauses.ordering[clauses.ordering.len - 1].span.end) else if (clauses.groupings.len != 0) common.Span.init(clauses.groupings[0].span.start, clauses.groupings[clauses.groupings.len - 1].span.end) else if (clauses.predicate) |predicate| predicate.span() else null,
         .projection => |projection| projection.span,
         .projections => |values| if (values.len == 0) null else common.Span.init(values[0].span.start, values[values.len - 1].span.end),
