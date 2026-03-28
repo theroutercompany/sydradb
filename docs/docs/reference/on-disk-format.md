@@ -36,7 +36,8 @@ Under `data_dir`, the engine uses:
 - `objects/info/commit-graph` – optional commit ancestry side index with generation numbers and logical changed-path Bloom filters
 - `objects/info/reachability-bitmap` – optional ref-keyed reachable-object side index for CAS maintenance fast paths
 - `objects/cruft/<timestamp>/...` – quarantined unreachable CAS content retained until the GC grace window expires
-- `refs/` – mutable plaintext refs and reflogs for the CAS head/branches/tags/checkpoints
+- `refs/` – loose compatibility refs and reflogs for pre-migration repositories
+- `reftable/` – append-only reftable stack for migrated/new repository refs and reflogs
 - `lost-found/` – optional fsck output for dangling commit/blob/tree ids
 
 ## WAL format (v0)
@@ -103,6 +104,7 @@ The CAS layer stores immutable objects addressed by a BLAKE3 hash of `(type, pay
 
 - Loose objects live under `objects/<prefix>/<hex>`.
 - Packed objects live in `objects/packs/*.pack` and are indexed by `objects/packs/*.idx`.
+- `objects/info/store-format` version 2 marks repositories that default to the reftable ref backend and CAS-primary startup; version 1 remains the compatibility format for pre-migration repositories.
 - `objects/info/multi-pack-index` provides an optional cross-pack fanout table so lookups can resolve mixed pack sets without scanning every individual `.idx` file first.
 - `objects/info/reachability-bitmap` caches the exact reachable object-id set for the current sorted ref snapshot, so `cas pack`, bundle selection, and non-reflog reachability checks can fall back to a side index instead of walking the full DAG every time.
 - The current implementation stores whole objects in packs; it does not use delta compression.

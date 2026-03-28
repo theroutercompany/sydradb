@@ -34,20 +34,32 @@ pub fn run(handle: *alloc_mod.AllocatorHandle) !void {
 }
 
 fn loadConfigOrDefault(alloc: std.mem.Allocator) !config.Config {
-    return config.load(alloc, "sydradb.toml") catch config.Config{
-        .data_dir = try alloc.dupe(u8, "./data"),
-        .http_port = 8080,
-        .fsync = .interval,
-        .flush_interval_ms = 2000,
-        .memtable_max_bytes = 8 * 1024 * 1024,
-        .retention_days = 0,
-        .auth_token = try alloc.dupe(u8, ""),
-        .enable_influx = false,
-        .enable_prom = true,
-        .mem_limit_bytes = 256 * 1024 * 1024,
-        .cas_mode = .off,
-        .metadata_read_mode = .legacy,
-        .retention_ns = std.StringHashMap(u32).init(alloc),
+    return loadConfigOrDefaultForPaths(alloc, "sydradb.toml", "./data");
+}
+
+fn loadConfigOrDefaultForPaths(
+    alloc: std.mem.Allocator,
+    config_path: []const u8,
+    default_data_dir: []const u8,
+) !config.Config {
+    return config.load(alloc, config_path) catch {
+        const defaults = try cas_mod.recommendedStartupDefaults(std.fs.cwd(), default_data_dir);
+        return config.Config{
+            .data_dir = try alloc.dupe(u8, default_data_dir),
+            .http_port = 8080,
+            .fsync = .interval,
+            .flush_interval_ms = 2000,
+            .memtable_max_bytes = 8 * 1024 * 1024,
+            .retention_days = 0,
+            .auth_token = try alloc.dupe(u8, ""),
+            .enable_influx = false,
+            .enable_prom = true,
+            .mem_limit_bytes = 256 * 1024 * 1024,
+            .cas_mode = defaults.cas_mode,
+            .metadata_read_mode = defaults.metadata_read_mode,
+            .query_compiler_mode = .compiled,
+            .retention_ns = std.StringHashMap(u32).init(alloc),
+        };
     };
 }
 
@@ -441,4 +453,63 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         return;
     }
     return error.Invalid;
+}
+
+test "loadConfigOrDefault prefers primary defaults for fresh repositories" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/missing.toml", .{tmp.sub_path});
+    defer alloc.free(config_path);
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/fresh-data", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    var cfg = try loadConfigOrDefaultForPaths(alloc, config_path, data_path);
+    defer cfg.deinit(alloc);
+
+    try std.testing.expectEqual(config.CasMode.dual_write, cfg.cas_mode);
+    try std.testing.expectEqual(config.MetadataReadMode.primary, cfg.metadata_read_mode);
+}
+
+test "loadConfigOrDefault preserves legacy defaults for existing legacy repositories" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_rel = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/legacy-data", .{tmp.sub_path});
+    defer alloc.free(data_rel);
+    try std.fs.cwd().makePath(data_rel);
+    var data_dir = try std.fs.cwd().openDir(data_rel, .{ .iterate = true });
+    defer data_dir.close();
+    try data_dir.writeFile(.{ .sub_path = "MANIFEST", .data = "", .flags = .{} });
+
+    const config_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/missing.toml", .{tmp.sub_path});
+    defer alloc.free(config_path);
+
+    var cfg = try loadConfigOrDefaultForPaths(alloc, config_path, data_rel);
+    defer cfg.deinit(alloc);
+
+    try std.testing.expectEqual(config.CasMode.off, cfg.cas_mode);
+    try std.testing.expectEqual(config.MetadataReadMode.legacy, cfg.metadata_read_mode);
+}
+
+test "loadConfigOrDefault prefers primary defaults for migrated reftable repositories" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_rel = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/reftable-data", .{tmp.sub_path});
+    defer alloc.free(data_rel);
+    var cas = try cas_mod.CasManager.init(alloc, data_rel, .none);
+    defer cas.deinit();
+
+    const config_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/missing.toml", .{tmp.sub_path});
+    defer alloc.free(config_path);
+
+    var cfg = try loadConfigOrDefaultForPaths(alloc, config_path, data_rel);
+    defer cfg.deinit(alloc);
+
+    try std.testing.expectEqual(config.CasMode.dual_write, cfg.cas_mode);
+    try std.testing.expectEqual(config.MetadataReadMode.primary, cfg.metadata_read_mode);
 }

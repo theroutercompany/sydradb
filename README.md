@@ -108,6 +108,7 @@ Apache-2.0
 ./zig-out/bin/sydradb cas tag <name> [spec]
 ./zig-out/bin/sydradb cas diff <lhs> <rhs>
 ./zig-out/bin/sydradb cas rollback <spec>
+./zig-out/bin/sydradb cas migrate-reftable
 ./zig-out/bin/sydradb cas gc [--apply] [--no-reflogs] [--grace-ms <n>]
 ./zig-out/bin/sydradb cas fsck [--connectivity-only] [--no-reflogs] [--lost-found]
 ./zig-out/bin/sydradb cas pack
@@ -139,7 +140,8 @@ Config notes:
 - `cas_mode = "dual_write"` writes immutable metadata commits and `refs/heads/main` alongside the legacy storage path.
 - `metadata_read_mode = "shadow"` serves from legacy metadata and cross-checks answers against the CAS snapshot.
 - `metadata_read_mode = "primary"` serves metadata from CAS and can boot even if `MANIFEST`, `tags.json`, or `series_catalog.jsonl` are missing.
-- CAS repositories now persist `objects/info/store-format` to version repository-wide storage behavior separately from per-object codecs.
+- Without `sydradb.toml`, fresh repositories default to `cas_mode = "dual_write"` plus `metadata_read_mode = "primary"`. Existing repositories without a migrated `objects/info/store-format` marker stay on `off` plus `legacy` until `cas migrate-reftable` is run.
+- CAS repositories now persist `objects/info/store-format` to version repository-wide storage behavior separately from per-object codecs. Fresh repositories initialize format v2 with a reftable ref backend; legacy repositories keep the v1 loose-ref format until explicitly migrated.
 - WAL recovery order is sourced from the CAS commit graph when CAS is enabled, with any uncaptured live WAL files appended as tail replay.
 - `snapshot`/`restore` now operate on CAS bundles. A restored bundle only materializes `objects/` and `refs/`; use `metadata_read_mode = "primary"` for mirrorless startup, or run `cas checkout` / `cas export-legacy` if you need compatibility files regenerated.
 - Sealed segment and WAL payloads are chunked into CAS extent trees; `cas checkout` / `cas export-legacy` materialize mirror files by walking those trees rather than depending on legacy blobs.

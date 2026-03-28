@@ -15,6 +15,12 @@ Implementation reference:
 
 `sydradb` loads `sydradb.toml` from the current working directory (CWD). If the file is missing or cannot be parsed, the server falls back to built-in defaults.
 
+Built-in defaults are repository-aware:
+
+- Fresh repositories default to `cas_mode = "dual_write"` and `metadata_read_mode = "primary"`.
+- Existing repositories that still look like legacy/on-disk mirror layouts stay on `cas_mode = "off"` and `metadata_read_mode = "legacy"` until `sydradb cas migrate-reftable` flips the repository format marker.
+- If `sydradb.toml` is present, its values still win.
+
 ## Parser notes (important)
 
 The current config loader is a **minimal line-based parser**, not a full TOML implementation.
@@ -128,3 +134,29 @@ Notes:
 - Namespace is derived as the substring before the first `.` in the series name (e.g. `weather.room1` → `weather`).
 - There is no built-in “default namespace” — `retention.default` only applies to series whose namespace is literally `default` (e.g. `default.cpu`).
 - The config parser loads namespace overrides, but the current engine retention pass operates on `retention_days`; namespace overrides may require additional wiring depending on runtime implementation.
+
+### `cas_mode` (string enum)
+
+Controls whether the engine writes CAS commits alongside compatibility files.
+
+Accepted values: `off`, `dual_write`
+
+Default in `sydradb.toml`: `off`
+
+Built-in startup default when `sydradb.toml` is absent:
+
+- Fresh repositories: `dual_write`
+- Existing legacy repositories: `off`
+
+### `metadata_read_mode` (string enum)
+
+Controls whether reads use legacy mirrors, compare against CAS in shadow mode, or serve from CAS directly.
+
+Accepted values: `legacy`, `shadow`, `primary`
+
+Default in `sydradb.toml`: `legacy`
+
+Built-in startup default when `sydradb.toml` is absent:
+
+- Fresh repositories: `primary`
+- Existing legacy repositories: `legacy`

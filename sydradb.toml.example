@@ -8,8 +8,8 @@ mem_limit_bytes = 268435456
 auth_token = ""  # set to enable auth on /api/*
 enable_influx = false
 enable_prom = true
-cas_mode = "off"  # off|dual_write
-metadata_read_mode = "legacy"  # legacy|shadow|primary
+cas_mode = "off"  # explicit compatibility mode; fresh repos without a config default to dual_write
+metadata_read_mode = "legacy"  # explicit compatibility mode; fresh repos without a config default to primary
 
 # Per-namespace TTL (days)
 retention.default = 0

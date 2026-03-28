@@ -13,7 +13,8 @@ const wal_mod = @import("wal.zig");
 
 pub const current_format_version: u16 = 1;
 pub const main_ref = "heads/main";
-pub const current_repository_format_version: u16 = 1;
+pub const legacy_repository_format_version: u16 = 1;
+pub const current_repository_format_version: u16 = 2;
 pub const default_extent_chunk_bytes: u32 = 64 * 1024;
 const store_format_path = "objects/info/store-format";
 const store_format_magic = "SYDSTORE1";
@@ -25,8 +26,23 @@ pub const RefBackend = enum(u8) {
 
 pub const RepositoryFormat = struct {
     version: u16 = current_repository_format_version,
-    ref_backend: RefBackend = .loose,
+    ref_backend: RefBackend = .reftable,
     extent_chunk_bytes: u32 = default_extent_chunk_bytes,
+};
+
+pub const StartupDefaults = struct {
+    cas_mode: cfg.CasMode,
+    metadata_read_mode: cfg.MetadataReadMode,
+};
+
+const legacy_startup_defaults = StartupDefaults{
+    .cas_mode = .off,
+    .metadata_read_mode = .legacy,
+};
+
+const primary_startup_defaults = StartupDefaults{
+    .cas_mode = .dual_write,
+    .metadata_read_mode = .primary,
 };
 
 pub const ExtentTreeRef = struct {
@@ -3521,12 +3537,77 @@ fn loadReachabilityBitmap(alloc: std.mem.Allocator, root: std.fs.Dir) !Reachabil
 fn loadOrInitRepositoryFormat(alloc: std.mem.Allocator, root: std.fs.Dir, fsync: cfg.FsyncPolicy) !RepositoryFormat {
     return loadRepositoryFormat(root) catch |err| switch (err) {
         error.FileNotFound => blk: {
-            const format = RepositoryFormat{};
+            const format = if (try hasLegacyCompatibilityState(root))
+                legacyCompatibleRepositoryFormat()
+            else
+                RepositoryFormat{};
             try writeRepositoryFormat(alloc, root, format, fsync);
             break :blk format;
         },
         else => return err,
     };
+}
+
+pub fn recommendedStartupDefaults(root: std.fs.Dir, data_dir_path: []const u8) !StartupDefaults {
+    var data_dir = root.openDir(data_dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return primary_startup_defaults,
+        else => return err,
+    };
+    defer data_dir.close();
+
+    if (loadRepositoryFormat(data_dir)) |format| {
+        return if (repositoryFormatDefaultsToPrimary(format))
+            primary_startup_defaults
+        else
+            legacy_startup_defaults;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    return if (try hasLegacyCompatibilityState(data_dir))
+        legacy_startup_defaults
+    else
+        primary_startup_defaults;
+}
+
+fn repositoryFormatDefaultsToPrimary(format: RepositoryFormat) bool {
+    return format.version >= current_repository_format_version and format.ref_backend == .reftable;
+}
+
+fn legacyCompatibleRepositoryFormat() RepositoryFormat {
+    return .{
+        .version = legacy_repository_format_version,
+        .ref_backend = .loose,
+        .extent_chunk_bytes = default_extent_chunk_bytes,
+    };
+}
+
+fn hasLegacyCompatibilityState(root: std.fs.Dir) !bool {
+    if (try pathExists(root, "MANIFEST")) return true;
+    if (try pathExists(root, "tags.json")) return true;
+    if (try pathExists(root, "series_catalog.jsonl")) return true;
+    if (try directoryHasEntries(root, "wal")) return true;
+    if (try directoryHasEntries(root, "segments")) return true;
+    return false;
+}
+
+fn pathExists(root: std.fs.Dir, path: []const u8) !bool {
+    root.access(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
+}
+
+fn directoryHasEntries(root: std.fs.Dir, path: []const u8) !bool {
+    var dir = root.openDir(path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer dir.close();
+    var it = dir.iterate();
+    return (try it.next()) != null;
 }
 
 fn loadRepositoryFormat(root: std.fs.Dir) !RepositoryFormat {
@@ -4870,7 +4951,7 @@ test "cas codecs are deterministic for identical logical data" {
     try std.testing.expect(id_a.eql(id_b));
 }
 
-test "cas manager initializes a repository format marker" {
+test "cas manager initializes a repository format marker for fresh repositories" {
     const alloc = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -4882,13 +4963,63 @@ test "cas manager initializes a repository format marker" {
     defer cas_manager.deinit();
 
     try std.testing.expectEqual(current_repository_format_version, cas_manager.format.version);
-    try std.testing.expectEqual(RefBackend.loose, cas_manager.format.ref_backend);
+    try std.testing.expectEqual(RefBackend.reftable, cas_manager.format.ref_backend);
     try std.testing.expectEqual(default_extent_chunk_bytes, cas_manager.format.extent_chunk_bytes);
 
     const loaded = try loadRepositoryFormat(cas_manager.store.root);
     try std.testing.expectEqual(cas_manager.format.version, loaded.version);
     try std.testing.expectEqual(cas_manager.format.ref_backend, loaded.ref_backend);
     try std.testing.expectEqual(cas_manager.format.extent_chunk_bytes, loaded.extent_chunk_bytes);
+}
+
+test "cas manager keeps legacy-compatible repository format defaults for existing legacy data" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/legacy-repo-format", .{tmp_dir.sub_path});
+    defer alloc.free(data_path);
+    try std.fs.cwd().makePath(data_path);
+
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+    try data_dir.writeFile(.{ .sub_path = "MANIFEST", .data = "", .flags = .{} });
+
+    var cas_manager = try CasManager.init(alloc, data_path, .none);
+    defer cas_manager.deinit();
+
+    try std.testing.expectEqual(legacy_repository_format_version, cas_manager.format.version);
+    try std.testing.expectEqual(RefBackend.loose, cas_manager.format.ref_backend);
+}
+
+test "startup defaults prefer primary only for fresh or migrated repositories" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    const fresh_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/startup-fresh", .{tmp_dir.sub_path});
+    defer alloc.free(fresh_path);
+    const fresh_defaults = try recommendedStartupDefaults(std.fs.cwd(), fresh_path);
+    try std.testing.expectEqual(primary_startup_defaults.cas_mode, fresh_defaults.cas_mode);
+    try std.testing.expectEqual(primary_startup_defaults.metadata_read_mode, fresh_defaults.metadata_read_mode);
+
+    const legacy_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/startup-legacy", .{tmp_dir.sub_path});
+    defer alloc.free(legacy_path);
+    try std.fs.cwd().makePath(legacy_path);
+    var legacy_dir = try std.fs.cwd().openDir(legacy_path, .{ .iterate = true });
+    defer legacy_dir.close();
+    try legacy_dir.writeFile(.{ .sub_path = "MANIFEST", .data = "", .flags = .{} });
+    const legacy_defaults = try recommendedStartupDefaults(std.fs.cwd(), legacy_path);
+    try std.testing.expectEqual(legacy_startup_defaults.cas_mode, legacy_defaults.cas_mode);
+    try std.testing.expectEqual(legacy_startup_defaults.metadata_read_mode, legacy_defaults.metadata_read_mode);
+
+    const migrated_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/startup-migrated", .{tmp_dir.sub_path});
+    defer alloc.free(migrated_path);
+    var cas_manager = try CasManager.init(alloc, migrated_path, .none);
+    defer cas_manager.deinit();
+    const migrated_defaults = try recommendedStartupDefaults(std.fs.cwd(), migrated_path);
+    try std.testing.expectEqual(primary_startup_defaults.cas_mode, migrated_defaults.cas_mode);
+    try std.testing.expectEqual(primary_startup_defaults.metadata_read_mode, migrated_defaults.metadata_read_mode);
 }
 
 test "legacy descriptor decoders normalize blob content refs" {
