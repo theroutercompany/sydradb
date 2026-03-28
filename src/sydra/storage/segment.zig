@@ -42,6 +42,57 @@ pub const SegmentMetadata = struct {
     }
 };
 
+pub const SegmentRootWriteMetadata = struct {
+    series_id: types.SeriesId,
+    hour_bucket: i64,
+    ts_codec: u8,
+    val_codec: u8,
+    selector: ?SelectorMetadataView = null,
+};
+
+pub const SegmentRootMetadata = struct {
+    series_id: types.SeriesId,
+    hour_bucket: i64,
+    count: u32,
+    start_ts: i64,
+    end_ts: i64,
+    ts_codec: u8,
+    val_codec: u8,
+    block_point_count: u32,
+    block_count: u32,
+    extent_chunk_bytes: u32,
+    selector: ?SelectorMetadata = null,
+
+    pub fn deinit(self: *SegmentRootMetadata, alloc: std.mem.Allocator) void {
+        if (self.selector) |*selector| selector.deinit(alloc);
+    }
+};
+
+pub const SegmentBlockStats = struct {
+    count: u32,
+    min_ts: i64,
+    max_ts: i64,
+    first_ts: i64,
+    last_ts: i64,
+    ts_size_bytes: u64,
+    values_size_bytes: u64,
+};
+
+pub const segment_root_block_point_count: u32 = 4096;
+
+const segment_root_meta_version: u8 = 1;
+const segment_block_stats_version: u8 = 1;
+
+const TreeEntry = struct {
+    name: []u8,
+    object_type: object_store.ObjectType,
+    object_id: object_store.ObjectId,
+
+    fn deinit(self: *TreeEntry, alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+    }
+};
+
 pub fn writeSegment(alloc: std.mem.Allocator, data_dir: std.fs.Dir, series_id: types.SeriesId, hour: i64, points: []const types.Point) ![]const u8 {
     return writeSegmentWithMetadata(alloc, data_dir, series_id, hour, points, null);
 }
@@ -109,6 +160,147 @@ pub fn writeSegmentWithMetadata(
     return try alloc.dupe(u8, file_name);
 }
 
+pub fn writeSegmentRootForFile(
+    alloc: std.mem.Allocator,
+    data_dir: std.fs.Dir,
+    store: *object_store.ObjectStore,
+    path: []const u8,
+    extent_chunk_bytes: u32,
+) !object_store.ObjectId {
+    var metadata = try inspectMetadata(alloc, data_dir, path);
+    defer metadata.deinit(alloc);
+
+    const points = try readAll(alloc, data_dir, path);
+    defer alloc.free(points);
+
+    return try writeSegmentRoot(alloc, store, .{
+        .series_id = metadata.series_id,
+        .hour_bucket = metadata.hour_bucket,
+        .ts_codec = metadata.ts_codec,
+        .val_codec = metadata.val_codec,
+        .selector = if (metadata.selector) |selector| .{
+            .series = selector.series,
+            .canonical_tags = selector.canonical_tags,
+        } else null,
+    }, points, extent_chunk_bytes);
+}
+
+pub fn writeSegmentRoot(
+    alloc: std.mem.Allocator,
+    store: *object_store.ObjectStore,
+    metadata: SegmentRootWriteMetadata,
+    points: []const types.Point,
+    extent_chunk_bytes: u32,
+) !object_store.ObjectId {
+    if (points.len == 0) return error.EmptySegment;
+
+    const effective_chunk_bytes = if (extent_chunk_bytes == 0) extents.DefaultChunkBytes else extent_chunk_bytes;
+    const block_count = std.math.divCeil(u32, @intCast(points.len), segment_root_block_point_count) catch unreachable;
+
+    var block_entries = std.array_list.Managed(TreeEntry).init(alloc);
+    defer {
+        for (block_entries.items) |*entry| entry.deinit(alloc);
+        block_entries.deinit();
+    }
+
+    var block_start: usize = 0;
+    var block_index: usize = 0;
+    while (block_start < points.len) : (block_index += 1) {
+        const block_end = @min(points.len, block_start + segment_root_block_point_count);
+        const block_points = points[block_start..block_end];
+
+        const ts_bytes = try encodeBlockTimestamps(alloc, block_points);
+        defer alloc.free(ts_bytes);
+        const values_bytes = try encodeBlockValues(alloc, block_points);
+        defer alloc.free(values_bytes);
+
+        const ts_extent = try extents.writeAll(alloc, store, ts_bytes, effective_chunk_bytes);
+        const values_extent = try extents.writeAll(alloc, store, values_bytes, effective_chunk_bytes);
+
+        const stats_payload = try encodeSegmentBlockStats(alloc, .{
+            .count = @intCast(block_points.len),
+            .min_ts = block_points[0].ts,
+            .max_ts = block_points[block_points.len - 1].ts,
+            .first_ts = block_points[0].ts,
+            .last_ts = block_points[block_points.len - 1].ts,
+            .ts_size_bytes = ts_bytes.len,
+            .values_size_bytes = values_bytes.len,
+        });
+        defer alloc.free(stats_payload);
+        const stats_id = try store.put(.blob, stats_payload);
+
+        var per_block = std.array_list.Managed(TreeEntry).init(alloc);
+        defer {
+            for (per_block.items) |*entry| entry.deinit(alloc);
+            per_block.deinit();
+        }
+
+        try per_block.append(.{
+            .name = try alloc.dupe(u8, "stats"),
+            .object_type = .blob,
+            .object_id = stats_id,
+        });
+        try per_block.append(.{
+            .name = try alloc.dupe(u8, "ts"),
+            .object_type = .tree,
+            .object_id = ts_extent.root_id,
+        });
+        try per_block.append(.{
+            .name = try alloc.dupe(u8, "values"),
+            .object_type = .tree,
+            .object_id = values_extent.root_id,
+        });
+
+        const block_tree_id = try putTree(alloc, store, per_block.items);
+        try block_entries.append(.{
+            .name = try std.fmt.allocPrint(alloc, "{d:0>16}", .{block_index}),
+            .object_type = .tree,
+            .object_id = block_tree_id,
+        });
+
+        block_start = block_end;
+    }
+
+    const blocks_tree_id = try putTree(alloc, store, block_entries.items);
+    var root_metadata = SegmentRootMetadata{
+        .series_id = metadata.series_id,
+        .hour_bucket = metadata.hour_bucket,
+        .count = @intCast(points.len),
+        .start_ts = points[0].ts,
+        .end_ts = points[points.len - 1].ts,
+        .ts_codec = metadata.ts_codec,
+        .val_codec = metadata.val_codec,
+        .block_point_count = segment_root_block_point_count,
+        .block_count = block_count,
+        .extent_chunk_bytes = effective_chunk_bytes,
+        .selector = if (metadata.selector) |selector| .{
+            .series = try alloc.dupe(u8, selector.series),
+            .canonical_tags = try alloc.dupe(u8, selector.canonical_tags),
+        } else null,
+    };
+    defer root_metadata.deinit(alloc);
+    const meta_payload = try encodeSegmentRootMetadata(alloc, root_metadata);
+    defer alloc.free(meta_payload);
+    const meta_id = try store.put(.blob, meta_payload);
+
+    var root_entries = [_]TreeEntry{
+        .{
+            .name = try alloc.dupe(u8, "blocks"),
+            .object_type = .tree,
+            .object_id = blocks_tree_id,
+        },
+        .{
+            .name = try alloc.dupe(u8, "meta"),
+            .object_type = .blob,
+            .object_id = meta_id,
+        },
+    };
+    defer {
+        for (&root_entries) |*entry| entry.deinit(alloc);
+    }
+    return try putTree(alloc, store, root_entries[0..]);
+}
+
 pub fn readAll(alloc: std.mem.Allocator, data_dir: std.fs.Dir, path: []const u8) ![]types.Point {
     var f = try data_dir.openFile(path, .{});
     defer f.close();
@@ -123,6 +315,11 @@ pub fn readAll(alloc: std.mem.Allocator, data_dir: std.fs.Dir, path: []const u8)
 
 pub fn readAllDescriptor(alloc: std.mem.Allocator, data_dir: std.fs.Dir, store: *object_store.ObjectStore, descriptor: anytype) ![]types.Point {
     const Descriptor = @TypeOf(descriptor);
+    if (@hasField(Descriptor, "segment_root")) {
+        if (descriptor.segment_root) |segment_root| {
+            return try readAllSegmentRoot(alloc, store, segment_root);
+        }
+    }
     if (@hasField(Descriptor, "content")) {
         if (descriptor.content) |content| {
             switch (content) {
@@ -152,6 +349,66 @@ pub fn readAllDescriptor(alloc: std.mem.Allocator, data_dir: std.fs.Dir, store: 
         return try readAll(alloc, data_dir, descriptor.path);
     }
     return error.MissingSegmentContent;
+}
+
+pub fn readAllSegmentRoot(
+    alloc: std.mem.Allocator,
+    store: *object_store.ObjectStore,
+    root_id: object_store.ObjectId,
+) ![]types.Point {
+    var root_tree = try loadTreeObject(alloc, store, root_id);
+    defer root_tree.deinit(alloc);
+
+    const meta_id = findTreeEntry(root_tree.entries, "meta", .blob) orelse return error.MissingSegmentRootMeta;
+    const blocks_id = findTreeEntry(root_tree.entries, "blocks", .tree) orelse return error.MissingSegmentRootBlocks;
+
+    const meta_payload = try loadBlobObject(alloc, store, meta_id);
+    defer alloc.free(meta_payload);
+    var metadata = try decodeSegmentRootMetadata(alloc, meta_payload);
+    defer metadata.deinit(alloc);
+
+    var blocks_tree = try loadTreeObject(alloc, store, blocks_id);
+    defer blocks_tree.deinit(alloc);
+
+    var points = std.array_list.Managed(types.Point).init(alloc);
+    errdefer points.deinit();
+    try points.ensureTotalCapacity(@intCast(metadata.count));
+
+    for (blocks_tree.entries) |block_entry| {
+        if (block_entry.object_type != .tree) return error.InvalidSegmentBlockTree;
+
+        var block_tree = try loadTreeObject(alloc, store, block_entry.object_id);
+        defer block_tree.deinit(alloc);
+
+        const stats_id = findTreeEntry(block_tree.entries, "stats", .blob) orelse return error.MissingSegmentBlockStats;
+        const ts_root_id = findTreeEntry(block_tree.entries, "ts", .tree) orelse return error.MissingSegmentBlockTs;
+        const values_root_id = findTreeEntry(block_tree.entries, "values", .tree) orelse return error.MissingSegmentBlockValues;
+
+        const stats_payload = try loadBlobObject(alloc, store, stats_id);
+        defer alloc.free(stats_payload);
+        const stats = try decodeSegmentBlockStats(stats_payload);
+
+        const ts_bytes = try extents.readAll(alloc, store, .{
+            .root_id = ts_root_id,
+            .size_bytes = stats.ts_size_bytes,
+            .chunk_bytes = metadata.extent_chunk_bytes,
+        });
+        defer alloc.free(ts_bytes);
+
+        const values_bytes = try extents.readAll(alloc, store, .{
+            .root_id = values_root_id,
+            .size_bytes = stats.values_size_bytes,
+            .chunk_bytes = metadata.extent_chunk_bytes,
+        });
+        defer alloc.free(values_bytes);
+
+        const block_points = try decodeBlockPoints(alloc, ts_bytes, values_bytes, stats);
+        defer alloc.free(block_points);
+        try points.appendSlice(block_points);
+    }
+
+    if (points.items.len != metadata.count) return error.CorruptSegmentRoot;
+    return try points.toOwnedSlice();
 }
 
 pub fn readAllFromBytes(alloc: std.mem.Allocator, bytes: []const u8) ![]types.Point {
@@ -461,4 +718,356 @@ test "segment metadata preserves selector metadata" {
     try std.testing.expectEqual(@as(usize, 2), loaded.len);
     try std.testing.expectEqual(@as(i64, 1_000), loaded[0].ts);
     try std.testing.expectApproxEqAbs(@as(f64, 2.0), loaded[1].value, 1e-9);
+}
+
+test "segment roots round-trip large segments with selector metadata" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/segment-root-store", .{tmp.sub_path});
+    defer alloc.free(store_path);
+    var store = try object_store.ObjectStore.init(alloc, store_path, .none);
+    defer store.deinit();
+
+    const point_count: usize = segment_root_block_point_count + 19;
+    const points = try alloc.alloc(types.Point, point_count);
+    defer alloc.free(points);
+    for (points, 0..) |*point, idx| {
+        point.* = .{
+            .ts = 10_000 + @as(i64, @intCast(idx)) * 5,
+            .value = @floatFromInt(idx),
+        };
+    }
+
+    const root_id = try writeSegmentRoot(alloc, &store, .{
+        .series_id = 99,
+        .hour_bucket = 7_200,
+        .ts_codec = 1,
+        .val_codec = 1,
+        .selector = .{
+            .series = "metric.cpu",
+            .canonical_tags = "{\"host\":\"a\"}",
+        },
+    }, points, 0);
+
+    const restored = try readAllSegmentRoot(alloc, &store, root_id);
+    defer alloc.free(restored);
+
+    try std.testing.expectEqual(points.len, restored.len);
+    for (points, restored) |expected, actual| {
+        try std.testing.expectEqual(expected.ts, actual.ts);
+        try std.testing.expectApproxEqAbs(expected.value, actual.value, 1e-9);
+    }
+}
+
+test "descriptor reads prefer native segment roots" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/segment-root-descriptor-store", .{tmp.sub_path});
+    defer alloc.free(store_path);
+    var store = try object_store.ObjectStore.init(alloc, store_path, .none);
+    defer store.deinit();
+
+    const points = [_]types.Point{
+        .{ .ts = 42, .value = 1.0 },
+        .{ .ts = 47, .value = 2.5 },
+        .{ .ts = 52, .value = 3.75 },
+    };
+    const root_id = try writeSegmentRoot(alloc, &store, .{
+        .series_id = 7,
+        .hour_bucket = 0,
+        .ts_codec = 1,
+        .val_codec = 1,
+    }, points[0..], 0);
+
+    const Descriptor = struct {
+        segment_root: ?object_store.ObjectId,
+        path: []const u8 = "",
+    };
+    const restored = try readAllDescriptor(alloc, tmp.dir, &store, Descriptor{ .segment_root = root_id });
+    defer alloc.free(restored);
+
+    try std.testing.expectEqual(@as(usize, points.len), restored.len);
+    for (points, restored) |expected, actual| {
+        try std.testing.expectEqual(expected.ts, actual.ts);
+        try std.testing.expectApproxEqAbs(expected.value, actual.value, 1e-9);
+    }
+}
+
+fn decodeBlockPoints(
+    alloc: std.mem.Allocator,
+    ts_bytes: []const u8,
+    values_bytes: []const u8,
+    stats: SegmentBlockStats,
+) ![]types.Point {
+    var ts_stream = std.io.fixedBufferStream(ts_bytes);
+    const ts_reader = ts_stream.reader();
+    const ts_list = try @import("../codec/gorilla.zig").decodeTsDoD(alloc, ts_reader, stats.count, stats.first_ts);
+    defer alloc.free(ts_list);
+
+    var values_stream = std.io.fixedBufferStream(values_bytes);
+    const values_reader = values_stream.reader();
+    const values = try @import("../codec/gorilla.zig").decodeF64(alloc, values_reader, stats.count);
+    defer alloc.free(values);
+
+    const points = try alloc.alloc(types.Point, stats.count);
+    for (points, ts_list, values) |*point, ts, value| {
+        point.* = .{ .ts = ts, .value = value };
+    }
+    return points;
+}
+
+fn encodeBlockTimestamps(alloc: std.mem.Allocator, points: []const types.Point) ![]u8 {
+    var bytes = std.array_list.Managed(u8).init(alloc);
+    errdefer bytes.deinit();
+    try @import("../codec/gorilla.zig").encodeTsDoD(bytes.writer(), points[0].ts, points);
+    return try bytes.toOwnedSlice();
+}
+
+fn encodeBlockValues(alloc: std.mem.Allocator, points: []const types.Point) ![]u8 {
+    var values = try alloc.alloc(f64, points.len);
+    defer alloc.free(values);
+    for (points, 0..) |point, idx| values[idx] = point.value;
+
+    var bytes = std.array_list.Managed(u8).init(alloc);
+    errdefer bytes.deinit();
+    try @import("../codec/gorilla.zig").encodeF64(bytes.writer(), values);
+    return try bytes.toOwnedSlice();
+}
+
+fn encodeSegmentRootMetadata(alloc: std.mem.Allocator, metadata: SegmentRootMetadata) ![]u8 {
+    var bytes = std.array_list.Managed(u8).init(alloc);
+    errdefer bytes.deinit();
+
+    try bytes.append(segment_root_meta_version);
+    try appendInt(&bytes, u64, metadata.series_id);
+    try appendInt(&bytes, i64, metadata.hour_bucket);
+    try appendInt(&bytes, u32, metadata.count);
+    try appendInt(&bytes, i64, metadata.start_ts);
+    try appendInt(&bytes, i64, metadata.end_ts);
+    try bytes.append(metadata.ts_codec);
+    try bytes.append(metadata.val_codec);
+    try appendInt(&bytes, u32, metadata.block_point_count);
+    try appendInt(&bytes, u32, metadata.block_count);
+    try appendInt(&bytes, u32, metadata.extent_chunk_bytes);
+    if (metadata.selector) |selector| {
+        try appendString(&bytes, selector.series);
+        try appendString(&bytes, selector.canonical_tags);
+    } else {
+        try appendString(&bytes, "");
+        try appendString(&bytes, "");
+    }
+    return try bytes.toOwnedSlice();
+}
+
+fn decodeSegmentRootMetadata(alloc: std.mem.Allocator, payload: []const u8) !SegmentRootMetadata {
+    var cursor: usize = 0;
+    if (try readByteAt(payload, &cursor) != segment_root_meta_version) return error.UnsupportedSegmentRootMetaVersion;
+
+    const series_id = try readIntAt(payload, &cursor, u64);
+    const hour_bucket = try readIntAt(payload, &cursor, i64);
+    const count = try readIntAt(payload, &cursor, u32);
+    const start_ts = try readIntAt(payload, &cursor, i64);
+    const end_ts = try readIntAt(payload, &cursor, i64);
+    const ts_codec = try readByteAt(payload, &cursor);
+    const val_codec = try readByteAt(payload, &cursor);
+    const block_point_count = try readIntAt(payload, &cursor, u32);
+    const block_count = try readIntAt(payload, &cursor, u32);
+    const extent_chunk_bytes = try readIntAt(payload, &cursor, u32);
+    const selector_series = try readOwnedStringAt(alloc, payload, &cursor);
+    errdefer alloc.free(selector_series);
+    const selector_tags = try readOwnedStringAt(alloc, payload, &cursor);
+    errdefer alloc.free(selector_tags);
+    if (cursor != payload.len) return error.ExtraObjectBytes;
+
+    return .{
+        .series_id = series_id,
+        .hour_bucket = hour_bucket,
+        .count = count,
+        .start_ts = start_ts,
+        .end_ts = end_ts,
+        .ts_codec = ts_codec,
+        .val_codec = val_codec,
+        .block_point_count = block_point_count,
+        .block_count = block_count,
+        .extent_chunk_bytes = extent_chunk_bytes,
+        .selector = if (selector_series.len == 0 and selector_tags.len == 0)
+            blk: {
+                alloc.free(selector_series);
+                alloc.free(selector_tags);
+                break :blk null;
+            }
+        else
+            .{
+                .series = selector_series,
+                .canonical_tags = selector_tags,
+            },
+    };
+}
+
+fn encodeSegmentBlockStats(alloc: std.mem.Allocator, stats: SegmentBlockStats) ![]u8 {
+    var bytes = std.array_list.Managed(u8).init(alloc);
+    errdefer bytes.deinit();
+
+    try bytes.append(segment_block_stats_version);
+    try appendInt(&bytes, u32, stats.count);
+    try appendInt(&bytes, i64, stats.min_ts);
+    try appendInt(&bytes, i64, stats.max_ts);
+    try appendInt(&bytes, i64, stats.first_ts);
+    try appendInt(&bytes, i64, stats.last_ts);
+    try appendInt(&bytes, u64, stats.ts_size_bytes);
+    try appendInt(&bytes, u64, stats.values_size_bytes);
+    return try bytes.toOwnedSlice();
+}
+
+fn decodeSegmentBlockStats(payload: []const u8) !SegmentBlockStats {
+    var cursor: usize = 0;
+    if (try readByteAt(payload, &cursor) != segment_block_stats_version) return error.UnsupportedSegmentBlockStatsVersion;
+
+    const stats = SegmentBlockStats{
+        .count = try readIntAt(payload, &cursor, u32),
+        .min_ts = try readIntAt(payload, &cursor, i64),
+        .max_ts = try readIntAt(payload, &cursor, i64),
+        .first_ts = try readIntAt(payload, &cursor, i64),
+        .last_ts = try readIntAt(payload, &cursor, i64),
+        .ts_size_bytes = try readIntAt(payload, &cursor, u64),
+        .values_size_bytes = try readIntAt(payload, &cursor, u64),
+    };
+    if (cursor != payload.len) return error.ExtraObjectBytes;
+    return stats;
+}
+
+fn putTree(alloc: std.mem.Allocator, store: *object_store.ObjectStore, entries: []const TreeEntry) !object_store.ObjectId {
+    const payload = try encodeTree(alloc, entries);
+    defer alloc.free(payload);
+    return try store.put(.tree, payload);
+}
+
+fn loadTreeObject(alloc: std.mem.Allocator, store: *object_store.ObjectStore, id: object_store.ObjectId) !struct {
+    entries: []TreeEntry,
+    pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        for (self.entries) |*entry| entry.deinit(allocator);
+        allocator.free(self.entries);
+    }
+} {
+    const loaded = try store.get(alloc, id);
+    defer alloc.free(loaded.payload);
+    if (loaded.obj_type != .tree) return error.InvalidSegmentRootTree;
+    return .{ .entries = try decodeTree(alloc, loaded.payload) };
+}
+
+fn loadBlobObject(alloc: std.mem.Allocator, store: *object_store.ObjectStore, id: object_store.ObjectId) ![]u8 {
+    const loaded = try store.get(alloc, id);
+    errdefer alloc.free(loaded.payload);
+    if (loaded.obj_type != .blob) return error.InvalidSegmentRootBlob;
+    return loaded.payload;
+}
+
+fn findTreeEntry(entries: []const TreeEntry, name: []const u8, object_type: object_store.ObjectType) ?object_store.ObjectId {
+    for (entries) |entry| {
+        if (entry.object_type != object_type) continue;
+        if (std.mem.eql(u8, entry.name, name)) return entry.object_id;
+    }
+    return null;
+}
+
+fn encodeTree(alloc: std.mem.Allocator, entries: []const TreeEntry) ![]u8 {
+    var copy_entries = try alloc.alloc(TreeEntry, entries.len);
+    defer {
+        for (copy_entries) |*entry| entry.deinit(alloc);
+        alloc.free(copy_entries);
+    }
+    for (entries, 0..) |entry, idx| {
+        copy_entries[idx] = .{
+            .name = try alloc.dupe(u8, entry.name),
+            .object_type = entry.object_type,
+            .object_id = entry.object_id,
+        };
+    }
+    std.sort.block(TreeEntry, copy_entries, {}, struct {
+        fn lessThan(_: void, lhs: TreeEntry, rhs: TreeEntry) bool {
+            return std.mem.lessThan(u8, lhs.name, rhs.name);
+        }
+    }.lessThan);
+
+    var bytes = std.array_list.Managed(u8).init(alloc);
+    errdefer bytes.deinit();
+    try bytes.append(1);
+    try appendInt(&bytes, u32, @intCast(copy_entries.len));
+    for (copy_entries) |entry| {
+        try appendString(&bytes, entry.name);
+        try bytes.append(@intFromEnum(entry.object_type));
+        try bytes.appendSlice(entry.object_id.hash[0..]);
+    }
+    return try bytes.toOwnedSlice();
+}
+
+fn decodeTree(alloc: std.mem.Allocator, payload: []const u8) ![]TreeEntry {
+    var cursor: usize = 0;
+    if (try readByteAt(payload, &cursor) != 1) return error.UnsupportedSegmentTreeVersion;
+    const entry_count = try readIntAt(payload, &cursor, u32);
+    var entries = try alloc.alloc(TreeEntry, entry_count);
+    var decoded_count: usize = 0;
+    errdefer {
+        for (entries[0..decoded_count]) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+
+    while (decoded_count < entry_count) : (decoded_count += 1) {
+        const name = try readOwnedStringAt(alloc, payload, &cursor);
+        errdefer alloc.free(name);
+        const object_type = std.meta.intToEnum(object_store.ObjectType, try readByteAt(payload, &cursor)) catch return error.UnknownTreeObjectType;
+        entries[decoded_count] = .{
+            .name = name,
+            .object_type = object_type,
+            .object_id = .{ .hash = try readHashAt(payload, &cursor) },
+        };
+    }
+    if (cursor != payload.len) return error.ExtraObjectBytes;
+    return entries;
+}
+
+fn appendString(bytes: *std.array_list.Managed(u8), value: []const u8) !void {
+    try appendInt(bytes, u32, @intCast(value.len));
+    try bytes.appendSlice(value);
+}
+
+fn appendInt(bytes: *std.array_list.Managed(u8), comptime T: type, value: T) !void {
+    var tmp: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, tmp[0..], value, .little);
+    try bytes.appendSlice(tmp[0..]);
+}
+
+fn readByteAt(payload: []const u8, cursor: *usize) !u8 {
+    if (cursor.* >= payload.len) return error.TruncatedObject;
+    const out = payload[cursor.*];
+    cursor.* += 1;
+    return out;
+}
+
+fn readIntAt(payload: []const u8, cursor: *usize, comptime T: type) !T {
+    const size = @sizeOf(T);
+    if (cursor.* + size > payload.len) return error.TruncatedObject;
+    const out = std.mem.readInt(T, @as(*const [size]u8, @ptrCast(payload[cursor.* .. cursor.* + size].ptr)), .little);
+    cursor.* += size;
+    return out;
+}
+
+fn readHashAt(payload: []const u8, cursor: *usize) ![32]u8 {
+    if (cursor.* + 32 > payload.len) return error.TruncatedObject;
+    var out: [32]u8 = undefined;
+    @memcpy(out[0..], payload[cursor.* .. cursor.* + 32]);
+    cursor.* += 32;
+    return out;
+}
+
+fn readOwnedStringAt(alloc: std.mem.Allocator, payload: []const u8, cursor: *usize) ![]u8 {
+    const len = try readIntAt(payload, cursor, u32);
+    if (cursor.* + len > payload.len) return error.TruncatedObject;
+    const out = try alloc.dupe(u8, payload[cursor.* .. cursor.* + len]);
+    cursor.* += len;
+    return out;
 }

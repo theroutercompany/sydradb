@@ -85,6 +85,7 @@ pub const ContentRef = union(enum) {
 pub const SegmentDescriptor = struct {
     path: []u8,
     mirror_path: []u8 = &[_]u8{},
+    segment_root: ?object_store.ObjectId = null,
     content_id: ?object_store.ObjectId = null,
     content: ?ContentRef = null,
     file_hash: [32]u8,
@@ -105,6 +106,10 @@ pub const SegmentDescriptor = struct {
         if (self.content) |content| return content;
         if (self.content_id) |content_id| return .{ .blob = content_id };
         return null;
+    }
+
+    pub fn segmentRoot(self: SegmentDescriptor) ?object_store.ObjectId {
+        return self.segment_root;
     }
 
     pub fn mirrorPath(self: SegmentDescriptor) []const u8 {
@@ -2236,8 +2241,9 @@ fn appendSegmentDescriptorBlob(
     var idx: usize = 0;
     const version = payload[idx];
     idx += 1;
-    if (version != 1 and version != 2 and version != 3 and version != 4) return false;
+    if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5) return false;
 
+    var segment_root: ?object_store.ObjectId = null;
     var content_root: ?object_store.ObjectId = null;
     switch (version) {
         1 => {},
@@ -2267,6 +2273,28 @@ fn appendSegmentDescriptorBlob(
                 else => return false,
             }
         },
+        5 => {
+            if (idx >= payload.len) return false;
+            const flag = payload[idx];
+            idx += 1;
+            switch (flag) {
+                0 => {},
+                1 => segment_root = .{ .hash = try readHashAt(payload, &idx) },
+                else => return false,
+            }
+
+            const kind = try readByteAt(payload, &idx);
+            switch (kind) {
+                0 => {},
+                1 => content_root = .{ .hash = try readHashAt(payload, &idx) },
+                2 => {
+                    content_root = .{ .hash = try readHashAt(payload, &idx) };
+                    _ = try readIntAt(payload, &idx, u64);
+                    _ = try readIntAt(payload, &idx, u32);
+                },
+                else => return false,
+            }
+        },
         else => unreachable,
     }
 
@@ -2280,6 +2308,7 @@ fn appendSegmentDescriptorBlob(
     _ = try readIntAt(payload, &idx, u32); // count
     if (idx + 2 != payload.len) return false;
 
+    if (segment_root) |id| try stack.append(id);
     if (content_root) |id| try stack.append(id);
     return true;
 }
@@ -3705,10 +3734,15 @@ pub fn buildLegacySnapshot(
         if (metadata.series_id != entry.series_id or metadata.hour_bucket != entry.hour_bucket or metadata.start_ts != entry.start_ts or metadata.end_ts != entry.end_ts or metadata.count != entry.count) {
             return error.ManifestSegmentMismatch;
         }
+        const segment_root = if (store) |object_store_ref|
+            try segment_mod.writeSegmentRootForFile(alloc, data_dir, object_store_ref, entry.path, extent_chunk_bytes)
+        else
+            null;
         const content = try ensureContentRefForFile(alloc, store, data_dir, entry.path, extent_chunk_bytes);
         try descriptors.append(.{
             .path = try alloc.dupe(u8, entry.path),
             .mirror_path = &[_]u8{},
+            .segment_root = segment_root,
             .content_id = if (content) |ref| switch (ref) {
                 .blob => |id| id,
                 .extent_tree => null,
@@ -3955,10 +3989,11 @@ fn encodeSegmentDescriptor(alloc: std.mem.Allocator, descriptor: SegmentDescript
     var bytes = std.array_list.Managed(u8).init(alloc);
     errdefer bytes.deinit();
 
-    const content = descriptor.contentRef() orelse return error.MissingSegmentContentId;
+    if (descriptor.segmentRoot() == null and descriptor.contentRef() == null) return error.MissingSegmentContentId;
 
-    try bytes.append(4);
-    try encodeContentRef(&bytes, content);
+    try bytes.append(5);
+    try appendOptionalObjectId(&bytes, descriptor.segmentRoot());
+    try encodeContentRef(&bytes, descriptor.contentRef());
     try appendString(&bytes, descriptor.mirrorPath());
     try bytes.appendSlice(descriptor.file_hash[0..]);
     try appendInt(&bytes, u64, descriptor.file_size);
@@ -3975,9 +4010,10 @@ fn encodeSegmentDescriptor(alloc: std.mem.Allocator, descriptor: SegmentDescript
 fn decodeSegmentDescriptor(alloc: std.mem.Allocator, payload: []const u8) !SegmentDescriptor {
     var cursor = Cursor{ .bytes = payload };
     const version = try cursor.readByte();
-    if (version != 1 and version != 2 and version != 3 and version != 4) return error.UnsupportedSegmentDescriptorVersion;
+    if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5) return error.UnsupportedSegmentDescriptorVersion;
 
-    const content = if (version == 4)
+    const segment_root = if (version == 5) try cursor.readOptionalObjectId() else null;
+    const content = if (version == 5 or version == 4)
         try decodeContentRef(&cursor)
     else if (version == 1)
         null
@@ -4002,6 +4038,7 @@ fn decodeSegmentDescriptor(alloc: std.mem.Allocator, payload: []const u8) !Segme
     return .{
         .path = path,
         .mirror_path = &[_]u8{},
+        .segment_root = segment_root,
         .content_id = if (content) |ref| switch (ref) {
             .blob => |id| id,
             .extent_tree => null,
@@ -5128,6 +5165,8 @@ test "cas bootstrap imports legacy metadata into a genesis commit" {
 
     try std.testing.expectEqual(@as(usize, 0), snapshot.commit.parents.len);
     try std.testing.expectEqual(@as(usize, 1), snapshot.segment_descriptors.len);
+    try std.testing.expect(snapshot.segment_descriptors[0].segment_root != null);
+    try std.testing.expect(snapshot.segment_descriptors[0].contentRef() != null);
     try std.testing.expectEqual(@as(usize, 1), snapshot.tag_snapshot.entries.len);
     try std.testing.expectEqual(@as(usize, 1), snapshot.series_catalog_snapshot.entries.len);
 }

@@ -113,11 +113,18 @@ The CAS layer stores immutable objects addressed by a BLAKE3 hash of `(type, pay
 
 Current typed metadata payloads include:
 
-- segment descriptors with a canonical `ContentRef` plus optional mirror paths for exported `.seg` files
+- segment descriptors with a canonical `segment_root` tree id, compatibility `ContentRef`, and optional mirror paths for exported `.seg` files
 - tag snapshots
 - series catalog snapshots
 - WAL indexes with a canonical `ContentRef`, optional mirror names, and captured byte counts for mutable `current.wal`
 - tree objects and commit objects that link the metadata DAG together
+
+Native segment roots now store:
+
+- a `meta` blob with series/hour/count/range/codec metadata plus optional selector strings
+- a `blocks/` tree keyed by logical block number
+- per-block trees containing `stats`, `ts`, and `values` entries
+- `ts` and `values` payloads chunked into extent trees with 64 KiB leaf blobs by default
 
 `ContentRef` currently supports:
 
