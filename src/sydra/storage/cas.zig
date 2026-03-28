@@ -603,10 +603,10 @@ pub const RefStore = struct {
         var old_ids = try self.alloc.alloc(?object_store.ObjectId, updates.len);
         defer self.alloc.free(old_ids);
 
-        var ref_entries = std.array_list.Managed(RefEntry).init(self.alloc);
+        var ref_records = std.array_list.Managed(ReftableRefRecord).init(self.alloc);
         defer {
-            for (ref_entries.items) |*entry| entry.deinit(self.alloc);
-            ref_entries.deinit();
+            for (ref_records.items) |*record| record.deinit(self.alloc);
+            ref_records.deinit();
         }
         var reflogs = std.array_list.Managed(ReflogEntry).init(self.alloc);
         defer {
@@ -620,7 +620,7 @@ pub const RefStore = struct {
             if (!optionalObjectIdEql(update.expected_old, current)) {
                 if (update.expected_old != null) return error.RefConflict;
             }
-            try ref_entries.append(.{
+            try ref_records.append(.{
                 .name = try self.alloc.dupe(u8, update.ref_name),
                 .id = update.new_id,
             });
@@ -633,7 +633,7 @@ pub const RefStore = struct {
             });
         }
 
-        try self.appendReftableTable(ref_entries.items, reflogs.items);
+        try self.appendReftableRecords(ref_records.items, reflogs.items);
         try self.maybeCompactReftable();
     }
 
@@ -815,7 +815,7 @@ pub const RefStore = struct {
             idx -= 1;
             var table = try loadReftableTable(self.alloc, self.root, table_names[idx]);
             defer table.deinit(self.alloc);
-            if (lookupRefEntry(table.refs, ref_name)) |entry| return entry.id;
+            if (lookupReftableRefRecord(table.refs, ref_name)) |record| return record.id;
         }
         return null;
     }
@@ -829,18 +829,26 @@ pub const RefStore = struct {
             for (refs.items) |*entry| entry.deinit(alloc);
             refs.deinit();
         }
+        var seen_names = std.array_list.Managed([]u8).init(alloc);
+        defer {
+            for (seen_names.items) |name| alloc.free(name);
+            seen_names.deinit();
+        }
 
         var idx = table_names.len;
         while (idx > 0) {
             idx -= 1;
             var table = try loadReftableTable(alloc, self.root, table_names[idx]);
             defer table.deinit(alloc);
-            for (table.refs) |entry| {
-                if (containsRef(refs.items, entry.name)) continue;
-                try refs.append(.{
-                    .name = try alloc.dupe(u8, entry.name),
-                    .id = entry.id,
-                });
+            for (table.refs) |record| {
+                if (containsString(seen_names.items, record.name)) continue;
+                try seen_names.append(try alloc.dupe(u8, record.name));
+                if (record.id) |id| {
+                    try refs.append(.{
+                        .name = try alloc.dupe(u8, record.name),
+                        .id = id,
+                    });
+                }
             }
         }
 
@@ -893,10 +901,19 @@ pub const RefStore = struct {
         return .{ .checked = checked, .stale = stale };
     }
 
-    fn appendReftableTable(self: *RefStore, refs: []const RefEntry, reflogs: []const ReflogEntry) !void {
-        const table_name = try std.fmt.allocPrint(self.alloc, "reftable/{d}.table", .{std.time.nanoTimestamp()});
+    fn appendReftableRecords(self: *RefStore, refs: []const ReftableRefRecord, reflogs: []const ReflogEntry) !void {
+        var state = try loadOrInitReftableState(self.alloc, self.root);
+        const update_index = state.next_update_index;
+        state.next_update_index += 1;
+        try writeReftableState(self.alloc, self.root, state, self.fsync);
+
+        const span = ReftableSpan{
+            .min_update_index = update_index,
+            .max_update_index = update_index,
+        };
+        const table_name = try reftableTablePathForSpan(self.alloc, span);
         defer self.alloc.free(table_name);
-        try writeReftableTable(self.alloc, self.root, table_name, refs, reflogs, self.fsync);
+        try writeReftableTable(self.alloc, self.root, table_name, span, refs, reflogs, self.fsync);
 
         const tables = try loadReftableTableNames(self.alloc, self.root);
         defer freeOwnedStrings(self.alloc, tables);
@@ -911,9 +928,30 @@ pub const RefStore = struct {
     }
 
     fn writeReftableSnapshot(self: *RefStore, refs: []const RefEntry, reflogs: []const ReflogEntry) !void {
-        const table_name = try std.fmt.allocPrint(self.alloc, "reftable/{d}.table", .{std.time.nanoTimestamp()});
+        var ref_records = try self.alloc.alloc(ReftableRefRecord, refs.len);
+        defer {
+            for (ref_records) |*record| record.deinit(self.alloc);
+            self.alloc.free(ref_records);
+        }
+        for (refs, 0..) |entry, idx| {
+            ref_records[idx] = .{
+                .name = try self.alloc.dupe(u8, entry.name),
+                .id = entry.id,
+            };
+        }
+
+        var state = try loadOrInitReftableState(self.alloc, self.root);
+        const update_index = state.next_update_index;
+        state.next_update_index += 1;
+        try writeReftableState(self.alloc, self.root, state, self.fsync);
+
+        const span = ReftableSpan{
+            .min_update_index = update_index,
+            .max_update_index = update_index,
+        };
+        const table_name = try reftableTablePathForSpan(self.alloc, span);
         defer self.alloc.free(table_name);
-        try writeReftableTable(self.alloc, self.root, table_name, refs, reflogs, self.fsync);
+        try writeReftableTable(self.alloc, self.root, table_name, span, ref_records, reflogs, self.fsync);
         const names = [_][]const u8{table_name};
         try writeReftableTablesList(self.alloc, self.root, names[0..], self.fsync);
     }
@@ -921,21 +959,40 @@ pub const RefStore = struct {
     fn maybeCompactReftable(self: *RefStore) !void {
         const table_names = try loadReftableTableNames(self.alloc, self.root);
         defer freeOwnedStrings(self.alloc, table_names);
-        if (table_names.len <= 8) return;
+        const compact_from = try selectReftableCompactionStart(self.alloc, self.root, table_names);
+        if (compact_from == null) return;
 
-        const refs = try self.listReftableRefs(self.alloc);
-        defer {
-            for (refs) |*entry| entry.deinit(self.alloc);
-            self.alloc.free(refs);
-        }
-        const reflogs = try loadReftableReflogEntries(self.alloc, self.root);
-        defer {
-            for (reflogs) |*entry| entry.deinit(self.alloc);
-            self.alloc.free(reflogs);
-        }
+        const start = compact_from.?;
+        var merged = try mergeReftableTables(self.alloc, self.root, table_names[start..]);
+        defer merged.deinit(self.alloc);
 
-        try self.writeReftableSnapshot(refs, reflogs);
-        for (table_names) |name| self.root.deleteFile(name) catch {};
+        const merged_name = try reftableTablePathForSpan(self.alloc, .{
+            .min_update_index = merged.min_update_index,
+            .max_update_index = merged.max_update_index,
+        });
+        defer self.alloc.free(merged_name);
+        try writeReftableTable(
+            self.alloc,
+            self.root,
+            merged_name,
+            .{
+                .min_update_index = merged.min_update_index,
+                .max_update_index = merged.max_update_index,
+            },
+            merged.refs,
+            merged.reflogs,
+            self.fsync,
+        );
+
+        var next = std.array_list.Managed([]u8).init(self.alloc);
+        defer {
+            for (next.items) |name| self.alloc.free(name);
+            next.deinit();
+        }
+        for (table_names[0..start]) |name| try next.append(try self.alloc.dupe(u8, name));
+        try next.append(try self.alloc.dupe(u8, merged_name));
+        try writeReftableTablesList(self.alloc, self.root, next.items, self.fsync);
+        for (table_names[start..]) |name| self.root.deleteFile(name) catch {};
     }
 
     fn hasReftableTables(self: *RefStore) !bool {
@@ -3214,6 +3271,13 @@ fn containsRef(refs: []const RefEntry, needle: []const u8) bool {
     return false;
 }
 
+fn containsString(entries: []const []const u8, needle: []const u8) bool {
+    for (entries) |entry| {
+        if (std.mem.eql(u8, entry, needle)) return true;
+    }
+    return false;
+}
+
 fn validateReflogFile(alloc: std.mem.Allocator, dir: std.fs.Dir, path: []const u8) !void {
     const body = try dir.readFileAlloc(alloc, path, 1024 * 1024);
     defer alloc.free(body);
@@ -5043,10 +5107,40 @@ fn listRefsRecursive(self: *RefStore, alloc: std.mem.Allocator, refs: *std.array
 
 const reftable_magic = "SYDRTBL1";
 const reftable_tables_list_path = "reftable/tables.list";
+const reftable_state_path = "reftable/state";
+const reftable_state_magic = "SYDRTST1";
+
+const ReftableSpan = struct {
+    min_update_index: u64,
+    max_update_index: u64,
+
+    fn width(self: ReftableSpan) u64 {
+        return if (self.max_update_index >= self.min_update_index)
+            self.max_update_index - self.min_update_index + 1
+        else
+            0;
+    }
+};
+
+const ReftableState = struct {
+    next_update_index: u64,
+};
+
+const ReftableRefRecord = struct {
+    name: []u8,
+    id: ?object_store.ObjectId,
+
+    fn deinit(self: *ReftableRefRecord, alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+    }
+};
 
 const ReftableTable = struct {
-    refs: []RefEntry,
+    refs: []ReftableRefRecord,
     reflogs: []ReflogEntry,
+    min_update_index: u64,
+    max_update_index: u64,
+    size_bytes: u64,
 
     fn deinit(self: *ReftableTable, alloc: std.mem.Allocator) void {
         for (self.refs) |*entry| entry.deinit(alloc);
@@ -5056,11 +5150,99 @@ const ReftableTable = struct {
     }
 };
 
-fn lookupRefEntry(entries: []const RefEntry, ref_name: []const u8) ?RefEntry {
+fn lookupReftableRefRecord(entries: []const ReftableRefRecord, ref_name: []const u8) ?ReftableRefRecord {
     for (entries) |entry| {
         if (std.mem.eql(u8, entry.name, ref_name)) return entry;
     }
     return null;
+}
+
+fn loadOrInitReftableState(alloc: std.mem.Allocator, root: std.fs.Dir) !ReftableState {
+    return loadReftableState(alloc, root) catch |err| switch (err) {
+        error.FileNotFound => .{ .next_update_index = try inferNextReftableUpdateIndex(alloc, root) },
+        else => return err,
+    };
+}
+
+fn loadReftableState(alloc: std.mem.Allocator, root: std.fs.Dir) !ReftableState {
+    const bytes = try root.readFileAlloc(alloc, reftable_state_path, 4096);
+    defer alloc.free(bytes);
+    if (bytes.len < reftable_state_magic.len + @sizeOf(u16) + @sizeOf(u64) + 32) return error.CorruptReftableState;
+    if (!std.mem.eql(u8, bytes[0..reftable_state_magic.len], reftable_state_magic)) return error.CorruptReftableState;
+
+    const checksum_start = bytes.len - 32;
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(bytes[0..checksum_start]);
+    var expected_checksum: [32]u8 = undefined;
+    hasher.final(expected_checksum[0..]);
+    if (!std.mem.eql(u8, expected_checksum[0..], bytes[checksum_start..])) return error.CorruptReftableState;
+
+    var cursor = Cursor{ .bytes = bytes[reftable_state_magic.len..checksum_start] };
+    const version = try cursor.readInt(u16);
+    if (version != 1) return error.UnsupportedReftableStateVersion;
+    const next_update_index = try cursor.readInt(u64);
+    try cursor.finish();
+    return .{ .next_update_index = next_update_index };
+}
+
+fn writeReftableState(alloc: std.mem.Allocator, root: std.fs.Dir, state: ReftableState, fsync: cfg.FsyncPolicy) !void {
+    var bytes = std.array_list.Managed(u8).init(alloc);
+    defer bytes.deinit();
+    try bytes.appendSlice(reftable_state_magic);
+    try appendInt(&bytes, u16, 1);
+    try appendInt(&bytes, u64, state.next_update_index);
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(bytes.items);
+    var checksum: [32]u8 = undefined;
+    hasher.final(checksum[0..]);
+    try bytes.appendSlice(checksum[0..]);
+
+    const temp_path = reftable_state_path ++ ".tmp";
+    var file = try root.createFile(temp_path, .{ .truncate = true, .read = true });
+    defer file.close();
+    errdefer root.deleteFile(temp_path) catch {};
+    try file.writeAll(bytes.items);
+    if (fsync != .none) try file.sync();
+    root.rename(temp_path, reftable_state_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            root.deleteFile(reftable_state_path) catch {};
+            try root.rename(temp_path, reftable_state_path);
+        },
+        else => return err,
+    };
+    if (fsync != .none) {
+        var root_for_sync = root;
+        try syncDir(&root_for_sync);
+    }
+}
+
+fn inferNextReftableUpdateIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !u64 {
+    const table_names = try loadReftableTableNames(alloc, root);
+    defer freeOwnedStrings(alloc, table_names);
+
+    var next_update_index: u64 = 1;
+    for (table_names) |name| {
+        const span = parseReftableSpanFromName(name) orelse continue;
+        next_update_index = @max(next_update_index, span.max_update_index + 1);
+    }
+    return next_update_index;
+}
+
+fn parseReftableSpanFromName(path: []const u8) ?ReftableSpan {
+    const base = std.fs.path.basename(path);
+    if (!std.mem.endsWith(u8, base, ".table")) return null;
+    const stem = base[0 .. base.len - ".table".len];
+    const dash_idx = std.mem.indexOfScalar(u8, stem, '-') orelse return null;
+    const min_update_index = std.fmt.parseInt(u64, stem[0..dash_idx], 10) catch return null;
+    const max_update_index = std.fmt.parseInt(u64, stem[dash_idx + 1 ..], 10) catch return null;
+    return .{
+        .min_update_index = min_update_index,
+        .max_update_index = max_update_index,
+    };
+}
+
+fn reftableTablePathForSpan(alloc: std.mem.Allocator, span: ReftableSpan) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "reftable/{d}-{d}.table", .{ span.min_update_index, span.max_update_index });
 }
 
 fn loadReftableTableNames(alloc: std.mem.Allocator, root: std.fs.Dir) ![][]u8 {
@@ -5120,7 +5302,8 @@ fn writeReftableTable(
     alloc: std.mem.Allocator,
     root: std.fs.Dir,
     table_path: []const u8,
-    refs: []const RefEntry,
+    span: ReftableSpan,
+    refs: []const ReftableRefRecord,
     reflogs: []const ReflogEntry,
     fsync: cfg.FsyncPolicy,
 ) !void {
@@ -5135,13 +5318,16 @@ fn writeReftableTable(
     var writer_state = file.writer(&write_buf);
     const writer = &writer_state.interface;
     try writer.writeAll(reftable_magic);
-    try writer.writeInt(u16, 1, .little);
+    try writer.writeInt(u16, 2, .little);
+    try writer.writeInt(u64, span.min_update_index, .little);
+    try writer.writeInt(u64, span.max_update_index, .little);
     try writer.writeInt(u64, @intCast(refs.len), .little);
     try writer.writeInt(u64, @intCast(reflogs.len), .little);
     for (refs) |entry| {
         try writer.writeInt(u16, @intCast(entry.name.len), .little);
         try writer.writeAll(entry.name);
-        try writer.writeAll(entry.id.hash[0..]);
+        try writer.writeByte(if (entry.id != null) 1 else 0);
+        if (entry.id) |id| try writer.writeAll(id.hash[0..]);
     }
     for (reflogs) |entry| {
         try writer.writeInt(u16, @intCast(entry.ref_name.len), .little);
@@ -5178,11 +5364,21 @@ fn loadReftableTable(alloc: std.mem.Allocator, root: std.fs.Dir, table_path: []c
 
     var cursor = Cursor{ .bytes = bytes, .index = reftable_magic.len };
     const version = try cursor.readInt(u16);
-    if (version != 1) return error.UnsupportedReftableVersion;
+    if (version != 1 and version != 2) return error.UnsupportedReftableVersion;
+    const span = if (version == 2)
+        ReftableSpan{
+            .min_update_index = try cursor.readInt(u64),
+            .max_update_index = try cursor.readInt(u64),
+        }
+    else
+        parseReftableSpanFromName(table_path) orelse ReftableSpan{
+            .min_update_index = 0,
+            .max_update_index = 0,
+        };
     const ref_count = try cursor.readInt(u64);
     const reflog_count = try cursor.readInt(u64);
 
-    const refs = try alloc.alloc(RefEntry, @intCast(ref_count));
+    const refs = try alloc.alloc(ReftableRefRecord, @intCast(ref_count));
     var refs_loaded: usize = 0;
     errdefer {
         for (refs[0..refs_loaded]) |*entry| entry.deinit(alloc);
@@ -5192,7 +5388,15 @@ fn loadReftableTable(alloc: std.mem.Allocator, root: std.fs.Dir, table_path: []c
         const name_len = try cursor.readInt(u16);
         const name = try cursor.readBytes(alloc, name_len);
         errdefer alloc.free(name);
-        entry.* = .{ .name = name, .id = .{ .hash = try cursor.readHash() } };
+        const id = if (version == 2)
+            switch (try cursor.readByte()) {
+                0 => null,
+                1 => object_store.ObjectId{ .hash = try cursor.readHash() },
+                else => return error.CorruptReftable,
+            }
+        else
+            object_store.ObjectId{ .hash = try cursor.readHash() };
+        entry.* = .{ .name = name, .id = id };
         refs_loaded += 1;
     }
 
@@ -5223,7 +5427,13 @@ fn loadReftableTable(alloc: std.mem.Allocator, root: std.fs.Dir, table_path: []c
         reflogs_loaded += 1;
     }
     try cursor.finish();
-    return .{ .refs = refs, .reflogs = reflogs };
+    return .{
+        .refs = refs,
+        .reflogs = reflogs,
+        .min_update_index = span.min_update_index,
+        .max_update_index = span.max_update_index,
+        .size_bytes = bytes.len,
+    };
 }
 
 fn loadReftableReflogEntries(alloc: std.mem.Allocator, root: std.fs.Dir) ![]ReflogEntry {
@@ -5275,6 +5485,131 @@ fn loadLooseReflogEntries(alloc: std.mem.Allocator, root: std.fs.Dir) ![]ReflogE
         }
     }
     return try entries.toOwnedSlice();
+}
+
+fn selectReftableCompactionStart(alloc: std.mem.Allocator, root: std.fs.Dir, table_names: []const []const u8) !?usize {
+    if (table_names.len <= 1) return null;
+
+    var tables = try alloc.alloc(ReftableTable, table_names.len);
+    defer {
+        for (tables) |*table| table.deinit(alloc);
+        alloc.free(tables);
+    }
+
+    for (table_names, 0..) |name, idx| {
+        tables[idx] = try loadReftableTable(alloc, root, name);
+    }
+
+    var start = table_names.len - 1;
+    var combined_span = effectiveReftableSpan(tables[start], @intCast(start));
+    var combined_size = tables[start].size_bytes;
+
+    while (start > 0) {
+        const prev_idx = start - 1;
+        const prev_span = effectiveReftableSpan(tables[prev_idx], @intCast(prev_idx));
+        const should_merge = table_names.len > 8 or combined_size <= prev_span.size_bytes * 2 or combined_span.width() <= prev_span.width() * 2;
+        if (!should_merge) break;
+        start = prev_idx;
+        combined_span = .{
+            .min_update_index = @min(prev_span.min_update_index, combined_span.min_update_index),
+            .max_update_index = @max(prev_span.max_update_index, combined_span.max_update_index),
+        };
+        combined_size += tables[prev_idx].size_bytes;
+    }
+
+    if (start == table_names.len - 1) return null;
+    return start;
+}
+
+fn effectiveReftableSpan(table: ReftableTable, ordinal: u64) struct {
+    min_update_index: u64,
+    max_update_index: u64,
+    size_bytes: u64,
+
+    fn width(self: @This()) u64 {
+        return if (self.max_update_index >= self.min_update_index)
+            self.max_update_index - self.min_update_index + 1
+        else
+            0;
+    }
+} {
+    const fallback = ordinal + 1;
+    return .{
+        .min_update_index = if (table.min_update_index == 0) fallback else table.min_update_index,
+        .max_update_index = if (table.max_update_index == 0) fallback else table.max_update_index,
+        .size_bytes = table.size_bytes,
+    };
+}
+
+fn mergeReftableTables(alloc: std.mem.Allocator, root: std.fs.Dir, table_names: []const []const u8) !ReftableTable {
+    var merged_refs = std.array_list.Managed(ReftableRefRecord).init(alloc);
+    errdefer {
+        for (merged_refs.items) |*record| record.deinit(alloc);
+        merged_refs.deinit();
+    }
+    var merged_reflogs = std.array_list.Managed(ReflogEntry).init(alloc);
+    errdefer {
+        for (merged_reflogs.items) |*entry| entry.deinit(alloc);
+        merged_reflogs.deinit();
+    }
+    var seen_names = std.array_list.Managed([]u8).init(alloc);
+    defer {
+        for (seen_names.items) |name| alloc.free(name);
+        seen_names.deinit();
+    }
+
+    var min_update_index: ?u64 = null;
+    var max_update_index: u64 = 0;
+    var total_size: u64 = 0;
+
+    var idx = table_names.len;
+    while (idx > 0) {
+        idx -= 1;
+        var table = try loadReftableTable(alloc, root, table_names[idx]);
+        defer table.deinit(alloc);
+
+        const span = effectiveReftableSpan(table, @intCast(idx));
+        min_update_index = if (min_update_index) |current| @min(current, span.min_update_index) else span.min_update_index;
+        max_update_index = @max(max_update_index, span.max_update_index);
+        total_size += table.size_bytes;
+
+        for (table.refs) |record| {
+            if (containsString(seen_names.items, record.name)) continue;
+            try seen_names.append(try alloc.dupe(u8, record.name));
+            try merged_refs.append(.{
+                .name = try alloc.dupe(u8, record.name),
+                .id = record.id,
+            });
+        }
+    }
+
+    std.sort.block(ReftableRefRecord, merged_refs.items, {}, struct {
+        fn lessThan(_: void, lhs: ReftableRefRecord, rhs: ReftableRefRecord) bool {
+            return std.mem.lessThan(u8, lhs.name, rhs.name);
+        }
+    }.lessThan);
+
+    for (table_names) |name| {
+        var table = try loadReftableTable(alloc, root, name);
+        defer table.deinit(alloc);
+        for (table.reflogs) |entry| {
+            try merged_reflogs.append(.{
+                .ref_name = try alloc.dupe(u8, entry.ref_name),
+                .old_id = entry.old_id,
+                .new_id = entry.new_id,
+                .timestamp_ms = entry.timestamp_ms,
+                .reason = try alloc.dupe(u8, entry.reason),
+            });
+        }
+    }
+
+    return .{
+        .refs = try merged_refs.toOwnedSlice(),
+        .reflogs = try merged_reflogs.toOwnedSlice(),
+        .min_update_index = min_update_index orelse 0,
+        .max_update_index = max_update_index,
+        .size_bytes = total_size,
+    };
 }
 
 fn writeManifestFile(alloc: std.mem.Allocator, data_dir: std.fs.Dir, descriptors: []const SegmentDescriptor) !void {
@@ -5814,6 +6149,83 @@ test "ref transactions enforce compare-and-swap and append reflogs" {
     const reflog = try refs.root.readFileAlloc(std.testing.allocator, "logs/refs/heads/main", 4096);
     defer std.testing.allocator.free(reflog);
     try std.testing.expect(std.mem.indexOf(u8, reflog, "advance-main") != null);
+}
+
+test "reftable transactions assign update spans and compact older tables" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/reftable-spans", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+
+    var refs = try RefStore.init(std.testing.allocator, path, .none);
+    defer refs.deinit();
+    refs.setBackend(.reftable);
+
+    var previous: ?object_store.ObjectId = null;
+    var idx: usize = 0;
+    while (idx < 12) : (idx += 1) {
+        const payload = try std.fmt.allocPrint(std.testing.allocator, "reftable-span-{d}", .{idx});
+        defer std.testing.allocator.free(payload);
+        const next_id = object_store.computeId(.commit, payload);
+        if (previous) |expected_old| {
+            try refs.compareAndSwapRef(main_ref, expected_old, next_id, "advance-reftable");
+        } else {
+            try refs.updateRefAtomic(main_ref, next_id);
+        }
+        previous = next_id;
+    }
+
+    const state = try loadReftableState(std.testing.allocator, refs.root);
+    try std.testing.expectEqual(@as(u64, 13), state.next_update_index);
+
+    const table_names = try loadReftableTableNames(std.testing.allocator, refs.root);
+    defer freeOwnedStrings(std.testing.allocator, table_names);
+    try std.testing.expect(table_names.len < 12);
+
+    var saw_compacted_span = false;
+    for (table_names) |name| {
+        const span = parseReftableSpanFromName(name) orelse continue;
+        if (span.max_update_index > span.min_update_index) {
+            saw_compacted_span = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_compacted_span);
+
+    const head = try refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(head.eql(previous.?));
+}
+
+test "reftable tombstones suppress older refs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/reftable-tombstone", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+
+    var refs = try RefStore.init(std.testing.allocator, path, .none);
+    defer refs.deinit();
+    refs.setBackend(.reftable);
+
+    const first = object_store.computeId(.commit, "tombstone-first");
+    try refs.updateRefAtomic(main_ref, first);
+
+    var tombstones = [_]ReftableRefRecord{.{
+        .name = try std.testing.allocator.dupe(u8, main_ref),
+        .id = null,
+    }};
+    defer tombstones[0].deinit(std.testing.allocator);
+
+    try refs.appendReftableRecords(tombstones[0..], &[_]ReflogEntry{});
+
+    try std.testing.expect((try refs.readHead(main_ref)) == null);
+    const listed = try refs.listRefs(std.testing.allocator);
+    defer {
+        for (listed) |*entry| entry.deinit(std.testing.allocator);
+        std.testing.allocator.free(listed);
+    }
+    try std.testing.expectEqual(@as(usize, 0), listed.len);
 }
 
 test "checkpoints support diffing and rollback" {

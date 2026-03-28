@@ -35,9 +35,13 @@ Under `data_dir`, the engine uses:
 - `objects/info/multi-pack-index` – optional pack-set fanout index across all active packs
 - `objects/info/commit-graph` – optional commit ancestry side index with generation numbers and logical changed-path Bloom filters
 - `objects/info/reachability-bitmap` – optional ref-keyed reachable-object side index for CAS maintenance fast paths
+- `objects/info/object-refs` – optional explicit child-edge index keyed by object id for GC/fsck/bitmap refresh
 - `objects/cruft/<timestamp>/...` – quarantined unreachable CAS content retained until the GC grace window expires
 - `refs/` – loose compatibility refs and reflogs for pre-migration repositories
 - `reftable/` – append-only reftable stack for migrated/new repository refs and reflogs
+  - `tables.list` – ordered active reftable stack
+  - `state` – monotonic next-update counter for update-indexed table naming
+  - `<min_update>-<max_update>.table` – update-indexed reftable files, including tombstones when refs are deleted
 - `lost-found/` – optional fsck output for dangling commit/blob/tree ids
 
 ## WAL format (v0)
@@ -106,10 +110,11 @@ The CAS layer stores immutable objects addressed by a BLAKE3 hash of `(type, pay
 - Packed objects live in `objects/packs/*.pack` and are indexed by `objects/packs/*.idx`.
 - `objects/info/store-format` version 2 marks repositories that default to the reftable ref backend and CAS-primary startup; version 1 remains the compatibility format for pre-migration repositories.
 - `objects/info/multi-pack-index` provides an optional cross-pack fanout table so lookups can resolve mixed pack sets without scanning every individual `.idx` file first.
+- `objects/info/object-refs` records typed object-to-child edges explicitly, so reachability, `fsck`, and bitmap refresh no longer need to infer every edge by reparsing arbitrary blob payloads.
 - `objects/info/reachability-bitmap` caches the exact reachable object-id set for the current sorted ref snapshot, so `cas pack`, bundle selection, and non-reflog reachability checks can fall back to a side index instead of walking the full DAG every time.
 - The current implementation stores whole objects in packs; it does not use delta compression.
-- `cas pack` writes an additional pack/index pair for the currently reachable loose object set, refreshes `objects/info/multi-pack-index`, and removes redundant loose copies for the newly packed objects without pruning older active packs.
-- `cas gc --apply` preserves unreachable content by first copying active pack files and moving loose unreachable objects into `objects/cruft/<timestamp>/`, then pruning older cruft directories after the configured grace window.
+- `cas pack` writes an additional pack/index/manifest set for the currently reachable loose object set, refreshes `objects/info/multi-pack-index`, and removes redundant loose copies for the newly packed objects without pruning older active packs.
+- `cas gc --apply` preserves unreachable content by first copying active pack files and sealing unreachable loose objects into `objects/cruft/<timestamp>/packs/*.pack`, then pruning older cruft directories after the configured grace window.
 
 Current typed metadata payloads include:
 
@@ -162,6 +167,8 @@ Operational notes:
 
 - `cas fsck` is reflog-aware by default, so commits only referenced by reflogs are still considered reachable.
 - `objects/info/commit-graph` version 2 stores fixed-width Bloom filters for logical metadata paths such as `metadata/segments`, `metadata/tags`, `metadata/series_catalog`, and `wal/*`.
+- Active packs now carry adjacent `.manifest` files with per-type object counts and pack checksums; `cas fsck` validates those manifests before trusting mixed-pack reachability.
+- Reftable writes now use update-indexed table names and a persisted `reftable/state` counter. Compaction rewrites suffixes geometrically into wider `<min>-<max>.table` spans while preserving tombstones.
 - `cas fsck --connectivity-only` limits validation to refs, reflogs, reachable objects, commit-graph consistency, and dangling detection.
 - `cas fsck --lost-found` writes dangling commit/blob/tree ids into `lost-found/`.
 - `cas gc --no-reflogs` ignores reflog protection when deciding what is unreachable.
