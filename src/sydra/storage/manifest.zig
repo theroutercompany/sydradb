@@ -1,6 +1,8 @@
 const std = @import("std");
 const types = @import("../types.zig");
 
+pub const manifest_path = "MANIFEST";
+
 pub const Entry = struct {
     series_id: types.SeriesId,
     hour_bucket: i64,
@@ -19,11 +21,11 @@ pub const Manifest = struct {
         var mf = Manifest{ .alloc = alloc, .entries = .{} };
         // create directory structure
         data_dir.makePath("segments") catch {};
-        var file = data_dir.openFile("MANIFEST", .{}) catch |e| switch (e) {
+        var file = data_dir.openFile(manifest_path, .{}) catch |e| switch (e) {
             error.FileNotFound => blk: {
-                var f = try data_dir.createFile("MANIFEST", .{ .read = true });
+                var f = try data_dir.createFile(manifest_path, .{ .read = true });
                 f.close();
-                break :blk try data_dir.openFile("MANIFEST", .{});
+                break :blk try data_dir.openFile(manifest_path, .{});
             },
             else => return e,
         };
@@ -78,15 +80,15 @@ pub const Manifest = struct {
         try self.entries.append(self.alloc, entry);
     }
 
-    pub fn add(self: *Manifest, data_dir: std.fs.Dir, sid: types.SeriesId, hour: i64, start_ts: i64, end_ts: i64, count: u32, path: []const u8) !void {
+    pub fn add(self: *Manifest, data_dir: std.fs.Dir, sid: types.SeriesId, hour: i64, start_ts: i64, end_ts: i64, count: u32, segment_path: []const u8) !void {
         // append line to MANIFEST
         const OpenFlags = std.fs.File.OpenFlags;
         const open_opts: OpenFlags = if (@hasField(OpenFlags, "write"))
             OpenFlags{ .write = true, .read = true }
         else
             OpenFlags{ .mode = .read_write };
-        var file = data_dir.openFile("MANIFEST", open_opts) catch |err| switch (err) {
-            error.FileNotFound => try data_dir.createFile("MANIFEST", .{ .read = true }),
+        var file = data_dir.openFile(manifest_path, open_opts) catch |err| switch (err) {
+            error.FileNotFound => try data_dir.createFile(manifest_path, .{ .read = true }),
             else => return err,
         };
         defer file.close();
@@ -100,7 +102,7 @@ pub const Manifest = struct {
             .start_ts = start_ts,
             .end_ts = end_ts,
             .count = count,
-            .path = @constCast(path),
+            .path = @constCast(segment_path),
         });
         try writer_state.end();
         try self.entries.append(self.alloc, .{
@@ -109,7 +111,7 @@ pub const Manifest = struct {
             .start_ts = start_ts,
             .end_ts = end_ts,
             .count = count,
-            .path = try self.alloc.dupe(u8, path),
+            .path = try self.alloc.dupe(u8, segment_path),
         });
     }
 
@@ -127,7 +129,7 @@ pub const Manifest = struct {
         }
         try writer_state.end();
         try file.sync();
-        try data_dir.rename(temp_name, "MANIFEST");
+        try data_dir.rename(temp_name, manifest_path);
     }
 };
 

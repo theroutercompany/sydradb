@@ -1,13 +1,15 @@
 const std = @import("std");
 const types = @import("../types.zig");
 
+pub const path = "tags.json";
+
 pub const TagIndex = struct {
     alloc: std.mem.Allocator,
     map: std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)),
 
     pub fn loadOrInit(alloc: std.mem.Allocator, data_dir: std.fs.Dir) !TagIndex {
         var idx = TagIndex{ .alloc = alloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(alloc) };
-        const f = data_dir.openFile("tags.json", .{}) catch |e| switch (e) {
+        const f = data_dir.openFile(path, .{}) catch |e| switch (e) {
             error.FileNotFound => return idx,
             else => return e,
         };
@@ -63,7 +65,7 @@ pub const TagIndex = struct {
     }
 
     pub fn save(self: *TagIndex, data_dir: std.fs.Dir) !void {
-        var f = try data_dir.createFile("tags.json", .{ .truncate = true, .read = true });
+        var f = try data_dir.createFile(path, .{ .truncate = true, .read = true });
         defer f.close();
         var write_buf: [4096]u8 = undefined;
         var writer_state = f.writer(&write_buf);

@@ -49,12 +49,18 @@ pub const Engine = struct {
         tags: tags_mod.TagIndex,
         series_catalog: series_catalog_mod.SeriesCatalog,
         cas_index: ?cas_mod.SnapshotIndex = null,
+        cas_index_mu: std.Thread.Mutex = .{},
 
         pub fn deinit(self: *MetadataState) void {
             self.manifest.deinit();
             self.tags.deinit();
             self.series_catalog.deinit();
-            if (self.cas_index) |*index| index.deinit();
+            self.cas_index_mu.lock();
+            defer self.cas_index_mu.unlock();
+            if (self.cas_index) |*index| {
+                index.deinit();
+                self.cas_index = null;
+            }
         }
 
         pub fn load(
@@ -73,11 +79,19 @@ pub const Engine = struct {
         }
 
         pub fn refreshCasIndex(self: *MetadataState, cas: *cas_mod.CasManager) !void {
+            var next = try cas.loadHeadIndex();
+            errdefer next.deinit();
+
+            self.cas_index_mu.lock();
+            defer self.cas_index_mu.unlock();
             if (self.cas_index) |*index| index.deinit();
-            self.cas_index = try cas.loadHeadIndex();
+            self.cas_index = next;
         }
 
         pub fn refreshCasIndexIfStale(self: *MetadataState, cas: *cas_mod.CasManager) !void {
+            self.cas_index_mu.lock();
+            defer self.cas_index_mu.unlock();
+
             const head = try cas.refs.readHead(cas_mod.main_ref) orelse {
                 if (self.cas_index) |*index| {
                     index.deinit();
@@ -88,16 +102,76 @@ pub const Engine = struct {
             if (self.cas_index) |*index| {
                 if (index.snapshot.commit_id.eql(head)) return;
             }
-            try self.refreshCasIndex(cas);
+
+            var next = try cas.loadHeadIndex();
+            errdefer next.deinit();
+            if (self.cas_index) |*index| index.deinit();
+            self.cas_index = next;
         }
 
         fn legacyView(self: *MetadataState) MetadataView {
             return .{ .legacy = self };
         }
 
-        fn casView(self: *MetadataState) ?MetadataView {
-            if (self.cas_index) |*index| return .{ .cas = index };
+        pub fn queryRangeFromCas(
+            self: *MetadataState,
+            alloc: std.mem.Allocator,
+            data_dir: std.fs.Dir,
+            series_id: types.SeriesId,
+            start_ts: i64,
+            end_ts: i64,
+            out: *std.array_list.Managed(types.Point),
+        ) !bool {
+            self.cas_index_mu.lock();
+            defer self.cas_index_mu.unlock();
+            if (self.cas_index) |*index| {
+                try index.queryRange(alloc, data_dir, series_id, start_ts, end_ts, out);
+                return true;
+            }
+            return false;
+        }
+
+        pub fn resolveBySeriesIdFromCas(self: *MetadataState, series_id: types.SeriesId) ?series_catalog_mod.Resolution {
+            self.cas_index_mu.lock();
+            defer self.cas_index_mu.unlock();
+            if (self.cas_index) |*index| return index.resolveBySeriesId(series_id);
             return null;
+        }
+
+        pub fn resolveUniqueSeriesNameDetailedFromCas(self: *MetadataState, series: []const u8) ?series_catalog_mod.Resolution {
+            self.cas_index_mu.lock();
+            defer self.cas_index_mu.unlock();
+            if (self.cas_index) |*index| return index.resolveUniqueSeriesNameDetailed(series);
+            return null;
+        }
+
+        pub fn resolveExactSeriesDetailedFromCas(
+            self: *MetadataState,
+            series: []const u8,
+            tags_json: []const u8,
+        ) !?series_catalog_mod.Resolution {
+            self.cas_index_mu.lock();
+            defer self.cas_index_mu.unlock();
+            if (self.cas_index) |*index| return try index.resolveExactSeriesDetailed(series, tags_json);
+            return null;
+        }
+
+        pub fn collectMatchingSeriesIdsFromCas(
+            self: *MetadataState,
+            alloc: std.mem.Allocator,
+            tags_value: std.json.Value,
+            op_and: bool,
+        ) !?std.array_list.Managed(types.SeriesId) {
+            self.cas_index_mu.lock();
+            defer self.cas_index_mu.unlock();
+            if (self.cas_index) |*index| return try collectMatchingSeriesIdsFromSnapshotIndex(alloc, index, tags_value, op_and);
+            return null;
+        }
+
+        pub fn hasCasIndex(self: *MetadataState) bool {
+            self.cas_index_mu.lock();
+            defer self.cas_index_mu.unlock();
+            return self.cas_index != null;
         }
 
         fn loadFromLegacy(
@@ -625,17 +699,14 @@ pub const Engine = struct {
             .legacy => try legacy_view.queryRange(self.alloc, self.data_dir, series_id, start_ts, end_ts, out),
             .shadow => {
                 try legacy_view.queryRange(self.alloc, self.data_dir, series_id, start_ts, end_ts, out);
-                if (self.metadata.casView()) |cas_view| {
-                    var cas_points = std.array_list.Managed(types.Point).init(self.alloc);
-                    defer cas_points.deinit();
-                    try cas_view.queryRange(self.alloc, self.data_dir, series_id, start_ts, end_ts, &cas_points);
+                var cas_points = std.array_list.Managed(types.Point).init(self.alloc);
+                defer cas_points.deinit();
+                if (try self.metadata.queryRangeFromCas(self.alloc, self.data_dir, series_id, start_ts, end_ts, &cas_points)) {
                     try verifyPointsMatch(out.items, cas_points.items);
                 }
             },
             .primary => {
-                if (self.metadata.casView()) |cas_view| {
-                    try cas_view.queryRange(self.alloc, self.data_dir, series_id, start_ts, end_ts, out);
-                } else {
+                if (!try self.metadata.queryRangeFromCas(self.alloc, self.data_dir, series_id, start_ts, end_ts, out)) {
                     try legacy_view.queryRange(self.alloc, self.data_dir, series_id, start_ts, end_ts, out);
                 }
             },
@@ -654,15 +725,14 @@ pub const Engine = struct {
                 return switch (self.config.metadata_read_mode) {
                     .legacy => legacy,
                     .shadow => blk: {
-                        if (self.metadata.casView()) |cas_view| {
-                            const cas_resolution = cas_view.resolveBySeriesId(series_id);
+                        if (self.metadata.resolveBySeriesIdFromCas(series_id)) |cas_resolution| {
                             if (!resolutionsEqual(legacy, cas_resolution)) {
                                 return error.CasShadowMismatch;
                             }
                         }
                         break :blk legacy;
                     },
-                    .primary => if (self.metadata.casView()) |cas_view| cas_view.resolveBySeriesId(series_id) else legacy,
+                    .primary => self.metadata.resolveBySeriesIdFromCas(series_id) orelse legacy,
                 };
             },
             .name => |series| {
@@ -670,15 +740,14 @@ pub const Engine = struct {
                 return switch (self.config.metadata_read_mode) {
                     .legacy => legacy,
                     .shadow => blk: {
-                        if (self.metadata.casView()) |cas_view| {
-                            const cas_resolution = cas_view.resolveUniqueSeriesNameDetailed(series);
+                        if (self.metadata.resolveUniqueSeriesNameDetailedFromCas(series)) |cas_resolution| {
                             if (!resolutionsEqual(legacy, cas_resolution)) {
                                 return error.CasShadowMismatch;
                             }
                         }
                         break :blk legacy;
                     },
-                    .primary => if (self.metadata.casView()) |cas_view| cas_view.resolveUniqueSeriesNameDetailed(series) else legacy,
+                    .primary => self.metadata.resolveUniqueSeriesNameDetailedFromCas(series) orelse legacy,
                 };
             },
             .exact => |exact| {
@@ -686,15 +755,14 @@ pub const Engine = struct {
                 return switch (self.config.metadata_read_mode) {
                     .legacy => legacy,
                     .shadow => blk: {
-                        if (self.metadata.casView()) |cas_view| {
-                            const cas_resolution = try cas_view.resolveExactSeriesDetailed(exact.series, exact.tags_json);
+                        if (try self.metadata.resolveExactSeriesDetailedFromCas(exact.series, exact.tags_json)) |cas_resolution| {
                             if (!resolutionsEqual(legacy, cas_resolution)) {
                                 return error.CasShadowMismatch;
                             }
                         }
                         break :blk legacy;
                     },
-                    .primary => if (self.metadata.casView()) |cas_view| try cas_view.resolveExactSeriesDetailed(exact.series, exact.tags_json) else legacy,
+                    .primary => if (try self.metadata.resolveExactSeriesDetailedFromCas(exact.series, exact.tags_json)) |cas_resolution| cas_resolution else legacy,
                 };
             },
         }
@@ -718,15 +786,15 @@ pub const Engine = struct {
             .shadow => {
                 var legacy = try collectMatchingSeriesIdsFromView(alloc, legacy_view, tags_value, op_and);
                 errdefer legacy.deinit();
-                if (self.metadata.casView()) |cas_view| {
-                    var cas_ids = try collectMatchingSeriesIdsFromView(alloc, cas_view, tags_value, op_and);
-                    defer cas_ids.deinit();
-                    try verifySeriesIdsMatch(legacy.items, cas_ids.items);
+                if (try self.metadata.collectMatchingSeriesIdsFromCas(alloc, tags_value, op_and)) |cas_ids| {
+                    var cas_ids_mut = cas_ids;
+                    defer cas_ids_mut.deinit();
+                    try verifySeriesIdsMatch(legacy.items, cas_ids_mut.items);
                 }
                 return legacy;
             },
             .primary => {
-                if (self.metadata.casView()) |cas_view| return try collectMatchingSeriesIdsFromView(alloc, cas_view, tags_value, op_and);
+                if (try self.metadata.collectMatchingSeriesIdsFromCas(alloc, tags_value, op_and)) |cas_ids| return cas_ids;
                 return try collectMatchingSeriesIdsFromView(alloc, legacy_view, tags_value, op_and);
             },
         }
@@ -769,7 +837,7 @@ pub const Engine = struct {
         if (self.cas) |*cas| {
             try self.metadata.refreshCasIndexIfStale(cas);
         }
-        const changed = if (self.metadata.cas_index != null and self.cas != null)
+        const changed = if (self.cas != null and self.metadata.hasCasIndex())
             try compactCasBackedSegments(self)
         else
             try @import("storage/compact.zig").compactAllWithResult(self.alloc, self.data_dir, &self.metadata.manifest);
@@ -818,10 +886,14 @@ pub const Engine = struct {
         var highwater = std.AutoHashMap(types.SeriesId, i64).init(self.alloc);
         defer highwater.deinit();
 
-        if (self.metadata.cas_index) |*index| {
-            try collectSegmentHighwater(&highwater, index.snapshot.segment_descriptors);
-        } else {
-            try collectSegmentHighwater(&highwater, self.metadata.manifest.entries.items);
+        {
+            self.metadata.cas_index_mu.lock();
+            defer self.metadata.cas_index_mu.unlock();
+            if (self.metadata.cas_index) |*index| {
+                try collectSegmentHighwater(&highwater, index.snapshot.segment_descriptors);
+            } else {
+                try collectSegmentHighwater(&highwater, self.metadata.manifest.entries.items);
+            }
         }
 
         var ctx = struct {
@@ -877,6 +949,8 @@ pub const Engine = struct {
     }
 
     fn replayRecoveryWalFromCas(self: *Engine, ctx: anytype) !bool {
+        self.metadata.cas_index_mu.lock();
+        defer self.metadata.cas_index_mu.unlock();
         const index = if (self.metadata.cas_index) |*snapshot_index| snapshot_index else return false;
         const cas = if (self.cas) |*cas_manager| cas_manager else return false;
 
@@ -955,6 +1029,8 @@ pub const Engine = struct {
     }
 
     fn recoveryWalFiles(self: *Engine) !?[][]u8 {
+        self.metadata.cas_index_mu.lock();
+        defer self.metadata.cas_index_mu.unlock();
         const index = if (self.metadata.cas_index) |*snapshot_index| snapshot_index else return null;
         var files = std.array_list.Managed([]u8).init(self.alloc);
         errdefer {
@@ -998,6 +1074,8 @@ const CompactibleDescriptorGroup = struct {
 };
 
 fn compactCasBackedSegments(engine: *Engine) !bool {
+    engine.metadata.cas_index_mu.lock();
+    defer engine.metadata.cas_index_mu.unlock();
     const snapshot_index = engine.metadata.cas_index orelse return false;
     const store = &(engine.cas orelse return false).store;
     var changed_any = false;
@@ -1231,6 +1309,62 @@ fn collectMatchingSeriesIdsFromView(
         const key = try std.fmt.allocPrint(alloc, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.string });
         defer alloc.free(key);
         const matches = view.tagMatches(key);
+        if (!saw_constraint) {
+            for (matches) |sid| try result.put(sid, {});
+            saw_constraint = true;
+            continue;
+        }
+        if (op_and) {
+            var result_it = result.iterator();
+            while (result_it.next()) |match| {
+                var found = false;
+                for (matches) |sid| {
+                    if (sid == match.key_ptr.*) {
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) _ = result.remove(match.key_ptr.*);
+            }
+        } else {
+            for (matches) |sid| try result.put(sid, {});
+        }
+    }
+
+    var ids = std.array_list.Managed(types.SeriesId).init(alloc);
+    errdefer ids.deinit();
+    var key_it = result.keyIterator();
+    while (key_it.next()) |sid| {
+        try ids.append(sid.*);
+    }
+    std.sort.block(types.SeriesId, ids.items, {}, struct {
+        fn lessThan(_: void, a: types.SeriesId, b: types.SeriesId) bool {
+            return a < b;
+        }
+    }.lessThan);
+    return ids;
+}
+
+fn collectMatchingSeriesIdsFromSnapshotIndex(
+    alloc: std.mem.Allocator,
+    index: *const cas_mod.SnapshotIndex,
+    tags_value: std.json.Value,
+    op_and: bool,
+) !std.array_list.Managed(types.SeriesId) {
+    var result = std.AutoHashMap(types.SeriesId, void).init(alloc);
+    defer result.deinit();
+
+    if (tags_value != .object) {
+        return std.array_list.Managed(types.SeriesId).init(alloc);
+    }
+
+    var saw_constraint = false;
+    var it = tags_value.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .string) continue;
+        const key = try std.fmt.allocPrint(alloc, "{s}={s}", .{ entry.key_ptr.*, entry.value_ptr.string });
+        defer alloc.free(key);
+        const matches = index.tagMatches(key);
         if (!saw_constraint) {
             for (matches) |sid| try result.put(sid, {});
             saw_constraint = true;
@@ -2023,6 +2157,88 @@ test "engine compaction creates a maintenance checkpoint ref" {
         }
     }
     try std.testing.expect(saw_checkpoint);
+}
+
+test "engine serializes cas index refresh during concurrent compaction syncs" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/compaction-refresh-race", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    const sid = types.hash64("compaction.refresh.race");
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .dual_write,
+        .metadata_read_mode = .primary,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    try engine.registerSeries("compaction.refresh.race", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 1_000, .value = 1.0, .tags_json = "{}" });
+    try waitForFlush(engine, 1, 1_000);
+    try engine.ingest(.{ .series_id = sid, .ts = 1_500, .value = 2.0, .tags_json = "{}" });
+    try waitForFlush(engine, 2, 1_000);
+    try std.testing.expect(try engine.compactNow());
+
+    const SyncWorker = struct {
+        engine: *Engine,
+        cas: *cas_mod.CasManager,
+        failure_mu: std.Thread.Mutex = .{},
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            var idx: usize = 0;
+            while (idx < 32) : (idx += 1) {
+                self.engine.metadata.refreshCasIndex(self.cas) catch |err| {
+                    self.failure_mu.lock();
+                    defer self.failure_mu.unlock();
+                    self.failure = err;
+                    return;
+                };
+                sleepMs(1);
+            }
+        }
+    };
+
+    var worker = SyncWorker{ .engine = engine, .cas = &(engine.cas orelse return error.CasDisabled) };
+    const thread = try std.Thread.spawn(.{}, SyncWorker.run, .{&worker});
+    var thread_joined = false;
+    defer if (!thread_joined) thread.join();
+
+    var attempts: usize = 0;
+    while (attempts < 32) : (attempts += 1) {
+        _ = try worker.cas.syncLegacySnapshot(
+            engine.data_dir,
+            &engine.metadata.manifest,
+            &engine.metadata.tags,
+            &engine.metadata.series_catalog,
+            "concurrent-compaction-sync",
+        );
+        try engine.metadata.refreshCasIndexIfStale(worker.cas);
+        sleepMs(1);
+    }
+
+    thread.join();
+    thread_joined = true;
+    worker.failure_mu.lock();
+    const worker_failure = worker.failure;
+    worker.failure_mu.unlock();
+    if (worker_failure) |err| return err;
+    try engine.verifyCasState();
 }
 
 test "engine resolveSelector surfaces metadata for by-id and exact lookups" {

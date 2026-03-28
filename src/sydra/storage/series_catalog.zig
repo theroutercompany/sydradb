@@ -5,6 +5,7 @@ const types = @import("../types.zig");
 
 const catalog_file_name = "series_catalog.jsonl";
 const default_tags_json = "{}";
+pub const path = catalog_file_name;
 
 const SidList = std.ArrayListUnmanaged(types.SeriesId);
 
