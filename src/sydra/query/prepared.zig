@@ -11,6 +11,7 @@ const common = @import("common.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const plan = @import("plan.zig");
+const query_functions = @import("functions.zig");
 const types = @import("../types.zig");
 const value_mod = @import("value.zig");
 const vm = @import("vm.zig");
@@ -39,6 +40,7 @@ pub const BindingContext = struct {
     diagnostics: []const frontend.diagnostics.Diagnostic = &.{},
     parameters: []const ParameterBinding = &.{},
     named_parameters: []const NamedParameterBinding = &.{},
+    parameter_descriptions: []const ParameterDescription = &.{},
     translation_fallback: bool = false,
 
     pub fn parameterCount(self: @This()) usize {
@@ -46,6 +48,7 @@ pub const BindingContext = struct {
     }
 
     pub fn maxParameterSlot(self: @This()) ParameterSlot {
+        if (self.parameter_descriptions.len != 0) return self.parameter_descriptions.len;
         var max_slot: ParameterSlot = 0;
         for (self.parameters) |binding| {
             if (binding.slot > max_slot) max_slot = binding.slot;
@@ -65,6 +68,29 @@ pub const BindingContext = struct {
             if (std.mem.eql(u8, binding.name, name)) return binding.slot;
         }
         return null;
+    }
+};
+
+pub const ParameterDescription = struct {
+    slot: ParameterSlot,
+    present: bool = false,
+    raw: []const u8 = "",
+    kind: frontend.stmt.ParameterKind = .positional,
+    name: ?[]const u8 = null,
+    explicit_index: ?u32 = null,
+    span: common.Span = .{ .start = 0, .end = 0 },
+    occurrences: usize = 0,
+    inferred_type: query_functions.Type = query_functions.Type.init(.any, true),
+
+    pub fn pgOid(self: @This()) u32 {
+        if (!self.present) return 0;
+        return switch (self.inferred_type.tag) {
+            .boolean => 16,
+            .integer, .duration, .timestamp => 20,
+            .float => 701,
+            .string, .tags => 25,
+            .numeric, .value, .null, .any => 0,
+        };
     }
 };
 
@@ -102,8 +128,10 @@ pub const PreparedStmt = struct {
     normalized: NormalizedStmt,
     typed_query: ?compiler.TypedQuery = null,
     owned_columns: bool = false,
+    described_columns: []const plan.ColumnInfo = &.{},
     arena_ptr: ?*std.heap.ArenaAllocator = null,
     compile_arena_ptr: ?*std.heap.ArenaAllocator = null,
+    describe_compile_arena_ptr: ?*std.heap.ArenaAllocator = null,
     bound_values: []?value_mod.Value = &.{},
     needs_compile: bool = false,
     machine: ?vm.VirtualMachine = null,
@@ -128,7 +156,6 @@ pub const PreparedStmt = struct {
     pub fn bindPositional(self: *PreparedStmt, slot: ParameterSlot, value: value_mod.Value) BindError!void {
         if (self.finalized) return error.Finalized;
         if (slot == 0 or slot > self.bound_values.len) return error.InvalidSlot;
-        if (!self.binding.hasSlot(slot)) return error.InvalidSlot;
         try self.replaceBoundValue(slot - 1, value);
         self.invalidateCompiledState();
     }
@@ -151,6 +178,13 @@ pub const PreparedStmt = struct {
     pub fn finalize(self: *PreparedStmt) void {
         if (self.finalized) return;
         self.clearCompiledState();
+        if (self.described_columns.len != 0) {
+            self.allocator.free(self.described_columns);
+        }
+        if (self.describe_compile_arena_ptr) |arena_ptr| {
+            arena_ptr.deinit();
+            self.allocator.destroy(arena_ptr);
+        }
         if (self.arena_ptr) |arena_ptr| {
             arena_ptr.deinit();
             self.allocator.destroy(arena_ptr);
@@ -159,6 +193,7 @@ pub const PreparedStmt = struct {
             for (self.bound_values) |value| freeBoundValueStorage(self.allocator, value);
             self.allocator.free(self.bound_values);
         }
+        freeParameterDescriptions(self.allocator, self.binding.parameter_descriptions);
         if (self.binding.diagnostics.len != 0) self.allocator.free(self.binding.diagnostics);
         self.finalized = true;
     }
@@ -171,8 +206,14 @@ pub const PreparedStmt = struct {
 
     pub fn describeColumns(self: *PreparedStmt) ExplainError![]const plan.ColumnInfo {
         if (self.finalized) return error.Finalized;
-        try self.ensureCompiled();
-        return self.columns;
+        try self.ensureColumnDescriptions();
+        if (self.columns.len != 0) return self.columns;
+        return self.described_columns;
+    }
+
+    pub fn describeParameters(self: *const PreparedStmt) error{Finalized}![]const ParameterDescription {
+        if (self.finalized) return error.Finalized;
+        return self.binding.parameter_descriptions;
     }
 
     pub fn tablesUsed(self: *const PreparedStmt, allocator: std.mem.Allocator) ![]TableUse {
@@ -219,6 +260,35 @@ pub const PreparedStmt = struct {
         self.compile_arena_ptr = compiled.compile_arena_ptr;
         self.machine = machine;
         self.needs_compile = false;
+    }
+
+    fn ensureColumnDescriptions(self: *PreparedStmt) PrepareError!void {
+        if (self.columns.len != 0 or self.described_columns.len != 0) return;
+        if (self.binding.maxParameterSlot() == 0) {
+            try self.ensureCompiled();
+            return;
+        }
+
+        const placeholder_bindings = try self.allocator.alloc(?value_mod.Value, self.bound_values.len);
+        defer self.allocator.free(placeholder_bindings);
+        for (placeholder_bindings) |*slot| slot.* = .null;
+
+        var compiled = try compilePreparedExecutable(
+            self.allocator,
+            self.engine,
+            self.normalized,
+            placeholder_bindings,
+        );
+        errdefer {
+            compiled.program.deinit();
+            if (compiled.columns.len != 0) self.allocator.free(compiled.columns);
+            compiled.compile_arena_ptr.deinit();
+            self.allocator.destroy(compiled.compile_arena_ptr);
+        }
+
+        compiled.program.deinit();
+        self.described_columns = compiled.columns;
+        self.describe_compile_arena_ptr = compiled.compile_arena_ptr;
     }
 
     fn replaceBoundValue(self: *PreparedStmt, slot_idx: usize, value: value_mod.Value) BindError!void {
@@ -306,7 +376,6 @@ pub fn prepareSydraQL(
             .diagnostics = shadow.diagnostics,
             .parameters = normalized.parameters,
             .named_parameters = normalized.named_parameters,
-            .translation_fallback = false,
         },
         flags,
         normalized,
@@ -337,7 +406,6 @@ pub fn prepareSqlCore(
                 .diagnostics = skeleton.diagnostics,
                 .parameters = normalized.parameters,
                 .named_parameters = normalized.named_parameters,
-                .translation_fallback = false,
             },
             flags,
             normalized,
@@ -408,11 +476,15 @@ pub fn formatBytecodeSnapshot(allocator: std.mem.Allocator, stmt: *PreparedStmt)
 fn prepareNormalizedStatement(
     allocator: std.mem.Allocator,
     engine: *engine_mod.Engine,
-    binding: BindingContext,
+    binding_in: BindingContext,
     flags: PrepareFlags,
     normalized: NormalizedStmt,
     arena_ptr: *std.heap.ArenaAllocator,
 ) PrepareError!PreparedStmt {
+    var binding = binding_in;
+    binding.parameter_descriptions = try buildParameterDescriptions(allocator, normalized);
+    errdefer freeParameterDescriptions(allocator, binding.parameter_descriptions);
+
     const max_slot = binding.maxParameterSlot();
     var bound_values: []?value_mod.Value = &.{};
     if (max_slot != 0) {
@@ -492,6 +564,304 @@ fn freeBoundValueStorage(allocator: std.mem.Allocator, value: ?value_mod.Value) 
         .string => |text| allocator.free(text),
         else => {},
     };
+}
+
+fn buildParameterDescriptions(
+    allocator: std.mem.Allocator,
+    normalized: NormalizedStmt,
+) ![]const ParameterDescription {
+    const slot_count = blk: {
+        var max_slot: ParameterSlot = 0;
+        for (normalized.parameters) |binding| {
+            if (binding.slot > max_slot) max_slot = binding.slot;
+        }
+        break :blk max_slot;
+    };
+    if (slot_count == 0) return &.{};
+
+    const descriptions = try allocator.alloc(ParameterDescription, slot_count);
+    for (descriptions, 0..) |*description, idx| {
+        description.* = .{ .slot = idx + 1 };
+    }
+    errdefer freeParameterDescriptions(allocator, descriptions);
+
+    for (normalized.parameters) |binding| {
+        var name_copy: ?[]const u8 = null;
+        errdefer if (name_copy) |owned_name| allocator.free(owned_name);
+
+        if (binding.name) |name| {
+            name_copy = try allocator.dupe(u8, name);
+        }
+
+        descriptions[binding.slot - 1] = .{
+            .slot = binding.slot,
+            .present = true,
+            .raw = try allocator.dupe(u8, binding.raw),
+            .kind = binding.kind,
+            .name = name_copy,
+            .explicit_index = binding.explicit_index,
+            .span = binding.span,
+            .occurrences = binding.occurrences,
+        };
+    }
+
+    inferStatementParameterTypes(
+        normalized.statement,
+        normalized.parameters,
+        normalized.named_parameters,
+        descriptions,
+    );
+    return descriptions;
+}
+
+fn freeParameterDescriptions(allocator: std.mem.Allocator, descriptions: []const ParameterDescription) void {
+    if (descriptions.len == 0) return;
+    for (descriptions) |description| {
+        if (description.raw.len != 0) allocator.free(description.raw);
+        if (description.name) |name| allocator.free(name);
+    }
+    allocator.free(descriptions);
+}
+
+fn inferStatementParameterTypes(
+    statement: frontend.normalize.Statement,
+    parameters: []const ParameterBinding,
+    named_parameters: []const NamedParameterBinding,
+    descriptions: []ParameterDescription,
+) void {
+    switch (statement) {
+        .select => |select| {
+            for (select.projections) |projection| {
+                inferExprParameterTypes(projection.expr, parameters, named_parameters, descriptions, null);
+            }
+            if (select.predicate) |predicate| {
+                inferExprParameterTypes(predicate, parameters, named_parameters, descriptions, null);
+            }
+            for (select.groupings) |grouping| {
+                inferExprParameterTypes(grouping.expr, parameters, named_parameters, descriptions, null);
+            }
+            for (select.ordering) |ordering| {
+                inferExprParameterTypes(ordering.expr, parameters, named_parameters, descriptions, null);
+            }
+        },
+        .insert => |insert| {
+            for (insert.values, 0..) |value_expr, idx| {
+                const expected = if (idx < insert.columns.len)
+                    inferNormalizedExprType(insert.columns[idx])
+                else
+                    null;
+                inferExprParameterTypes(value_expr, parameters, named_parameters, descriptions, expected);
+            }
+        },
+        .delete => |delete| {
+            if (delete.predicate) |predicate| {
+                inferExprParameterTypes(predicate, parameters, named_parameters, descriptions, null);
+            }
+        },
+        .explain => |explain| {
+            inferStatementParameterTypes(explain.target.*, parameters, named_parameters, descriptions);
+        },
+    }
+}
+
+fn inferExprParameterTypes(
+    expr: *const frontend.normalize.Expr,
+    parameters: []const ParameterBinding,
+    named_parameters: []const NamedParameterBinding,
+    descriptions: []ParameterDescription,
+    expected_type: ?query_functions.Type,
+) void {
+    switch (expr.*) {
+        .identifier,
+        .integer,
+        .string,
+        => {},
+        .parameter => |parameter| {
+            const slot = resolveNormalizedParameterSlot(parameters, named_parameters, parameter) orelse return;
+            applyParameterTypeHint(descriptions, slot, expected_type orelse query_functions.Type.init(.any, true));
+        },
+        .comparison => |comparison| {
+            if (parameterSlotIfAny(comparison.left, parameters, named_parameters)) |slot| {
+                applyParameterTypeHint(descriptions, slot, inferNormalizedExprType(comparison.right) orelse query_functions.Type.init(.any, true));
+            }
+            if (parameterSlotIfAny(comparison.right, parameters, named_parameters)) |slot| {
+                applyParameterTypeHint(descriptions, slot, inferNormalizedExprType(comparison.left) orelse query_functions.Type.init(.any, true));
+            }
+            inferExprParameterTypes(comparison.left, parameters, named_parameters, descriptions, null);
+            inferExprParameterTypes(comparison.right, parameters, named_parameters, descriptions, null);
+        },
+        .call => |call| {
+            if (query_functions.lookup(call.callee.value)) |signature| {
+                for (call.args, 0..) |arg, idx| {
+                    inferExprParameterTypes(arg, parameters, named_parameters, descriptions, expectationToType(signature, idx));
+                }
+            } else {
+                for (call.args) |arg| {
+                    inferExprParameterTypes(arg, parameters, named_parameters, descriptions, null);
+                }
+            }
+        },
+    }
+}
+
+fn applyParameterTypeHint(
+    descriptions: []ParameterDescription,
+    slot: ParameterSlot,
+    hinted_type: query_functions.Type,
+) void {
+    if (slot == 0 or slot > descriptions.len) return;
+    descriptions[slot - 1].inferred_type = mergeParameterTypes(
+        descriptions[slot - 1].inferred_type,
+        hinted_type,
+    );
+}
+
+fn mergeParameterTypes(current: query_functions.Type, next: query_functions.Type) query_functions.Type {
+    if (next.tag == .any) return current;
+    if (current.tag == .any) return next;
+    if (current.tag == next.tag) {
+        return .{ .tag = current.tag, .nullable = current.nullable or next.nullable };
+    }
+
+    if (isNumericLike(current.tag) and isNumericLike(next.tag)) {
+        return query_functions.Type.init(.numeric, current.nullable or next.nullable);
+    }
+    if (isIntegerLike(current.tag) and isIntegerLike(next.tag)) {
+        return query_functions.Type.init(.integer, current.nullable or next.nullable);
+    }
+    if (isStringLike(current.tag) and isStringLike(next.tag)) {
+        return query_functions.Type.init(.string, current.nullable or next.nullable);
+    }
+    return query_functions.Type.init(.any, current.nullable or next.nullable);
+}
+
+fn isNumericLike(tag: query_functions.TypeTag) bool {
+    return switch (tag) {
+        .integer, .float, .numeric, .value => true,
+        else => false,
+    };
+}
+
+fn isIntegerLike(tag: query_functions.TypeTag) bool {
+    return switch (tag) {
+        .integer, .timestamp, .duration => true,
+        else => false,
+    };
+}
+
+fn isStringLike(tag: query_functions.TypeTag) bool {
+    return switch (tag) {
+        .string, .tags => true,
+        else => false,
+    };
+}
+
+fn expectationToType(signature: *const query_functions.FunctionSignature, arg_index: usize) ?query_functions.Type {
+    const spec = if (arg_index < signature.params.len)
+        signature.params[arg_index]
+    else if (signature.params.len != 0 and signature.params[signature.params.len - 1].variadic)
+        signature.params[signature.params.len - 1]
+    else
+        return null;
+
+    if (spec.expectation.allowed.len == 0) return null;
+    const tag = spec.expectation.allowed[0];
+    return switch (tag) {
+        .timestamp,
+        .duration,
+        .integer,
+        .float,
+        .boolean,
+        .string,
+        .tags,
+        .numeric,
+        .value,
+        => query_functions.Type.init(tag, spec.expectation.allow_nullable),
+        .null, .any => null,
+    };
+}
+
+fn inferNormalizedExprType(expr: *const frontend.normalize.Expr) ?query_functions.Type {
+    return switch (expr.*) {
+        .identifier => |identifier| inferIdentifierType(identifier.value),
+        .integer => query_functions.Type.init(.integer, false),
+        .string => query_functions.Type.init(.string, false),
+        .parameter => null,
+        .comparison => query_functions.Type.init(.boolean, true),
+        .call => |call| blk: {
+            const signature = query_functions.lookup(call.callee.value) orelse break :blk null;
+            break :blk switch (signature.return_strategy) {
+                .fixed => |ty| ty,
+                .same_as => |same_as| if (call.args.len == 0 or same_as.index >= call.args.len)
+                    null
+                else
+                    inferNormalizedExprType(call.args[same_as.index]),
+            };
+        },
+    };
+}
+
+fn inferIdentifierType(name: []const u8) query_functions.Type {
+    const segment = trailingSegment(name);
+    if (std.ascii.eqlIgnoreCase(segment, "time")) return query_functions.Type.init(.timestamp, false);
+    if (std.ascii.eqlIgnoreCase(segment, "value")) return query_functions.Type.init(.value, true);
+    if (hasTagPrefix(name)) return query_functions.Type.init(.string, true);
+    return query_functions.Type.init(.any, true);
+}
+
+fn parameterSlotIfAny(
+    expr: *const frontend.normalize.Expr,
+    parameters: []const ParameterBinding,
+    named_parameters: []const NamedParameterBinding,
+) ?ParameterSlot {
+    if (expr.* != .parameter) return null;
+    return resolveNormalizedParameterSlot(parameters, named_parameters, expr.parameter);
+}
+
+fn resolveNormalizedParameterSlot(
+    parameters: []const ParameterBinding,
+    named_parameters: []const NamedParameterBinding,
+    parameter: frontend.normalize.Parameter,
+) ?ParameterSlot {
+    if (parameter.kind == .positional) {
+        if (parseExplicitParameterIndex(parameter.raw)) |explicit| return explicit;
+    } else {
+        const raw_name = if (parameter.raw.len > 0) parameter.raw[1..] else parameter.raw;
+        for (named_parameters) |binding| {
+            if (std.mem.eql(u8, binding.name, raw_name)) return binding.slot;
+        }
+    }
+
+    for (parameters) |binding| {
+        if (binding.kind != parameter.kind) continue;
+        if (std.mem.eql(u8, binding.raw, parameter.raw)) return binding.slot;
+    }
+    return null;
+}
+
+fn parseExplicitParameterIndex(raw: []const u8) ?u32 {
+    if (raw.len < 2) return null;
+    const digits = raw[1..];
+    if (digits.len == 0) return null;
+    for (digits) |ch| {
+        if (!std.ascii.isDigit(ch)) return null;
+    }
+    return std.fmt.parseUnsigned(u32, digits, 10) catch null;
+}
+
+fn trailingSegment(slice: []const u8) []const u8 {
+    if (slice.len == 0) return slice;
+    var index = slice.len;
+    while (index > 0) {
+        index -= 1;
+        if (slice[index] == '.') return slice[index + 1 ..];
+    }
+    return slice;
+}
+
+fn hasTagPrefix(slice: []const u8) bool {
+    const dot = std.mem.indexOfScalar(u8, slice, '.') orelse return false;
+    return std.ascii.eqlIgnoreCase(slice[0..dot], "tag");
 }
 
 fn appendFrontendStatementTableUses(
@@ -1124,6 +1494,100 @@ test "prepared statement binds positional parameters before lazy compilation" {
     try std.testing.expectEqual(@as(i64, 20), row.row[0].integer);
     try std.testing.expectApproxEqAbs(@as(f64, 2.0), try row.row[1].asFloat(), 1e-9);
     try std.testing.expect((try stmt.step()) == .done);
+}
+
+test "prepared statement describes parameters and columns before binding" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-describe", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .legacy,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    const sid = @import("../types.zig").seriesIdFrom("describe.room1", "{}");
+    try engine.registerSeries("describe.room1", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.0, .tags_json = "{}" });
+    try waitForQueryablePoints(alloc, engine, sid, 1, 1_000);
+
+    var stmt = try prepareSqlCore(alloc, engine, "SELECT time, value FROM describe.room1 WHERE time >= $1 ORDER BY time ASC LIMIT 1", .{});
+    defer stmt.finalize();
+
+    const parameters = try stmt.describeParameters();
+    try std.testing.expectEqual(@as(usize, 1), parameters.len);
+    try std.testing.expect(parameters[0].present);
+    try std.testing.expectEqual(@as(usize, 1), parameters[0].slot);
+    try std.testing.expectEqual(@as(u32, 20), parameters[0].pgOid());
+
+    const columns = try stmt.describeColumns();
+    try std.testing.expectEqual(@as(usize, 2), columns.len);
+    try std.testing.expectEqualStrings("time", columns[0].name);
+    try std.testing.expectEqualStrings("value", columns[1].name);
+    try std.testing.expectError(error.UnboundParameter, stmt.step());
+}
+
+test "prepared statement accepts unused positional gap slots" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-gap-slot", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .legacy,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    const sid = @import("../types.zig").seriesIdFrom("bind.gap", "{}");
+    try engine.registerSeries("bind.gap", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.0, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 20, .value = 2.0, .tags_json = "{}" });
+    try waitForQueryablePoints(alloc, engine, sid, 2, 1_000);
+
+    var stmt = try prepareSqlCore(alloc, engine, "SELECT time, value FROM bind.gap WHERE time >= $2 ORDER BY time ASC LIMIT 1", .{});
+    defer stmt.finalize();
+
+    const parameters = try stmt.describeParameters();
+    try std.testing.expectEqual(@as(usize, 2), parameters.len);
+    try std.testing.expect(!parameters[0].present);
+    try std.testing.expect(parameters[1].present);
+
+    try stmt.bindPositional(1, .null);
+    try stmt.bindPositional(2, .{ .integer = 15 });
+    const row = try stmt.step();
+    try std.testing.expect(row == .row);
+    try std.testing.expectEqual(@as(i64, 20), row.row[0].integer);
 }
 
 test "prepared statement binds named parameters and clears bindings" {

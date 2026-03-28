@@ -234,7 +234,9 @@ pub fn writeEmptyQueryResponse(writer: anytype) !void {
 pub fn writeErrorResponse(writer: anytype, severity: []const u8, code: []const u8, message: []const u8) !void {
     try writer.writeByte('E');
     var length: u32 = 4 + 1; // length field + terminating zero
-    length += @intCast(severity.len + code.len + message.len + 3); // fields identifiers
+    length += @intCast(severity.len + 2); // field id + value + zero
+    length += @intCast(code.len + 2);
+    length += @intCast(message.len + 2);
     var buf: [4]u8 = undefined;
     std.mem.writeInt(u32, buf[0..4], length, .big);
     try writer.writeAll(buf[0..4]);

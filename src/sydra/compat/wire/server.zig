@@ -4,6 +4,7 @@ const session_mod = @import("session.zig");
 const prepared_query = @import("../../query/prepared.zig");
 const translator = @import("../../query/translator.zig");
 const query_exec = @import("../../query/exec.zig");
+const frontend = @import("../../query/frontend.zig");
 const plan = @import("../../query/plan.zig");
 const value_mod = @import("../../query/value.zig");
 const engine_mod = @import("../../engine.zig");
@@ -14,6 +15,10 @@ const ManagedArrayList = std.array_list.Managed;
 const log = std.log.scoped(.pgwire);
 
 const max_message_size: usize = 16 * 1024 * 1024;
+
+const DescribedColumnState = struct {
+    name: []u8,
+};
 
 pub const ServerConfig = struct {
     address: []const u8 = "127.0.0.1",
@@ -26,6 +31,9 @@ const ParsedStatementState = struct {
     name: []u8,
     sql: []u8,
     parameter_slots: usize,
+    statement_kind: frontend.stmt.StatementKind,
+    parameter_oids: []u32,
+    columns: []DescribedColumnState,
 };
 
 const BoundPortalState = struct {
@@ -50,6 +58,8 @@ const ExtendedQueryState = struct {
         for (self.parsed_statements.items) |entry| {
             self.alloc.free(entry.name);
             self.alloc.free(entry.sql);
+            if (entry.parameter_oids.len != 0) self.alloc.free(entry.parameter_oids);
+            freeDescribedColumns(self.alloc, entry.columns);
         }
         self.parsed_statements.deinit();
         for (self.bound_portals.items) |*entry| {
@@ -59,14 +69,33 @@ const ExtendedQueryState = struct {
         self.bound_portals.deinit();
     }
 
-    fn upsertParsedStatement(self: *ExtendedQueryState, name: []const u8, sql: []const u8, parameter_slots: usize) !void {
+    fn upsertParsedStatement(
+        self: *ExtendedQueryState,
+        name: []const u8,
+        sql: []const u8,
+        parameter_slots: usize,
+        statement_kind: frontend.stmt.StatementKind,
+        parameter_oids: []u32,
+        columns: []DescribedColumnState,
+    ) !void {
+        errdefer if (parameter_oids.len != 0) self.alloc.free(parameter_oids);
+        errdefer freeDescribedColumns(self.alloc, columns);
+
+        if (name.len == 0) {
+            _ = self.closePortal("");
+        }
         if (self.findParsedIndex(name)) |idx| {
             self.alloc.free(self.parsed_statements.items[idx].name);
             self.alloc.free(self.parsed_statements.items[idx].sql);
+            if (self.parsed_statements.items[idx].parameter_oids.len != 0) self.alloc.free(self.parsed_statements.items[idx].parameter_oids);
+            freeDescribedColumns(self.alloc, self.parsed_statements.items[idx].columns);
             self.parsed_statements.items[idx] = .{
                 .name = try self.alloc.dupe(u8, name),
                 .sql = try self.alloc.dupe(u8, sql),
                 .parameter_slots = parameter_slots,
+                .statement_kind = statement_kind,
+                .parameter_oids = parameter_oids,
+                .columns = columns,
             };
             return;
         }
@@ -74,6 +103,9 @@ const ExtendedQueryState = struct {
             .name = try self.alloc.dupe(u8, name),
             .sql = try self.alloc.dupe(u8, sql),
             .parameter_slots = parameter_slots,
+            .statement_kind = statement_kind,
+            .parameter_oids = parameter_oids,
+            .columns = columns,
         });
     }
 
@@ -87,6 +119,8 @@ const ExtendedQueryState = struct {
         const entry = self.parsed_statements.swapRemove(idx);
         self.alloc.free(entry.name);
         self.alloc.free(entry.sql);
+        if (entry.parameter_oids.len != 0) self.alloc.free(entry.parameter_oids);
+        freeDescribedColumns(self.alloc, entry.columns);
         return true;
     }
 
@@ -229,7 +263,7 @@ fn messageLoop(
                 try handleBindMessage(alloc, writer, payload_storage, engine, &extended_state);
             },
             'D' => {
-                try handleDescribeMessage(alloc, writer, payload_storage, &extended_state);
+                try handleDescribeMessage(writer, payload_storage, &extended_state);
             },
             'E' => {
                 try handleExecuteMessage(alloc, writer, payload_storage, &extended_state);
@@ -302,6 +336,14 @@ fn parameterFormatCode(codes: []const u16, param_idx: usize) u16 {
     return if (param_idx < codes.len) codes[param_idx] else 0;
 }
 
+fn freeDescribedColumns(alloc: std.mem.Allocator, columns: []DescribedColumnState) void {
+    if (columns.len == 0) return;
+    for (columns) |column| {
+        alloc.free(column.name);
+    }
+    alloc.free(columns);
+}
+
 fn readPayloadBytes(payload: []const u8, cursor: *usize, len: usize) ![]const u8 {
     if (payload.len < cursor.* + len) return error.InvalidMessageLength;
     const out = payload[cursor.* .. cursor.* + len];
@@ -309,7 +351,27 @@ fn readPayloadBytes(payload: []const u8, cursor: *usize, len: usize) ![]const u8
     return out;
 }
 
-fn parseBindTextValue(text: []const u8) !value_mod.Value {
+fn parseBindTextValue(text: []const u8, parameter: prepared_query.ParameterDescription) !value_mod.Value {
+    switch (parameter.inferred_type.tag) {
+        .string, .tags => return .{ .string = text },
+        .boolean => {
+            if (std.ascii.eqlIgnoreCase(text, "t") or std.ascii.eqlIgnoreCase(text, "true")) return .{ .boolean = true };
+            if (std.ascii.eqlIgnoreCase(text, "f") or std.ascii.eqlIgnoreCase(text, "false")) return .{ .boolean = false };
+            return error.InvalidFormat;
+        },
+        .integer, .timestamp, .duration => {
+            const value = std.fmt.parseInt(i64, text, 10) catch return error.InvalidFormat;
+            return .{ .integer = value };
+        },
+        .float => {
+            if (std.fmt.parseFloat(f64, text)) |value| {
+                return .{ .float = value };
+            } else |_| if (std.fmt.parseInt(i64, text, 10)) |value| {
+                return .{ .integer = value };
+            } else |_| return error.InvalidFormat;
+        },
+        .numeric, .value, .null, .any => {},
+    }
     if (std.ascii.eqlIgnoreCase(text, "null")) return .null;
     if (std.ascii.eqlIgnoreCase(text, "t") or std.ascii.eqlIgnoreCase(text, "true")) return .{ .boolean = true };
     if (std.ascii.eqlIgnoreCase(text, "f") or std.ascii.eqlIgnoreCase(text, "false")) return .{ .boolean = false };
@@ -427,7 +489,35 @@ fn handleParseMessage(
         return;
     }
 
-    try state.upsertParsedStatement(statement_name, trimmed, stmt.binding.maxParameterSlot());
+    const parameter_descriptions = try stmt.describeParameters();
+    const parameter_oids = try alloc.alloc(u32, parameter_descriptions.len);
+    errdefer alloc.free(parameter_oids);
+    for (parameter_descriptions, 0..) |description, idx| {
+        parameter_oids[idx] = description.pgOid();
+    }
+
+    const columns = stmt.describeColumns() catch |err| {
+        try protocol.writeErrorResponse(writer, "ERROR", "XX000", @errorName(err));
+        return;
+    };
+    var described_columns_list = std.array_list.Managed(DescribedColumnState).init(alloc);
+    errdefer {
+        for (described_columns_list.items) |column| alloc.free(column.name);
+        described_columns_list.deinit();
+    }
+    for (columns) |column| {
+        try described_columns_list.append(.{ .name = try alloc.dupe(u8, column.name) });
+    }
+    const described_columns = try described_columns_list.toOwnedSlice();
+
+    try state.upsertParsedStatement(
+        statement_name,
+        trimmed,
+        stmt.binding.maxParameterSlot(),
+        stmt.binding.statement_kind,
+        parameter_oids,
+        described_columns,
+    );
     try protocol.writeParseComplete(writer);
 }
 
@@ -483,7 +573,8 @@ fn handleBindMessage(
             return;
         },
     };
-    errdefer stmt.finalize();
+    var portal_adopted = false;
+    defer if (!portal_adopted) stmt.finalize();
 
     for (0..parameter_count) |param_idx| {
         const param_length = readPayloadI32(payload, &cursor) catch {
@@ -503,7 +594,14 @@ fn handleBindMessage(
             try protocol.writeErrorResponse(writer, "ERROR", "08P01", "bind parameter value truncated");
             return;
         };
-        try stmt.bindPositional(param_idx + 1, try parseBindTextValue(text));
+        const parameter = stmt.describeParameters() catch |err| {
+            try protocol.writeErrorResponse(writer, "ERROR", "XX000", @errorName(err));
+            return;
+        };
+        try stmt.bindPositional(param_idx + 1, parseBindTextValue(text, parameter[param_idx]) catch {
+            try protocol.writeErrorResponse(writer, "ERROR", "22P02", "invalid text representation for bind parameter");
+            return;
+        });
     }
 
     const result_format_count = readPayloadU16(payload, &cursor) catch {
@@ -515,13 +613,19 @@ fn handleBindMessage(
         return;
     };
     defer if (result_format_codes.len != 0) alloc.free(result_format_codes);
+    for (result_format_codes) |format_code| {
+        if (format_code != 0) {
+            try protocol.writeErrorResponse(writer, "ERROR", "0A000", "binary result formats are not supported");
+            return;
+        }
+    }
 
     try state.upsertPortal(portal_name, stmt);
+    portal_adopted = true;
     try protocol.writeBindComplete(writer);
 }
 
 fn handleDescribeMessage(
-    alloc: std.mem.Allocator,
     writer: std.Io.AnyWriter,
     payload: []u8,
     state: *ExtendedQueryState,
@@ -544,11 +648,12 @@ fn handleDescribeMessage(
                 try protocol.writeErrorResponse(writer, "ERROR", "26000", "unknown prepared statement");
                 return;
             };
-            const parameter_oids = try alloc.alloc(u32, parsed.parameter_slots);
-            defer alloc.free(parameter_oids);
-            @memset(parameter_oids, 0);
-            try protocol.writeParameterDescription(writer, parameter_oids);
-            try protocol.writeNoData(writer);
+            try protocol.writeParameterDescription(writer, parsed.parameter_oids);
+            if (parsed.statement_kind == .select and parsed.columns.len != 0) {
+                try writeDescribedRowDescription(writer, parsed.columns);
+            } else {
+                try protocol.writeNoData(writer);
+            }
         },
         'P' => {
             const portal = state.getPortal(name) orelse {
@@ -786,22 +891,57 @@ fn handleSydraqlQuery(
 }
 
 fn writeRowDescription(writer: std.Io.AnyWriter, columns: []const plan.ColumnInfo) !void {
+    try writeColumnDescriptions(writer, ColumnDescriptionAdapter.initPlan(columns));
+}
+
+fn writeDescribedRowDescription(writer: std.Io.AnyWriter, columns: []const DescribedColumnState) !void {
+    try writeColumnDescriptions(writer, ColumnDescriptionAdapter.initDescribed(columns));
+}
+
+const ColumnDescriptionAdapter = union(enum) {
+    plan: []const plan.ColumnInfo,
+    described: []const DescribedColumnState,
+
+    fn initPlan(columns: []const plan.ColumnInfo) ColumnDescriptionAdapter {
+        return .{ .plan = columns };
+    }
+
+    fn initDescribed(columns: []const DescribedColumnState) ColumnDescriptionAdapter {
+        return .{ .described = columns };
+    }
+
+    fn len(self: ColumnDescriptionAdapter) usize {
+        return switch (self) {
+            .plan => |columns| columns.len,
+            .described => |columns| columns.len,
+        };
+    }
+
+    fn nameAt(self: ColumnDescriptionAdapter, idx: usize) []const u8 {
+        return switch (self) {
+            .plan => |columns| columns[idx].name,
+            .described => |columns| columns[idx].name,
+        };
+    }
+};
+
+fn writeColumnDescriptions(writer: std.Io.AnyWriter, columns: ColumnDescriptionAdapter) !void {
     try writer.writeByte('T');
     var len: u32 = 4 + 2;
-    for (columns) |col| {
-        len += @as(u32, @intCast(col.name.len + 19));
+    for (0..columns.len()) |idx| {
+        len += @as(u32, @intCast(columns.nameAt(idx).len + 19));
     }
     var buf4: [4]u8 = undefined;
     std.mem.writeInt(u32, buf4[0..4], len, .big);
     try writer.writeAll(buf4[0..4]);
 
     var buf2: [2]u8 = undefined;
-    std.mem.writeInt(u16, buf2[0..2], @as(u16, @intCast(columns.len)), .big);
+    std.mem.writeInt(u16, buf2[0..2], @as(u16, @intCast(columns.len())), .big);
     try writer.writeAll(buf2[0..2]);
 
     const default_type = query_functions.Type.init(.value, true);
-    for (columns) |col| {
-        try writer.writeAll(col.name);
+    for (0..columns.len()) |idx| {
+        try writer.writeAll(columns.nameAt(idx));
         try writer.writeByte(0);
 
         std.mem.writeInt(u32, buf4[0..4], 0, .big);
@@ -1061,8 +1201,112 @@ test "extended protocol executes direct SQL prepared statements" {
     const written = allocating_writer.written();
     const message_types = try collectBackendMessageTypes(alloc, written);
     defer alloc.free(message_types);
-    try std.testing.expectEqualSlices(u8, &.{ '1', 't', 'n', '2', 'T', 'D', 'C', 'Z' }, message_types);
+    try std.testing.expectEqualSlices(u8, &.{ '1', 't', 'T', '2', 'T', 'D', 'C', 'Z' }, message_types);
     try std.testing.expect(std.mem.indexOf(u8, written, "SELECT 1") != null);
+}
+
+test "extended protocol suspends and resumes portals" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/pgwire-extended-suspend", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .compiled,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    const sid = @import("../../types.zig").seriesIdFrom("ext.suspend", "{}");
+    try engine.registerSeries("ext.suspend", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.0, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 20, .value = 2.0, .tags_json = "{}" });
+    try waitForQueryablePoints(alloc, engine, sid, 2, 1_000);
+
+    var input = std.array_list.Managed(u8).init(alloc);
+    defer input.deinit();
+    try appendParseMessage(&input, "stmt1", "SELECT time, value FROM ext.suspend ORDER BY time ASC", 0);
+    try appendBindMessage(&input, "portal1", "stmt1", &.{});
+    try appendExecuteMessage(&input, "portal1", 1);
+    try appendExecuteMessage(&input, "portal1", 1);
+    try appendExecuteMessage(&input, "portal1", 1);
+    try appendFrontendMessage(&input, 'S', &.{});
+
+    var read_stream = std.io.fixedBufferStream(input.items);
+    var read_state = read_stream.reader();
+    const reader = read_state.any();
+
+    var allocating_writer: std.Io.Writer.Allocating = .init(alloc);
+    defer allocating_writer.deinit();
+
+    try messageLoop(alloc, reader, anyWriter(&allocating_writer.writer), &allocating_writer.writer, engine);
+
+    const written = allocating_writer.written();
+    const message_types = try collectBackendMessageTypes(alloc, written);
+    defer alloc.free(message_types);
+    try std.testing.expectEqualSlices(u8, &.{ '1', '2', 'D', 's', 'D', 's', 'C', 'Z' }, message_types);
+}
+
+test "extended protocol rejects binary result formats" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/pgwire-extended-binary-result", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .compiled,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    var input = std.array_list.Managed(u8).init(alloc);
+    defer input.deinit();
+    try appendParseMessage(&input, "stmt1", "SELECT 1", 0);
+    try appendBindMessageWithFormats(&input, "portal1", "stmt1", &.{}, &.{}, &.{1});
+    try appendFrontendMessage(&input, 'S', &.{});
+
+    var read_stream = std.io.fixedBufferStream(input.items);
+    var read_state = read_stream.reader();
+    const reader = read_state.any();
+
+    var allocating_writer: std.Io.Writer.Allocating = .init(alloc);
+    defer allocating_writer.deinit();
+
+    try messageLoop(alloc, reader, anyWriter(&allocating_writer.writer), &allocating_writer.writer, engine);
+
+    const written = allocating_writer.written();
+    const message_types = try collectBackendMessageTypes(alloc, written);
+    defer alloc.free(message_types);
+    try std.testing.expectEqualSlices(u8, &.{ '1', 'E', 'Z' }, message_types);
+    try std.testing.expect(std.mem.indexOf(u8, written, "binary result formats are not supported") != null);
 }
 
 fn appendFrontendMessage(buffer: *std.array_list.Managed(u8), msg_type: u8, payload: []const u8) !void {
@@ -1092,6 +1336,17 @@ fn appendParseMessage(buffer: *std.array_list.Managed(u8), statement_name: []con
 }
 
 fn appendBindMessage(buffer: *std.array_list.Managed(u8), portal_name: []const u8, statement_name: []const u8, parameters: []const []const u8) !void {
+    try appendBindMessageWithFormats(buffer, portal_name, statement_name, parameters, &.{}, &.{});
+}
+
+fn appendBindMessageWithFormats(
+    buffer: *std.array_list.Managed(u8),
+    portal_name: []const u8,
+    statement_name: []const u8,
+    parameters: []const []const u8,
+    parameter_formats: []const u16,
+    result_formats: []const u16,
+) !void {
     var payload = std.array_list.Managed(u8).init(buffer.allocator);
     defer payload.deinit();
     try payload.appendSlice(portal_name);
@@ -1099,8 +1354,12 @@ fn appendBindMessage(buffer: *std.array_list.Managed(u8), portal_name: []const u
     try payload.appendSlice(statement_name);
     try payload.append(0);
     var buf2: [2]u8 = undefined;
-    std.mem.writeInt(u16, buf2[0..2], 0, .big);
+    std.mem.writeInt(u16, buf2[0..2], @as(u16, @intCast(parameter_formats.len)), .big);
     try payload.appendSlice(buf2[0..2]);
+    for (parameter_formats) |format_code| {
+        std.mem.writeInt(u16, buf2[0..2], format_code, .big);
+        try payload.appendSlice(buf2[0..2]);
+    }
     std.mem.writeInt(u16, buf2[0..2], @as(u16, @intCast(parameters.len)), .big);
     try payload.appendSlice(buf2[0..2]);
     var buf4: [4]u8 = undefined;
@@ -1109,8 +1368,12 @@ fn appendBindMessage(buffer: *std.array_list.Managed(u8), portal_name: []const u
         try payload.appendSlice(buf4[0..4]);
         try payload.appendSlice(parameter);
     }
-    std.mem.writeInt(u16, buf2[0..2], 0, .big);
+    std.mem.writeInt(u16, buf2[0..2], @as(u16, @intCast(result_formats.len)), .big);
     try payload.appendSlice(buf2[0..2]);
+    for (result_formats) |format_code| {
+        std.mem.writeInt(u16, buf2[0..2], format_code, .big);
+        try payload.appendSlice(buf2[0..2]);
+    }
     try appendFrontendMessage(buffer, 'B', payload.items);
 }
 
