@@ -1150,9 +1150,7 @@ fn compactDescriptorGroup(
 
     for (group.indices) |descriptor_index| {
         const descriptor = descriptors[descriptor_index];
-        const points = try segment_mod.readAllDescriptor(engine.alloc, engine.data_dir, store, descriptor);
-        defer engine.alloc.free(points);
-        try all.appendSlice(points);
+        try segment_mod.appendDescriptorPoints(engine.alloc, engine.data_dir, store, descriptor, &all);
     }
 
     std.sort.block(types.Point, all.items, {}, struct {
