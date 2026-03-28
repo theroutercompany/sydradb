@@ -1788,6 +1788,42 @@ pub const CasManager = struct {
         try self.refreshCommitGraph();
     }
 
+    pub fn upgradeRepository(self: *CasManager, data_dir: std.fs.Dir) !UpgradeResult {
+        _ = try self.fsck(data_dir, .{});
+
+        var migrated_reftable = false;
+        if (self.format.ref_backend != .reftable or self.format.version < current_repository_format_version) {
+            try self.refs.migrateLooseToReftable();
+            self.refs.setBackend(.reftable);
+            self.format.ref_backend = .reftable;
+            self.format.version = current_repository_format_version;
+            try writeRepositoryFormat(self.alloc, self.store.root, self.format, self.store.fsync);
+            migrated_reftable = true;
+        }
+
+        try self.refreshCommitGraph();
+        try self.store.verifyActivePackMetadata(self.alloc);
+        const pack_result = try self.pack();
+        return .{
+            .migrated_reftable = migrated_reftable,
+            .format_version = self.format.version,
+            .ref_backend = self.format.ref_backend,
+            .reachable_objects = pack_result.reachable_objects,
+            .rewritten_objects = pack_result.rewritten_objects,
+        };
+    }
+
+    pub fn vacuum(self: *CasManager, data_dir: std.fs.Dir) !VacuumResult {
+        const fsck_report = try self.fsck(data_dir, .{});
+        const pack_result = try self.pack();
+        const gc_result = try self.gc(.{ .dry_run = false });
+        return .{
+            .fsck = fsck_report,
+            .pack = pack_result,
+            .gc = gc_result,
+        };
+    }
+
     pub fn resolveCommitSpec(self: *CasManager, spec: []const u8) !object_store.ObjectId {
         if (spec.len == 64) {
             return try object_store.ObjectId.fromHex(spec);
@@ -2871,6 +2907,20 @@ pub const BundleResult = struct {
     object_count: usize,
     pack_count: usize = 0,
     reftable_file_count: usize = 0,
+};
+
+pub const UpgradeResult = struct {
+    migrated_reftable: bool,
+    format_version: u16,
+    ref_backend: RefBackend,
+    reachable_objects: usize,
+    rewritten_objects: usize,
+};
+
+pub const VacuumResult = struct {
+    fsck: FsckReport,
+    pack: PackResult,
+    gc: GcResult,
 };
 
 const bundle_manifest_name = "bundle.manifest";
@@ -6137,6 +6187,95 @@ test "startup defaults prefer primary only for fresh or migrated repositories" {
     const migrated_defaults = try recommendedStartupDefaults(std.fs.cwd(), migrated_path);
     try std.testing.expectEqual(primary_startup_defaults.cas_mode, migrated_defaults.cas_mode);
     try std.testing.expectEqual(primary_startup_defaults.metadata_read_mode, migrated_defaults.metadata_read_mode);
+}
+
+test "upgrade repository migrates legacy refs to reftable and refreshes format" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/upgrade-repo", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    try std.fs.cwd().makePath(data_path);
+
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
+    defer series_catalog.deinit();
+
+    const sid = types.hash64("upgrade.series");
+    _ = try series_catalog.register("upgrade.series", "{}", sid);
+    const points = [_]types.Point{.{ .ts = 1_000, .value = 1.5 }};
+    const seg_path = try segment_mod.writeSegment(talloc, data_dir, sid, 0, points[0..]);
+    defer talloc.free(seg_path);
+    try manifest.add(data_dir, sid, 0, 1_000, 1_000, 1, seg_path);
+
+    var cas_manager = try CasManager.init(talloc, data_path, .none);
+    defer cas_manager.deinit();
+    const head = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+
+    cas_manager.refs.root.deleteTree("reftable") catch {};
+    try cas_manager.refs.root.makePath("reftable");
+    try cas_manager.refs.writeRefFileAtomic(main_ref, head);
+    cas_manager.refs.setBackend(.loose);
+    cas_manager.format = legacyCompatibleRepositoryFormat();
+    try writeRepositoryFormat(talloc, cas_manager.store.root, cas_manager.format, .none);
+
+    const result = try cas_manager.upgradeRepository(data_dir);
+    try std.testing.expect(result.migrated_reftable);
+    try std.testing.expectEqual(current_repository_format_version, result.format_version);
+    try std.testing.expectEqual(RefBackend.reftable, result.ref_backend);
+
+    const upgraded_head = try cas_manager.refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(upgraded_head.eql(head));
+    const state = try loadReftableState(talloc, cas_manager.refs.root);
+    try std.testing.expect(state.next_update_index >= 2);
+}
+
+test "vacuum preserves the active head while applying pack and gc" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/vacuum-repo", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    try std.fs.cwd().makePath(data_path);
+
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
+    defer series_catalog.deinit();
+
+    const sid = types.hash64("vacuum.series");
+    _ = try series_catalog.register("vacuum.series", "{}", sid);
+    const points = [_]types.Point{.{ .ts = 1_000, .value = 3.5 }};
+    const seg_path = try segment_mod.writeSegment(talloc, data_dir, sid, 0, points[0..]);
+    defer talloc.free(seg_path);
+    try manifest.add(data_dir, sid, 0, 1_000, 1_000, 1, seg_path);
+
+    var cas_manager = try CasManager.init(talloc, data_path, .none);
+    defer cas_manager.deinit();
+    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    const orphan = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, "vacuum-orphan");
+    try std.testing.expect(!initial.eql(orphan));
+    try cas_manager.refs.updateHeadAtomic(main_ref, initial);
+
+    const result = try cas_manager.vacuum(data_dir);
+    try std.testing.expect(result.pack.reachable_objects > 0);
+    try std.testing.expect(result.gc.quarantined_count > 0 or result.gc.pruned_count > 0 or result.gc.deleted > 0);
+
+    const head = try cas_manager.refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(head.eql(initial));
 }
 
 test "legacy descriptor decoders normalize blob content refs" {

@@ -229,13 +229,25 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     var cfg = try loadConfigOrDefault(alloc);
     defer cfg.deinit(alloc);
 
-    var data_dir = try std.fs.cwd().openDir(cfg.data_dir, .{ .iterate = true });
-    defer data_dir.close();
-
-    var cas = try cas_mod.CasManager.init(alloc, cfg.data_dir, cfg.fsync);
-    defer cas.deinit();
-
     const sub = std.mem.sliceTo(args[2], 0);
+    if (std.mem.eql(u8, sub, "clone")) {
+        if (args.len < 5) return error.Invalid;
+        const result = try cas_mod.cloneLocalRepository(alloc, std.mem.sliceTo(args[3], 0), std.mem.sliceTo(args[4], 0), cfg.fsync);
+        std.debug.print(
+            "cas clone refs={d} prerequisites={d} objects={d} packs={d} reftable_files={d}\n",
+            .{ result.ref_count, result.prerequisite_count, result.object_count, result.pack_count, result.reftable_file_count },
+        );
+        return;
+    }
+    if (std.mem.eql(u8, sub, "verify-bundle")) {
+        if (args.len < 4) return error.Invalid;
+        const result = try cas_mod.verifyBundle(alloc, std.mem.sliceTo(args[3], 0));
+        std.debug.print(
+            "cas verify-bundle refs={d} prerequisites={d} objects={d} packs={d} reftable_files={d}\n",
+            .{ result.ref_count, result.prerequisite_count, result.object_count, result.pack_count, result.reftable_file_count },
+        );
+        return;
+    }
     if (std.mem.eql(u8, sub, "bundle")) {
         if (args.len < 5) return error.Invalid;
         const action = std.mem.sliceTo(args[3], 0);
@@ -250,29 +262,36 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
             }
             const result = try cas_mod.createBundle(alloc, cfg.data_dir, dst, cfg.fsync, since_spec);
             std.debug.print(
-                "cas bundle create refs={d} prerequisites={d} objects={d}\n",
-                .{ result.ref_count, result.prerequisite_count, result.object_count },
+                "cas bundle create refs={d} prerequisites={d} objects={d} packs={d} reftable_files={d}\n",
+                .{ result.ref_count, result.prerequisite_count, result.object_count, result.pack_count, result.reftable_file_count },
             );
             return;
         }
         if (std.mem.eql(u8, action, "verify")) {
             const result = try cas_mod.verifyBundle(alloc, std.mem.sliceTo(args[4], 0));
             std.debug.print(
-                "cas bundle verify refs={d} prerequisites={d} objects={d}\n",
-                .{ result.ref_count, result.prerequisite_count, result.object_count },
+                "cas bundle verify refs={d} prerequisites={d} objects={d} packs={d} reftable_files={d}\n",
+                .{ result.ref_count, result.prerequisite_count, result.object_count, result.pack_count, result.reftable_file_count },
             );
             return;
         }
         if (std.mem.eql(u8, action, "apply")) {
             const result = try cas_mod.applyBundle(alloc, std.mem.sliceTo(args[4], 0), cfg.data_dir, cfg.fsync);
             std.debug.print(
-                "cas bundle apply refs={d} prerequisites={d} objects={d}\n",
-                .{ result.ref_count, result.prerequisite_count, result.object_count },
+                "cas bundle apply refs={d} prerequisites={d} objects={d} packs={d} reftable_files={d}\n",
+                .{ result.ref_count, result.prerequisite_count, result.object_count, result.pack_count, result.reftable_file_count },
             );
             return;
         }
         return error.Invalid;
     }
+
+    var data_dir = try std.fs.cwd().openDir(cfg.data_dir, .{ .iterate = true });
+    defer data_dir.close();
+
+    var cas = try cas_mod.CasManager.init(alloc, cfg.data_dir, cfg.fsync);
+    defer cas.deinit();
+
     if (std.mem.eql(u8, sub, "verify")) {
         var manifest = try @import("storage/manifest.zig").Manifest.loadOrInit(alloc, data_dir);
         defer manifest.deinit();
@@ -356,6 +375,34 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     if (std.mem.eql(u8, sub, "migrate-reftable")) {
         try cas.migrateToReftable(data_dir);
         std.debug.print("cas migrate-reftable backend=reftable\n", .{});
+        return;
+    }
+    if (std.mem.eql(u8, sub, "upgrade")) {
+        const result = try cas.upgradeRepository(data_dir);
+        std.debug.print(
+            "cas upgrade migrated_reftable={} format_version={d} ref_backend={s} reachable={d} rewritten={d}\n",
+            .{
+                result.migrated_reftable,
+                result.format_version,
+                if (result.ref_backend == .reftable) "reftable" else "loose",
+                result.reachable_objects,
+                result.rewritten_objects,
+            },
+        );
+        return;
+    }
+    if (std.mem.eql(u8, sub, "vacuum")) {
+        const result = try cas.vacuum(data_dir);
+        std.debug.print(
+            "cas vacuum reachable={d} rewritten={d} unreachable={d} pruned={d} deleted={d}\n",
+            .{
+                result.pack.reachable_objects,
+                result.pack.rewritten_objects,
+                result.gc.unreachable_count,
+                result.gc.pruned_count,
+                result.gc.deleted,
+            },
+        );
         return;
     }
     if (std.mem.eql(u8, sub, "gc")) {
