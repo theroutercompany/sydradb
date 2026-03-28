@@ -44,6 +44,20 @@ pub const PackWriteResult = struct {
     }
 };
 
+pub const PackManifest = struct {
+    pack_path: []u8,
+    pack_checksum: [32]u8,
+    object_count: u64,
+    blob_count: u64,
+    tree_count: u64,
+    commit_count: u64,
+    ref_count: u64,
+
+    pub fn deinit(self: *PackManifest, alloc: std.mem.Allocator) void {
+        alloc.free(self.pack_path);
+    }
+};
+
 pub const ObjectStore = struct {
     allocator: std.mem.Allocator,
     root: std.fs.Dir,
@@ -226,6 +240,30 @@ pub const ObjectStore = struct {
     }
 
     pub fn writePack(self: *ObjectStore, allocator: std.mem.Allocator, ids: []const ObjectId) !PackWriteResult {
+        const stamp = std.time.nanoTimestamp();
+        const base_prefix = try std.fmt.allocPrint(allocator, "objects/packs/pack-{d}", .{stamp});
+        defer allocator.free(base_prefix);
+        return try self.writePackAt(allocator, ids, base_prefix, true, true);
+    }
+
+    pub fn writeCruftPack(self: *ObjectStore, allocator: std.mem.Allocator, ids: []const ObjectId, stamp_ms: i64) !PackWriteResult {
+        const dir_path = try std.fmt.allocPrint(allocator, "objects/cruft/{d}/packs", .{stamp_ms});
+        defer allocator.free(dir_path);
+        try self.root.makePath(dir_path);
+
+        const base_prefix = try std.fmt.allocPrint(allocator, "{s}/cruft-{d}", .{ dir_path, std.time.nanoTimestamp() });
+        defer allocator.free(base_prefix);
+        return try self.writePackAt(allocator, ids, base_prefix, false, true);
+    }
+
+    fn writePackAt(
+        self: *ObjectStore,
+        allocator: std.mem.Allocator,
+        ids: []const ObjectId,
+        base_prefix: []const u8,
+        refresh_active_indexes: bool,
+        delete_loose_after: bool,
+    ) !PackWriteResult {
         const sorted_ids = try allocator.dupe(ObjectId, ids);
         defer allocator.free(sorted_ids);
         std.sort.block(ObjectId, sorted_ids, {}, struct {
@@ -234,19 +272,33 @@ pub const ObjectStore = struct {
             }
         }.lessThan);
 
-        const stamp = std.time.nanoTimestamp();
-        const pack_rel = try std.fmt.allocPrint(allocator, "objects/packs/pack-{d}.pack", .{stamp});
+        const pack_rel = try std.fmt.allocPrint(allocator, "{s}.pack", .{base_prefix});
         errdefer allocator.free(pack_rel);
-        const idx_rel = try std.fmt.allocPrint(allocator, "objects/packs/pack-{d}.idx", .{stamp});
+        const idx_rel = try std.fmt.allocPrint(allocator, "{s}.idx", .{base_prefix});
         errdefer allocator.free(idx_rel);
+        const manifest_rel = try std.fmt.allocPrint(allocator, "{s}.manifest", .{base_prefix});
+        defer allocator.free(manifest_rel);
 
         const tmp_pack_rel = try std.fmt.allocPrint(allocator, "{s}.tmp", .{pack_rel});
         defer allocator.free(tmp_pack_rel);
         const tmp_idx_rel = try std.fmt.allocPrint(allocator, "{s}.tmp", .{idx_rel});
         defer allocator.free(tmp_idx_rel);
+        const tmp_manifest_rel = try std.fmt.allocPrint(allocator, "{s}.tmp", .{manifest_rel});
+        defer allocator.free(tmp_manifest_rel);
 
         var offsets = try allocator.alloc(u64, sorted_ids.len);
         defer allocator.free(offsets);
+
+        var manifest = PackManifest{
+            .pack_path = try allocator.dupe(u8, pack_rel),
+            .pack_checksum = [_]u8{0} ** 32,
+            .object_count = sorted_ids.len,
+            .blob_count = 0,
+            .tree_count = 0,
+            .commit_count = 0,
+            .ref_count = 0,
+        };
+        defer manifest.deinit(allocator);
 
         var pack_file = try self.root.createFile(tmp_pack_rel, .{ .truncate = true, .read = true });
         defer pack_file.close();
@@ -265,6 +317,13 @@ pub const ObjectStore = struct {
             const loaded = try self.get(allocator, id);
             defer allocator.free(loaded.payload);
 
+            switch (loaded.obj_type) {
+                .blob => manifest.blob_count += 1,
+                .tree => manifest.tree_count += 1,
+                .commit => manifest.commit_count += 1,
+                .ref => manifest.ref_count += 1,
+            }
+
             try pack_writer.writeAll(id.hash[0..]);
             try pack_writer.writeByte(@intFromEnum(loaded.obj_type));
             try pack_writer.writeInt(u64, @intCast(loaded.payload.len), .little);
@@ -278,6 +337,7 @@ pub const ObjectStore = struct {
         }
 
         const pack_checksum = try hashRelativeFile(self.root, allocator, tmp_pack_rel);
+        manifest.pack_checksum = pack_checksum;
         const pack_stat = try pack_file.stat();
 
         const idx_bytes = try encodePackIndex(allocator, sorted_ids, offsets, pack_stat.size, pack_checksum);
@@ -291,18 +351,33 @@ pub const ObjectStore = struct {
             try idx_file.sync();
         }
 
+        const manifest_bytes = try encodePackManifest(allocator, manifest);
+        defer allocator.free(manifest_bytes);
+        var manifest_file = try self.root.createFile(tmp_manifest_rel, .{ .truncate = true, .read = true });
+        defer manifest_file.close();
+        errdefer self.root.deleteFile(tmp_manifest_rel) catch {};
+        try manifest_file.writeAll(manifest_bytes);
+        if (shouldSync(self.fsync)) {
+            try manifest_file.sync();
+        }
+
         try self.root.rename(tmp_pack_rel, pack_rel);
         try self.root.rename(tmp_idx_rel, idx_rel);
+        try self.root.rename(tmp_manifest_rel, manifest_rel);
         if (shouldSync(self.fsync)) {
             try syncDir(&self.root);
         }
-        try self.rebuildMultiPackIndex(allocator);
+        if (refresh_active_indexes) {
+            try self.rebuildMultiPackIndex(allocator);
+        }
 
-        for (sorted_ids) |id| {
-            self.delete(id) catch |err| switch (err) {
-                error.FileNotFound, error.ObjectStoredInPack => {},
-                else => return err,
-            };
+        if (delete_loose_after) {
+            for (sorted_ids) |id| {
+                self.delete(id) catch |err| switch (err) {
+                    error.FileNotFound, error.ObjectStoredInPack => {},
+                    else => return err,
+                };
+            }
         }
 
         return .{
@@ -319,6 +394,41 @@ pub const ObjectStore = struct {
         } else |err| switch (err) {
             error.FileNotFound => return false,
             else => return err,
+        }
+    }
+
+    pub fn verifyActivePackMetadata(self: *ObjectStore, allocator: std.mem.Allocator) !void {
+        const idx_paths = try self.listPackIndexPaths(allocator);
+        defer freeOwnedStrings(allocator, idx_paths);
+
+        for (idx_paths) |idx_path| {
+            var index = try loadPackIndex(allocator, self.root, idx_path);
+            defer index.deinit(allocator);
+
+            const manifest_path = try manifestPathForIndex(allocator, idx_path);
+            defer allocator.free(manifest_path);
+            var manifest = try loadPackManifest(allocator, self.root, manifest_path);
+            defer manifest.deinit(allocator);
+
+            if (!std.mem.eql(u8, manifest.manifest.pack_path, index.pack_path)) return error.CorruptPackManifest;
+            if (!std.mem.eql(u8, manifest.manifest.pack_checksum[0..], index.pack_checksum[0..])) return error.CorruptPackManifest;
+            if (manifest.manifest.object_count != index.object_ids.len) return error.CorruptPackManifest;
+
+            var counts = [_]u64{0} ** 4;
+            var pack_file = try self.root.openFile(index.pack_path, .{ .mode = .read_only });
+            defer pack_file.close();
+            for (index.offsets) |offset| {
+                try pack_file.seekTo(offset + 32);
+                var type_buf: [1]u8 = undefined;
+                if (try pack_file.readAll(type_buf[0..]) != type_buf.len) return error.CorruptPack;
+                const obj_type = std.meta.intToEnum(ObjectType, type_buf[0]) catch return error.UnknownObjectType;
+                counts[@intFromEnum(obj_type) - 1] += 1;
+            }
+
+            if (counts[@intFromEnum(ObjectType.blob) - 1] != manifest.manifest.blob_count) return error.CorruptPackManifest;
+            if (counts[@intFromEnum(ObjectType.tree) - 1] != manifest.manifest.tree_count) return error.CorruptPackManifest;
+            if (counts[@intFromEnum(ObjectType.commit) - 1] != manifest.manifest.commit_count) return error.CorruptPackManifest;
+            if (counts[@intFromEnum(ObjectType.ref) - 1] != manifest.manifest.ref_count) return error.CorruptPackManifest;
         }
     }
 
@@ -556,6 +666,7 @@ fn syncDir(dir: *std.fs.Dir) !void {
 const packMagic = "SYDPACK1";
 const idxMagic = "SYDIDX1\x00";
 const midxMagic = "SYDMIDX1";
+const manifestMagic = "SYDPMAN1";
 const midxPath = "objects/info/multi-pack-index";
 
 const PackLocation = struct {
@@ -650,6 +761,14 @@ const PackIndex = struct {
     }
 };
 
+const LoadedPackManifest = struct {
+    manifest: PackManifest,
+
+    fn deinit(self: *LoadedPackManifest, alloc: std.mem.Allocator) void {
+        self.manifest.deinit(alloc);
+    }
+};
+
 fn encodePackIndex(
     alloc: std.mem.Allocator,
     ids: []const ObjectId,
@@ -724,6 +843,29 @@ fn encodeMultiPackIndex(
     return try bytes.toOwnedSlice();
 }
 
+fn encodePackManifest(alloc: std.mem.Allocator, manifest: PackManifest) ![]u8 {
+    var bytes = std.array_list.Managed(u8).init(alloc);
+    errdefer bytes.deinit();
+
+    try bytes.appendSlice(manifestMagic[0..]);
+    try appendInt(&bytes, u16, 1);
+    try appendInt(&bytes, u16, @intCast(manifest.pack_path.len));
+    try bytes.appendSlice(manifest.pack_path);
+    try bytes.appendSlice(manifest.pack_checksum[0..]);
+    try appendInt(&bytes, u64, manifest.object_count);
+    try appendInt(&bytes, u64, manifest.blob_count);
+    try appendInt(&bytes, u64, manifest.tree_count);
+    try appendInt(&bytes, u64, manifest.commit_count);
+    try appendInt(&bytes, u64, manifest.ref_count);
+
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(bytes.items);
+    var checksum: [32]u8 = undefined;
+    hasher.final(checksum[0..]);
+    try bytes.appendSlice(checksum[0..]);
+    return try bytes.toOwnedSlice();
+}
+
 fn loadPackIndex(alloc: std.mem.Allocator, root: std.fs.Dir, idx_path: []const u8) !PackIndex {
     const bytes = try root.readFileAlloc(alloc, idx_path, 256 * 1024 * 1024);
     defer alloc.free(bytes);
@@ -773,6 +915,49 @@ fn loadPackIndex(alloc: std.mem.Allocator, root: std.fs.Dir, idx_path: []const u
         .object_ids = object_ids,
         .offsets = offsets,
     };
+}
+
+fn loadPackManifest(alloc: std.mem.Allocator, root: std.fs.Dir, manifest_path: []const u8) !LoadedPackManifest {
+    const bytes = try root.readFileAlloc(alloc, manifest_path, 16 * 1024 * 1024);
+    defer alloc.free(bytes);
+    if (bytes.len < manifestMagic.len + @sizeOf(u16) + @sizeOf(u16) + 32 + @sizeOf(u64) * 5 + 32) return error.CorruptPackManifest;
+    if (!std.mem.eql(u8, bytes[0..manifestMagic.len], manifestMagic[0..])) return error.CorruptPackManifest;
+
+    const checksum_start = bytes.len - 32;
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(bytes[0..checksum_start]);
+    var expected_checksum: [32]u8 = undefined;
+    hasher.final(expected_checksum[0..]);
+    if (!std.mem.eql(u8, expected_checksum[0..], bytes[checksum_start..])) return error.CorruptPackManifest;
+
+    var cursor: usize = manifestMagic.len;
+    const version = readIntAt(bytes, &cursor, u16);
+    if (version != 1) return error.UnsupportedPackManifestVersion;
+    const path_len = readIntAt(bytes, &cursor, u16);
+    if (cursor + path_len > checksum_start) return error.CorruptPackManifest;
+    const pack_path = try alloc.dupe(u8, bytes[cursor .. cursor + path_len]);
+    cursor += path_len;
+    errdefer alloc.free(pack_path);
+
+    var pack_checksum: [32]u8 = undefined;
+    @memcpy(pack_checksum[0..], bytes[cursor .. cursor + 32]);
+    cursor += 32;
+    const object_count = readIntAt(bytes, &cursor, u64);
+    const blob_count = readIntAt(bytes, &cursor, u64);
+    const tree_count = readIntAt(bytes, &cursor, u64);
+    const commit_count = readIntAt(bytes, &cursor, u64);
+    const ref_count = readIntAt(bytes, &cursor, u64);
+    if (cursor != checksum_start) return error.CorruptPackManifest;
+
+    return .{ .manifest = .{
+        .pack_path = pack_path,
+        .pack_checksum = pack_checksum,
+        .object_count = object_count,
+        .blob_count = blob_count,
+        .tree_count = tree_count,
+        .commit_count = commit_count,
+        .ref_count = ref_count,
+    } };
 }
 
 fn readMultiPackIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !MultiPackIndex {
@@ -837,6 +1022,11 @@ fn readMultiPackIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !MultiPackInde
 fn packPathForIndex(alloc: std.mem.Allocator, idx_path: []const u8) ![]u8 {
     if (!std.mem.endsWith(u8, idx_path, ".idx")) return error.InvalidPackIndexPath;
     return try std.fmt.allocPrint(alloc, "{s}.pack", .{idx_path[0 .. idx_path.len - 4]});
+}
+
+fn manifestPathForIndex(alloc: std.mem.Allocator, idx_path: []const u8) ![]u8 {
+    if (!std.mem.endsWith(u8, idx_path, ".idx")) return error.InvalidPackIndexPath;
+    return try std.fmt.allocPrint(alloc, "{s}.manifest", .{idx_path[0 .. idx_path.len - 4]});
 }
 
 fn appendInt(bytes: *std.array_list.Managed(u8), comptime T: type, value: T) !void {
@@ -964,6 +1154,25 @@ test "object store can read packed objects after loose copies are pruned" {
     const all_ids = try store.listIds(std.testing.allocator);
     defer std.testing.allocator.free(all_ids);
     try std.testing.expectEqual(@as(usize, 2), all_ids.len);
+}
+
+test "pack manifests track per-type counts and checksum" {
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    const store_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/object-store-pack-manifest", .{tmp_dir.sub_path});
+    defer std.testing.allocator.free(store_path);
+    var store = try ObjectStore.init(std.testing.allocator, store_path, .none);
+    defer store.deinit();
+
+    const blob_id = try store.put(.blob, "manifest blob");
+    const tree_id = try store.put(.tree, "manifest tree");
+    const commit_id = try store.put(.commit, "manifest commit");
+
+    var pack_write = try store.writePack(std.testing.allocator, &[_]ObjectId{ blob_id, tree_id, commit_id });
+    defer pack_write.deinit(std.testing.allocator);
+
+    try store.verifyActivePackMetadata(std.testing.allocator);
 }
 
 test "object store rejects corrupt pack indexes" {
