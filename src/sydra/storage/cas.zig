@@ -3728,11 +3728,26 @@ pub fn buildLegacySnapshot(
 
     sortDescriptors(descriptors.items);
 
+    const segment_descriptors = try descriptors.toOwnedSlice();
+    errdefer {
+        for (segment_descriptors) |*descriptor| descriptor.deinit(alloc);
+        alloc.free(segment_descriptors);
+    }
+
+    var tag_snapshot = try buildTagSnapshot(alloc, tags);
+    errdefer tag_snapshot.deinit(alloc);
+
+    var series_catalog_snapshot = try buildSeriesCatalogSnapshot(alloc, series_catalog);
+    errdefer series_catalog_snapshot.deinit(alloc);
+
+    var wal_index = try buildWalIndex(alloc, data_dir, store, extent_chunk_bytes);
+    errdefer wal_index.deinit(alloc);
+
     return .{
-        .segment_descriptors = try descriptors.toOwnedSlice(),
-        .tag_snapshot = try buildTagSnapshot(alloc, tags),
-        .series_catalog_snapshot = try buildSeriesCatalogSnapshot(alloc, series_catalog),
-        .wal_index = try buildWalIndex(alloc, data_dir, store, extent_chunk_bytes),
+        .segment_descriptors = segment_descriptors,
+        .tag_snapshot = tag_snapshot,
+        .series_catalog_snapshot = series_catalog_snapshot,
+        .wal_index = wal_index,
     };
 }
 
