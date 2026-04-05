@@ -2390,7 +2390,7 @@ pub const CasManager = struct {
         var stack = std.array_list.Managed(object_store.ObjectId).init(self.alloc);
         defer stack.deinit();
 
-        const refs_index = loadObjectRefsIndex(self.alloc, self.store.root) catch |err| switch (err) {
+        var refs_index = loadObjectRefsIndex(self.alloc, self.store.root) catch |err| switch (err) {
             error.FileNotFound, error.CorruptObjectRefsIndex, error.UnsupportedObjectRefsIndexVersion => null,
             else => return err,
         };
@@ -2600,7 +2600,7 @@ fn loadObjectRefsIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !ObjectRefsIn
         alloc.free(records);
     }
     for (records) |*record| {
-        const id = .{ .hash = try cursor.readHash() };
+        const id = object_store.ObjectId{ .hash = try cursor.readHash() };
         const obj_type = std.meta.intToEnum(object_store.ObjectType, try cursor.readByte()) catch return error.CorruptObjectRefsIndex;
         const role = std.meta.intToEnum(ObjectLogicalRole, try cursor.readByte()) catch return error.CorruptObjectRefsIndex;
         const child_count = try cursor.readInt(u32);
@@ -3027,7 +3027,7 @@ fn readBundleManifest(alloc: std.mem.Allocator, bundle_path: []const u8) !Bundle
     else
         legacy_repository_format_version;
     const ref_backend = if (format_version >= 2)
-        std.meta.intToEnum(RefBackend, @intCast(try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "ref_backend"))) catch return error.InvalidBundle
+        std.meta.intToEnum(RefBackend, @as(u8, @intCast(try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "ref_backend")))) catch return error.InvalidBundle
     else
         RefBackend.loose;
     const incremental_value = try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "incremental");
@@ -3362,28 +3362,38 @@ pub fn applyBundle(alloc: std.mem.Allocator, bundle_path: []const u8, dst_path: 
     }
 
     if (manifest.reftable_files.len > 0) {
-        dest.refs.root.deleteTree("reftable") catch |err| switch (err) {
+        dest.refs.root.access("reftable", .{}) catch |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
         };
+        if (dest.refs.root.access("reftable", .{})) |_| {
+            try dest.refs.root.deleteTree("reftable");
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
         try dest.refs.root.makePath("reftable");
         try copyRelativeFiles(bundle_root, dest.refs.root, manifest.reftable_files);
     }
     if (manifest.loose_ref_files.len > 0) {
-        dest.refs.root.deleteTree("refs") catch |err| switch (err) {
+        if (dest.refs.root.access("refs", .{})) |_| {
+            try dest.refs.root.deleteTree("refs");
+        } else |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
-        };
+        }
         try dest.refs.root.makePath("refs");
         try dest.refs.root.makePath("refs/heads");
         try dest.refs.root.makePath("refs/txn");
         try copyRelativeFiles(bundle_root, dest.refs.root, manifest.loose_ref_files);
     }
     if (manifest.reflog_files.len > 0) {
-        dest.refs.root.deleteTree("logs/refs") catch |err| switch (err) {
+        if (dest.refs.root.access("logs/refs", .{})) |_| {
+            try dest.refs.root.deleteTree("logs/refs");
+        } else |err| switch (err) {
             error.FileNotFound => {},
             else => return err,
-        };
+        }
         try dest.refs.root.makePath("logs/refs");
         try dest.refs.root.makePath("logs/refs/heads");
         try copyRelativeFiles(bundle_root, dest.refs.root, manifest.reflog_files);
@@ -5823,11 +5833,12 @@ fn selectReftableCompactionStart(alloc: std.mem.Allocator, root: std.fs.Dir, tab
         const should_merge = table_names.len > 8 or combined_size <= prev_span.size_bytes * 2 or combined_span.width() <= prev_span.width() * 2;
         if (!should_merge) break;
         start = prev_idx;
+        combined_size += tables[prev_idx].size_bytes;
         combined_span = .{
             .min_update_index = @min(prev_span.min_update_index, combined_span.min_update_index),
             .max_update_index = @max(prev_span.max_update_index, combined_span.max_update_index),
+            .size_bytes = combined_size,
         };
-        combined_size += tables[prev_idx].size_bytes;
     }
 
     if (start == table_names.len - 1) return null;
