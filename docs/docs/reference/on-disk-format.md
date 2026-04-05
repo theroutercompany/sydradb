@@ -31,6 +31,8 @@ Under `data_dir`, the engine uses:
 - `objects/<prefix>/<hex>` – loose content-addressed objects
 - `objects/packs/*.pack` – immutable packed object containers
 - `objects/packs/*.idx` – fanout-based pack indexes for packed objects
+- `objects/packs/*.rev` – reverse indexes that preserve physical pack object order
+- `objects/packs/*.manifest` – per-pack manifests with checksums and per-type object counts
 - `objects/info/store-format` – repository-wide storage format marker and feature defaults
 - `objects/info/multi-pack-index` – optional pack-set fanout index across all active packs
 - `objects/info/commit-graph` – optional commit ancestry side index with generation numbers and logical changed-path Bloom filters
@@ -109,7 +111,7 @@ The CAS layer stores immutable objects addressed by a BLAKE3 hash of `(type, pay
 - Loose objects live under `objects/<prefix>/<hex>`.
 - Packed objects live in `objects/packs/*.pack` and are indexed by `objects/packs/*.idx`.
 - `objects/info/store-format` version 2 marks repositories that default to the reftable ref backend and CAS-primary startup; version 1 remains the compatibility format for pre-migration repositories.
-- `objects/info/multi-pack-index` provides an optional cross-pack fanout table so lookups can resolve mixed pack sets without scanning every individual `.idx` file first.
+- `objects/info/multi-pack-index` provides an optional cross-pack fanout table so lookups can resolve mixed pack sets without scanning every individual `.idx` file first. Version 2 also records whether each active pack has a reverse index sidecar.
 - `objects/info/object-refs` records typed object-to-child edges explicitly, so reachability, `fsck`, and bitmap refresh no longer need to infer every edge by reparsing arbitrary blob payloads.
 - `objects/info/reachability-bitmap` caches the exact reachable object-id set for the current sorted ref snapshot, so `cas pack`, bundle selection, and non-reflog reachability checks can fall back to a side index instead of walking the full DAG every time.
 - The current implementation stores whole objects in packs; it does not use delta compression.

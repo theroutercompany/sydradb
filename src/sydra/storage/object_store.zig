@@ -36,11 +36,13 @@ pub const LoadedObject = struct {
 pub const PackWriteResult = struct {
     pack_path: []u8,
     idx_path: []u8,
+    rev_path: []u8,
     object_count: usize,
 
     pub fn deinit(self: *PackWriteResult, alloc: std.mem.Allocator) void {
         alloc.free(self.pack_path);
         alloc.free(self.idx_path);
+        alloc.free(self.rev_path);
     }
 };
 
@@ -55,6 +57,18 @@ pub const PackManifest = struct {
 
     pub fn deinit(self: *PackManifest, alloc: std.mem.Allocator) void {
         alloc.free(self.pack_path);
+    }
+};
+
+pub const PackReverseIndex = struct {
+    pack_path: []u8,
+    object_ids: []ObjectId,
+    offsets: []u64,
+
+    pub fn deinit(self: *PackReverseIndex, alloc: std.mem.Allocator) void {
+        alloc.free(self.pack_path);
+        alloc.free(self.object_ids);
+        alloc.free(self.offsets);
     }
 };
 
@@ -276,6 +290,8 @@ pub const ObjectStore = struct {
         errdefer allocator.free(pack_rel);
         const idx_rel = try std.fmt.allocPrint(allocator, "{s}.idx", .{base_prefix});
         errdefer allocator.free(idx_rel);
+        const rev_rel = try std.fmt.allocPrint(allocator, "{s}.rev", .{base_prefix});
+        errdefer allocator.free(rev_rel);
         const manifest_rel = try std.fmt.allocPrint(allocator, "{s}.manifest", .{base_prefix});
         defer allocator.free(manifest_rel);
 
@@ -283,6 +299,8 @@ pub const ObjectStore = struct {
         defer allocator.free(tmp_pack_rel);
         const tmp_idx_rel = try std.fmt.allocPrint(allocator, "{s}.tmp", .{idx_rel});
         defer allocator.free(tmp_idx_rel);
+        const tmp_rev_rel = try std.fmt.allocPrint(allocator, "{s}.tmp", .{rev_rel});
+        defer allocator.free(tmp_rev_rel);
         const tmp_manifest_rel = try std.fmt.allocPrint(allocator, "{s}.tmp", .{manifest_rel});
         defer allocator.free(tmp_manifest_rel);
 
@@ -351,6 +369,16 @@ pub const ObjectStore = struct {
             try idx_file.sync();
         }
 
+        const rev_bytes = try encodePackReverseIndex(allocator, pack_rel, sorted_ids, offsets);
+        defer allocator.free(rev_bytes);
+        var rev_file = try self.root.createFile(tmp_rev_rel, .{ .truncate = true, .read = true });
+        defer rev_file.close();
+        errdefer self.root.deleteFile(tmp_rev_rel) catch {};
+        try rev_file.writeAll(rev_bytes);
+        if (shouldSync(self.fsync)) {
+            try rev_file.sync();
+        }
+
         const manifest_bytes = try encodePackManifest(allocator, manifest);
         defer allocator.free(manifest_bytes);
         var manifest_file = try self.root.createFile(tmp_manifest_rel, .{ .truncate = true, .read = true });
@@ -363,6 +391,7 @@ pub const ObjectStore = struct {
 
         try self.root.rename(tmp_pack_rel, pack_rel);
         try self.root.rename(tmp_idx_rel, idx_rel);
+        try self.root.rename(tmp_rev_rel, rev_rel);
         try self.root.rename(tmp_manifest_rel, manifest_rel);
         if (shouldSync(self.fsync)) {
             try syncDir(&self.root);
@@ -383,6 +412,7 @@ pub const ObjectStore = struct {
         return .{
             .pack_path = pack_rel,
             .idx_path = idx_rel,
+            .rev_path = rev_rel,
             .object_count = sorted_ids.len,
         };
     }
@@ -404,6 +434,10 @@ pub const ObjectStore = struct {
         for (idx_paths) |idx_path| {
             var index = try loadPackIndex(allocator, self.root, idx_path);
             defer index.deinit(allocator);
+            const rev_path = try revPathForIndex(allocator, idx_path);
+            defer allocator.free(rev_path);
+            var reverse = try loadPackReverseIndex(allocator, self.root, rev_path);
+            defer reverse.deinit(allocator);
 
             const manifest_path = try manifestPathForIndex(allocator, idx_path);
             defer allocator.free(manifest_path);
@@ -413,16 +447,21 @@ pub const ObjectStore = struct {
             if (!std.mem.eql(u8, manifest.manifest.pack_path, index.pack_path)) return error.CorruptPackManifest;
             if (!std.mem.eql(u8, manifest.manifest.pack_checksum[0..], index.pack_checksum[0..])) return error.CorruptPackManifest;
             if (manifest.manifest.object_count != index.object_ids.len) return error.CorruptPackManifest;
+            if (!std.mem.eql(u8, reverse.pack_path, index.pack_path)) return error.CorruptPackReverseIndex;
+            if (reverse.object_ids.len != index.object_ids.len) return error.CorruptPackReverseIndex;
+            if (reverse.offsets.len != index.offsets.len) return error.CorruptPackReverseIndex;
 
             var counts = [_]u64{0} ** 4;
             var pack_file = try self.root.openFile(index.pack_path, .{ .mode = .read_only });
             defer pack_file.close();
-            for (index.offsets) |offset| {
+            for (reverse.offsets, reverse.object_ids, 0..) |offset, reverse_id, object_idx| {
                 try pack_file.seekTo(offset + 32);
                 var type_buf: [1]u8 = undefined;
                 if (try pack_file.readAll(type_buf[0..]) != type_buf.len) return error.CorruptPack;
                 const obj_type = std.meta.intToEnum(ObjectType, type_buf[0]) catch return error.UnknownObjectType;
                 counts[@intFromEnum(obj_type) - 1] += 1;
+                if (!reverse_id.eql(index.object_ids[object_idx])) return error.CorruptPackReverseIndex;
+                if (offset != index.offsets[object_idx]) return error.CorruptPackReverseIndex;
             }
 
             if (counts[@intFromEnum(ObjectType.blob) - 1] != manifest.manifest.blob_count) return error.CorruptPackManifest;
@@ -585,6 +624,8 @@ pub const ObjectStore = struct {
             for (pack_paths) |path| allocator.free(path);
             allocator.free(pack_paths);
         }
+        const pack_has_reverse = try allocator.alloc(bool, idx_paths.len);
+        defer allocator.free(pack_has_reverse);
 
         var records = std.array_list.Managed(MultiPackRecord).init(allocator);
         defer records.deinit();
@@ -595,6 +636,21 @@ pub const ObjectStore = struct {
             var index = try loadPackIndex(allocator, self.root, idx_path);
             defer index.deinit(allocator);
             pack_paths[pack_idx] = try allocator.dupe(u8, index.pack_path);
+            const rev_path = try revPathForIndex(allocator, idx_path);
+            defer allocator.free(rev_path);
+            pack_has_reverse[pack_idx] = try pathExists(self.root, rev_path);
+            if (!pack_has_reverse[pack_idx]) {
+                try writePackReverseIndexFile(
+                    allocator,
+                    self.root,
+                    rev_path,
+                    index.pack_path,
+                    index.object_ids,
+                    index.offsets,
+                    self.fsync,
+                );
+                pack_has_reverse[pack_idx] = true;
+            }
             for (index.object_ids, index.offsets) |id, offset| {
                 const gop = try seen.getOrPut(id);
                 if (gop.found_existing) continue;
@@ -612,7 +668,7 @@ pub const ObjectStore = struct {
             }
         }.lessThan);
 
-        const bytes = try encodeMultiPackIndex(allocator, pack_paths, records.items);
+        const bytes = try encodeMultiPackIndex(allocator, pack_paths, pack_has_reverse, records.items);
         defer allocator.free(bytes);
 
         const temp_path = midxPath ++ ".tmp";
@@ -667,6 +723,7 @@ const packMagic = "SYDPACK1";
 const idxMagic = "SYDIDX1\x00";
 const midxMagic = "SYDMIDX1";
 const manifestMagic = "SYDPMAN1";
+const revMagic = "SYDREV1\x00";
 const midxPath = "objects/info/multi-pack-index";
 
 const PackLocation = struct {
@@ -687,16 +744,19 @@ const MultiPackRecord = struct {
 const MultiPackLocation = struct {
     pack_path: []const u8,
     offset: u64,
+    has_reverse_index: bool,
 };
 
 const MultiPackIndex = struct {
     pack_paths: [][]u8,
+    pack_has_reverse: []bool,
     fanout: [256]u64,
     records: []MultiPackRecord,
 
     fn deinit(self: *MultiPackIndex, alloc: std.mem.Allocator) void {
         for (self.pack_paths) |path| alloc.free(path);
         alloc.free(self.pack_paths);
+        alloc.free(self.pack_has_reverse);
         alloc.free(self.records);
     }
 
@@ -715,6 +775,7 @@ const MultiPackIndex = struct {
                 return .{
                     .pack_path = self.pack_paths[pack_idx],
                     .offset = candidate.offset,
+                    .has_reverse_index = self.pack_has_reverse[pack_idx],
                 };
             }
             if (std.mem.lessThan(u8, candidate.id.hash[0..], id.hash[0..])) {
@@ -808,6 +869,7 @@ fn encodePackIndex(
 fn encodeMultiPackIndex(
     alloc: std.mem.Allocator,
     pack_paths: []const []const u8,
+    pack_has_reverse: []const bool,
     records: []const MultiPackRecord,
 ) ![]u8 {
     var fanout: [256]u64 = [_]u64{0} ** 256;
@@ -823,13 +885,14 @@ fn encodeMultiPackIndex(
     errdefer bytes.deinit();
 
     try bytes.appendSlice(midxMagic[0..]);
-    try appendInt(&bytes, u16, 1);
+    try appendInt(&bytes, u16, 2);
     try appendInt(&bytes, u64, @intCast(records.len));
     try appendInt(&bytes, u64, @intCast(pack_paths.len));
     for (fanout) |count| try appendInt(&bytes, u64, count);
-    for (pack_paths) |pack_path| {
+    for (pack_paths, pack_has_reverse) |pack_path, has_reverse| {
         try appendInt(&bytes, u16, @intCast(pack_path.len));
         try bytes.appendSlice(pack_path);
+        try bytes.append(if (has_reverse) 1 else 0);
     }
     for (records) |record| try bytes.appendSlice(record.id.hash[0..]);
     for (records) |record| try appendInt(&bytes, u32, record.pack_path_index);
@@ -857,6 +920,31 @@ fn encodePackManifest(alloc: std.mem.Allocator, manifest: PackManifest) ![]u8 {
     try appendInt(&bytes, u64, manifest.tree_count);
     try appendInt(&bytes, u64, manifest.commit_count);
     try appendInt(&bytes, u64, manifest.ref_count);
+
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(bytes.items);
+    var checksum: [32]u8 = undefined;
+    hasher.final(checksum[0..]);
+    try bytes.appendSlice(checksum[0..]);
+    return try bytes.toOwnedSlice();
+}
+
+fn encodePackReverseIndex(
+    alloc: std.mem.Allocator,
+    pack_path: []const u8,
+    ids: []const ObjectId,
+    offsets: []const u64,
+) ![]u8 {
+    var bytes = std.array_list.Managed(u8).init(alloc);
+    errdefer bytes.deinit();
+
+    try bytes.appendSlice(revMagic[0..]);
+    try appendInt(&bytes, u16, 1);
+    try appendInt(&bytes, u16, @intCast(pack_path.len));
+    try bytes.appendSlice(pack_path);
+    try appendInt(&bytes, u64, @intCast(ids.len));
+    for (ids) |id| try bytes.appendSlice(id.hash[0..]);
+    for (offsets) |offset| try appendInt(&bytes, u64, offset);
 
     var hasher = std.crypto.hash.Blake3.init(.{});
     hasher.update(bytes.items);
@@ -960,6 +1048,84 @@ fn loadPackManifest(alloc: std.mem.Allocator, root: std.fs.Dir, manifest_path: [
     } };
 }
 
+fn loadPackReverseIndex(alloc: std.mem.Allocator, root: std.fs.Dir, rev_path: []const u8) !PackReverseIndex {
+    const bytes = try root.readFileAlloc(alloc, rev_path, 256 * 1024 * 1024);
+    defer alloc.free(bytes);
+    if (bytes.len < revMagic.len + @sizeOf(u16) + @sizeOf(u16) + @sizeOf(u64) + 32) return error.CorruptPackReverseIndex;
+    if (!std.mem.eql(u8, bytes[0..revMagic.len], revMagic[0..])) return error.CorruptPackReverseIndex;
+
+    const checksum_start = bytes.len - 32;
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(bytes[0..checksum_start]);
+    var expected_checksum: [32]u8 = undefined;
+    hasher.final(expected_checksum[0..]);
+    if (!std.mem.eql(u8, expected_checksum[0..], bytes[checksum_start..])) return error.CorruptPackReverseIndex;
+
+    var cursor: usize = revMagic.len;
+    const version = readIntAt(bytes, &cursor, u16);
+    if (version != 1) return error.UnsupportedPackReverseIndexVersion;
+    const path_len = readIntAt(bytes, &cursor, u16);
+    if (cursor + path_len > checksum_start) return error.CorruptPackReverseIndex;
+    const pack_path = try alloc.dupe(u8, bytes[cursor .. cursor + path_len]);
+    cursor += path_len;
+    errdefer alloc.free(pack_path);
+
+    const object_count = readIntAt(bytes, &cursor, u64);
+    const object_ids = try alloc.alloc(ObjectId, @intCast(object_count));
+    errdefer alloc.free(object_ids);
+    for (object_ids) |*id| {
+        @memcpy(id.hash[0..], bytes[cursor .. cursor + 32]);
+        cursor += 32;
+    }
+
+    const offsets = try alloc.alloc(u64, @intCast(object_count));
+    errdefer alloc.free(offsets);
+    for (offsets) |*offset| {
+        offset.* = readIntAt(bytes, &cursor, u64);
+    }
+
+    if (cursor != checksum_start) return error.CorruptPackReverseIndex;
+    return .{
+        .pack_path = pack_path,
+        .object_ids = object_ids,
+        .offsets = offsets,
+    };
+}
+
+fn writePackReverseIndexFile(
+    alloc: std.mem.Allocator,
+    root: std.fs.Dir,
+    rev_path: []const u8,
+    pack_path: []const u8,
+    ids: []const ObjectId,
+    offsets: []const u64,
+    fsync: cfg.FsyncPolicy,
+) !void {
+    const bytes = try encodePackReverseIndex(alloc, pack_path, ids, offsets);
+    defer alloc.free(bytes);
+
+    const tmp_rev_rel = try std.fmt.allocPrint(alloc, "{s}.tmp", .{rev_path});
+    defer alloc.free(tmp_rev_rel);
+    var rev_file = try root.createFile(tmp_rev_rel, .{ .truncate = true, .read = true });
+    defer rev_file.close();
+    errdefer root.deleteFile(tmp_rev_rel) catch {};
+    try rev_file.writeAll(bytes);
+    if (shouldSync(fsync)) {
+        try rev_file.sync();
+    }
+    root.rename(tmp_rev_rel, rev_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            root.deleteFile(rev_path) catch {};
+            try root.rename(tmp_rev_rel, rev_path);
+        },
+        else => return err,
+    };
+    if (shouldSync(fsync)) {
+        var root_for_sync = root;
+        try syncDir(&root_for_sync);
+    }
+}
+
 fn readMultiPackIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !MultiPackIndex {
     const bytes = try root.readFileAlloc(alloc, midxPath, 256 * 1024 * 1024);
     defer alloc.free(bytes);
@@ -977,7 +1143,7 @@ fn readMultiPackIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !MultiPackInde
 
     var cursor: usize = midxMagic.len;
     const version = readIntAt(bytes, &cursor, u16);
-    if (version != 1) return error.UnsupportedMultiPackIndexVersion;
+    if (version != 1 and version != 2) return error.UnsupportedMultiPackIndexVersion;
     const object_count = readIntAt(bytes, &cursor, u64);
     const pack_count = readIntAt(bytes, &cursor, u64);
 
@@ -990,11 +1156,24 @@ fn readMultiPackIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !MultiPackInde
         for (pack_paths[0..pack_paths_loaded]) |path| alloc.free(path);
         alloc.free(pack_paths);
     }
+    const pack_has_reverse = try alloc.alloc(bool, @intCast(pack_count));
+    errdefer alloc.free(pack_has_reverse);
     for (pack_paths) |*pack_path| {
         const path_len = readIntAt(bytes, &cursor, u16);
         if (cursor + path_len > checksum_start) return error.CorruptMultiPackIndex;
         pack_path.* = try alloc.dupe(u8, bytes[cursor .. cursor + path_len]);
         cursor += path_len;
+        if (version >= 2) {
+            if (cursor >= checksum_start) return error.CorruptMultiPackIndex;
+            pack_has_reverse[pack_paths_loaded] = switch (bytes[cursor]) {
+                0 => false,
+                1 => true,
+                else => return error.CorruptMultiPackIndex,
+            };
+            cursor += 1;
+        } else {
+            pack_has_reverse[pack_paths_loaded] = false;
+        }
         pack_paths_loaded += 1;
     }
 
@@ -1014,6 +1193,7 @@ fn readMultiPackIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !MultiPackInde
 
     return .{
         .pack_paths = pack_paths,
+        .pack_has_reverse = pack_has_reverse,
         .fanout = fanout,
         .records = records,
     };
@@ -1027,6 +1207,11 @@ fn packPathForIndex(alloc: std.mem.Allocator, idx_path: []const u8) ![]u8 {
 fn manifestPathForIndex(alloc: std.mem.Allocator, idx_path: []const u8) ![]u8 {
     if (!std.mem.endsWith(u8, idx_path, ".idx")) return error.InvalidPackIndexPath;
     return try std.fmt.allocPrint(alloc, "{s}.manifest", .{idx_path[0 .. idx_path.len - 4]});
+}
+
+fn revPathForIndex(alloc: std.mem.Allocator, idx_path: []const u8) ![]u8 {
+    if (!std.mem.endsWith(u8, idx_path, ".idx")) return error.InvalidPackIndexPath;
+    return try std.fmt.allocPrint(alloc, "{s}.rev", .{idx_path[0 .. idx_path.len - 4]});
 }
 
 fn appendInt(bytes: *std.array_list.Managed(u8), comptime T: type, value: T) !void {
@@ -1070,6 +1255,14 @@ fn hashRelativeFile(root: std.fs.Dir, alloc: std.mem.Allocator, path: []const u8
 fn freeOwnedStrings(alloc: std.mem.Allocator, items: [][]u8) void {
     for (items) |item| alloc.free(item);
     alloc.free(items);
+}
+
+fn pathExists(root: std.fs.Dir, path: []const u8) !bool {
+    root.access(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    return true;
 }
 
 test "object store write/read round-trip" {
@@ -1175,6 +1368,34 @@ test "pack manifests track per-type counts and checksum" {
     try store.verifyActivePackMetadata(std.testing.allocator);
 }
 
+test "pack reverse indexes track physical object order" {
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    const store_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/object-store-pack-rev", .{tmp_dir.sub_path});
+    defer std.testing.allocator.free(store_path);
+    var store = try ObjectStore.init(std.testing.allocator, store_path, .none);
+    defer store.deinit();
+
+    const first = try store.put(.blob, "alpha");
+    const second = try store.put(.tree, "beta");
+
+    var pack_write = try store.writePack(std.testing.allocator, &[_]ObjectId{ second, first });
+    defer pack_write.deinit(std.testing.allocator);
+
+    _ = try store.root.statFile(pack_write.rev_path);
+    var reverse = try loadPackReverseIndex(std.testing.allocator, store.root, pack_write.rev_path);
+    defer reverse.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), reverse.object_ids.len);
+    const expected = if (std.mem.lessThan(u8, first.hash[0..], second.hash[0..]))
+        [_]ObjectId{ first, second }
+    else
+        [_]ObjectId{ second, first };
+    try std.testing.expect(reverse.object_ids[0].eql(expected[0]));
+    try std.testing.expect(reverse.object_ids[1].eql(expected[1]));
+    try store.verifyActivePackMetadata(std.testing.allocator);
+}
+
 test "object store rejects corrupt pack indexes" {
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
     defer tmp_dir.cleanup();
@@ -1199,6 +1420,28 @@ test "object store rejects corrupt pack indexes" {
     };
 
     try std.testing.expectError(error.CorruptPackIndex, store.get(std.testing.allocator, id));
+}
+
+test "multi-pack rebuild synthesizes missing reverse indexes" {
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    const store_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/object-store-pack-rev-rebuild", .{tmp_dir.sub_path});
+    defer std.testing.allocator.free(store_path);
+    var store = try ObjectStore.init(std.testing.allocator, store_path, .none);
+    defer store.deinit();
+
+    const first = try store.put(.blob, "first-pack");
+    var first_pack = try store.writePack(std.testing.allocator, &[_]ObjectId{first});
+    defer first_pack.deinit(std.testing.allocator);
+    try store.root.deleteFile(first_pack.rev_path);
+
+    const second = try store.put(.blob, "second-pack");
+    var second_pack = try store.writePack(std.testing.allocator, &[_]ObjectId{second});
+    defer second_pack.deinit(std.testing.allocator);
+
+    _ = try store.root.statFile(first_pack.rev_path);
+    try store.verifyActivePackMetadata(std.testing.allocator);
 }
 
 test "object store resolves objects across multiple packs with a multi-pack index" {
