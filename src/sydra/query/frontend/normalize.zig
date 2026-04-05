@@ -206,6 +206,39 @@ pub fn normalizeFrontendStmt(allocator: std.mem.Allocator, stmt: stmt_mod.Fronte
     };
 }
 
+pub fn cloneNormalizedStmt(allocator: std.mem.Allocator, normalized: NormalizedStmt) NormalizeError!NormalizedStmt {
+    const statement = try cloneStatement(allocator, normalized.statement);
+
+    const parameters = try allocator.alloc(ParameterBinding, normalized.parameters.len);
+    errdefer allocator.free(parameters);
+    for (normalized.parameters, 0..) |binding, idx| {
+        parameters[idx] = .{
+            .slot = binding.slot,
+            .raw = try allocator.dupe(u8, binding.raw),
+            .kind = binding.kind,
+            .name = if (binding.name) |name| try allocator.dupe(u8, name) else null,
+            .explicit_index = binding.explicit_index,
+            .span = binding.span,
+            .occurrences = binding.occurrences,
+        };
+    }
+
+    const named_parameters = try allocator.alloc(NamedParameterBinding, normalized.named_parameters.len);
+    errdefer allocator.free(named_parameters);
+    for (normalized.named_parameters, 0..) |binding, idx| {
+        named_parameters[idx] = .{
+            .name = try allocator.dupe(u8, binding.name),
+            .slot = binding.slot,
+        };
+    }
+
+    return .{
+        .statement = statement,
+        .parameters = parameters,
+        .named_parameters = named_parameters,
+    };
+}
+
 pub fn normalizeAstStatement(allocator: std.mem.Allocator, statement: *const ast.Statement) NormalizeError!NormalizedStmt {
     const frontend_stmt = try frontendStmtFromAstStatement(allocator, statement);
     return normalizeFrontendStmt(allocator, frontend_stmt);
@@ -283,6 +316,153 @@ fn fromAstSelect(allocator: std.mem.Allocator, select: *const ast.Select) Normal
         } else null,
         .span = select.span,
     };
+}
+
+fn cloneStatement(allocator: std.mem.Allocator, statement: Statement) NormalizeError!Statement {
+    return switch (statement) {
+        .select => |select| .{ .select = try cloneSelect(allocator, select) },
+        .insert => |insert| .{ .insert = try cloneInsert(allocator, insert) },
+        .delete => |delete| .{ .delete = try cloneDelete(allocator, delete) },
+        .explain => |explain| .{ .explain = try cloneExplain(allocator, explain) },
+    };
+}
+
+fn cloneSelect(allocator: std.mem.Allocator, select: Select) NormalizeError!Select {
+    const projections = try allocator.alloc(Projection, select.projections.len);
+    for (select.projections, 0..) |projection, idx| {
+        projections[idx] = .{
+            .expr = try cloneExpr(allocator, projection.expr),
+            .alias = if (projection.alias) |alias| try cloneIdentifier(allocator, alias) else null,
+            .span = projection.span,
+        };
+    }
+
+    const groupings = try allocator.alloc(Grouping, select.groupings.len);
+    for (select.groupings, 0..) |grouping, idx| {
+        groupings[idx] = .{
+            .expr = try cloneExpr(allocator, grouping.expr),
+            .span = grouping.span,
+        };
+    }
+
+    const ordering = try allocator.alloc(Ordering, select.ordering.len);
+    for (select.ordering, 0..) |item, idx| {
+        ordering[idx] = .{
+            .expr = try cloneExpr(allocator, item.expr),
+            .direction = item.direction,
+            .span = item.span,
+        };
+    }
+
+    return .{
+        .projections = projections,
+        .selector = if (select.selector) |selector| try cloneSelector(allocator, selector) else null,
+        .predicate = if (select.predicate) |predicate| try cloneExpr(allocator, predicate) else null,
+        .groupings = groupings,
+        .ordering = ordering,
+        .limit = select.limit,
+        .span = select.span,
+    };
+}
+
+fn cloneInsert(allocator: std.mem.Allocator, insert: Insert) NormalizeError!Insert {
+    const columns = try allocator.alloc(*const Expr, insert.columns.len);
+    for (insert.columns, 0..) |column, idx| columns[idx] = try cloneExpr(allocator, column);
+
+    const values = try allocator.alloc(*const Expr, insert.values.len);
+    for (insert.values, 0..) |value, idx| values[idx] = try cloneExpr(allocator, value);
+
+    return .{
+        .target = try cloneIdentifier(allocator, insert.target),
+        .columns = columns,
+        .values = values,
+        .span = insert.span,
+    };
+}
+
+fn cloneDelete(allocator: std.mem.Allocator, delete: Delete) NormalizeError!Delete {
+    return .{
+        .target = try cloneIdentifier(allocator, delete.target),
+        .predicate = if (delete.predicate) |predicate| try cloneExpr(allocator, predicate) else null,
+        .span = delete.span,
+    };
+}
+
+fn cloneExplain(allocator: std.mem.Allocator, explain: Explain) NormalizeError!Explain {
+    const target = try allocator.create(Statement);
+    target.* = try cloneStatement(allocator, explain.target.*);
+    return .{
+        .mode = explain.mode,
+        .target = target,
+        .span = explain.span,
+    };
+}
+
+fn cloneSelector(allocator: std.mem.Allocator, selector: Selector) NormalizeError!Selector {
+    return .{
+        .series = switch (selector.series) {
+            .name => |name| .{ .name = try cloneIdentifier(allocator, name) },
+            .by_id => |by_id| .{ .by_id = by_id },
+        },
+        .span = selector.span,
+    };
+}
+
+fn cloneExpr(allocator: std.mem.Allocator, expr: *const Expr) NormalizeError!*const Expr {
+    const out = try allocator.create(Expr);
+    out.* = switch (expr.*) {
+        .identifier => |identifier| .{ .identifier = try cloneIdentifier(allocator, identifier) },
+        .integer => |integer| .{ .integer = .{
+            .value = integer.value,
+            .text = try allocator.dupe(u8, integer.text),
+            .span = integer.span,
+        } },
+        .float => |float| .{ .float = .{
+            .value = float.value,
+            .text = try allocator.dupe(u8, float.text),
+            .span = float.span,
+        } },
+        .string => |string| .{ .string = .{
+            .value = try allocator.dupe(u8, string.value),
+            .span = string.span,
+        } },
+        .boolean => |boolean| .{ .boolean = .{
+            .value = boolean.value,
+            .span = boolean.span,
+        } },
+        .null_value => |null_value| .{ .null_value = .{ .span = null_value.span } },
+        .duration => |duration| .{ .duration = .{
+            .value = duration.value,
+            .text = try allocator.dupe(u8, duration.text),
+            .span = duration.span,
+        } },
+        .timestamp => |timestamp| .{ .timestamp = .{
+            .value = timestamp.value,
+            .text = try allocator.dupe(u8, timestamp.text),
+            .span = timestamp.span,
+        } },
+        .parameter => |parameter| .{ .parameter = .{
+            .raw = try allocator.dupe(u8, parameter.raw),
+            .kind = parameter.kind,
+            .span = parameter.span,
+        } },
+        .comparison => |comparison| .{ .comparison = .{
+            .op = comparison.op,
+            .left = try cloneExpr(allocator, comparison.left),
+            .right = try cloneExpr(allocator, comparison.right),
+            .span = comparison.span,
+        } },
+        .call => |call| blk: {
+            const args = try allocator.alloc(*const Expr, call.args.len);
+            for (call.args, 0..) |arg, idx| args[idx] = try cloneExpr(allocator, arg);
+            break :blk .{ .call = .{
+                .callee = try cloneIdentifier(allocator, call.callee),
+                .args = args,
+                .span = call.span,
+            } };
+        },
+    };
+    return out;
 }
 
 fn fromAstInsert(allocator: std.mem.Allocator, insert: *const ast.Insert) NormalizeError!stmt_mod.Insert {

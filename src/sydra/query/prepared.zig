@@ -178,6 +178,7 @@ pub const PreparedStmt = struct {
     pub fn finalize(self: *PreparedStmt) void {
         if (self.finalized) return;
         self.clearCompiledState();
+        if (self.source_text.len != 0) self.allocator.free(@constCast(self.source_text));
         if (self.described_columns.len != 0) {
             self.allocator.free(self.described_columns);
         }
@@ -196,6 +197,44 @@ pub const PreparedStmt = struct {
         freeParameterDescriptions(self.allocator, self.binding.parameter_descriptions);
         if (self.binding.diagnostics.len != 0) self.allocator.free(self.binding.diagnostics);
         self.finalized = true;
+    }
+
+    pub fn cloneForExecution(
+        self: *const PreparedStmt,
+        allocator: std.mem.Allocator,
+        engine: *engine_mod.Engine,
+    ) CloneError!PreparedStmt {
+        if (self.finalized) return error.Finalized;
+
+        const arena_ptr = try allocator.create(std.heap.ArenaAllocator);
+        errdefer allocator.destroy(arena_ptr);
+        arena_ptr.* = std.heap.ArenaAllocator.init(allocator);
+        errdefer arena_ptr.deinit();
+
+        const normalized = try frontend.normalize.cloneNormalizedStmt(arena_ptr.allocator(), self.normalized);
+        const diagnostics = if (self.binding.diagnostics.len == 0)
+            &.{}
+        else
+            try allocator.dupe(frontend.diagnostics.Diagnostic, self.binding.diagnostics);
+        errdefer if (diagnostics.len != 0) allocator.free(diagnostics);
+
+        return try prepareNormalizedStatement(
+            allocator,
+            engine,
+            .{
+                .language = self.language,
+                .source_text = self.source_text,
+                .statement_kind = normalized.kind(),
+                .statement_span = normalized.span(),
+                .diagnostics = diagnostics,
+                .parameters = normalized.parameters,
+                .named_parameters = normalized.named_parameters,
+                .translation_fallback = self.binding.translation_fallback,
+            },
+            self.flags,
+            normalized,
+            arena_ptr,
+        );
     }
 
     pub fn explainBytecode(self: *PreparedStmt, allocator: std.mem.Allocator) ExplainError![]bytecode.DisassemblyLine {
@@ -350,6 +389,10 @@ pub const BindError = std.mem.Allocator.Error || error{
     UnknownParameter,
 };
 
+pub const CloneError = PrepareError || error{
+    Finalized,
+};
+
 pub fn freeTableUses(allocator: std.mem.Allocator, uses: []TableUse) void {
     for (uses) |use| {
         if (use.name.len != 0) allocator.free(use.name);
@@ -491,6 +534,9 @@ fn prepareNormalizedStatement(
     arena_ptr: *std.heap.ArenaAllocator,
 ) PrepareError!PreparedStmt {
     var binding = binding_in;
+    const owned_source_text = try allocator.dupe(u8, binding_in.source_text);
+    errdefer allocator.free(owned_source_text);
+    binding.source_text = owned_source_text;
     binding.parameter_descriptions = try buildParameterDescriptions(allocator, normalized);
     errdefer freeParameterDescriptions(allocator, binding.parameter_descriptions);
 
@@ -506,7 +552,7 @@ fn prepareNormalizedStatement(
         .allocator = allocator,
         .engine = engine,
         .language = binding.language,
-        .source_text = binding.source_text,
+        .source_text = owned_source_text,
         .flags = flags,
         .binding = binding,
         .program = emptyProgram(allocator),

@@ -34,9 +34,7 @@ pub const ServerConfig = struct {
 
 const ParsedStatementState = struct {
     name: []u8,
-    sql: []u8,
-    parameter_slots: usize,
-    statement_kind: frontend.stmt.StatementKind,
+    template: prepared_query.PreparedStmt,
     parameter_oids: []u32,
     columns: []DescribedColumnState,
 };
@@ -62,9 +60,9 @@ const ExtendedQueryState = struct {
     }
 
     fn deinit(self: *ExtendedQueryState) void {
-        for (self.parsed_statements.items) |entry| {
+        for (self.parsed_statements.items) |*entry| {
             self.alloc.free(entry.name);
-            self.alloc.free(entry.sql);
+            entry.template.finalize();
             if (entry.parameter_oids.len != 0) self.alloc.free(entry.parameter_oids);
             freeDescribedColumns(self.alloc, entry.columns);
         }
@@ -80,41 +78,42 @@ const ExtendedQueryState = struct {
     fn upsertParsedStatement(
         self: *ExtendedQueryState,
         name: []const u8,
-        sql: []const u8,
-        parameter_slots: usize,
-        statement_kind: frontend.stmt.StatementKind,
+        stmt: prepared_query.PreparedStmt,
         parameter_oids: []u32,
         columns: []DescribedColumnState,
     ) !void {
         errdefer if (parameter_oids.len != 0) self.alloc.free(parameter_oids);
         errdefer freeDescribedColumns(self.alloc, columns);
+        var stmt_adopted = false;
+        defer if (!stmt_adopted) {
+            var cleanup = stmt;
+            cleanup.finalize();
+        };
 
         if (name.len == 0) {
             _ = self.closePortal("");
         }
         if (self.findParsedIndex(name)) |idx| {
             self.alloc.free(self.parsed_statements.items[idx].name);
-            self.alloc.free(self.parsed_statements.items[idx].sql);
+            self.parsed_statements.items[idx].template.finalize();
             if (self.parsed_statements.items[idx].parameter_oids.len != 0) self.alloc.free(self.parsed_statements.items[idx].parameter_oids);
             freeDescribedColumns(self.alloc, self.parsed_statements.items[idx].columns);
             self.parsed_statements.items[idx] = .{
                 .name = try self.alloc.dupe(u8, name),
-                .sql = try self.alloc.dupe(u8, sql),
-                .parameter_slots = parameter_slots,
-                .statement_kind = statement_kind,
+                .template = stmt,
                 .parameter_oids = parameter_oids,
                 .columns = columns,
             };
+            stmt_adopted = true;
             return;
         }
         try self.parsed_statements.append(.{
             .name = try self.alloc.dupe(u8, name),
-            .sql = try self.alloc.dupe(u8, sql),
-            .parameter_slots = parameter_slots,
-            .statement_kind = statement_kind,
+            .template = stmt,
             .parameter_oids = parameter_oids,
             .columns = columns,
         });
+        stmt_adopted = true;
     }
 
     fn getParsedStatement(self: *ExtendedQueryState, name: []const u8) ?*ParsedStatementState {
@@ -124,9 +123,9 @@ const ExtendedQueryState = struct {
 
     fn closeParsedStatement(self: *ExtendedQueryState, name: []const u8) bool {
         const idx = self.findParsedIndex(name) orelse return false;
-        const entry = self.parsed_statements.swapRemove(idx);
+        var entry = self.parsed_statements.swapRemove(idx);
         self.alloc.free(entry.name);
-        self.alloc.free(entry.sql);
+        entry.template.finalize();
         if (entry.parameter_oids.len != 0) self.alloc.free(entry.parameter_oids);
         freeDescribedColumns(self.alloc, entry.columns);
         return true;
@@ -522,7 +521,8 @@ fn handleParseMessage(
             return;
         },
     };
-    defer stmt.finalize();
+    var stmt_adopted = false;
+    defer if (!stmt_adopted) stmt.finalize();
 
     if (parameter_count != 0 and parameter_count != stmt.binding.maxParameterSlot()) {
         try protocol.writeErrorResponse(writer, "ERROR", "08P01", "parse parameter count does not match statement");
@@ -552,12 +552,11 @@ fn handleParseMessage(
 
     try state.upsertParsedStatement(
         statement_name,
-        trimmed,
-        stmt.binding.maxParameterSlot(),
-        stmt.binding.statement_kind,
+        stmt,
         parameter_oids,
         described_columns,
     );
+    stmt_adopted = true;
     try protocol.writeParseComplete(writer);
 }
 
@@ -597,19 +596,19 @@ fn handleBindMessage(
         try protocol.writeErrorResponse(writer, "ERROR", "08P01", "bind parameter count missing");
         return;
     };
-    if (parameter_count != parsed.parameter_slots) {
+    if (parameter_count != parsed.template.binding.maxParameterSlot()) {
         try protocol.writeErrorResponse(writer, "ERROR", "08P01", "bind parameter count does not match prepared statement");
         return;
     }
 
-    var stmt = prepared_query.prepareSqlCore(alloc, engine, parsed.sql, .{}) catch |err| switch (err) {
+    var stmt = parsed.template.cloneForExecution(alloc, engine) catch |err| switch (err) {
         error.OutOfMemory => return err,
         error.NotImplemented => {
             try protocol.writeErrorResponse(writer, "ERROR", "0A000", "SQL bind unsupported by direct prepare");
             return;
         },
         else => {
-            try protocol.writeErrorResponse(writer, "ERROR", "42601", @errorName(err));
+            try protocol.writeErrorResponse(writer, "ERROR", "XX000", @errorName(err));
             return;
         },
     };
@@ -689,7 +688,7 @@ fn handleDescribeMessage(
                 return;
             };
             try protocol.writeParameterDescription(writer, parsed.parameter_oids);
-            if (statementKindProducesRows(parsed.statement_kind) and parsed.columns.len != 0) {
+            if (statementKindProducesRows(parsed.template.statementKind()) and parsed.columns.len != 0) {
                 try writeDescribedRowDescription(writer, parsed.columns);
             } else {
                 try protocol.writeNoData(writer);
@@ -1425,7 +1424,7 @@ test "extended protocol executes direct SQL prepared inserts" {
     defer input.deinit();
     try appendParseMessage(&input, "stmt1", "INSERT INTO ext.inserted(time, value) VALUES ($1, $2)", 2);
     try appendDescribeMessage(&input, 'S', "stmt1");
-    try appendBindMessage(&input, "portal1", "stmt1", &.{"10", "4.5"});
+    try appendBindMessage(&input, "portal1", "stmt1", &.{ "10", "4.5" });
     try appendDescribeMessage(&input, 'P', "portal1");
     try appendExecuteMessage(&input, "portal1", 0);
     try appendFrontendMessage(&input, 'S', &.{});
