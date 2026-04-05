@@ -2,6 +2,7 @@ const std = @import("std");
 const lexer = @import("lexer.zig");
 const ast = @import("ast.zig");
 const common = @import("common.zig");
+const literals = @import("literals.zig");
 const parsergen = @import("frontend/parsergen.zig");
 const sydraql_core = @import("frontend/grammars/sydraql_core.zig");
 
@@ -22,6 +23,8 @@ pub const ParseError = lexer.LexError || std.mem.Allocator.Error || error{
     UnexpectedExpression,
     UnterminatedParenthesis,
     InvalidNumber,
+    InvalidDuration,
+    InvalidTimestamp,
 };
 
 const ExprList = std.ArrayListUnmanaged(*const ast.Expr);
@@ -511,6 +514,14 @@ pub const Parser = struct {
                 _ = try self.advance();
                 return self.makeNumberLiteral(token.lexeme, token.span);
             },
+            .duration => {
+                _ = try self.advance();
+                return self.makeDurationLiteral(token.lexeme, token.span);
+            },
+            .timestamp => {
+                _ = try self.advance();
+                return self.makeTimestampLiteral(token.lexeme, token.span);
+            },
             .string => {
                 _ = try self.advance();
                 return self.makeStringLiteral(token.lexeme, token.span);
@@ -592,13 +603,23 @@ pub const Parser = struct {
     }
 
     fn makeNumberLiteral(self: *Parser, text: []const u8, span: common.Span) ParseError!*const ast.Expr {
-        if (isFloatLiteral(text)) {
+        if (literals.isFloatLiteral(text)) {
             const value = std.fmt.parseFloat(f64, text) catch return ParseError.InvalidNumber;
             return self.allocExpr(.{ .literal = .{ .value = .{ .float = value }, .span = span } });
         } else {
             const value = std.fmt.parseInt(i64, text, 10) catch return ParseError.InvalidNumber;
             return self.allocExpr(.{ .literal = .{ .value = .{ .integer = value }, .span = span } });
         }
+    }
+
+    fn makeDurationLiteral(self: *Parser, text: []const u8, span: common.Span) ParseError!*const ast.Expr {
+        const value = literals.parseDurationSeconds(text) catch return ParseError.InvalidDuration;
+        return self.allocExpr(.{ .literal = .{ .value = .{ .duration = value }, .span = span } });
+    }
+
+    fn makeTimestampLiteral(self: *Parser, text: []const u8, span: common.Span) ParseError!*const ast.Expr {
+        const value = literals.parseTimestampSeconds(text) catch return ParseError.InvalidTimestamp;
+        return self.allocExpr(.{ .literal = .{ .value = .{ .timestamp = value }, .span = span } });
     }
 
     fn makeStringLiteral(self: *Parser, text: []const u8, span: common.Span) ParseError!*const ast.Expr {
@@ -766,10 +787,6 @@ pub const Parser = struct {
     }
 };
 
-fn isFloatLiteral(text: []const u8) bool {
-    return std.mem.indexOfAny(u8, text, ".eE") != null;
-}
-
 fn isIdentifierToken(token: lexer.Token) bool {
     return token.isIdentifierLike();
 }
@@ -845,6 +862,25 @@ test "parse insert with values" {
     const insert_stmt = statement.insert.*;
     try std.testing.expectEqual(@as(usize, 0), insert_stmt.columns.len);
     try std.testing.expectEqual(@as(usize, 3), insert_stmt.values.len);
+}
+
+test "parse duration and timestamp literals" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser_inst = Parser.init(arena.allocator(), "select time_bucket(5m, time, 2022-03-27T00:00:00Z), true, null, 3.14");
+    const statement = try parser_inst.parse();
+    try std.testing.expect(statement == .select);
+
+    const select_stmt = statement.select.*;
+    try std.testing.expectEqual(@as(usize, 4), select_stmt.projections.len);
+    try std.testing.expect(select_stmt.projections[0].expr.* == .call);
+    try std.testing.expect(select_stmt.projections[0].expr.call.args[0].* == .literal);
+    try std.testing.expect(select_stmt.projections[0].expr.call.args[0].literal.value == .duration);
+    try std.testing.expect(select_stmt.projections[0].expr.call.args[2].literal.value == .timestamp);
+    try std.testing.expect(select_stmt.projections[1].expr.literal.value == .boolean);
+    try std.testing.expect(select_stmt.projections[2].expr.literal.value == .null);
+    try std.testing.expect(select_stmt.projections[3].expr.literal.value == .float);
 }
 
 test "parse delete statement" {

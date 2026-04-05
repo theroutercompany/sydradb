@@ -1,6 +1,8 @@
 # kind|mismatch|query
 select|false|select 1
+select|false|select true, null, 3.14
 select|false|select time, value from weather.room1 where time >= 10 order by time limit 5
+select|false|select time_bucket(5m, time, 2022-03-27T00:00:00Z) from weather.room1 where time >= 10
 insert|false|insert into metrics(time, value) values(1, 2)
 delete|false|delete from metrics where time >= 1
 explain|false|explain bytecode select 1

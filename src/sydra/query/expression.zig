@@ -225,6 +225,8 @@ fn literalToValue(literal: ast.Literal) Value {
         .float => |f| Value{ .float = f },
         .boolean => |b| Value{ .boolean = b },
         .string => |s| Value{ .string = s },
+        .duration => |value| Value{ .float = value },
+        .timestamp => |value| Value{ .float = value },
         .null => Value.null,
     };
 }
@@ -271,6 +273,14 @@ fn literalEqual(a: ast.Literal, b: ast.Literal) bool {
         },
         .string => |astr| switch (b.value) {
             .string => |bstr| std.mem.eql(u8, astr, bstr),
+            else => false,
+        },
+        .duration => |ad| switch (b.value) {
+            .duration => |bd| ad == bd,
+            else => false,
+        },
+        .timestamp => |at| switch (b.value) {
+            .timestamp => |bt| at == bt,
             else => false,
         },
         .null => switch (b.value) {

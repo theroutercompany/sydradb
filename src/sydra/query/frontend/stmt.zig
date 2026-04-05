@@ -118,7 +118,12 @@ pub const Ordering = struct {
 pub const Expr = union(enum) {
     identifier: Identifier,
     integer: IntegerLiteral,
+    float: FloatLiteral,
     string: StringLiteral,
+    boolean: BooleanLiteral,
+    null_value: NullLiteral,
+    duration: DurationLiteral,
+    timestamp: TimestampLiteral,
     parameter: Parameter,
     comparison: Comparison,
     call: Call,
@@ -127,7 +132,12 @@ pub const Expr = union(enum) {
         return switch (self) {
             .identifier => |identifier| identifier.span,
             .integer => |literal| literal.span,
+            .float => |literal| literal.span,
             .string => |literal| literal.span,
+            .boolean => |literal| literal.span,
+            .null_value => |literal| literal.span,
+            .duration => |literal| literal.span,
+            .timestamp => |literal| literal.span,
             .parameter => |parameter| parameter.span,
             .comparison => |comparison| comparison.span,
             .call => |call| call.span,
@@ -141,8 +151,35 @@ pub const IntegerLiteral = struct {
     span: common.Span,
 };
 
+pub const FloatLiteral = struct {
+    value: f64,
+    text: []const u8,
+    span: common.Span,
+};
+
 pub const StringLiteral = struct {
     value: []const u8,
+    span: common.Span,
+};
+
+pub const BooleanLiteral = struct {
+    value: bool,
+    span: common.Span,
+};
+
+pub const NullLiteral = struct {
+    span: common.Span,
+};
+
+pub const DurationLiteral = struct {
+    value: f64,
+    text: []const u8,
+    span: common.Span,
+};
+
+pub const TimestampLiteral = struct {
+    value: f64,
+    text: []const u8,
     span: common.Span,
 };
 

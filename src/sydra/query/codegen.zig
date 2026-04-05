@@ -350,6 +350,8 @@ fn literalValue(expr: *const ast.Expr) CodegenError!value_mod.Value {
         .float => |value| .{ .float = value },
         .boolean => |value| .{ .boolean = value },
         .string => |value| .{ .string = value },
+        .duration => |value| .{ .float = value },
+        .timestamp => |value| .{ .float = value },
         .null => .null,
     };
 }

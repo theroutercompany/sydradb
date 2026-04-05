@@ -12,7 +12,12 @@ pub const ById = stmt_mod.ById;
 pub const LimitClause = stmt_mod.LimitClause;
 pub const OrderDirection = stmt_mod.OrderDirection;
 pub const IntegerLiteral = stmt_mod.IntegerLiteral;
+pub const FloatLiteral = stmt_mod.FloatLiteral;
 pub const StringLiteral = stmt_mod.StringLiteral;
+pub const BooleanLiteral = stmt_mod.BooleanLiteral;
+pub const NullLiteral = stmt_mod.NullLiteral;
+pub const DurationLiteral = stmt_mod.DurationLiteral;
+pub const TimestampLiteral = stmt_mod.TimestampLiteral;
 pub const ParameterKind = stmt_mod.ParameterKind;
 pub const Parameter = stmt_mod.Parameter;
 pub const ComparisonOp = stmt_mod.ComparisonOp;
@@ -103,7 +108,12 @@ pub const Ordering = struct {
 pub const Expr = union(enum) {
     identifier: Identifier,
     integer: IntegerLiteral,
+    float: FloatLiteral,
     string: StringLiteral,
+    boolean: BooleanLiteral,
+    null_value: NullLiteral,
+    duration: DurationLiteral,
+    timestamp: TimestampLiteral,
     parameter: Parameter,
     comparison: Comparison,
     call: Call,
@@ -112,7 +122,12 @@ pub const Expr = union(enum) {
         return switch (self) {
             .identifier => |identifier| identifier.span,
             .integer => |literal| literal.span,
+            .float => |literal| literal.span,
             .string => |literal| literal.span,
+            .boolean => |literal| literal.span,
+            .null_value => |literal| literal.span,
+            .duration => |literal| literal.span,
+            .timestamp => |literal| literal.span,
             .parameter => |parameter| parameter.span,
             .comparison => |comparison| comparison.span,
             .call => |call| call.span,
@@ -339,11 +354,30 @@ fn fromAstExpr(allocator: std.mem.Allocator, expr: *const ast.Expr) NormalizeErr
                 .text = try std.fmt.allocPrint(allocator, "{d}", .{value}),
                 .span = literal.span,
             } },
+            .float => |value| .{ .float = .{
+                .value = value,
+                .text = try std.fmt.allocPrint(allocator, "{}", .{value}),
+                .span = literal.span,
+            } },
             .string => |value| .{ .string = .{
                 .value = try allocator.dupe(u8, value),
                 .span = literal.span,
             } },
-            else => return error.UnsupportedLiteral,
+            .boolean => |value| .{ .boolean = .{
+                .value = value,
+                .span = literal.span,
+            } },
+            .null => .{ .null_value = .{ .span = literal.span } },
+            .duration => |value| .{ .duration = .{
+                .value = value,
+                .text = try std.fmt.allocPrint(allocator, "{}s", .{value}),
+                .span = literal.span,
+            } },
+            .timestamp => |value| .{ .timestamp = .{
+                .value = value,
+                .text = try std.fmt.allocPrint(allocator, "{}", .{value}),
+                .span = literal.span,
+            } },
         },
         .call => |call| blk: {
             const args = try allocator.alloc(*const stmt_mod.Expr, call.args.len);
@@ -506,9 +540,29 @@ fn normalizeExpr(allocator: std.mem.Allocator, expr: *const stmt_mod.Expr) Norma
             .text = try allocator.dupe(u8, integer.text),
             .span = integer.span,
         } },
+        .float => |float| .{ .float = .{
+            .value = float.value,
+            .text = try allocator.dupe(u8, float.text),
+            .span = float.span,
+        } },
         .string => |string| .{ .string = .{
             .value = try allocator.dupe(u8, string.value),
             .span = string.span,
+        } },
+        .boolean => |boolean| .{ .boolean = .{
+            .value = boolean.value,
+            .span = boolean.span,
+        } },
+        .null_value => |null_value| .{ .null_value = .{ .span = null_value.span } },
+        .duration => |duration| .{ .duration = .{
+            .value = duration.value,
+            .text = try allocator.dupe(u8, duration.text),
+            .span = duration.span,
+        } },
+        .timestamp => |timestamp| .{ .timestamp = .{
+            .value = timestamp.value,
+            .text = try allocator.dupe(u8, timestamp.text),
+            .span = timestamp.span,
         } },
         .parameter => |parameter| .{ .parameter = .{
             .raw = try allocator.dupe(u8, parameter.raw),
@@ -569,7 +623,12 @@ fn collectExprParameters(
     switch (expr.*) {
         .identifier,
         .integer,
+        .float,
         .string,
+        .boolean,
+        .null_value,
+        .duration,
+        .timestamp,
         => {},
         .parameter => |parameter| try appendParameterBinding(allocator, parameter, parameters, named_parameters, next_slot),
         .comparison => |comparison| {
@@ -815,9 +874,29 @@ fn lowerExpr(
             .value = .{ .integer = integer.value },
             .span = integer.span,
         } },
+        .float => |float| .{ .literal = .{
+            .value = .{ .float = float.value },
+            .span = float.span,
+        } },
         .string => |string| .{ .literal = .{
             .value = .{ .string = string.value },
             .span = string.span,
+        } },
+        .boolean => |boolean| .{ .literal = .{
+            .value = .{ .boolean = boolean.value },
+            .span = boolean.span,
+        } },
+        .null_value => |null_value| .{ .literal = .{
+            .value = .null,
+            .span = null_value.span,
+        } },
+        .duration => |duration| .{ .literal = .{
+            .value = .{ .duration = duration.value },
+            .span = duration.span,
+        } },
+        .timestamp => |timestamp| .{ .literal = .{
+            .value = .{ .timestamp = timestamp.value },
+            .span = timestamp.span,
         } },
         .parameter => |parameter| .{ .literal = try literalFromBoundValue(parameters, named_parameters, bindings, parameter) },
         .comparison => |comparison| .{ .binary = .{

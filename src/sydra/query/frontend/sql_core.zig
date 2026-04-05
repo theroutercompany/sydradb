@@ -214,8 +214,10 @@ fn failureSpan(tokens: []const lexer.Token, failure: ?parsergen.FailureInfo) ?@i
 fn terminalNameForToken(token: lexer.Token) []const u8 {
     return switch (token.kind) {
         .identifier, .quoted_identifier => "identifier",
-        .number, .duration => "number",
-        .string, .timestamp => "string",
+        .number => "number",
+        .duration => "duration",
+        .string => "string",
+        .timestamp => "timestamp",
         .parameter => "parameter",
         .keyword => switch (token.keyword.?) {
             .select => "select",
@@ -237,6 +239,9 @@ fn terminalNameForToken(token: lexer.Token) []const u8 {
             .desc => "desc",
             .logical_and => "and",
             .logical_or => "or",
+            .boolean_true => "true",
+            .boolean_false => "false",
+            .null_literal => "null",
             .time => "identifier",
             .tag => "identifier",
             else => "",

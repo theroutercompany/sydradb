@@ -81,6 +81,8 @@ pub const LiteralValue = union(enum) {
     float: f64,
     string: []const u8,
     boolean: bool,
+    duration: f64,
+    timestamp: f64,
     null,
 };
 

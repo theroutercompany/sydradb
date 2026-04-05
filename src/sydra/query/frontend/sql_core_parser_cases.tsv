@@ -4,6 +4,9 @@ select|select time, value from metrics where time >= $1 and value <= $2 order by
 select|select time, value from weather.room1 where time >= 0
 select|select value from metrics where (time >= $1 and value <= $2) or value = $3
 select|select value as reading from by_id(41) where time >= $1 order by reading limit 10
+select|select 3.14 as reading, true as enabled, null as missing
+select|select time_bucket(5m, time, 2022-03-27T00:00:00Z) from by_id(41) where time >= 1
 explain|explain select avg(value) from metrics
 insert|insert into metrics(time, value) values(1, 2)
+insert|insert into metrics values(2022-03-27T00:00:00Z, 3.14)
 delete|delete from metrics where time >= 1

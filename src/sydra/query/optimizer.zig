@@ -384,6 +384,14 @@ fn literalEqual(a: ast.Literal, b: ast.Literal) bool {
             .boolean => |bbool| abool == bbool,
             else => false,
         },
+        .duration => |aduration| switch (b.value) {
+            .duration => |bduration| aduration == bduration,
+            else => false,
+        },
+        .timestamp => |atimestamp| switch (b.value) {
+            .timestamp => |btimestamp| atimestamp == btimestamp,
+            else => false,
+        },
         .null => switch (b.value) {
             .null => true,
             else => false,

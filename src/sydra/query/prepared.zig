@@ -767,7 +767,12 @@ fn inferExprParameterTypes(
     switch (expr.*) {
         .identifier,
         .integer,
+        .float,
         .string,
+        .boolean,
+        .null_value,
+        .duration,
+        .timestamp,
         => {},
         .parameter => |parameter| {
             const slot = resolveNormalizedParameterSlot(parameters, named_parameters, parameter) orelse return;
@@ -878,7 +883,12 @@ fn inferNormalizedExprType(expr: *const frontend.normalize.Expr) ?query_function
     return switch (expr.*) {
         .identifier => |identifier| inferIdentifierType(identifier.value),
         .integer => query_functions.Type.init(.integer, false),
+        .float => query_functions.Type.init(.float, false),
         .string => query_functions.Type.init(.string, false),
+        .boolean => query_functions.Type.init(.boolean, false),
+        .null_value => query_functions.Type.init(.null, true),
+        .duration => query_functions.Type.init(.duration, false),
+        .timestamp => query_functions.Type.init(.timestamp, false),
         .parameter => null,
         .comparison => query_functions.Type.init(.boolean, true),
         .call => |call| blk: {
@@ -1567,6 +1577,88 @@ test "prepareSqlCore handles logical predicates through generated frontend cover
     try std.testing.expect((try stmt.step()) == .done);
 }
 
+test "prepareSqlCore handles constant float boolean and null literals" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-sql-literals", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .legacy,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    var stmt = try prepareSqlCore(alloc, engine, "SELECT 3.14 AS reading, true AS enabled, null AS missing", .{});
+    defer stmt.finalize();
+
+    const row = try stmt.step();
+    try std.testing.expect(row == .row);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.14), try row.row[0].asFloat(), 1e-9);
+    try std.testing.expectEqual(true, row.row[1].boolean);
+    try std.testing.expect(row.row[2] == .null);
+    try std.testing.expect((try stmt.step()) == .done);
+}
+
+test "prepareSqlCore handles duration and timestamp literals through direct frontend coverage" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-sql-time-literals", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .legacy,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    const sid = @import("../types.zig").seriesIdFrom("time.literals", "{}");
+    try engine.registerSeries("time.literals", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 1_648_339_200, .value = 7.0, .tags_json = "{}" });
+    try waitForQueryablePoints(alloc, engine, sid, 1, 1_000);
+
+    var stmt = try prepareSqlCore(
+        alloc,
+        engine,
+        "SELECT time_bucket(5m, time, 2022-03-27T00:00:00Z) AS bucket FROM time.literals WHERE time >= 2022-03-27T00:00:00Z ORDER BY time ASC LIMIT 1",
+        .{},
+    );
+    defer stmt.finalize();
+
+    const row = try stmt.step();
+    try std.testing.expect(row == .row);
+    try std.testing.expectEqual(@as(i64, 1_648_339_200), row.row[0].integer);
+    try std.testing.expect((try stmt.step()) == .done);
+}
+
 test "prepared statement executes parameterized inserts through the VM" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -1940,9 +2032,28 @@ fn expectNormalizedExprEqual(expected: *const frontend.normalize.Expr, actual: *
             try std.testing.expect(actual.* == .integer);
             try std.testing.expectEqual(integer.value, actual.integer.value);
         },
+        .float => |float| {
+            try std.testing.expect(actual.* == .float);
+            try std.testing.expectApproxEqAbs(float.value, actual.float.value, 1e-9);
+        },
         .string => |string| {
             try std.testing.expect(actual.* == .string);
             try std.testing.expectEqualStrings(string.value, actual.string.value);
+        },
+        .boolean => |boolean| {
+            try std.testing.expect(actual.* == .boolean);
+            try std.testing.expectEqual(boolean.value, actual.boolean.value);
+        },
+        .null_value => {
+            try std.testing.expect(actual.* == .null_value);
+        },
+        .duration => |duration| {
+            try std.testing.expect(actual.* == .duration);
+            try std.testing.expectApproxEqAbs(duration.value, actual.duration.value, 1e-9);
+        },
+        .timestamp => |timestamp| {
+            try std.testing.expect(actual.* == .timestamp);
+            try std.testing.expectApproxEqAbs(timestamp.value, actual.timestamp.value, 1e-9);
         },
         .parameter => |parameter| {
             try std.testing.expect(actual.* == .parameter);

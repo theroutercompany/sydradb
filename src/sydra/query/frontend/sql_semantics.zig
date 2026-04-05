@@ -2,6 +2,7 @@ const std = @import("std");
 
 const common = @import("../common.zig");
 const lexer = @import("../lexer.zig");
+const literals = @import("../literals.zig");
 const parsergen = @import("parsergen.zig");
 const stmt_mod = @import("stmt.zig");
 
@@ -101,7 +102,12 @@ const Dispatcher = struct {
         if (std.mem.eql(u8, action_name, "emitBinaryExpr()")) return try self.emitBinaryExpr(rhs);
         if (std.mem.eql(u8, action_name, "emitIdentifier()")) return try self.emitIdentifier(rhs);
         if (std.mem.eql(u8, action_name, "emitNumber()")) return try self.emitNumber(rhs);
+        if (std.mem.eql(u8, action_name, "emitDuration()")) return try self.emitDuration(rhs);
         if (std.mem.eql(u8, action_name, "emitString()")) return try self.emitString(rhs);
+        if (std.mem.eql(u8, action_name, "emitTimestamp()")) return try self.emitTimestamp(rhs);
+        if (std.mem.eql(u8, action_name, "emitTrueLiteral()")) return try self.emitBooleanLiteral(rhs, true);
+        if (std.mem.eql(u8, action_name, "emitFalseLiteral()")) return try self.emitBooleanLiteral(rhs, false);
+        if (std.mem.eql(u8, action_name, "emitNullLiteral()")) return try self.emitNullLiteral(rhs);
         if (std.mem.eql(u8, action_name, "emitParameter()")) return try self.emitParameter(rhs);
         if (std.mem.eql(u8, action_name, "emitParenthesizedExpr()")) return rhs[1];
         if (std.mem.eql(u8, action_name, "emitCall()")) return try self.emitCall(rhs);
@@ -310,10 +316,28 @@ const Dispatcher = struct {
 
     fn emitNumber(self: *@This(), rhs: []const SemanticValue) !SemanticValue {
         const token = try tokenFromValue(rhs[0]);
-        const value = try std.fmt.parseInt(i64, token.lexeme, 10);
         const expr = try self.arena.create(stmt_mod.Expr);
-        expr.* = .{ .integer = .{
-            .value = value,
+        if (literals.isFloatLiteral(token.lexeme)) {
+            expr.* = .{ .float = .{
+                .value = try std.fmt.parseFloat(f64, token.lexeme),
+                .text = token.lexeme,
+                .span = token.span,
+            } };
+        } else {
+            expr.* = .{ .integer = .{
+                .value = try std.fmt.parseInt(i64, token.lexeme, 10),
+                .text = token.lexeme,
+                .span = token.span,
+            } };
+        }
+        return .{ .expr = expr };
+    }
+
+    fn emitDuration(self: *@This(), rhs: []const SemanticValue) !SemanticValue {
+        const token = try tokenFromValue(rhs[0]);
+        const expr = try self.arena.create(stmt_mod.Expr);
+        expr.* = .{ .duration = .{
+            .value = try literals.parseDurationSeconds(token.lexeme),
             .text = token.lexeme,
             .span = token.span,
         } };
@@ -327,6 +351,34 @@ const Dispatcher = struct {
             .value = trimQuotes(token.lexeme),
             .span = token.span,
         } };
+        return .{ .expr = expr };
+    }
+
+    fn emitTimestamp(self: *@This(), rhs: []const SemanticValue) !SemanticValue {
+        const token = try tokenFromValue(rhs[0]);
+        const expr = try self.arena.create(stmt_mod.Expr);
+        expr.* = .{ .timestamp = .{
+            .value = try literals.parseTimestampSeconds(token.lexeme),
+            .text = token.lexeme,
+            .span = token.span,
+        } };
+        return .{ .expr = expr };
+    }
+
+    fn emitBooleanLiteral(self: *@This(), rhs: []const SemanticValue, value: bool) !SemanticValue {
+        const token = try tokenFromValue(rhs[0]);
+        const expr = try self.arena.create(stmt_mod.Expr);
+        expr.* = .{ .boolean = .{
+            .value = value,
+            .span = token.span,
+        } };
+        return .{ .expr = expr };
+    }
+
+    fn emitNullLiteral(self: *@This(), rhs: []const SemanticValue) !SemanticValue {
+        const token = try tokenFromValue(rhs[0]);
+        const expr = try self.arena.create(stmt_mod.Expr);
+        expr.* = .{ .null_value = .{ .span = token.span } };
         return .{ .expr = expr };
     }
 

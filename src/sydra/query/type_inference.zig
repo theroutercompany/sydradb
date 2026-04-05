@@ -105,6 +105,8 @@ fn literalType(literal: ast.Literal) functions.Type {
         .float => functions.Type.init(.float, false),
         .string => functions.Type.init(.string, false),
         .boolean => functions.Type.init(.boolean, false),
+        .duration => functions.Type.init(.duration, false),
+        .timestamp => functions.Type.init(.timestamp, false),
         .null => default_value_type,
     };
 }
