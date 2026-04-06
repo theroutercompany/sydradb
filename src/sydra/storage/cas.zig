@@ -569,7 +569,8 @@ pub const RefStore = struct {
 
     pub fn readRef(self: *RefStore, ref_name: []const u8) !?object_store.ObjectId {
         if (self.backend == .reftable) {
-            if (try self.readReftableRef(ref_name)) |id| return id;
+            const reftable_id = try self.readReftableRef(ref_name);
+            if (reftable_id != null or try self.hasReftableTables()) return reftable_id;
         }
         return self.readLooseRef(ref_name);
     }
@@ -2218,7 +2219,9 @@ pub const CasManager = struct {
 
     fn ensureHeadSymRef(self: *CasManager) !void {
         if (try self.refs.readHead(main_ref) == null) return;
-        if ((try self.refs.readSymRef("HEAD")) == null) {
+        const head_target = try self.refs.readSymRef("HEAD");
+        defer if (head_target) |target| self.alloc.free(target);
+        if (head_target == null) {
             try self.refs.writeSymRef("HEAD", main_ref);
         }
     }
@@ -2721,7 +2724,7 @@ pub const CasManager = struct {
                         if (index.lookup(id_ptr.*)) |record| {
                             switch (record.role) {
                                 .segment_descriptor => {
-                                    const descriptor = try decodeSegmentDescriptor(self.alloc, loaded.payload);
+                                    var descriptor = try decodeSegmentDescriptor(self.alloc, loaded.payload);
                                     defer descriptor.deinit(self.alloc);
                                     if (descriptor.segmentRoot() == null) report.compatibility_debt.legacy_segment_descriptors += 1;
                                 },
@@ -3060,7 +3063,7 @@ pub const CasManager = struct {
         var snapshot = try reader.loadSnapshot(commit_id);
         defer snapshot.deinit(self.alloc);
 
-        const canonical = try self.canonicalizeSnapshot(data_dir, snapshot);
+        var canonical = try self.canonicalizeSnapshot(data_dir, snapshot);
         defer canonical.snapshot.deinit(self.alloc);
 
         const changed = parents_changed or canonical.changed;
@@ -4304,7 +4307,13 @@ pub fn verifyBundle(alloc: std.mem.Allocator, bundle_path: []const u8) !BundleRe
 
     var root = try std.fs.cwd().openDir(bundle_path, .{ .iterate = true });
     defer root.close();
-    var store = object_store.ObjectStore{ .allocator = alloc, .root = root, .fsync = .none };
+    var store = object_store.ObjectStore{
+        .allocator = alloc,
+        .root = root,
+        .fsync = .none,
+        .alternates = .{ .repo_paths = try alloc.alloc([]u8, 0) },
+    };
+    defer store.alternates.deinit(alloc);
 
     const ids = try store.listIds(alloc);
     defer alloc.free(ids);
@@ -4362,7 +4371,13 @@ pub fn applyBundle(alloc: std.mem.Allocator, bundle_path: []const u8, dst_path: 
 
     var bundle_root = try std.fs.cwd().openDir(bundle_path, .{ .iterate = true });
     defer bundle_root.close();
-    var bundle_store = object_store.ObjectStore{ .allocator = alloc, .root = bundle_root, .fsync = .none };
+    var bundle_store = object_store.ObjectStore{
+        .allocator = alloc,
+        .root = bundle_root,
+        .fsync = .none,
+        .alternates = .{ .repo_paths = try alloc.alloc([]u8, 0) },
+    };
+    defer bundle_store.alternates.deinit(alloc);
 
     var dest = try CasManager.init(alloc, dst_path, fsync);
     defer dest.deinit();
@@ -7254,6 +7269,7 @@ fn writeReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir, summary
     hasher.final(checksum[0..]);
     try bytes.appendSlice(checksum[0..]);
 
+    try root.makePath("reftable/info");
     const temp_path = reftable_summary_path ++ ".tmp";
     var file = try root.createFile(temp_path, .{ .truncate = true, .read = true });
     defer file.close();
@@ -7442,8 +7458,8 @@ fn writeReftableTable(
         try appendInt(&bytes, u64, entry.block_offset);
     }
 
-    std.mem.writeInt(u32, @as(*[4]u8, @ptrCast(bytes.items[(reftable_magic.len + @sizeOf(u16) + @sizeOf(u64) * 2) ..][0..4].ptr)), @intCast(ref_index.items.len), .little);
-    std.mem.writeInt(u32, @as(*[4]u8, @ptrCast(bytes.items[(reftable_magic.len + @sizeOf(u16) + @sizeOf(u64) * 2 + @sizeOf(u32)) ..][0..4].ptr)), @intCast(reflog_index.items.len), .little);
+    std.mem.writeInt(u32, @as(*[4]u8, @ptrCast(bytes.items[(reftable_magic.len + @sizeOf(u16) + @sizeOf(u64) * 2)..][0..4].ptr)), @intCast(ref_index.items.len), .little);
+    std.mem.writeInt(u32, @as(*[4]u8, @ptrCast(bytes.items[(reftable_magic.len + @sizeOf(u16) + @sizeOf(u64) * 2 + @sizeOf(u32))..][0..4].ptr)), @intCast(reflog_index.items.len), .little);
     std.mem.writeInt(u64, @as(*[8]u8, @ptrCast(bytes.items[ref_index_offset_pos .. ref_index_offset_pos + @sizeOf(u64)].ptr)), @intCast(ref_index_offset), .little);
     std.mem.writeInt(u64, @as(*[8]u8, @ptrCast(bytes.items[reflog_index_offset_pos .. reflog_index_offset_pos + @sizeOf(u64)].ptr)), @intCast(reflog_index_offset), .little);
 
@@ -7738,7 +7754,11 @@ fn readReftableRefWithCursor(alloc: std.mem.Allocator, root: std.fs.Dir, ref_nam
         idx -= 1;
         const record = summary.records[idx];
         if (!summaryContainsRef(record, ref_name)) continue;
-        if (try readReftableRefFromTable(alloc, root, record.table_name, ref_name)) |id| return id;
+        switch (try readReftableRefFromTable(alloc, root, record.table_name, ref_name)) {
+            .present => |id| return id,
+            .tombstone => return null,
+            .absent => {},
+        }
     }
     return null;
 }
@@ -7871,7 +7891,24 @@ fn loadReftableRefRecordsForTable(alloc: std.mem.Allocator, root: std.fs.Dir, ta
     return try refs.toOwnedSlice();
 }
 
-fn readReftableRefFromTable(alloc: std.mem.Allocator, root: std.fs.Dir, table_path: []const u8, ref_name: []const u8) !?object_store.ObjectId {
+const ReftableLookup = union(enum) {
+    absent,
+    tombstone,
+    present: object_store.ObjectId,
+};
+
+fn readReftableRefRecordState(records: []const ReftableRefRecord, ref_name: []const u8) ReftableLookup {
+    for (records) |record| {
+        if (!std.mem.eql(u8, record.name, ref_name)) continue;
+        return if (record.id) |id|
+            .{ .present = id }
+        else
+            .tombstone;
+    }
+    return .absent;
+}
+
+fn readReftableRefFromTable(alloc: std.mem.Allocator, root: std.fs.Dir, table_path: []const u8, ref_name: []const u8) !ReftableLookup {
     const bytes = try root.readFileAlloc(alloc, table_path, 16 * 1024 * 1024);
     defer alloc.free(bytes);
     if (bytes.len < reftable_magic.len + @sizeOf(u16) + @sizeOf(u64) * 2) return error.CorruptReftable;
@@ -7881,8 +7918,7 @@ fn readReftableRefFromTable(alloc: std.mem.Allocator, root: std.fs.Dir, table_pa
     if (version != reftable_current_version) {
         var table = try loadReftableTable(alloc, root, table_path);
         defer table.deinit(alloc);
-        if (lookupReftableRefRecord(table.refs, ref_name)) |record| return record.id;
-        return null;
+        return readReftableRefRecordState(table.refs, ref_name);
     }
 
     const header = try loadReftableHeaderV3(bytes);
@@ -7899,15 +7935,14 @@ fn readReftableRefFromTable(alloc: std.mem.Allocator, root: std.fs.Dir, table_pa
         if (std.mem.order(u8, entry.first_key, ref_name) == .gt) break;
         candidate_idx = idx;
     }
-    if (candidate_idx == null) return null;
+    if (candidate_idx == null) return .absent;
 
     const block_entries = try decodeReftableRefBlockAt(alloc, bytes[0..header.checksum_start], ref_index[candidate_idx.?].block_offset);
     defer {
         for (block_entries) |*record| record.deinit(alloc);
         alloc.free(block_entries);
     }
-    if (lookupReftableRefRecord(block_entries, ref_name)) |record| return record.id;
-    return null;
+    return readReftableRefRecordState(block_entries, ref_name);
 }
 
 fn loadReftableReflogEntriesForRefInTable(
@@ -8594,27 +8629,33 @@ test "upgrade normalizes active commits to canonical roots and clears compatibil
     defer snapshot.deinit(talloc);
 
     const legacy_descriptors = try talloc.alloc(SegmentDescriptor, snapshot.segment_descriptors.len);
-    errdefer {
-        for (legacy_descriptors) |*descriptor| {
-            if (descriptor.path.len != 0) descriptor.deinit(talloc);
+    var initialized_legacy_descriptors: usize = 0;
+    var legacy_descriptors_adopted = false;
+    errdefer if (!legacy_descriptors_adopted) {
+        for (legacy_descriptors[0..initialized_legacy_descriptors]) |*descriptor| {
+            descriptor.deinit(talloc);
         }
         talloc.free(legacy_descriptors);
-    }
+    };
     for (snapshot.segment_descriptors, 0..) |descriptor, idx| {
         legacy_descriptors[idx] = try cloneSegmentDescriptor(talloc, descriptor);
         legacy_descriptors[idx].segment_root = null;
+        initialized_legacy_descriptors = idx + 1;
     }
 
     const legacy_wal_entries = try talloc.alloc(WalChunkDescriptor, snapshot.wal_index.entries.len);
-    errdefer {
-        for (legacy_wal_entries) |*entry| {
-            if (entry.name.len != 0) entry.deinit(talloc);
+    var initialized_legacy_wal_entries: usize = 0;
+    var legacy_wal_entries_adopted = false;
+    errdefer if (!legacy_wal_entries_adopted) {
+        for (legacy_wal_entries[0..initialized_legacy_wal_entries]) |*entry| {
+            entry.deinit(talloc);
         }
         talloc.free(legacy_wal_entries);
-    }
+    };
     for (snapshot.wal_index.entries, 0..) |entry, idx| {
         legacy_wal_entries[idx] = try cloneWalChunkDescriptor(talloc, entry);
         legacy_wal_entries[idx].journal_root = null;
+        initialized_legacy_wal_entries = idx + 1;
     }
 
     var legacy_snapshot = LegacySnapshot{
@@ -8624,6 +8665,8 @@ test "upgrade normalizes active commits to canonical roots and clears compatibil
         .wal_index = .{ .entries = legacy_wal_entries },
         .checkpoint_state = try buildCheckpointState(talloc, legacy_descriptors, legacy_wal_entries),
     };
+    legacy_descriptors_adopted = true;
+    legacy_wal_entries_adopted = true;
     defer legacy_snapshot.deinit(talloc);
 
     var writer = CommitWriter{ .alloc = talloc, .store = &cas_manager.store, .extent_chunk_bytes = cas_manager.format.extent_chunk_bytes };
@@ -8633,7 +8676,11 @@ test "upgrade normalizes active commits to canonical roots and clears compatibil
 
     const before = try cas_manager.fsck(data_dir, .{});
     try std.testing.expect(before.compatibility_debt.legacy_segment_descriptors > 0);
-    try std.testing.expect(before.compatibility_debt.legacy_wal_descriptors > 0);
+    if (legacy_snapshot.wal_index.entries.len != 0) {
+        try std.testing.expect(before.compatibility_debt.legacy_wal_descriptors > 0);
+    } else {
+        try std.testing.expectEqual(@as(usize, 0), before.compatibility_debt.legacy_wal_descriptors);
+    }
 
     const upgraded = try cas_manager.upgradeRepository(data_dir);
     try std.testing.expect(upgraded.normalized_commits > 0);
@@ -8748,10 +8795,7 @@ test "expire trims loose reflogs checkpoints and borrowed alternates" {
     dest_cas.format = legacyCompatibleRepositoryFormat();
     try writeRepositoryFormat(talloc, dest_cas.store.root, dest_cas.format, .none);
     dest_cas.refs.setBackend(.loose);
-    dest_cas.refs.root.deleteTree("reftable") catch |err| switch (err) {
-        error.FileNotFound => {},
-        else => return err,
-    };
+    try dest_cas.refs.root.deleteTree("reftable");
     try dest_cas.store.configureAlternates(talloc, &[_][]const u8{source_path});
     try dest_cas.refs.updateHeadAtomic(main_ref, head);
 

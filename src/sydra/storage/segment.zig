@@ -97,7 +97,7 @@ pub const SegmentBlockCursor = struct {
         root_id: object_store.ObjectId,
     ) !SegmentBlockCursor {
         var root_tree = try loadTreeObject(alloc, store, root_id);
-        errdefer root_tree.deinit(alloc);
+        defer root_tree.deinit(alloc);
 
         const meta_id = findTreeEntry(root_tree.entries, "meta", .blob) orelse return error.MissingSegmentRootMeta;
         const blocks_id = findTreeEntry(root_tree.entries, "blocks", .tree) orelse return error.MissingSegmentRootBlocks;
@@ -1234,17 +1234,14 @@ fn decodeSegmentRootMetadata(alloc: std.mem.Allocator, payload: []const u8) !Seg
         .block_point_count = block_point_count,
         .block_count = block_count,
         .extent_chunk_bytes = extent_chunk_bytes,
-        .selector = if (selector_series.len == 0 and selector_tags.len == 0)
-            blk: {
-                alloc.free(selector_series);
-                alloc.free(selector_tags);
-                break :blk null;
-            }
-        else
-            .{
-                .series = selector_series,
-                .canonical_tags = selector_tags,
-            },
+        .selector = if (selector_series.len == 0 and selector_tags.len == 0) blk: {
+            alloc.free(selector_series);
+            alloc.free(selector_tags);
+            break :blk null;
+        } else .{
+            .series = selector_series,
+            .canonical_tags = selector_tags,
+        },
     };
 }
 

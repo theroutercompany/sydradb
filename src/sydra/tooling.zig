@@ -1,4 +1,9 @@
 pub const alloc = @import("alloc.zig");
+pub const cas = @import("storage/cas.zig");
 pub const config = @import("config.zig");
 pub const engine = @import("engine.zig");
+pub const manifest = @import("storage/manifest.zig");
+pub const query_exec = @import("query/exec.zig");
+pub const series_catalog = @import("storage/series_catalog.zig");
+pub const tags = @import("storage/tags.zig");
 pub const types = @import("types.zig");

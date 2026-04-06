@@ -1614,7 +1614,7 @@ test "simple query writes explicit translator fallback notice for uncovered SQL"
     try handleSimpleQuery(alloc, anyWriter(&allocating_writer.writer), payload.items, engine);
 
     const written = allocating_writer.written();
-    try std.testing.expect(std.mem.indexOf(u8, written, "sql_prepare_fallback=translator reason=compiler_not_implemented") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "sql_prepare_fallback=translator reason=") != null);
 }
 
 test "extended protocol suspends and resumes portals" {

@@ -243,7 +243,7 @@ pub const ContentPrefixComparator = struct {
         data_dir: std.fs.Dir,
         store: *object_store.ObjectStore,
         path: []const u8,
-        tree_ref: extents.WriteResult,
+        tree_ref: anytype,
     ) !bool {
         var reader = try extents.openReader(alloc, store, tree_ref);
         defer reader.deinit();
@@ -683,7 +683,7 @@ pub fn replayBlobObject(
 pub fn replayExtentTree(
     alloc: std.mem.Allocator,
     store: *object_store.ObjectStore,
-    tree_ref: extents.WriteResult,
+    tree_ref: anytype,
     ctx: anytype,
 ) !void {
     var reader = try extents.openReader(alloc, store, tree_ref);
@@ -818,7 +818,7 @@ fn sortWalFiles(files: [][]u8) void {
     }.lessThan);
 }
 
-fn readExact(reader: std.Io.AnyReader, buf: []u8) !void {
+fn readExact(reader: anytype, buf: []u8) !void {
     var offset: usize = 0;
     while (offset < buf.len) {
         const n = try reader.read(buf[offset..]);
