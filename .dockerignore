@@ -5,6 +5,7 @@
 .DS_Store
 
 .zig-cache
+.zig-local-cache
 zig-out
 result
 
