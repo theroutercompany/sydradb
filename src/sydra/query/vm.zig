@@ -32,6 +32,7 @@ pub const VirtualMachine = struct {
     registers: []value_mod.Value,
     row_buffer: []value_mod.Value,
     series_cursors: []vdbe.SeriesCursor,
+    tag_cursors: []vdbe.TagCursor,
     sorters: []vdbe.TempSorter,
     aggregate_tables: []vdbe.AggTable,
     rows_affected: usize = 0,
@@ -53,6 +54,10 @@ pub const VirtualMachine = struct {
         errdefer allocator.free(series_cursors);
         for (series_cursors) |*cursor| cursor.* = vdbe.SeriesCursor.init(allocator);
 
+        const tag_cursors = try allocator.alloc(vdbe.TagCursor, cursor_count);
+        errdefer allocator.free(tag_cursors);
+        for (tag_cursors) |*cursor| cursor.* = .{};
+
         const sorter_count = @max(program.temp_stores.len, 1);
         const sorters = try allocator.alloc(vdbe.TempSorter, sorter_count);
         errdefer allocator.free(sorters);
@@ -70,6 +75,7 @@ pub const VirtualMachine = struct {
             .registers = registers,
             .row_buffer = row_buffer,
             .series_cursors = series_cursors,
+            .tag_cursors = tag_cursors,
             .sorters = sorters,
             .aggregate_tables = aggregate_tables,
         };
@@ -77,10 +83,12 @@ pub const VirtualMachine = struct {
 
     pub fn deinit(self: *VirtualMachine) void {
         for (self.series_cursors) |*cursor| cursor.deinit();
+        for (self.tag_cursors) |*cursor| cursor.deinit(self.allocator);
         for (self.sorters) |*sorter| sorter.deinit(self.allocator);
         for (self.aggregate_tables) |*table| table.deinit(self.allocator);
         self.allocator.free(self.aggregate_tables);
         self.allocator.free(self.sorters);
+        self.allocator.free(self.tag_cursors);
         self.allocator.free(self.series_cursors);
         self.allocator.free(self.registers);
         self.allocator.free(self.row_buffer);
@@ -94,6 +102,7 @@ pub const VirtualMachine = struct {
         for (self.registers) |*slot| slot.* = .null;
         for (self.row_buffer) |*slot| slot.* = .null;
         for (self.series_cursors) |*cursor| cursor.reset();
+        for (self.tag_cursors) |*cursor| cursor.clear(self.allocator);
         for (self.sorters) |*sorter| sorter.clear(self.allocator);
         for (self.aggregate_tables) |*table| table.clear(self.allocator);
     }
@@ -155,6 +164,13 @@ pub const VirtualMachine = struct {
         const selector = self.program.selectors[selector_id];
         var cursor = &self.series_cursors[cursor_id];
         cursor.reset();
+        if (cursor_id < self.tag_cursors.len) {
+            var tag_cursor = &self.tag_cursors[cursor_id];
+            tag_cursor.clear(self.allocator);
+            if (selector.canonical_tags) |tags_json| {
+                try tag_cursor.loadCanonicalTags(self.allocator, tags_json);
+            }
+        }
         try self.engine.queryRange(selector.series_id, instruction.p2, instruction.p3, &cursor.points);
     }
 
@@ -408,7 +424,11 @@ pub const VirtualMachine = struct {
             .{ .integer = point.ts },
             .{ .float = point.value },
         };
-        var ctx = expression.RowContext{ .schema = &schema, .values = &values };
+        var ctx = expression.RowContext{
+            .schema = &schema,
+            .values = &values,
+            .tags = if (self.tag_cursors.len != 0) self.tag_cursors[0].entries else &.{},
+        };
         return try expression.evaluateRow(expr, &ctx);
     }
 
@@ -422,6 +442,7 @@ pub const VirtualMachine = struct {
         var ctx = expression.RowContext{
             .schema = self.program.schemas[0],
             .values = values,
+            .tags = if (self.tag_cursors.len != 0) self.tag_cursors[0].entries else &.{},
         };
         for (ordering, 0..) |order_expr, idx| {
             keys[idx] = try expression.evaluateRow(order_expr.expr, &ctx);

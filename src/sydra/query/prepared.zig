@@ -2030,6 +2030,67 @@ test "prepared statement surfaces frontend coverage metadata" {
     try std.testing.expect(stmt.fallbackReason() == null);
 }
 
+test "prepared statement evaluates selector tags through the tag cursor" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-tag-cursor", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .legacy,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    const sid = @import("../types.zig").seriesIdFrom("tagged.room1", "{\"host\":\"a\",\"rack\":\"r1\"}");
+    try engine.registerSeries("tagged.room1", "{\"host\":\"a\",\"rack\":\"r1\"}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.0, .tags_json = "{\"host\":\"a\",\"rack\":\"r1\"}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 20, .value = 3.0, .tags_json = "{\"host\":\"a\",\"rack\":\"r1\"}" });
+    try waitForQueryablePoints(alloc, engine, sid, 2, 1_000);
+
+    var projection_stmt = try prepareSqlCore(
+        alloc,
+        engine,
+        "SELECT tag.host AS host, value FROM tagged.room1 WHERE tag.host = 'a' ORDER BY time ASC LIMIT 1",
+        .{},
+    );
+    defer projection_stmt.finalize();
+
+    const projection_row = try projection_stmt.step();
+    try std.testing.expect(projection_row == .row);
+    try std.testing.expectEqualStrings("a", projection_row.row[0].string);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), projection_row.row[1].float, 1e-9);
+    try std.testing.expect((try projection_stmt.step()) == .done);
+
+    var grouped_stmt = try prepareSqlCore(
+        alloc,
+        engine,
+        "SELECT tag.host AS host, avg(value) AS avg_value FROM tagged.room1 WHERE tag.host = 'a' GROUP BY tag.host",
+        .{},
+    );
+    defer grouped_stmt.finalize();
+
+    const grouped_row = try grouped_stmt.step();
+    try std.testing.expect(grouped_row == .row);
+    try std.testing.expectEqualStrings("a", grouped_row.row[0].string);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), grouped_row.row[1].float, 1e-9);
+    try std.testing.expect((try grouped_stmt.step()) == .done);
+}
+
 test "binding context tracks named parameter slots" {
     const binding: BindingContext = .{
         .language = .sql_core,

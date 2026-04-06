@@ -779,6 +779,54 @@ test "executeWithMode compiled supports scalar alias ordering and first/last agg
     try std.testing.expect((try aggregate_cursor.next()) == null);
 }
 
+test "executeWithMode compiled supports single-selector tag reads" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/compiled-tag-read", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .compiled,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try engine_mod.Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const sid = @import("../types.zig").seriesIdFrom("tagged.room1", "{\"host\":\"web\",\"rack\":\"r1\"}");
+    try engine.registerSeries("tagged.room1", "{\"host\":\"web\",\"rack\":\"r1\"}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.0, .tags_json = "{\"host\":\"web\",\"rack\":\"r1\"}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 20, .value = 3.0, .tags_json = "{\"host\":\"web\",\"rack\":\"r1\"}" });
+    try waitForFlushForTest(engine, 1, 1_000);
+
+    var cursor = try executeWithMode(
+        talloc,
+        engine,
+        "select tag.host as host, avg(value) as avg_value from tagged.room1 where tag.host = 'web' group by tag.host",
+        .compiled,
+    );
+    defer cursor.deinit();
+
+    const row = (try cursor.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("web", row.values[0].string);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), try row.values[1].asFloat(), 1e-9);
+    try std.testing.expect((try cursor.next()) == null);
+    try std.testing.expect(!cursor.stats.legacy_fallback);
+}
+
 test "shadowCompareSelect matches compiled and legacy rows for supported query" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });

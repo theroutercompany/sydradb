@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const expression = @import("expression.zig");
 const types = @import("../types.zig");
 const value_mod = @import("value.zig");
 
@@ -34,9 +35,56 @@ pub const RollupCursor = struct {
 
 pub const TagCursor = struct {
     active: bool = false,
+    entries: []expression.TagField = &.{},
+
+    pub fn deinit(self: *TagCursor, allocator: std.mem.Allocator) void {
+        self.clear(allocator);
+        self.* = undefined;
+    }
 
     pub fn reset(self: *TagCursor) void {
         self.active = false;
+    }
+
+    pub fn clear(self: *TagCursor, allocator: std.mem.Allocator) void {
+        for (self.entries) |entry| {
+            allocator.free(@constCast(entry.key));
+            allocator.free(@constCast(entry.value));
+        }
+        if (self.entries.len != 0) allocator.free(self.entries);
+        self.entries = &.{};
+        self.active = false;
+    }
+
+    pub fn loadCanonicalTags(self: *TagCursor, allocator: std.mem.Allocator, tags_json: []const u8) !void {
+        self.clear(allocator);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, tags_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return;
+
+        var count: usize = 0;
+        var it_count = parsed.value.object.iterator();
+        while (it_count.next()) |entry| {
+            if (entry.value_ptr.* == .string) count += 1;
+        }
+        if (count == 0) return;
+
+        const entries = try allocator.alloc(expression.TagField, count);
+        errdefer allocator.free(entries);
+
+        var idx: usize = 0;
+        var it = parsed.value.object.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.* != .string) continue;
+            entries[idx] = .{
+                .key = try allocator.dupe(u8, entry.key_ptr.*),
+                .value = try allocator.dupe(u8, entry.value_ptr.string),
+            };
+            idx += 1;
+        }
+
+        self.entries = entries;
+        self.active = true;
     }
 };
 
@@ -176,4 +224,18 @@ test "vdbe substrate cursor and sorter reset state" {
     sorter.clear(alloc);
     try std.testing.expectEqual(@as(usize, 0), sorter.rows.items.len);
     try std.testing.expect(!sorter.sorted);
+}
+
+test "tag cursor loads canonical selector tags" {
+    const alloc = std.testing.allocator;
+    var cursor = TagCursor{};
+    defer cursor.deinit(alloc);
+
+    try cursor.loadCanonicalTags(alloc, "{\"host\":\"a\",\"rack\":\"r1\"}");
+    try std.testing.expect(cursor.active);
+    try std.testing.expectEqual(@as(usize, 2), cursor.entries.len);
+
+    cursor.clear(alloc);
+    try std.testing.expectEqual(@as(usize, 0), cursor.entries.len);
+    try std.testing.expect(!cursor.active);
 }

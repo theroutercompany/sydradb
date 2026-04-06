@@ -17,9 +17,15 @@ pub const Resolver = struct {
     evalCall: *const fn (*const anyopaque, ast.Call, *const Resolver) EvalError!Value,
 };
 
+pub const TagField = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
 pub const RowContext = struct {
     schema: []const plan.ColumnInfo,
     values: []const Value,
+    tags: []const TagField = &.{},
 };
 
 pub fn evaluate(expr: *const ast.Expr, resolver: *const Resolver) EvalError!Value {
@@ -80,6 +86,15 @@ fn rowGetIdentifier(ctx_ptr: *const anyopaque, ident: ast.Identifier) EvalError!
     const ctx = @as(*const RowContext, @ptrCast(@alignCast(ctx_ptr)));
     const name = ident.value;
     const unqualified = trailingSegment(name);
+    if (hasTagPrefix(name)) {
+        const key = tagKey(name);
+        for (ctx.tags) |entry| {
+            if (namesEqual(entry.key, key)) {
+                return .{ .string = entry.value };
+            }
+        }
+        return Value.null;
+    }
     for (ctx.schema, 0..) |column, idx| {
         if (namesEqual(column.name, name) or namesEqual(column.name, unqualified)) {
             return ctx.values[idx];
@@ -310,6 +325,16 @@ fn trailingSegment(name: []const u8) []const u8 {
         if (ch == '.') start = idx + 1;
     }
     return name[start..];
+}
+
+fn hasTagPrefix(name: []const u8) bool {
+    const dot = std.mem.indexOfScalar(u8, name, '.') orelse return false;
+    return std.ascii.eqlIgnoreCase(name[0..dot], "tag");
+}
+
+fn tagKey(name: []const u8) []const u8 {
+    const dot = std.mem.indexOfScalar(u8, name, '.') orelse return name;
+    return name[dot + 1 ..];
 }
 
 test "time_bucket supports explicit origin" {

@@ -109,7 +109,7 @@ fn buildScanProgram(allocator: std.mem.Allocator, compiled: compiler.CompiledSel
     const loop_pc = instructions.items.len;
     try instructions.append(.{ .opcode = .next_point, .p1 = 0, .p2 = 0 });
 
-    try emitPredicate(allocator, &instructions, &constants, typed.predicate, loop_pc);
+    try emitPredicate(allocator, &instructions, &constants, &exprs, typed.predicate, loop_pc);
     try emitProjectionLoads(allocator, &instructions, &constants, &exprs, typed.projections);
     if (uses_sorter) {
         try instructions.append(.{
@@ -200,7 +200,7 @@ fn buildAggregateProgram(allocator: std.mem.Allocator, compiled: compiler.Compil
 
     const loop_pc = instructions.items.len;
     try instructions.append(.{ .opcode = .next_point, .p1 = 0, .p2 = 0 });
-    try emitPredicate(allocator, &instructions, &constants, typed.predicate, loop_pc);
+    try emitPredicate(allocator, &instructions, &constants, &exprs, typed.predicate, loop_pc);
 
     const grouping_expr_start: usize = exprs.items.len;
     for (typed.groupings) |grouping| {
@@ -258,49 +258,65 @@ fn emitPredicate(
     allocator: std.mem.Allocator,
     instructions: *std.array_list.Managed(bytecode.Instruction),
     constants: *std.array_list.Managed(value_mod.Value),
+    exprs: *std.array_list.Managed(*const ast.Expr),
     predicate: ?compiler.TypedExpr,
     loop_pc: usize,
 ) CodegenError!void {
     _ = allocator;
     if (predicate == null) return;
-    try emitPredicateExpr(instructions, constants, predicate.?.expr, loop_pc);
+    try emitPredicateExpr(instructions, constants, exprs, predicate.?.expr, loop_pc);
 }
 
 fn emitPredicateExpr(
     instructions: *std.array_list.Managed(bytecode.Instruction),
     constants: *std.array_list.Managed(value_mod.Value),
+    exprs: *std.array_list.Managed(*const ast.Expr),
     expr: *const ast.Expr,
     loop_pc: usize,
 ) CodegenError!void {
-    if (expr.* != .binary) return error.UnsupportedPredicate;
-    const binary = expr.binary;
-    if (binary.op == .logical_and) {
-        try emitPredicateExpr(instructions, constants, binary.left, loop_pc);
-        try emitPredicateExpr(instructions, constants, binary.right, loop_pc);
-        return;
+    if (expr.* == .binary) {
+        const binary = expr.binary;
+        if (binary.op == .logical_and) {
+            try emitPredicateExpr(instructions, constants, exprs, binary.left, loop_pc);
+            try emitPredicateExpr(instructions, constants, exprs, binary.right, loop_pc);
+            return;
+        }
+
+        if ((binary.left.* == .identifier or binary.right.* == .identifier)) {
+            const identifier_expr = if (binary.left.* == .identifier) binary.left else binary.right;
+            const literal_expr = if (identifier_expr == binary.left) binary.right else binary.left;
+            if (columnCode(identifier_expr.identifier.value)) |code| {
+                const left_reg: i64 = 0;
+                const right_reg: i64 = 1;
+                const bool_reg: i64 = 2;
+                try instructions.append(.{ .opcode = .column, .p1 = 0, .p2 = code, .p3 = left_reg });
+
+                const const_id: u16 = @intCast(constants.items.len);
+                try constants.append(try literalValue(literal_expr));
+                try instructions.append(.{ .opcode = .load_const, .p1 = right_reg, .p4 = .{ .constant = const_id } });
+
+                const compare_kind = compareKind(binary.op, identifier_expr == binary.left) orelse return error.UnsupportedPredicate;
+                try instructions.append(.{
+                    .opcode = .compare,
+                    .p1 = left_reg,
+                    .p2 = right_reg,
+                    .p3 = bool_reg,
+                    .p5 = @intFromEnum(compare_kind),
+                });
+                try instructions.append(.{ .opcode = .jump_if_false, .p1 = bool_reg, .p2 = @intCast(loop_pc) });
+                return;
+            }
+        }
     }
 
-    const identifier_expr = if (binary.left.* == .identifier) binary.left else if (binary.right.* == .identifier) binary.right else return error.UnsupportedPredicate;
-    const literal_expr = if (identifier_expr == binary.left) binary.right else binary.left;
-    const column_code = columnCode(identifier_expr.identifier.value) orelse return error.UnsupportedPredicate;
-    const left_reg: i64 = 0;
-    const right_reg: i64 = 1;
-    const bool_reg: i64 = 2;
-    try instructions.append(.{ .opcode = .column, .p1 = 0, .p2 = column_code, .p3 = left_reg });
-
-    const const_id: u16 = @intCast(constants.items.len);
-    try constants.append(try literalValue(literal_expr));
-    try instructions.append(.{ .opcode = .load_const, .p1 = right_reg, .p4 = .{ .constant = const_id } });
-
-    const compare_kind = compareKind(binary.op, identifier_expr == binary.left) orelse return error.UnsupportedPredicate;
+    const expr_id: u16 = @intCast(exprs.items.len);
+    try exprs.append(expr);
     try instructions.append(.{
-        .opcode = .compare,
-        .p1 = left_reg,
-        .p2 = right_reg,
-        .p3 = bool_reg,
-        .p5 = @intFromEnum(compare_kind),
+        .opcode = .function,
+        .p1 = 2,
+        .p4 = .{ .expr = expr_id },
     });
-    try instructions.append(.{ .opcode = .jump_if_false, .p1 = bool_reg, .p2 = @intCast(loop_pc) });
+    try instructions.append(.{ .opcode = .jump_if_false, .p1 = 2, .p2 = @intCast(loop_pc) });
 }
 
 fn emitProjectionLoads(

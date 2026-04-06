@@ -17,15 +17,16 @@ pub fn buildTypedSelect(
     if (select.fill != null) return error.UnsupportedFill;
 
     const deferred_features = &[_]ir.DeferredFeature{};
+    const allow_tag_identifiers = bound_selector != null;
     const predicate = if (select.predicate) |expr| try typeCheckedExpr(allocator, expr) else null;
     if (predicate) |typed| {
-        try ensurePredicateSupported(typed.expr);
+        try ensurePredicateSupported(typed.expr, allow_tag_identifiers);
     }
 
-    const groupings = try buildTypedGroupings(allocator, select.groupings);
-    const aggregates = try buildAggregateSpecs(allocator, select.projections);
+    const groupings = try buildTypedGroupings(allocator, select.groupings, allow_tag_identifiers);
+    const aggregates = try buildAggregateSpecs(allocator, select.projections, allow_tag_identifiers);
     const is_aggregate_query = groupings.len != 0 or aggregates.len != 0;
-    const projections = try buildTypedProjections(allocator, select.projections, groupings, aggregates, bound_selector != null);
+    const projections = try buildTypedProjections(allocator, select.projections, groupings, aggregates, allow_tag_identifiers);
     const ordering = try buildTypedOrderings(allocator, select.ordering, projections);
     const time_range = extractTimeRange(if (predicate) |typed| typed.expr else null);
     const properties = deriveProperties(select, groupings, aggregates, ordering);
@@ -58,18 +59,23 @@ pub fn typeCheckedExpr(allocator: std.mem.Allocator, expr: *const ast.Expr) erro
 pub fn buildTypedGroupings(
     allocator: std.mem.Allocator,
     groupings: []const ast.GroupExpr,
+    allow_tag_identifiers: bool,
 ) errors.CompileError![]const ir.TypedGrouping {
     if (groupings.len == 0) return &[_]ir.TypedGrouping{};
     if (groupings.len != 1) return error.UnsupportedGrouping;
 
     const typed = try typeCheckedExpr(allocator, groupings[0].expr);
-    if (!isTimeBucketExpr(groupings[0].expr)) return error.UnsupportedGrouping;
-    try ensureTimeBucketSupported(groupings[0].expr);
+    const is_time_bucket = isTimeBucketExpr(groupings[0].expr);
+    if (is_time_bucket) {
+        try ensureTimeBucketSupported(groupings[0].expr);
+    } else if (!groupingSupportsSingleSelectorTag(groupings[0].expr, allow_tag_identifiers)) {
+        return error.UnsupportedGrouping;
+    }
 
     const list = try allocator.alloc(ir.TypedGrouping, 1);
     list[0] = .{
         .expr = typed,
-        .is_time_bucket = true,
+        .is_time_bucket = is_time_bucket,
     };
     return list;
 }
@@ -77,6 +83,7 @@ pub fn buildTypedGroupings(
 pub fn buildAggregateSpecs(
     allocator: std.mem.Allocator,
     projections: []const ast.Projection,
+    allow_tag_identifiers: bool,
 ) errors.CompileError![]const ir.AggregateSpec {
     var count: usize = 0;
     for (projections) |projection| {
@@ -102,7 +109,7 @@ pub fn buildAggregateSpecs(
         const arg_exprs = try allocator.alloc(ir.TypedExpr, call.args.len);
         for (call.args, 0..) |arg, arg_idx| {
             arg_exprs[arg_idx] = try typeCheckedExpr(allocator, arg);
-            try ensureRawRowScalarSupported(arg);
+            try ensureRawRowScalarSupported(arg, allow_tag_identifiers);
         }
 
         specs[index] = .{
@@ -122,7 +129,7 @@ pub fn buildTypedProjections(
     projections: []const ast.Projection,
     groupings: []const ir.TypedGrouping,
     aggregates: []const ir.AggregateSpec,
-    has_selector: bool,
+    allow_tag_identifiers: bool,
 ) errors.CompileError![]const ir.TypedProjection {
     if (projections.len == 0) return &[_]ir.TypedProjection{};
 
@@ -136,8 +143,8 @@ pub fn buildTypedProjections(
 
         if (aggregate_query) {
             if (!is_grouping and !is_aggregate) return error.UnsupportedProjection;
-        } else if (has_selector) {
-            try ensureRawRowScalarSupported(projection.expr);
+        } else if (allow_tag_identifiers) {
+            try ensureRawRowScalarSupported(projection.expr, allow_tag_identifiers);
         } else {
             try ensureConstantOnlySupported(projection.expr);
         }
@@ -191,7 +198,12 @@ pub fn deriveProperties(
 
     return .{
         .requires_sorted_input = requires_sorted_input,
-        .can_use_rollup = groupings.len != 0,
+        .can_use_rollup = blk: {
+            for (groupings) |grouping| {
+                if (grouping.is_time_bucket) break :blk true;
+            }
+            break :blk false;
+        },
         .materializes = aggregates.len != 0 or ordering.len != 0 or select.limit != null,
         .uses_top_n = ordering.len != 0 and select.limit != null,
     };
@@ -283,8 +295,8 @@ fn expressionContainsIdentifier(expr: *const ast.Expr, name: []const u8) bool {
     };
 }
 
-fn ensurePredicateSupported(expr: *const ast.Expr) errors.CompileError!void {
-    try ensureRawRowScalarSupported(expr);
+fn ensurePredicateSupported(expr: *const ast.Expr, allow_tag_identifiers: bool) errors.CompileError!void {
+    try ensureRawRowScalarSupported(expr, allow_tag_identifiers);
 }
 
 fn ensureConstantOnlySupported(expr: *const ast.Expr) errors.CompileError!void {
@@ -301,17 +313,17 @@ fn ensureConstantOnlySupported(expr: *const ast.Expr) errors.CompileError!void {
     }
 }
 
-fn ensureRawRowScalarSupported(expr: *const ast.Expr) errors.CompileError!void {
+fn ensureRawRowScalarSupported(expr: *const ast.Expr, allow_tag_identifiers: bool) errors.CompileError!void {
     switch (expr.*) {
         .identifier => |ident| {
-            if (!identifierAllowedInRawRow(ident.value)) return error.UnsupportedExpression;
+            if (!identifierAllowedInRawRow(ident.value, allow_tag_identifiers)) return error.UnsupportedExpression;
         },
         .literal => {},
-        .unary => |unary| try ensureRawRowScalarSupported(unary.operand),
+        .unary => |unary| try ensureRawRowScalarSupported(unary.operand, allow_tag_identifiers),
         .binary => |binary| {
             try ensureBinaryOpSupported(binary.op);
-            try ensureRawRowScalarSupported(binary.left);
-            try ensureRawRowScalarSupported(binary.right);
+            try ensureRawRowScalarSupported(binary.left, allow_tag_identifiers);
+            try ensureRawRowScalarSupported(binary.right, allow_tag_identifiers);
         },
         .call => |call| {
             if (std.ascii.eqlIgnoreCase(call.callee.value, "time_bucket")) {
@@ -320,13 +332,13 @@ fn ensureRawRowScalarSupported(expr: *const ast.Expr) errors.CompileError!void {
             }
             if (isSupportedUnaryRawRowFunction(call.callee.value)) {
                 if (call.args.len != 1) return error.UnsupportedFunction;
-                try ensureRawRowScalarSupported(call.args[0]);
+                try ensureRawRowScalarSupported(call.args[0], allow_tag_identifiers);
                 return;
             }
             if (std.ascii.eqlIgnoreCase(call.callee.value, "pow")) {
                 if (call.args.len != 2) return error.UnsupportedFunction;
-                try ensureRawRowScalarSupported(call.args[0]);
-                try ensureRawRowScalarSupported(call.args[1]);
+                try ensureRawRowScalarSupported(call.args[0], allow_tag_identifiers);
+                try ensureRawRowScalarSupported(call.args[1], allow_tag_identifiers);
                 return;
             }
             return error.UnsupportedFunction;
@@ -343,7 +355,7 @@ fn ensureTimeBucketSupported(expr: *const ast.Expr) errors.CompileError!void {
     if (!infer.expressionHasTime(call.args[1])) return error.UnsupportedFunction;
     for (call.args, 0..) |arg, idx| {
         if (idx == 1) {
-            try ensureRawRowScalarSupported(arg);
+            try ensureRawRowScalarSupported(arg, false);
         } else {
             try ensureConstantOnlySupported(arg);
         }
@@ -389,9 +401,19 @@ fn ensureOrderIdentifier(
     return error.UnsupportedOrdering;
 }
 
-fn identifierAllowedInRawRow(name: []const u8) bool {
+fn identifierAllowedInRawRow(name: []const u8, allow_tag_identifiers: bool) bool {
     const segment = trailingSegment(name);
-    return std.ascii.eqlIgnoreCase(segment, "time") or std.ascii.eqlIgnoreCase(segment, "value");
+    return std.ascii.eqlIgnoreCase(segment, "time") or
+        std.ascii.eqlIgnoreCase(segment, "value") or
+        (allow_tag_identifiers and hasTagPrefix(name));
+}
+
+fn groupingSupportsSingleSelectorTag(expr: *const ast.Expr, allow_tag_identifiers: bool) bool {
+    if (!allow_tag_identifiers) return false;
+    return switch (expr.*) {
+        .identifier => |ident| hasTagPrefix(ident.value),
+        else => false,
+    };
 }
 
 fn matchesGrouping(expr: *const ast.Expr, groupings: []const ir.TypedGrouping) bool {
@@ -513,6 +535,11 @@ fn trailingSegment(slice: []const u8) []const u8 {
     return slice;
 }
 
+fn hasTagPrefix(slice: []const u8) bool {
+    const dot = std.mem.indexOfScalar(u8, slice, '.') orelse return false;
+    return std.ascii.eqlIgnoreCase(slice[0..dot], "tag");
+}
+
 test "extractTimeRange merges bounded predicates" {
     const parser = @import("../parser.zig");
 
@@ -539,6 +566,6 @@ test "raw row scalar support accepts pow and time_bucket origin" {
     const statement = try parser_inst.parse();
     const select = statement.select;
 
-    try ensureRawRowScalarSupported(select.projections[0].expr);
-    try ensureRawRowScalarSupported(select.projections[1].expr);
+    try ensureRawRowScalarSupported(select.projections[0].expr, false);
+    try ensureRawRowScalarSupported(select.projections[1].expr, false);
 }
