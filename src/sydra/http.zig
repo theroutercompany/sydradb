@@ -971,6 +971,102 @@ test "buildStatusPayload emits extended runtime counters" {
     try std.testing.expectEqual(@as(i64, 5), runtime.get("cas_shadow_mismatch_total").?.integer);
 }
 
+test "supportedAnalysisGroupBy stays truthful" {
+    try std.testing.expectEqual(@as(usize, 1), supportedAnalysisGroupBy().len);
+    try std.testing.expectEqualStrings("none", supportedAnalysisGroupBy()[0]);
+}
+
+test "queryMarketRows reconstructs rows from fanout series" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/http-market-query", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const cfg = config.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var eng = try Engine.init(talloc, cfg);
+    defer eng.deinit();
+
+    const labels_json = try canonicalLabelsForMarket(talloc, "AAPL", "XNAS", null, null);
+    defer talloc.free(labels_json);
+    _ = try eng.ingestExactMetric("market.trade.price", labels_json, 100, 10.5, null);
+    _ = try eng.ingestExactMetric("market.trade.size", labels_json, 100, 5.0, null);
+    _ = try eng.ingestExactMetric("market.trade.price", labels_json, 200, 11.0, null);
+    _ = try eng.ingestExactMetric("market.trade.size", labels_json, 200, 7.0, null);
+
+    var labels_value = std.json.Value{ .object = std.json.ObjectMap.init(talloc) };
+    defer labels_value.object.deinit();
+    try labels_value.object.put("symbol", .{ .string = "AAPL" });
+    try labels_value.object.put("venue", .{ .string = "XNAS" });
+
+    const rows = try queryMarketRows(talloc, eng, "market.trade", labels_value, 0, 500, null, null);
+    defer freeMarketQueryRows(talloc, rows);
+
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqual(@as(i64, 100), rows[0].ts_ns);
+    try std.testing.expectApproxEqAbs(@as(f64, 10.5), (try marketQueryRowColumnValue(talloc, rows[0], "price")).?, 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 5.0), (try marketQueryRowColumnValue(talloc, rows[0], "size")).?, 1e-9);
+    try std.testing.expectEqualStrings("{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}", rows[0].labels_json);
+}
+
+test "querySignalHistoryRows strips provenance labels" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/http-signal-history", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const cfg = config.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var eng = try Engine.init(talloc, cfg);
+    defer eng.deinit();
+
+    const signal_labels = try @import("storage/series_catalog.zig").canonicalizeTagsJson(
+        talloc,
+        "{\"data_revision\":\"legacy-live\",\"definition_id\":\"ema\",\"definition_version\":\"1\",\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}",
+    );
+    defer talloc.free(signal_labels);
+    _ = try eng.ingestExactMetric("_signal.ema", signal_labels, 100, 1.0, null);
+    _ = try eng.ingestExactMetric("_signal.ema", signal_labels, 200, 0.0, null);
+
+    const rows = try querySignalHistoryRows(talloc, eng, "ema", 1, 0, 500, null);
+    defer freeSignalHistoryRows(talloc, rows);
+
+    try std.testing.expectEqual(@as(usize, 2), rows.len);
+    try std.testing.expectEqualStrings("{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}", rows[0].labels_json);
+    try std.testing.expectEqualStrings("ema", rows[0].definition_id);
+    try std.testing.expectEqual(@as(u32, 1), rows[0].definition_version);
+}
+
 fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
     const compatibility_debt = eng.currentCompatibilityDebt() catch cas_mod.CompatibilityDebtReport{};
     const ingest_total = eng.metrics.ingest_total.load(.monotonic);
@@ -2184,7 +2280,13 @@ fn writeRollupWithRuntimeAndStats(
     try jw.objectField("transform_kind");
     try jw.write(entry.transform_kind.text());
     try jw.objectField("runtime");
-    try writeRuntimeState(jw, runtime, if (eng) |engine| engine.pendingStatsForMetric(entry.source_metric) else .{ .pending_instances = 0, .max_lag_ns = null });
+    try writeRuntimeState(
+        jw,
+        runtime,
+        if (eng) |engine| engine.pendingStatsForDefinition("rollup", entry.id, entry.version) else .{ .pending_instances = 0, .max_lag_ns = null },
+        if (eng) |engine| engine.latestCheckpointTs("rollup", entry.id, entry.version) else null,
+        null,
+    );
     try jw.endObject();
 }
 
@@ -2220,7 +2322,13 @@ fn writeSignalWithRuntimeAndStats(
     try jw.objectField("emit_rule");
     try jw.write(entry.emit_rule);
     try jw.objectField("runtime");
-    try writeRuntimeState(jw, runtime, if (eng) |engine| engine.pendingStatsForMetric(entry.input_metric) else .{ .pending_instances = 0, .max_lag_ns = null });
+    try writeRuntimeState(
+        jw,
+        runtime,
+        if (eng) |engine| engine.pendingStatsForDefinition("signal", entry.id, entry.version) else .{ .pending_instances = 0, .max_lag_ns = null },
+        if (eng) |engine| engine.latestCheckpointTs("signal", entry.id, entry.version) else null,
+        if (eng) |engine| engine.latestEventSequence("signal", entry.id, entry.version) else null,
+    );
     try jw.endObject();
 }
 
@@ -2228,6 +2336,8 @@ fn writeRuntimeState(
     jw: *std.json.Stringify,
     runtime: ?market_runtime_mod.DefinitionRuntime,
     pending_stats: Engine.PendingStats,
+    latest_checkpoint_ts: ?i64,
+    latest_event_sequence: ?u64,
 ) !void {
     try jw.beginObject();
     if (runtime) |value| {
@@ -2265,6 +2375,10 @@ fn writeRuntimeState(
     try jw.write(pending_stats.pending_instances);
     try jw.objectField("max_lag_ns");
     if (pending_stats.max_lag_ns) |lag| try jw.write(lag) else try jw.write(null);
+    try jw.objectField("latest_checkpoint_ts");
+    if (latest_checkpoint_ts) |ts| try jw.write(ts) else try jw.write(null);
+    try jw.objectField("latest_event_sequence");
+    if (latest_event_sequence) |seq| try jw.write(seq) else try jw.write(null);
     try jw.endObject();
 }
 
@@ -2434,7 +2548,7 @@ fn handleAnalysisCatalog(req: *std.http.Server.Request) !void {
     var jw = std.json.Stringify{ .writer = &response.writer };
     try jw.beginObject();
     try jw.objectField("group_by");
-    try jw.write(&[_][]const u8{ "none", "venue", "symbol" });
+    try jw.write(supportedAnalysisGroupBy());
     try jw.objectField("execution_side");
     try jw.write(&[_][]const u8{ "auto", "buy", "sell" });
     try jw.objectField("entry_price_source");
@@ -2443,6 +2557,10 @@ fn handleAnalysisCatalog(req: *std.http.Server.Request) !void {
     try jw.write(&[_][]const u8{ "mid", "trade" });
     try jw.endObject();
     try response.end();
+}
+
+fn supportedAnalysisGroupBy() []const []const u8 {
+    return &[_][]const u8{"none"};
 }
 
 fn handleCasRefs(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
@@ -2640,15 +2758,20 @@ fn handleAnalysisMarkout(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.
             return respondJsonError(alloc, req, .bad_request, "invalid_group_by", "invalid group_by")
     else
         "none";
-    const labels_json = try canonicalLabelsForMarket(alloc, symbol, venue, null, null);
-    defer alloc.free(labels_json);
-
+    if (!std.mem.eql(u8, group_by, "none")) {
+        return respondJsonError(alloc, req, .bad_request, "unsupported_group_by", "unsupported group_by");
+    }
     var max_horizon: i64 = 0;
     for (horizons_ns) |horizon| {
         if (horizon > max_horizon) max_horizon = horizon;
     }
-    const prices = try queryMetricPoints(alloc, eng, "market.trade.price", labels_json, start_ts, end_ts + max_horizon, revision);
-    defer alloc.free(prices);
+    var filter = std.json.Value{ .object = std.json.ObjectMap.init(alloc) };
+    defer filter.object.deinit();
+    try filter.object.put("symbol", .{ .string = symbol });
+    try filter.object.put("venue", .{ .string = venue });
+    const price_columns = [_][]const u8{"price"};
+    const price_rows = try queryMarketRows(alloc, eng, "market.trade", filter, start_ts, end_ts + max_horizon, price_columns[0..], revision);
+    defer freeMarketQueryRows(alloc, price_rows);
     var signal_version: ?u32 = null;
     const signal_rows = if (signal_name) |signal_id| blk: {
         var signal = try eng.latestSignal(signal_id) orelse return respondJsonError(alloc, req, .not_found, "signal_not_found", "signal not found");
@@ -2722,27 +2845,43 @@ fn handleAnalysisMarkout(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.
         if (signal_name) |_| {
             for (signal_rows) |row| {
                 if (row.ts_ns < start_ts or row.ts_ns > end_ts) continue;
-                while (future_idx < prices.len and prices[future_idx].ts < row.ts_ns + horizon_ns) : (future_idx += 1) {}
-                if (future_idx >= prices.len) {
+                while (future_idx < price_rows.len and price_rows[future_idx].ts_ns < row.ts_ns + horizon_ns) : (future_idx += 1) {}
+                if (future_idx >= price_rows.len) {
                     dropped += 1;
                     continue;
                 }
-                const entry_idx = findPriceIndexAtOrAfter(prices, row.ts_ns) orelse {
+                const entry_idx = findMarketRowIndexAtOrAfter(price_rows, row.ts_ns) orelse {
                     dropped += 1;
                     continue;
                 };
-                total += prices[future_idx].value - prices[entry_idx].value;
+                const future_price = try marketQueryRowColumnValue(alloc, price_rows[future_idx], "price") orelse {
+                    dropped += 1;
+                    continue;
+                };
+                const entry_price = try marketQueryRowColumnValue(alloc, price_rows[entry_idx], "price") orelse {
+                    dropped += 1;
+                    continue;
+                };
+                total += future_price - entry_price;
                 count += 1;
             }
         } else {
-            for (prices) |point| {
-                if (point.ts < start_ts or point.ts > end_ts) continue;
-                while (future_idx < prices.len and prices[future_idx].ts < point.ts + horizon_ns) : (future_idx += 1) {}
-                if (future_idx >= prices.len) {
+            for (price_rows) |row| {
+                if (row.ts_ns < start_ts or row.ts_ns > end_ts) continue;
+                while (future_idx < price_rows.len and price_rows[future_idx].ts_ns < row.ts_ns + horizon_ns) : (future_idx += 1) {}
+                if (future_idx >= price_rows.len) {
                     dropped += 1;
                     continue;
                 }
-                total += prices[future_idx].value - point.value;
+                const future_price = try marketQueryRowColumnValue(alloc, price_rows[future_idx], "price") orelse {
+                    dropped += 1;
+                    continue;
+                };
+                const entry_price = try marketQueryRowColumnValue(alloc, row, "price") orelse {
+                    dropped += 1;
+                    continue;
+                };
+                total += future_price - entry_price;
                 count += 1;
             }
         }
@@ -2791,33 +2930,47 @@ fn handleAnalysisSlippage(alloc: std.mem.Allocator, eng: *Engine, req: *std.http
             return respondJsonError(alloc, req, .bad_request, "invalid_group_by", "invalid group_by")
     else
         "none";
-    const labels_json = try canonicalLabelsForMarket(alloc, symbol, venue, null, null);
-    defer alloc.free(labels_json);
+    if (!std.mem.eql(u8, group_by, "none")) {
+        return respondJsonError(alloc, req, .bad_request, "unsupported_group_by", "unsupported group_by");
+    }
+    var filter = std.json.Value{ .object = std.json.ObjectMap.init(alloc) };
+    defer filter.object.deinit();
+    try filter.object.put("symbol", .{ .string = symbol });
+    try filter.object.put("venue", .{ .string = venue });
+    const trade_columns = [_][]const u8{"price"};
+    const quote_columns = [_][]const u8{ "bid", "ask" };
+    const trade_rows = try queryMarketRows(alloc, eng, "market.trade", filter, start_ts, end_ts, trade_columns[0..], revision);
+    defer freeMarketQueryRows(alloc, trade_rows);
+    const quote_rows = try queryMarketRows(alloc, eng, "market.quote", filter, start_ts, end_ts, quote_columns[0..], revision);
+    defer freeMarketQueryRows(alloc, quote_rows);
 
-    const trades = try queryMetricPoints(alloc, eng, "market.trade.price", labels_json, start_ts, end_ts, revision);
-    defer alloc.free(trades);
-    const bids = try queryMetricPoints(alloc, eng, "market.quote.bid", labels_json, start_ts, end_ts, revision);
-    defer alloc.free(bids);
-    const asks = try queryMetricPoints(alloc, eng, "market.quote.ask", labels_json, start_ts, end_ts, revision);
-    defer alloc.free(asks);
-
-    var bid_idx: usize = 0;
-    var ask_idx: usize = 0;
+    var quote_idx: usize = 0;
     var signed_total: f64 = 0;
     var abs_total: f64 = 0;
     var spread_capture_total: f64 = 0;
     var count: usize = 0;
     var dropped_samples: usize = 0;
-    for (trades) |trade| {
-        while (bid_idx + 1 < bids.len and bids[bid_idx + 1].ts <= trade.ts) : (bid_idx += 1) {}
-        while (ask_idx + 1 < asks.len and asks[ask_idx + 1].ts <= trade.ts) : (ask_idx += 1) {}
-        if (bids.len == 0 or asks.len == 0) {
+    for (trade_rows) |trade| {
+        while (quote_idx + 1 < quote_rows.len and quote_rows[quote_idx + 1].ts_ns <= trade.ts_ns) : (quote_idx += 1) {}
+        if (quote_rows.len == 0) {
             dropped_samples += 1;
             break;
         }
-        const mid = (bids[bid_idx].value + asks[ask_idx].value) / 2.0;
-        const entry_price = if (std.mem.eql(u8, entry_price_source, "trade")) trade.value else mid;
-        const benchmark_price = if (std.mem.eql(u8, benchmark_source, "mid")) mid else trade.value;
+        const bid = try marketQueryRowColumnValue(alloc, quote_rows[quote_idx], "bid") orelse {
+            dropped_samples += 1;
+            continue;
+        };
+        const ask = try marketQueryRowColumnValue(alloc, quote_rows[quote_idx], "ask") orelse {
+            dropped_samples += 1;
+            continue;
+        };
+        const trade_price = try marketQueryRowColumnValue(alloc, trade, "price") orelse {
+            dropped_samples += 1;
+            continue;
+        };
+        const mid = (bid + ask) / 2.0;
+        const entry_price = if (std.mem.eql(u8, entry_price_source, "trade")) trade_price else mid;
+        const benchmark_price = if (std.mem.eql(u8, benchmark_source, "mid")) mid else trade_price;
         var slip = entry_price - benchmark_price;
         if (std.mem.eql(u8, execution_side, "sell")) slip = -slip;
         signed_total += slip;
@@ -2901,30 +3054,40 @@ fn handleAnalysisQuoteQuality(alloc: std.mem.Allocator, eng: *Engine, req: *std.
             return respondJsonError(alloc, req, .bad_request, "invalid_group_by", "invalid group_by")
     else
         "none";
-    const labels_json = try canonicalLabelsForMarket(alloc, symbol, venue, null, null);
-    defer alloc.free(labels_json);
-
-    const bids = try queryMetricPoints(alloc, eng, "market.quote.bid", labels_json, start_ts, end_ts, revision);
-    defer alloc.free(bids);
-    const asks = try queryMetricPoints(alloc, eng, "market.quote.ask", labels_json, start_ts, end_ts, revision);
-    defer alloc.free(asks);
-    const paired = @min(bids.len, asks.len);
+    if (!std.mem.eql(u8, group_by, "none")) {
+        return respondJsonError(alloc, req, .bad_request, "unsupported_group_by", "unsupported group_by");
+    }
+    var filter = std.json.Value{ .object = std.json.ObjectMap.init(alloc) };
+    defer filter.object.deinit();
+    try filter.object.put("symbol", .{ .string = symbol });
+    try filter.object.put("venue", .{ .string = venue });
+    const quote_columns = [_][]const u8{ "bid", "ask" };
+    const quote_rows = try queryMarketRows(alloc, eng, "market.quote", filter, start_ts, end_ts, quote_columns[0..], revision);
+    defer freeMarketQueryRows(alloc, quote_rows);
     var avg_spread_total: f64 = 0;
     var stale_count: usize = 0;
     var crossed_count: usize = 0;
     var locked_count: usize = 0;
     var dropped_samples: usize = 0;
-    for (0..paired) |idx| {
-        if (bids[idx].ts != asks[idx].ts) {
+    for (quote_rows, 0..) |row, idx| {
+        const bid = try marketQueryRowColumnValue(alloc, row, "bid") orelse {
             dropped_samples += 1;
             continue;
-        }
-        const spread = asks[idx].value - bids[idx].value;
+        };
+        const ask = try marketQueryRowColumnValue(alloc, row, "ask") orelse {
+            dropped_samples += 1;
+            continue;
+        };
+        const spread = ask - bid;
         avg_spread_total += spread;
         if (spread < 0) crossed_count += 1;
         if (spread == 0) locked_count += 1;
-        if (idx > 0 and bids[idx].value == bids[idx - 1].value and asks[idx].value == asks[idx - 1].value and (bids[idx].ts - bids[idx - 1].ts) > stale_after_ns) {
-            stale_count += 1;
+        if (idx > 0) {
+            const prev_bid = try marketQueryRowColumnValue(alloc, quote_rows[idx - 1], "bid") orelse continue;
+            const prev_ask = try marketQueryRowColumnValue(alloc, quote_rows[idx - 1], "ask") orelse continue;
+            if (bid == prev_bid and ask == prev_ask and (row.ts_ns - quote_rows[idx - 1].ts_ns) > stale_after_ns) {
+                stale_count += 1;
+            }
         }
     }
     var send_buffer: [768]u8 = undefined;
@@ -2956,7 +3119,7 @@ fn handleAnalysisQuoteQuality(alloc: std.mem.Allocator, eng: *Engine, req: *std.
     try jw.write(venue);
     try jw.endObject();
     try jw.objectField("sample_count");
-    try jw.write(paired);
+    try jw.write(quote_rows.len);
     try jw.objectField("dropped_samples");
     try jw.write(dropped_samples);
     try jw.objectField("dropped_reasons");
@@ -2964,7 +3127,7 @@ fn handleAnalysisQuoteQuality(alloc: std.mem.Allocator, eng: *Engine, req: *std.
     if (dropped_samples != 0) try jw.write("unpaired_quote_samples");
     try jw.endArray();
     try jw.objectField("avg_spread");
-    if (paired != 0) try jw.write(avg_spread_total / @as(f64, @floatFromInt(paired))) else try jw.write(null);
+    if (quote_rows.len != 0) try jw.write(avg_spread_total / @as(f64, @floatFromInt(quote_rows.len))) else try jw.write(null);
     try jw.objectField("stale_count");
     try jw.write(stale_count);
     try jw.objectField("crossed_count");
@@ -3170,6 +3333,20 @@ fn writeSignalEventPayload(writer: anytype, event: anytype) !void {
     try jw.endObject();
 }
 
+fn marketQueryRowColumnValue(alloc: std.mem.Allocator, row: MarketQueryRow, column: []const u8) !?f64 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, row.columns_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    if (parsed.value.object.get(column)) |value| {
+        return switch (value) {
+            .integer => @floatFromInt(value.integer),
+            .float => value.float,
+            else => null,
+        };
+    }
+    return null;
+}
+
 fn queryMarketRows(
     alloc: std.mem.Allocator,
     eng: *Engine,
@@ -3177,7 +3354,7 @@ fn queryMarketRows(
     labels_value: std.json.Value,
     start_ts_ns: i64,
     end_ts_ns: i64,
-    requested_columns: ?[][]const u8,
+    requested_columns: ?[]const []const u8,
     revision: ?[]const u8,
 ) ![]MarketQueryRow {
     var schema = eng.marketSchema(metric) orelse return error.MarketSchemaNotFound;
@@ -3529,9 +3706,9 @@ fn labelValueFromJson(alloc: std.mem.Allocator, labels_json: []const u8, key: []
     return null;
 }
 
-fn findPriceIndexAtOrAfter(points: []const types.Point, ts_ns: i64) ?usize {
-    for (points, 0..) |point, idx| {
-        if (point.ts >= ts_ns) return idx;
+fn findMarketRowIndexAtOrAfter(rows: []const MarketQueryRow, ts_ns: i64) ?usize {
+    for (rows, 0..) |row, idx| {
+        if (row.ts_ns >= ts_ns) return idx;
     }
     return null;
 }
