@@ -6,11 +6,13 @@ const codegen = @import("codegen.zig");
 const compiler = @import("compiler.zig");
 const engine_mod = @import("../engine.zig");
 const exec = @import("exec.zig");
+const executor = @import("executor.zig");
 const frontend = @import("frontend.zig");
 const common = @import("common.zig");
 const lexer = @import("lexer.zig");
 const parser = @import("parser.zig");
 const plan = @import("plan.zig");
+const physical = @import("physical.zig");
 const query_functions = @import("functions.zig");
 const table_use = @import("table_use.zig");
 const types = @import("../types.zig");
@@ -133,6 +135,9 @@ pub const PreparedStmt = struct {
     arena_ptr: ?*std.heap.ArenaAllocator = null,
     compile_arena_ptr: ?*std.heap.ArenaAllocator = null,
     describe_compile_arena_ptr: ?*std.heap.ArenaAllocator = null,
+    physical_plan: ?physical.PhysicalPlan = null,
+    physical_cursor: ?executor.ExecutionCursor = null,
+    physical_rows_emitted: usize = 0,
     bound_values: []?value_mod.Value = &.{},
     needs_compile: bool = false,
     machine: ?vm.VirtualMachine = null,
@@ -147,11 +152,25 @@ pub const PreparedStmt = struct {
                 .done => .done,
             };
         }
+        try self.ensurePhysicalCursor();
+        if (self.physical_cursor) |*cursor| {
+            const maybe_row = try cursor.next();
+            if (maybe_row) |row| {
+                self.physical_rows_emitted += 1;
+                return .{ .row = row.values };
+            }
+            return .done;
+        }
         return error.NotImplemented;
     }
 
     pub fn reset(self: *PreparedStmt) void {
         if (self.machine) |*machine| machine.reset();
+        if (self.physical_cursor) |*cursor| {
+            cursor.deinit();
+            self.physical_cursor = null;
+        }
+        self.physical_rows_emitted = 0;
     }
 
     pub fn bindPositional(self: *PreparedStmt, slot: ParameterSlot, value: value_mod.Value) BindError!void {
@@ -243,6 +262,7 @@ pub const PreparedStmt = struct {
     pub fn explainBytecode(self: *PreparedStmt, allocator: std.mem.Allocator) ExplainError![]bytecode.DisassemblyLine {
         if (self.finalized) return error.Finalized;
         try self.ensureCompiled();
+        if (self.machine == null) return error.NotImplemented;
         return try bytecode.disassemble(allocator, self.program);
     }
 
@@ -283,6 +303,7 @@ pub const PreparedStmt = struct {
 
     pub fn rowsAffected(self: *const PreparedStmt) usize {
         if (self.machine) |machine| return machine.rowsAffected();
+        if (self.physical_plan != null) return self.physical_rows_emitted;
         return 0;
     }
 
@@ -291,30 +312,31 @@ pub const PreparedStmt = struct {
     }
 
     fn ensureCompiled(self: *PreparedStmt) PrepareError!void {
-        if (!self.needs_compile and self.machine != null) return;
+        if (!self.needs_compile and (self.machine != null or self.physical_plan != null)) return;
         var compiled = try compilePreparedExecutable(
             self.allocator,
             self.engine,
             self.normalized,
             self.bound_values,
         );
-        errdefer {
-            compiled.program.deinit();
-            if (compiled.columns.len != 0) self.allocator.free(compiled.columns);
-            compiled.compile_arena_ptr.deinit();
-            self.allocator.destroy(compiled.compile_arena_ptr);
-        }
-
-        var machine = try vm.VirtualMachine.init(self.allocator, self.engine, &compiled.program);
-        errdefer machine.deinit();
+        errdefer compiled.deinit(self.allocator);
 
         self.clearCompiledState();
-        self.program = compiled.program;
         self.columns = compiled.columns;
         self.typed_query = compiled.typed_query;
         self.owned_columns = true;
         self.compile_arena_ptr = compiled.compile_arena_ptr;
-        self.machine = machine;
+        switch (compiled.backend) {
+            .vm => |program| {
+                self.program = program;
+                var machine = try vm.VirtualMachine.init(self.allocator, self.engine, &self.program);
+                errdefer machine.deinit();
+                self.machine = machine;
+            },
+            .physical => |physical_plan| {
+                self.physical_plan = physical_plan;
+            },
+        }
         self.needs_compile = false;
     }
 
@@ -335,16 +357,23 @@ pub const PreparedStmt = struct {
             self.normalized,
             placeholder_bindings,
         );
-        errdefer {
-            compiled.program.deinit();
-            if (compiled.columns.len != 0) self.allocator.free(compiled.columns);
-            compiled.compile_arena_ptr.deinit();
-            self.allocator.destroy(compiled.compile_arena_ptr);
-        }
+        errdefer compiled.deinit(self.allocator);
 
-        compiled.program.deinit();
+        switch (compiled.backend) {
+            .vm => |*program| program.deinit(),
+            .physical => {},
+        }
         self.described_columns = compiled.columns;
         self.describe_compile_arena_ptr = compiled.compile_arena_ptr;
+    }
+
+    fn ensurePhysicalCursor(self: *PreparedStmt) StepError!void {
+        if (self.physical_cursor != null) return;
+        const physical_plan = self.physical_plan orelse return;
+        var exec_inst = executor.Executor.init(self.allocator, self.engine, physical_plan);
+        defer exec_inst.deinit();
+        self.physical_cursor = try exec_inst.run();
+        self.physical_rows_emitted = 0;
     }
 
     fn replaceBoundValue(self: *PreparedStmt, slot_idx: usize, value: value_mod.Value) BindError!void {
@@ -360,6 +389,10 @@ pub const PreparedStmt = struct {
     fn clearCompiledState(self: *PreparedStmt) void {
         if (self.machine) |*machine| machine.deinit();
         self.machine = null;
+        if (self.physical_cursor) |*cursor| cursor.deinit();
+        self.physical_cursor = null;
+        self.physical_plan = null;
+        self.physical_rows_emitted = 0;
         self.program.deinit();
         self.program = emptyProgram(self.allocator);
         if (self.owned_columns and self.columns.len != 0) {
@@ -382,7 +415,7 @@ pub const PrepareError = std.mem.Allocator.Error || lexer.LexError || parser.Par
     InvalidTrace,
 } || codegen.CodegenError;
 
-pub const StepError = vm.VmError || PrepareError || error{
+pub const StepError = executor.ExecuteError || vm.VmError || PrepareError || error{
     NotImplemented,
     Finalized,
 };
@@ -583,10 +616,23 @@ fn prepareNormalizedStatement(
 }
 
 const CompiledPreparedExecutable = struct {
-    program: bytecode.Program,
+    backend: union(enum) {
+        vm: bytecode.Program,
+        physical: physical.PhysicalPlan,
+    },
     columns: []const plan.ColumnInfo,
     typed_query: ?compiler.TypedQuery = null,
     compile_arena_ptr: *std.heap.ArenaAllocator,
+
+    fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        switch (self.backend) {
+            .vm => |*program| program.deinit(),
+            .physical => {},
+        }
+        if (self.columns.len != 0) allocator.free(self.columns);
+        self.compile_arena_ptr.deinit();
+        allocator.destroy(self.compile_arena_ptr);
+    }
 };
 
 fn compilePreparedExecutable(
@@ -604,12 +650,24 @@ fn compilePreparedExecutable(
     switch (statement) {
         .select => {
             const compiled = try compiler.compileSelect(compile_arena_ptr.allocator(), engine, &statement);
-            var lowered = try codegen.buildProgram(allocator, compiled);
+            const lowered = codegen.buildProgram(allocator, compiled) catch |err| switch (err) {
+                error.UnsupportedPreparedQuery => {
+                    const columns = try buildPreparedColumns(allocator, compiled.typed_query.projections);
+                    errdefer allocator.free(columns);
+                    return .{
+                        .backend = .{ .physical = compiled.backend.physical_plan },
+                        .columns = columns,
+                        .typed_query = compiled.typed_query,
+                        .compile_arena_ptr = compile_arena_ptr,
+                    };
+                },
+                else => return err,
+            };
             errdefer lowered.program.deinit();
             errdefer if (lowered.columns.len != 0) allocator.free(lowered.columns);
 
             return .{
-                .program = lowered.program,
+                .backend = .{ .vm = lowered.program },
                 .columns = lowered.columns,
                 .typed_query = compiled.typed_query,
                 .compile_arena_ptr = compile_arena_ptr,
@@ -652,14 +710,14 @@ fn buildInsertPreparedExecutable(
     errdefer allocator.free(write_targets);
 
     return .{
-        .program = .{
+        .backend = .{ .vm = .{
             .allocator = allocator,
             .instructions = instructions,
             .exprs = exprs,
             .write_targets = write_targets,
             .register_count = 1,
             .source_name = "prepared_insert",
-        },
+        } },
         .columns = &.{},
         .typed_query = null,
         .compile_arena_ptr = compile_arena_ptr,
@@ -703,18 +761,29 @@ fn buildDeletePreparedExecutable(
     errdefer allocator.free(write_targets);
 
     return .{
-        .program = .{
+        .backend = .{ .vm = .{
             .allocator = allocator,
             .instructions = instructions,
             .exprs = predicate_exprs,
             .write_targets = write_targets,
             .register_count = 1,
             .source_name = "prepared_delete",
-        },
+        } },
         .columns = &.{},
         .typed_query = null,
         .compile_arena_ptr = compile_arena_ptr,
     };
+}
+
+fn buildPreparedColumns(
+    allocator: std.mem.Allocator,
+    projections: []const compiler.TypedProjection,
+) ![]plan.ColumnInfo {
+    const columns = try allocator.alloc(plan.ColumnInfo, projections.len);
+    for (projections, 0..) |projection, idx| {
+        columns[idx] = .{ .name = projection.name, .expr = projection.expr.expr };
+    }
+    return columns;
 }
 
 const InsertExprMapping = struct {
@@ -1521,6 +1590,84 @@ test "prepared VM supports aggregate reads and grouped time buckets" {
     try std.testing.expectEqualStrings("web", try second_tag_group.row[1].asString());
     try std.testing.expectApproxEqAbs(@as(f64, 3.0), try second_tag_group.row[2].asFloat(), 1e-9);
     try std.testing.expect((try grouped_tag_stmt.step()) == .done);
+}
+
+test "prepareSydraQL falls back to the physical backend for native fill(previous)" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-fill-physical", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .legacy,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    const sid: u64 = 7446;
+    try engine.registerSeries("fill.room3", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.5, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 130, .value = 4.0, .tags_json = "{}" });
+    try waitForQueryablePoints(alloc, engine, sid, 2, 1_000);
+
+    var stmt = try prepareSydraQL(
+        alloc,
+        engine,
+        "select time_bucket(60, time) as bucket, avg(value) as avg_value from fill.room3 where time >= 0 group by time_bucket(60, time) fill(previous) order by bucket asc",
+        .{},
+    );
+    defer stmt.finalize();
+
+    const columns = try stmt.describeColumns();
+    try std.testing.expectEqual(@as(usize, 2), columns.len);
+    try std.testing.expectEqualStrings("bucket", columns[0].name);
+    try std.testing.expectEqualStrings("avg_value", columns[1].name);
+    try std.testing.expectError(error.NotImplemented, stmt.explainBytecode(alloc));
+
+    const first = try stmt.step();
+    try std.testing.expect(first == .row);
+    try std.testing.expectEqual(@as(i64, 0), first.row[0].integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), try first.row[1].asFloat(), 1e-9);
+
+    const second = try stmt.step();
+    try std.testing.expect(second == .row);
+    try std.testing.expectEqual(@as(i64, 60), second.row[0].integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), try second.row[1].asFloat(), 1e-9);
+
+    const third = try stmt.step();
+    try std.testing.expect(third == .row);
+    try std.testing.expectEqual(@as(i64, 120), third.row[0].integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 4.0), try third.row[1].asFloat(), 1e-9);
+
+    try std.testing.expect((try stmt.step()) == .done);
+    try std.testing.expectEqual(@as(usize, 3), stmt.rowsAffected());
+
+    stmt.reset();
+    const replay = try stmt.step();
+    try std.testing.expect(replay == .row);
+    try std.testing.expectEqual(@as(i64, 0), replay.row[0].integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), try replay.row[1].asFloat(), 1e-9);
+
+    var cloned = try stmt.cloneForExecution(alloc, engine);
+    defer cloned.finalize();
+    const cloned_first = try cloned.step();
+    try std.testing.expect(cloned_first == .row);
+    try std.testing.expectEqual(@as(i64, 0), cloned_first.row[0].integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), try cloned_first.row[1].asFloat(), 1e-9);
 }
 
 test "prepared bytecode snapshots stay stable for constant and scan plans" {
