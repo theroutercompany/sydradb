@@ -50,11 +50,16 @@ Reads NDJSON from stdin and ingests into the local engine.
 cat points.ndjson | ./zig-out/bin/sydradb ingest
 ```
 
-Each line must contain `series`, `ts`, and `value`.
+Each line uses the same parser as `POST /api/v1/ingest`:
+
+- `series` and `ts` are required
+- `value` may be integer or float
+- if `value` is absent, the first numeric field under `fields` is used
+- `tags` participate in canonical series-id derivation
+
+The command flushes before exit, so a successful return means the ingested points are queryable from the local repository state.
 
 Implementation: [`cmdIngest`](./source/sydra/server.md#fn-cmdingestalloc-stdmemallocator-args-0u8-void).
-
-Note: CLI ingest hashes only the series name; see [Series IDs](./series-ids.md) for how HTTP derives IDs when tags are present.
 
 ## `query <series_id> <start_ts> <end_ts>`
 

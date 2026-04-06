@@ -108,6 +108,7 @@ bash demos/demo-quickstart.sh
 bash demos/demo-sydraql-compiled.sh
 bash demos/demo-cas-lifecycle.sh
 bash demos/demo-pgwire-preview.sh
+zig build demo-smoke
 ```
 
 See [`demos/README.md`](/Users/rexliu/sydradb/demos/README.md) for the current checklist.
@@ -121,7 +122,7 @@ Apache-2.0
 ```bash
 ./zig-out/bin/sydradb             # serve (HTTP): /api/v1/ingest, /api/v1/query/range, /api/v1/sydraql, /metrics
 ./zig-out/bin/sydradb pgwire      # PostgreSQL wire protocol preview (simple query + preview prepared flow)
-./zig-out/bin/sydradb ingest      # read NDJSON from stdin into local WAL
+./zig-out/bin/sydradb ingest      # read NDJSON from stdin, flush, and exit only after points are queryable
 ./zig-out/bin/sydradb query <series_id> <start_ts> <end_ts>
 ./zig-out/bin/sydradb compact     # merge small→large segments (v2 stub)
 ./zig-out/bin/sydradb snapshot <dst_dir>   # write a self-contained CAS bundle
@@ -178,7 +179,9 @@ retention.weather = 30
 
 Config notes:
 
-- `mem_limit_bytes` is parsed, but it is not currently enforced as a global runtime quota.
+- `mem_limit_bytes` is enforced as a coarse ingest backpressure limit over queued + buffered in-memory points. When the limit is hit, ingest rejects new points and increments `/metrics` rejection counters.
+- `/api/*` error responses now include JSON fields `error`, `code`, and `status` so clients can distinguish missing input, unsupported query shapes, and overload conditions.
+- `sydradb ingest` now uses the same line parser and series-id derivation as HTTP ingest, including `tags` and fallback-to-first-numeric `fields` behavior.
 - `cas_mode = "dual_write"` writes immutable metadata commits and `refs/heads/main` alongside the legacy storage path.
 - `metadata_read_mode = "shadow"` serves from legacy metadata and cross-checks answers against the CAS snapshot.
 - `metadata_read_mode = "primary"` serves metadata from CAS and can boot even if `MANIFEST`, `tags.json`, or `series_catalog.jsonl` are missing.

@@ -122,22 +122,21 @@ Expected per-line JSON fields:
 
 - `series` (string)
 - `ts` (integer)
-- `value` (float)
+- `value` (number, optional)
+- `fields` (object, optional; first numeric field is used when `value` is absent)
+- `tags` (object, optional)
 
 Series IDs:
 
-- This command uses `types.hash64(series)` (hashes only the series name).
-- HTTP ingest uses a different `series_id` derivation when tags are present (see `Reference/Series IDs`).
+- This command now uses the same `types.seriesIdFrom(series, tags_json)` derivation as HTTP ingest.
+- The command flushes before exit, so a successful return means the ingested points are queryable from local state.
 
-```zig title="cmdIngest series_id derivation (excerpt)"
-const series = obj.get("series").?.string;
-const ts: i64 = @intCast(obj.get("ts").?.integer);
-const value = obj.get("value").?.float;
+```zig title="cmdIngest shared parse + apply (excerpt)"
+const parsed = ingest_mod.parseLine(alloc, slice) catch continue;
+defer parsed.deinit(alloc);
 
-// CLI ingest hashes only the series name (tags are not part of the SeriesId here).
-const sid = @import("types.zig").hash64(series);
-
-try eng.ingest(.{ .series_id = sid, .ts = ts, .value = value, .tags_json = "{}" });
+_ = try ingest_mod.applyParsedLine(eng, parsed);
+_ = try eng.flushNow();
 ```
 
 ### `fn cmdQuery(alloc: std.mem.Allocator, args: [][:0]u8) !void`

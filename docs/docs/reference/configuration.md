@@ -86,7 +86,13 @@ Default: `8388608` (8 MiB)
 
 ### `mem_limit_bytes` (integer)
 
-Parsed by config, but not currently enforced as a global runtime memory quota.
+Used as a coarse ingest backpressure limit over queued + buffered in-memory points.
+
+When the limit is hit:
+
+- new ingests are rejected before queueing
+- `/metrics` increments the ingest rejection counters
+- HTTP ingest returns a JSON error with code `ingest_backpressure`
 
 Default: `268435456` (256 MiB)
 

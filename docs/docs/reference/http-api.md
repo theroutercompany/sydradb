@@ -46,6 +46,7 @@ Returns:
 Error cases:
 
 - A line that exceeds the internal buffer fails the request with `413 Payload Too Large`.
+- If ingest backpressure is hit, the request fails with a JSON error and `503 Service Unavailable`.
 
 ## `POST /api/v1/query/range`
 
@@ -97,6 +98,14 @@ Response JSON object:
 - `columns`: array of `{name,type,nullable}`
 - `rows`: array of row arrays
 - `stats`: execution timings and operator stats
+
+Error responses for `/api/*` are JSON:
+
+```json
+{"error":"query required","code":"query_required","status":400}
+```
+
+For sydraQL specifically, `code` now distinguishes unsupported query shapes (`unsupported_query_shape`), validation failures (`validation_failed`), and runtime shadow-mode issues (`shadow_mismatch`).
 
 Implementation:
 

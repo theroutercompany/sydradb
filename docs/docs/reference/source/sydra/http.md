@@ -174,10 +174,10 @@ Executes sydraQL (`POST` body is plain text) and responds with:
 
 ```zig title="handleSydraql request validation + exec (excerpt)"
 const content_len = req.head.content_length orelse {
-    return respondJsonError(alloc, req, .length_required, "length required");
+    return respondJsonError(alloc, req, .length_required, "length_required", "length required");
 };
 if (content_len > 256 * 1024) {
-    return respondJsonError(alloc, req, .payload_too_large, "payload too large");
+    return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large");
 }
 
 const len: usize = @intCast(content_len);
@@ -187,7 +187,7 @@ defer alloc.free(body);
 
 const sydraql = std.mem.trim(u8, body, " \t\r\n");
 if (sydraql.len == 0) {
-    return respondJsonError(alloc, req, .bad_request, "query required");
+    return respondJsonError(alloc, req, .bad_request, "query_required", "query required");
 }
 
 var cursor = query_exec.execute(alloc, eng, sydraql) catch |err| {
@@ -201,8 +201,7 @@ defer cursor.deinit();
 - `const default_tags_json = "{}"`
 - `const TagsJson = struct { value: []const u8, owned: ?[]u8 }`
 - `fn extractTagsJson(...) !TagsJson` – converts a JSON object into a JSON string
-- `fn respondJsonError(...) !void` – `{"error":"..."}` error payloads
+- `fn respondJsonError(...) !void` – JSON error payloads with `error`, `code`, and `status`
 - `fn writeStatsObject(...) !void` – emits the `stats` object for sydraQL responses
 - `fn findHeader(...) ?[]const u8` – case-insensitive header lookup
-
 
