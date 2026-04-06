@@ -158,6 +158,8 @@ Apache-2.0
 ./zig-out/bin/sydradb cas export-legacy [spec]
 ```
 
+CLI result payloads are written to stdout. Interactive startup summaries stay on stderr and are only emitted when stderr is attached to a TTY.
+
 Config: `sydradb.toml`
 
 ```

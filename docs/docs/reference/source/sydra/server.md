@@ -16,6 +16,8 @@ This module:
 - Instantiates the engine and ancillary subsystems
 - Routes to the HTTP server or subcommands (`pgwire`, `ingest`, `query`, etc.)
 
+Human-facing banners stay on stderr and are gated to TTY sessions. Command result payloads are emitted on stdout.
+
 ## Public API
 
 ### `pub fn run(handle: *alloc_mod.AllocatorHandle) !void`
@@ -156,6 +158,8 @@ Runs `Engine.queryRange` and prints CSV rows as:
 ts,value
 ```
 
+The CSV rows are emitted on stdout.
+
 ### `fn cmdCompact(alloc: std.mem.Allocator, args: [][:0]u8) !void`
 
 Opens `cfg.data_dir`, loads or initializes the manifest, then runs storage compaction across all segments.
@@ -184,3 +188,4 @@ Calls `snapshot.zig` to restore from a snapshot.
 
 - Counts segment files under `<data_dir>/segments/**` and prints `segments_total`.
 - If built with the `small_pool` allocator mode, prints allocator stats via `handle.snapshotSmallPoolStats()`.
+- The stats lines are emitted on stdout.

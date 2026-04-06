@@ -16,6 +16,13 @@ fn printInteractiveBanner(comptime fmt: []const u8, args: anytype) void {
     }
 }
 
+fn printStdout(alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
+    const msg = try std.fmt.allocPrint(alloc, fmt, args);
+    defer alloc.free(msg);
+    var stdout = std.fs.File.stdout();
+    try stdout.writeAll(msg);
+}
+
 pub fn run(handle: *alloc_mod.AllocatorHandle) !void {
     const alloc = handle.allocator();
     const args = try std.process.argsAlloc(alloc);
@@ -155,7 +162,7 @@ fn cmdQuery(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     var out = try std.array_list.Managed(@import("types.zig").Point).initCapacity(alloc, 0);
     defer out.deinit();
     try eng.queryRange(sid, start_ts, end_ts, &out);
-    for (out.items) |p| std.debug.print("{d},{d}\n", .{ p.ts, p.value });
+    for (out.items) |p| try printStdout(alloc, "{d},{d}\n", .{ p.ts, p.value });
 }
 
 fn cmdCompact(alloc: std.mem.Allocator, _: [][:0]u8) !void {
@@ -189,12 +196,13 @@ fn cmdStats(handle: *alloc_mod.AllocatorHandle, alloc: std.mem.Allocator, _: [][
             }
         }
     }
-    std.debug.print("segments_total {d}\n", .{seg_count});
+    try printStdout(alloc, "segments_total {d}\n", .{seg_count});
 
     if (alloc_mod.is_small_pool) {
         const stats = handle.snapshotSmallPoolStats();
         if (stats.shard_enabled) {
-            std.debug.print(
+            try printStdout(
+                alloc,
                 "small_pool.shards count={d} hits={d} misses={d} deferred={d} epoch_current={d} epoch_min={d}\n",
                 .{
                     stats.shard_count,
@@ -206,12 +214,14 @@ fn cmdStats(handle: *alloc_mod.AllocatorHandle, alloc: std.mem.Allocator, _: [][
                 },
             );
         } else {
-            std.debug.print(
+            try printStdout(
+                alloc,
                 "small_pool.shards disabled hits={d} misses={d}\n",
                 .{ stats.shard_alloc_hits, stats.shard_alloc_misses },
             );
         }
-        std.debug.print(
+        try printStdout(
+            alloc,
             "small_pool.fallback allocs={d} frees={d} resizes={d} remaps={d}\n",
             .{ stats.fallback_allocs, stats.fallback_frees, stats.fallback_resizes, stats.fallback_remaps },
         );
@@ -718,7 +728,8 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
             };
             try writeCasBundleJson(alloc, "clone", null, bundle_result);
         } else {
-            std.debug.print(
+            try printStdout(
+                alloc,
                 "cas clone refs={d} prerequisites={d} objects={d} packs={d} reftable_files={d}\n",
                 .{ result.ref_count, result.prerequisite_count, result.object_count, result.pack_count, result.reftable_file_count },
             );
@@ -737,7 +748,8 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
             try writeCasLocalExchangeJson(alloc, "fetch-local", result);
         } else {
             const repo_hex = result.repository_id.toHex();
-            std.debug.print(
+            try printStdout(
+                alloc,
                 "cas fetch-local repository={s} refs={d} borrowed_repositories={d}\n",
                 .{ repo_hex, result.ref_count, result.borrowed_repositories },
             );
@@ -756,7 +768,8 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
             try writeCasLocalExchangeJson(alloc, "push-local", result);
         } else {
             const repo_hex = result.repository_id.toHex();
-            std.debug.print(
+            try printStdout(
+                alloc,
                 "cas push-local repository={s} refs={d} borrowed_repositories={d}\n",
                 .{ repo_hex, result.ref_count, result.borrowed_repositories },
             );
@@ -769,7 +782,8 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         if (json_output) {
             try writeCasBundleJson(alloc, "verify-bundle", null, result);
         } else {
-            std.debug.print(
+            try printStdout(
+                alloc,
                 "cas verify-bundle refs={d} prerequisites={d} objects={d} packs={d} reftable_files={d}\n",
                 .{ result.ref_count, result.prerequisite_count, result.object_count, result.pack_count, result.reftable_file_count },
             );
@@ -792,7 +806,8 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
             if (json_output) {
                 try writeCasBundleJson(alloc, "bundle", "create", result);
             } else {
-                std.debug.print(
+                try printStdout(
+                    alloc,
                     "cas bundle create refs={d} prerequisites={d} objects={d} packs={d} reftable_files={d}\n",
                     .{ result.ref_count, result.prerequisite_count, result.object_count, result.pack_count, result.reftable_file_count },
                 );
@@ -804,7 +819,8 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
             if (json_output) {
                 try writeCasBundleJson(alloc, "bundle", "verify", result);
             } else {
-                std.debug.print(
+                try printStdout(
+                    alloc,
                     "cas bundle verify refs={d} prerequisites={d} objects={d} packs={d} reftable_files={d}\n",
                     .{ result.ref_count, result.prerequisite_count, result.object_count, result.pack_count, result.reftable_file_count },
                 );
@@ -816,7 +832,8 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
             if (json_output) {
                 try writeCasBundleJson(alloc, "bundle", "apply", result);
             } else {
-                std.debug.print(
+                try printStdout(
+                    alloc,
                     "cas bundle apply refs={d} prerequisites={d} objects={d} packs={d} reftable_files={d}\n",
                     .{ result.ref_count, result.prerequisite_count, result.object_count, result.pack_count, result.reftable_file_count },
                 );
@@ -843,7 +860,7 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         if (json_output) {
             try writeJsonBufferToStdout("{\"schema_version\":1,\"command\":\"verify\",\"ok\":true}");
         } else {
-            std.debug.print("cas verify ok\n", .{});
+            try printStdout(alloc, "cas verify ok\n", .{});
         }
         return;
     }
@@ -858,7 +875,7 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         } else {
             for (refs) |entry| {
                 const hex = entry.id.toHex();
-                std.debug.print("{s} {s}\n", .{ entry.name, hex });
+                try printStdout(alloc, "{s} {s}\n", .{ entry.name, hex });
             }
         }
         return;
@@ -887,7 +904,7 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
             if (adapter.err) |err| return err;
             try writeJsonBufferToStdout(json_buf.items);
         } else {
-            std.debug.print("cas head {s}\n", .{head});
+            try printStdout(alloc, "cas head {s}\n", .{head});
         }
         return;
     }
@@ -903,7 +920,7 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         } else {
             for (entries) |entry| {
                 const hex = entry.commit_id.toHex();
-                std.debug.print("{s} parents={d} ts_ms={d} reason={s}\n", .{ hex, entry.parent_count, entry.created_at_ms, entry.reason });
+                try printStdout(alloc, "{s} parents={d} ts_ms={d} reason={s}\n", .{ hex, entry.parent_count, entry.created_at_ms, entry.reason });
             }
         }
         return;
@@ -951,7 +968,7 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
             for (entries) |entry| {
                 const old_hex = if (entry.old_id) |id| id.toHex() else [_]u8{'0'} ** 64;
                 const new_hex = entry.new_id.toHex();
-                std.debug.print("{d} {s} {s} {s}\n", .{ entry.timestamp_ms, old_hex, new_hex, entry.reason });
+                try printStdout(alloc, "{d} {s} {s} {s}\n", .{ entry.timestamp_ms, old_hex, new_hex, entry.reason });
             }
         }
         return;
@@ -964,7 +981,8 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         if (json_output) {
             try writeCasDiffJson(alloc, lhs, rhs, diff);
         } else {
-            std.debug.print(
+            try printStdout(
+                alloc,
                 "cas diff {s}..{s} segments_added={d} segments_removed={d} tags_changed={d} series_entries_changed={d} wal_added={d} wal_removed={d}\n",
                 .{
                     lhs,
@@ -991,7 +1009,7 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         if (json_output) {
             try writeJsonBufferToStdout("{\"schema_version\":1,\"command\":\"migrate-reftable\",\"backend\":\"reftable\"}");
         } else {
-            std.debug.print("cas migrate-reftable backend=reftable\n", .{});
+            try printStdout(alloc, "cas migrate-reftable backend=reftable\n", .{});
         }
         return;
     }
@@ -1000,7 +1018,8 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         if (json_output) {
             try writeCasUpgradeJson(alloc, result);
         } else {
-            std.debug.print(
+            try printStdout(
+                alloc,
                 "cas upgrade migrated_reftable={} format_version={d} ref_backend={s} reachable={d} rewritten={d} normalized_commits={d} compatibility_legacy_segments={d} compatibility_legacy_wal={d} compatibility_loose_refs={d}\n",
                 .{
                     result.migrated_reftable,
@@ -1052,7 +1071,8 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
             if (adapter.err) |err| return err;
             try writeJsonBufferToStdout(json_buf.items);
         } else {
-            std.debug.print(
+            try printStdout(
+                alloc,
                 "cas expire reflog_entries_expired={d} checkpoint_refs_expired={d} borrowed_packs_materialized={d}\n",
                 .{
                     result.reflog_entries_expired,
@@ -1111,7 +1131,8 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
             if (adapter.err) |err| return err;
             try writeJsonBufferToStdout(json_buf.items);
         } else {
-            std.debug.print(
+            try printStdout(
+                alloc,
                 "cas prune dry_run={} pruned={d} pruned_bytes={d} stale_segment_files={d} stale_segment_bytes={d} stale_wal_files={d} stale_wal_bytes={d} mirror_deleted={d}\n",
                 .{
                     options.dry_run,
@@ -1156,7 +1177,8 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         if (json_output) {
             try writeCasVacuumJson(alloc, result);
         } else {
-            std.debug.print(
+            try printStdout(
+                alloc,
                 "cas vacuum reachable={d} rewritten={d} unreachable={d} pruned={d} deleted={d} repaired_side_indexes={} pack_sidecars_rebuilt={d} reflog_entries_expired={d} checkpoint_refs_expired={d} borrowed_packs_materialized={d}\n",
                 .{
                     result.pack.reachable_objects,
@@ -1195,7 +1217,8 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         if (json_output) {
             try writeCasGcJson(alloc, options, result);
         } else {
-            std.debug.print(
+            try printStdout(
+                alloc,
                 "cas gc dry_run={} reachable={d} unreachable={d} unreachable_bytes={d} reflog_protected={d} quarantined={d} quarantined_bytes={d} pruned={d} pruned_bytes={d} deleted={d} stale_segment_files={d} stale_segment_bytes={d} stale_wal_files={d} stale_wal_bytes={d} mirror_deleted={d}\n",
                 .{
                     options.dry_run,
@@ -1243,7 +1266,8 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         if (json_output) {
             try writeCasFsckJson(alloc, options, repair, repair_report, report);
         } else {
-            std.debug.print(
+            try printStdout(
+                alloc,
                 "cas fsck mode={s} repair={} refs={d} reachable={d} reflog_heads={d} reflog_protected={d} commits={d} trees={d} blobs={d} dangling={d} lost_found={d} commit_graph_entries_checked={d} segment_contents_checked={d} wal_contents_checked={d} missing_segment_mirrors={d} missing_wal_mirrors={d} reflog_files_checked={d} stale_reflog_files={d} compatibility_legacy_segments={d} compatibility_legacy_wal={d} compatibility_loose_refs={d} repaired_side_indexes={} pack_sidecars_rebuilt={d} reftable_state_rebuilt={} reftable_tables_list_rebuilt={}\n",
                 .{
                     if (options.mode == .connectivity_only) "connectivity-only" else "full",
@@ -1281,7 +1305,7 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         if (json_output) {
             try writeCasPackJson(alloc, result);
         } else {
-            std.debug.print("cas pack reachable={d} rewritten={d}\n", .{ result.reachable_objects, result.rewritten_objects });
+            try printStdout(alloc, "cas pack reachable={d} rewritten={d}\n", .{ result.reachable_objects, result.rewritten_objects });
         }
         return;
     }

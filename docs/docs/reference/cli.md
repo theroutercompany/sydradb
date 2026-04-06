@@ -8,6 +8,8 @@ tags:
 
 The `sydradb` binary provides a small command surface. When invoked with no arguments, it runs the HTTP server.
 
+Command result payloads are written to stdout. Interactive startup/status banners are reserved for stderr and only emitted when stderr is attached to a TTY.
+
 Implementation reference:
 
 - [`src/main.zig`](./source/entrypoints/src-main.md)
@@ -73,6 +75,8 @@ Queries a single series over a time range and prints `ts,value` rows:
 ./zig-out/bin/sydradb query 123 1694290000 1694310000
 ```
 
+The CSV rows are written to stdout.
+
 Implementation: [`cmdQuery`](./source/sydra/server.md#fn-cmdqueryalloc-stdmemallocator-args-0u8-void).
 
 ## `compact`
@@ -112,6 +116,8 @@ Prints basic counters (including segment counts). In `small_pool` allocator mode
 ```sh
 ./zig-out/bin/sydradb stats
 ```
+
+The stats lines are written to stdout.
 
 Implementation: [`cmdStats`](./source/sydra/server.md#fn-cmdstatshandle-alloc_modallocatorhandle-alloc-stdmemallocator-args-0u8-void).
 
