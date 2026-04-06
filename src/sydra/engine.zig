@@ -291,7 +291,8 @@ pub const Engine = struct {
         series_id: types.SeriesId,
         ts: i64,
         value: f64,
-        // raw tags json for future tag index updates
+        // Queue-owned copy of the canonical tags JSON kept for parity across
+        // async ingest entrypoints.
         tags_json: []const u8,
     };
 
@@ -314,6 +315,7 @@ pub const Engine = struct {
             return q;
         }
         pub fn deinit(self: *Queue) void {
+            for (self.buf.items) |item| self.alloc.free(item.tags_json);
             self.buf.deinit();
         }
         pub fn push(self: *Queue, item: IngestItem) !void {
@@ -333,7 +335,14 @@ pub const Engine = struct {
                 self.mu.unlock();
             }
             if (self.closed) return error.Closed;
-            try self.buf.append(item);
+            const owned_tags = try self.alloc.dupe(u8, item.tags_json);
+            errdefer self.alloc.free(owned_tags);
+            try self.buf.append(.{
+                .series_id = item.series_id,
+                .ts = item.ts,
+                .value = item.value,
+                .tags_json = owned_tags,
+            });
             self.cv.signal();
         }
         pub fn pop(self: *Queue) ?IngestItem {
@@ -418,6 +427,9 @@ pub const Engine = struct {
         query_compile_series_not_found_total: AtomicU64,
         query_compile_ambiguous_selector_total: AtomicU64,
         query_compile_shadow_mismatch_total: AtomicU64,
+        ingest_rejected_total: AtomicU64,
+        ingest_rejected_mem_limit_total: AtomicU64,
+        cas_shadow_mismatch_total: AtomicU64,
 
         pub fn init() Metrics {
             return .{
@@ -446,6 +458,9 @@ pub const Engine = struct {
                 .query_compile_series_not_found_total = AtomicU64.init(0),
                 .query_compile_ambiguous_selector_total = AtomicU64.init(0),
                 .query_compile_shadow_mismatch_total = AtomicU64.init(0),
+                .ingest_rejected_total = AtomicU64.init(0),
+                .ingest_rejected_mem_limit_total = AtomicU64.init(0),
+                .cas_shadow_mismatch_total = AtomicU64.init(0),
             };
         }
     };
@@ -540,6 +555,15 @@ pub const Engine = struct {
     }
 
     pub fn ingest(self: *Engine, item: IngestItem) !void {
+        if (self.config.mem_limit_bytes != 0) {
+            const queued_bytes = self.queue.len() * @sizeOf(IngestItem);
+            const resident_bytes = self.mem.bytes.load(.monotonic) + queued_bytes;
+            if (resident_bytes >= self.config.mem_limit_bytes) {
+                _ = self.metrics.ingest_rejected_total.fetchAdd(1, .monotonic);
+                _ = self.metrics.ingest_rejected_mem_limit_total.fetchAdd(1, .monotonic);
+                return error.MemoryLimitExceeded;
+            }
+        }
         try self.queue.push(item);
         const len_now = self.queue.len();
         const len_now_u64: u64 = @intCast(len_now);
@@ -560,6 +584,7 @@ pub const Engine = struct {
         var last_pop_ns = std.time.nanoTimestamp();
         while (!self.stop_flag) {
             if (self.queue.pop()) |it| {
+                defer self.alloc.free(it.tags_json);
                 const now_ns = std.time.nanoTimestamp();
                 const wait_delta = now_ns - last_pop_ns;
                 _ = self.metrics.queue_pop_total.fetchAdd(1, .monotonic);
@@ -709,7 +734,10 @@ pub const Engine = struct {
                 var cas_points = std.array_list.Managed(types.Point).init(self.alloc);
                 defer cas_points.deinit();
                 if (try self.metadata.queryRangeFromCas(self.alloc, self.data_dir, series_id, start_ts, end_ts, &cas_points)) {
-                    try verifyPointsMatch(out.items, cas_points.items);
+                    verifyPointsMatch(out.items, cas_points.items) catch {
+                        self.recordCasShadowMismatch();
+                        std.log.warn("cas shadow mismatch: queryRange series_id={d}", .{series_id});
+                    };
                 }
             },
             .primary => {
@@ -734,7 +762,8 @@ pub const Engine = struct {
                     .shadow => blk: {
                         if (self.metadata.resolveBySeriesIdFromCas(series_id)) |cas_resolution| {
                             if (!resolutionsEqual(legacy, cas_resolution)) {
-                                return error.CasShadowMismatch;
+                                self.recordCasShadowMismatch();
+                                std.log.warn("cas shadow mismatch: resolveBySeriesId series_id={d}", .{series_id});
                             }
                         }
                         break :blk legacy;
@@ -749,7 +778,8 @@ pub const Engine = struct {
                     .shadow => blk: {
                         if (self.metadata.resolveUniqueSeriesNameDetailedFromCas(series)) |cas_resolution| {
                             if (!resolutionsEqual(legacy, cas_resolution)) {
-                                return error.CasShadowMismatch;
+                                self.recordCasShadowMismatch();
+                                std.log.warn("cas shadow mismatch: resolveUniqueSeriesName series='{s}'", .{series});
                             }
                         }
                         break :blk legacy;
@@ -764,7 +794,8 @@ pub const Engine = struct {
                     .shadow => blk: {
                         if (try self.metadata.resolveExactSeriesDetailedFromCas(exact.series, exact.tags_json)) |cas_resolution| {
                             if (!resolutionsEqual(legacy, cas_resolution)) {
-                                return error.CasShadowMismatch;
+                                self.recordCasShadowMismatch();
+                                std.log.warn("cas shadow mismatch: resolveExactSeries series='{s}'", .{exact.series});
                             }
                         }
                         break :blk legacy;
@@ -776,10 +807,7 @@ pub const Engine = struct {
     }
 
     pub fn resolveUniqueSeriesName(self: *Engine, series: []const u8) series_catalog_mod.Match {
-        return (self.resolveSelector(.{ .name = series }) catch |err| switch (err) {
-            error.CasShadowMismatch => std.debug.panic("cas shadow mismatch for series selector '{s}'", .{series}),
-            else => return .not_found,
-        }).toMatch();
+        return (self.resolveSelector(.{ .name = series }) catch return .not_found).toMatch();
     }
 
     pub fn resolveExactSeries(self: *Engine, series: []const u8, tags_json: []const u8) !series_catalog_mod.Match {
@@ -835,7 +863,10 @@ pub const Engine = struct {
                 if (try self.metadata.collectMatchingSeriesIdsFromCas(alloc, tags_value, op_and)) |cas_ids| {
                     var cas_ids_mut = cas_ids;
                     defer cas_ids_mut.deinit();
-                    try verifySeriesIdsMatch(legacy.items, cas_ids_mut.items);
+                    verifySeriesIdsMatch(legacy.items, cas_ids_mut.items) catch {
+                        self.recordCasShadowMismatch();
+                        std.log.warn("cas shadow mismatch: collectMatchingSeriesIds", .{});
+                    };
                 }
                 return legacy;
             },
@@ -877,6 +908,55 @@ pub const Engine = struct {
             return try cas.verifyHeadMatchesLegacy(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog);
         }
         return error.CasDisabled;
+    }
+
+    pub fn flushNow(self: *Engine) !bool {
+        try pauseWriterForMaintenance(self);
+        errdefer resumeWriterAfterMaintenance(self) catch |err| {
+            std.log.err("failed to resume writer after flushNow: {s}", .{@errorName(err)});
+        };
+
+        const flushed = try flushMemtable(self);
+        if (flushed) try self.syncCasSnapshot("manual-flush");
+        try self.wal.file.sync();
+        try resumeWriterAfterMaintenance(self);
+        return flushed;
+    }
+
+    pub fn waitForDrained(self: *Engine, timeout_ms: u64) WaitError!void {
+        const deadline: i64 = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+        while (std.time.milliTimestamp() < deadline) {
+            if (self.queue.len() == 0 and self.mem.bytes.load(.monotonic) == 0) {
+                if (self.cas != null) {
+                    self.verifyCasState() catch {
+                        sleepMs(10);
+                        continue;
+                    };
+                }
+                return;
+            }
+            sleepMs(10);
+        }
+        return WaitError.Timeout;
+    }
+
+    pub fn waitForQueryablePoints(
+        self: *Engine,
+        allocator: std.mem.Allocator,
+        series_id: types.SeriesId,
+        expected_count: usize,
+        timeout_ms: u64,
+    ) !void {
+        const deadline_ns = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ms)) * std.time.ns_per_ms;
+        while (std.time.nanoTimestamp() <= deadline_ns) {
+            var points = std.array_list.Managed(types.Point).init(allocator);
+            defer points.deinit();
+
+            try self.queryRange(series_id, std.math.minInt(i64), std.math.maxInt(i64), &points);
+            if (points.items.len >= expected_count) return;
+            std.Thread.sleep(5 * std.time.ns_per_ms);
+        }
+        return WaitError.Timeout;
     }
 
     pub fn compactNow(self: *Engine) !bool {
@@ -926,6 +1006,10 @@ pub const Engine = struct {
             const ref_name = try cas.createCheckpoint(prefix) orelse return;
             self.alloc.free(ref_name);
         }
+    }
+
+    fn recordCasShadowMismatch(self: *Engine) void {
+        _ = self.metrics.cas_shadow_mismatch_total.fetchAdd(1, .monotonic);
     }
 
     fn recover(self: *Engine) !void {
@@ -1621,6 +1705,7 @@ fn appendRebuildEntry(
 }
 
 const waitError = error{Timeout};
+pub const WaitError = waitError;
 
 fn waitForFlush(engine: *Engine, expected_entries: usize, timeout_ms: u64) waitError!void {
     const deadline: i64 = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));

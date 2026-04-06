@@ -16,12 +16,11 @@ pub fn run(handle: *alloc_mod.AllocatorHandle) !void {
     defer std.process.argsFree(alloc, args);
     if (args.len <= 1 or std.mem.eql(u8, args[1], "serve")) {
         var cfg = try loadConfigOrDefault(alloc);
-        defer cfg.deinit(alloc);
-        var eng = try engine_mod.Engine.init(alloc, cfg);
+        var eng = try initOwnedEngine(alloc, &cfg);
         defer eng.deinit();
         try catalog.bootstrap(alloc);
-        std.debug.print("sydradb serve :{d}\n", .{cfg.http_port});
-        try http.runHttp(handle, eng, cfg.http_port);
+        std.debug.print("sydradb serve :{d}\n", .{eng.config.http_port});
+        try http.runHttp(handle, eng, eng.config.http_port);
         return;
     }
 
@@ -38,6 +37,13 @@ pub fn run(handle: *alloc_mod.AllocatorHandle) !void {
 
 fn loadConfigOrDefault(alloc: std.mem.Allocator) !config.Config {
     return loadConfigOrDefaultForPaths(alloc, "sydradb.toml", "./data");
+}
+
+fn initOwnedEngine(alloc: std.mem.Allocator, cfg_ptr: *config.Config) !*engine_mod.Engine {
+    errdefer cfg_ptr.deinit(alloc);
+    const engine = try engine_mod.Engine.init(alloc, cfg_ptr.*);
+    cfg_ptr.* = undefined;
+    return engine;
 }
 
 fn loadConfigOrDefaultForPaths(
@@ -68,9 +74,7 @@ fn loadConfigOrDefaultForPaths(
 
 fn cmdPgWire(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     var cfg = try loadConfigOrDefault(alloc);
-    defer cfg.deinit(alloc);
-
-    var eng = try engine_mod.Engine.init(alloc, cfg);
+    var eng = try initOwnedEngine(alloc, &cfg);
     defer eng.deinit();
 
     try catalog.bootstrap(alloc);
@@ -100,8 +104,7 @@ fn cmdPgWire(alloc: std.mem.Allocator, args: [][:0]u8) !void {
 
 fn cmdIngest(alloc: std.mem.Allocator, _: [][:0]u8) !void {
     var cfg = try loadConfigOrDefault(alloc);
-    defer cfg.deinit(alloc);
-    var eng = try engine_mod.Engine.init(alloc, cfg);
+    var eng = try initOwnedEngine(alloc, &cfg);
     defer eng.deinit();
     // Read NDJSON from stdin
     var stdin_file = std.fs.File.stdin();
@@ -116,29 +119,29 @@ fn cmdIngest(alloc: std.mem.Allocator, _: [][:0]u8) !void {
             else => return err,
         };
         const slice = maybe_slice orelse break;
-        const trimmed = std.mem.trim(u8, slice, " \t\r\n");
-        if (trimmed.len == 0) continue;
-        const line = try alloc.dupe(u8, trimmed);
-        defer alloc.free(line);
-        var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch continue;
-        defer parsed.deinit();
-        const obj = parsed.value.object;
-        const series = obj.get("series").?.string;
-        const ts: i64 = @intCast(obj.get("ts").?.integer);
-        const value = obj.get("value").?.float;
-        const sid = @import("types.zig").hash64(series);
-        try eng.registerSeries(series, "{}", sid);
-        try eng.ingest(.{ .series_id = sid, .ts = ts, .value = value, .tags_json = "{}" });
+        const parsed = http.parseIngestLine(alloc, slice) catch |err| switch (err) {
+            error.EmptyLine,
+            error.InvalidRecord,
+            error.MissingSeries,
+            error.MissingTimestamp,
+            error.InvalidSeries,
+            error.InvalidTimestamp,
+            => continue,
+            else => return err,
+        };
+        defer parsed.deinit(alloc);
+        _ = try http.applyIngestLine(eng, parsed);
         count += 1;
     }
+    _ = try eng.flushNow();
+    try eng.waitForDrained(1_000);
     std.debug.print("ingested {d} points\n", .{count});
 }
 
 fn cmdQuery(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     if (args.len < 5) return error.Invalid;
     var cfg = try loadConfigOrDefault(alloc);
-    defer cfg.deinit(alloc);
-    var eng = try engine_mod.Engine.init(alloc, cfg);
+    var eng = try initOwnedEngine(alloc, &cfg);
     defer eng.deinit();
     const sid = try std.fmt.parseInt(u64, args[2], 10);
     const start_ts = try std.fmt.parseInt(i64, args[3], 10);
@@ -151,8 +154,7 @@ fn cmdQuery(alloc: std.mem.Allocator, args: [][:0]u8) !void {
 
 fn cmdCompact(alloc: std.mem.Allocator, _: [][:0]u8) !void {
     var cfg = try loadConfigOrDefault(alloc);
-    defer cfg.deinit(alloc);
-    var eng = try engine_mod.Engine.init(alloc, cfg);
+    var eng = try initOwnedEngine(alloc, &cfg);
     defer eng.deinit();
     _ = try eng.compactNow();
 }
@@ -213,8 +215,7 @@ fn cmdStats(handle: *alloc_mod.AllocatorHandle, alloc: std.mem.Allocator, _: [][
 fn cmdSnapshot(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     if (args.len < 3) return error.Invalid;
     var cfg = try loadConfigOrDefault(alloc);
-    defer cfg.deinit(alloc);
-    var eng = try engine_mod.Engine.init(alloc, cfg);
+    var eng = try initOwnedEngine(alloc, &cfg);
     defer eng.deinit();
     try eng.snapshotTo(args[2]);
 }

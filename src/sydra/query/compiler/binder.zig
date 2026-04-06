@@ -39,7 +39,7 @@ pub fn bindSelector(
     return switch (selector.?.series) {
         .by_id => |by_id| {
             const resolution = engine.resolveSelector(.{ .by_id = @intCast(by_id.value) }) catch |err| switch (err) {
-                error.CasShadowMismatch => return error.ShadowMismatch,
+                error.OutOfMemory => return error.OutOfMemory,
                 else => unreachable,
             };
             return .{
@@ -56,7 +56,7 @@ pub fn bindSelector(
         },
         .name => |ident| {
             const resolution = engine.resolveSelector(.{ .name = ident.value }) catch |err| switch (err) {
-                error.CasShadowMismatch => return error.ShadowMismatch,
+                error.OutOfMemory => return error.OutOfMemory,
                 else => unreachable,
             };
             return switch (resolution.status) {

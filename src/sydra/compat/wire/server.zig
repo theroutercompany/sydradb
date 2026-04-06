@@ -1832,14 +1832,5 @@ fn waitForQueryablePoints(
     expected_count: usize,
     timeout_ms: u64,
 ) !void {
-    const deadline_ns = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ms)) * std.time.ns_per_ms;
-    while (std.time.nanoTimestamp() <= deadline_ns) {
-        var points = std.array_list.Managed(@import("../../types.zig").Point).init(allocator);
-        defer points.deinit();
-
-        try engine.queryRange(series_id, std.math.minInt(i64), std.math.maxInt(i64), &points);
-        if (points.items.len >= expected_count) return;
-        std.Thread.sleep(5 * std.time.ns_per_ms);
-    }
-    return error.NotImplemented;
+    return engine.waitForQueryablePoints(allocator, series_id, expected_count, timeout_ms);
 }

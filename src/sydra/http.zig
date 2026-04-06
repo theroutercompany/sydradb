@@ -75,11 +75,11 @@ fn handleRequest(handle: *alloc_mod.AllocatorHandle, alloc: std.mem.Allocator, e
         const maybe_auth = findHeader(req, "authorization");
         if (maybe_auth) |auth| {
             if (!(std.mem.startsWith(u8, auth, "Bearer ") and std.mem.eql(u8, auth[7..], eng.config.auth_token))) {
-                try req.respond("unauthorized", .{ .status = .unauthorized, .keep_alive = false });
+                try respondJsonError(alloc, req, .unauthorized, "unauthorized", "unauthorized");
                 return;
             }
         } else {
-            try req.respond("unauthorized", .{ .status = .unauthorized, .keep_alive = false });
+            try respondJsonError(alloc, req, .unauthorized, "unauthorized", "unauthorized");
             return;
         }
     }
@@ -113,6 +113,11 @@ fn handleRequest(handle: *alloc_mod.AllocatorHandle, alloc: std.mem.Allocator, e
     }
     if (std.mem.eql(u8, path, "/api/v1/sydraql") and method == .POST) {
         return try handleSydraql(alloc, eng, req);
+    }
+
+    if (std.mem.startsWith(u8, path, "/api/")) {
+        try respondJsonError(alloc, req, .not_found, "not_found", "not found");
+        return;
     }
 
     try req.respond("not found", .{ .status = .not_found });
@@ -218,10 +223,10 @@ fn handleSydraql(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     var body_buf: [1024]u8 = undefined;
     const body_reader = req.readerExpectNone(&body_buf);
     const content_len = req.head.content_length orelse {
-        return respondJsonError(alloc, req, .length_required, "length required");
+        return respondJsonError(alloc, req, .length_required, "length_required", "length required");
     };
     if (content_len > 256 * 1024) {
-        return respondJsonError(alloc, req, .payload_too_large, "payload too large");
+        return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large");
     }
 
     const len: usize = @intCast(content_len);
@@ -231,7 +236,7 @@ fn handleSydraql(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
 
     const sydraql = std.mem.trim(u8, body, " \t\r\n");
     if (sydraql.len == 0) {
-        return respondJsonError(alloc, req, .bad_request, "query required");
+        return respondJsonError(alloc, req, .bad_request, "query_required", "query required");
     }
 
     const start_time = std.time.microTimestamp();
@@ -295,28 +300,79 @@ fn handleSydraql(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
 }
 
 fn respondExecutionError(alloc: std.mem.Allocator, req: *std.http.Server.Request, err: query_exec.ExecuteError) !void {
-    const status: std.http.Status = switch (err) {
-        error.OutOfMemory => .internal_server_error,
+    const contract: struct {
+        status: std.http.Status,
+        code: []const u8,
+        message: []const u8,
+    } = switch (err) {
+        error.OutOfMemory => .{
+            .status = .internal_server_error,
+            .code = "out_of_memory",
+            .message = "out of memory",
+        },
+        error.ValidationFailed => .{
+            .status = .bad_request,
+            .code = "validation_failed",
+            .message = "validation failed",
+        },
         error.UnsupportedPlan,
         error.UnsupportedExpression,
         error.UnsupportedAggregate,
-        error.ValidationFailed,
-        => .bad_request,
-        else => .bad_request,
+        error.UnsupportedStatement,
+        error.UnsupportedFill,
+        error.UnsupportedTagFilter,
+        error.UnsupportedGrouping,
+        error.UnsupportedProjection,
+        error.UnsupportedOrdering,
+        error.UnsupportedPredicate,
+        error.UnsupportedFunction,
+        => .{
+            .status = .bad_request,
+            .code = "unsupported_query_shape",
+            .message = @errorName(err),
+        },
+        error.ShadowMismatch,
+        error.CasShadowMismatch,
+        => .{
+            .status = .service_unavailable,
+            .code = "shadow_mismatch",
+            .message = @errorName(err),
+        },
+        else => .{
+            .status = .bad_request,
+            .code = "execution_error",
+            .message = @errorName(err),
+        },
     };
-    return respondJsonError(alloc, req, status, @errorName(err));
+    return respondJsonError(alloc, req, contract.status, contract.code, contract.message);
 }
 
 fn respondJsonError(
     alloc: std.mem.Allocator,
     req: *std.http.Server.Request,
     status: std.http.Status,
+    code: []const u8,
     message: []const u8,
 ) !void {
-    const payload = try std.fmt.allocPrint(alloc, "{{\"error\":\"{s}\"}}", .{message});
-    defer alloc.free(payload);
+    var payload = std.array_list.Managed(u8).init(alloc);
+    defer payload.deinit();
+    var writer = payload.writer();
+    var tmp: [128]u8 = undefined;
+    var adapter = writer.adaptToNewApi(&tmp);
+    var iface = &adapter.new_interface;
+    var jw = std.json.Stringify{ .writer = iface };
+    try jw.beginObject();
+    try jw.objectField("error");
+    try jw.write(message);
+    try jw.objectField("code");
+    try jw.write(code);
+    try jw.objectField("status");
+    try jw.write(@intFromEnum(status));
+    try jw.endObject();
+    try iface.flush();
+    if (adapter.err) |write_err| return write_err;
     const headers = [_]std.http.Header{.{ .name = "Content-Type", .value = "application/json" }};
-    try req.respond(payload, .{ .status = status, .keep_alive = false, .extra_headers = &headers });
+    try req.respond(payload.items, .{ .status = status, .keep_alive = false, .extra_headers = &headers });
 }
 
 fn writeJsonValue(jw: *std.json.Stringify, value: query_value.Value) !void {
@@ -462,6 +518,8 @@ test "writeStatsObject emits operator metrics" {
 
 fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
     const ingest_total = eng.metrics.ingest_total.load(.monotonic);
+    const ingest_rejected_total = eng.metrics.ingest_rejected_total.load(.monotonic);
+    const ingest_rejected_mem_limit_total = eng.metrics.ingest_rejected_mem_limit_total.load(.monotonic);
     const flush_total = eng.metrics.flush_total.load(.monotonic);
     const flush_ns_total = eng.metrics.flush_ns_total.load(.monotonic);
     const flush_points_total = eng.metrics.flush_points_total.load(.monotonic);
@@ -473,6 +531,7 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     const query_compile_series_not_found_total = eng.metrics.query_compile_series_not_found_total.load(.monotonic);
     const query_compile_ambiguous_selector_total = eng.metrics.query_compile_ambiguous_selector_total.load(.monotonic);
     const query_compile_shadow_mismatch_total = eng.metrics.query_compile_shadow_mismatch_total.load(.monotonic);
+    const cas_shadow_mismatch_total = eng.metrics.cas_shadow_mismatch_total.load(.monotonic);
     const queue_depth = eng.queue.len();
     const memtable_bytes = eng.mem.bytes.load(.monotonic);
     const flush_seconds_total = @as(f64, @floatFromInt(flush_ns_total)) / 1_000_000_000.0;
@@ -483,6 +542,8 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
 
     try writer.writeAll("# HELP sydradb_up 1 if server is up\n# TYPE sydradb_up gauge\nsydradb_up 1\n");
     try writer.print("# HELP sydradb_ingest_total Total ingested points since start\n# TYPE sydradb_ingest_total counter\nsydradb_ingest_total {d}\n", .{ingest_total});
+    try writer.print("# HELP sydradb_ingest_rejected_total Total ingest requests rejected before queueing\n# TYPE sydradb_ingest_rejected_total counter\nsydradb_ingest_rejected_total {d}\n", .{ingest_rejected_total});
+    try writer.print("# HELP sydradb_ingest_rejected_mem_limit_total Total ingest requests rejected due to mem_limit_bytes\n# TYPE sydradb_ingest_rejected_mem_limit_total counter\nsydradb_ingest_rejected_mem_limit_total {d}\n", .{ingest_rejected_mem_limit_total});
     try writer.print("# HELP sydradb_flush_total Total flush operations\n# TYPE sydradb_flush_total counter\nsydradb_flush_total {d}\n", .{flush_total});
     try writer.print("# HELP sydradb_flush_seconds_total Aggregate flush duration in seconds\n# TYPE sydradb_flush_seconds_total counter\nsydradb_flush_seconds_total {d:.6}\n", .{flush_seconds_total});
     try writer.print("# HELP sydradb_flush_points_total Total points flushed to disk\n# TYPE sydradb_flush_points_total counter\nsydradb_flush_points_total {d}\n", .{flush_points_total});
@@ -494,6 +555,7 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     try writer.print("# HELP sydradb_query_compile_series_not_found_total Total query compiler fallbacks caused by unresolved selectors\n# TYPE sydradb_query_compile_series_not_found_total counter\nsydradb_query_compile_series_not_found_total {d}\n", .{query_compile_series_not_found_total});
     try writer.print("# HELP sydradb_query_compile_ambiguous_selector_total Total query compiler fallbacks caused by ambiguous selectors\n# TYPE sydradb_query_compile_ambiguous_selector_total counter\nsydradb_query_compile_ambiguous_selector_total {d}\n", .{query_compile_ambiguous_selector_total});
     try writer.print("# HELP sydradb_query_compile_shadow_mismatch_total Total query compiler fallbacks caused by shadow mismatches\n# TYPE sydradb_query_compile_shadow_mismatch_total counter\nsydradb_query_compile_shadow_mismatch_total {d}\n", .{query_compile_shadow_mismatch_total});
+    try writer.print("# HELP sydradb_cas_shadow_mismatch_total Total CAS shadow mismatches observed in runtime verification paths\n# TYPE sydradb_cas_shadow_mismatch_total counter\nsydradb_cas_shadow_mismatch_total {d}\n", .{cas_shadow_mismatch_total});
     try writer.print("# HELP sydradb_queue_depth Current ingest queue depth\n# TYPE sydradb_queue_depth gauge\nsydradb_queue_depth {d}\n", .{queue_depth});
     try writer.print("# HELP sydradb_memtable_bytes Current memtable size in bytes\n# TYPE sydradb_memtable_bytes gauge\nsydradb_memtable_bytes {d}\n", .{memtable_bytes});
 
@@ -654,10 +716,62 @@ fn handleStatus(req: *std.http.Server.Request) !void {
 
 const default_tags_json = "{}";
 
+pub const ParsedIngestLine = struct {
+    series: []u8,
+    ts: i64,
+    value: f64,
+    tags_json: []u8,
+
+    pub fn deinit(self: ParsedIngestLine, alloc: std.mem.Allocator) void {
+        alloc.free(self.series);
+        alloc.free(self.tags_json);
+    }
+};
+
 const TagsJson = struct {
     value: []const u8,
     owned: ?[]u8 = null,
 };
+
+pub fn parseIngestLine(alloc: std.mem.Allocator, raw_line: []const u8) !ParsedIngestLine {
+    const trimmed = std.mem.trim(u8, raw_line, " \t\r\n");
+    if (trimmed.len == 0) return error.EmptyLine;
+
+    const line = try alloc.dupe(u8, trimmed);
+    defer alloc.free(line);
+
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch return error.InvalidRecord;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRecord;
+
+    const obj = parsed.value.object;
+    const series_value = obj.get("series") orelse return error.MissingSeries;
+    if (series_value != .string) return error.InvalidSeries;
+
+    const ts_value = obj.get("ts") orelse return error.MissingTimestamp;
+    if (ts_value != .integer) return error.InvalidTimestamp;
+
+    const tags = try extractTagsJson(alloc, obj.get("tags"));
+    return .{
+        .series = try alloc.dupe(u8, series_value.string),
+        .ts = @intCast(ts_value.integer),
+        .value = firstNumericValue(obj),
+        .tags_json = if (tags.owned) |owned| owned else try alloc.dupe(u8, default_tags_json),
+    };
+}
+
+pub fn applyIngestLine(eng: *Engine, parsed: ParsedIngestLine) !types.SeriesId {
+    const sid = types.seriesIdFrom(parsed.series, parsed.tags_json);
+    try eng.registerSeries(parsed.series, parsed.tags_json, sid);
+    try eng.ingest(.{
+        .series_id = sid,
+        .ts = parsed.ts,
+        .value = parsed.value,
+        .tags_json = parsed.tags_json,
+    });
+    eng.noteTags(sid, parsed.tags_json);
+    return sid;
+}
 
 fn extractTagsJson(alloc: std.mem.Allocator, maybe_value: ?std.json.Value) !TagsJson {
     if (maybe_value) |val| {
@@ -679,6 +793,31 @@ fn extractTagsJson(alloc: std.mem.Allocator, maybe_value: ?std.json.Value) !Tags
     return .{ .value = default_tags_json };
 }
 
+fn firstNumericValue(obj: std.json.ObjectMap) f64 {
+    if (obj.get("value")) |value| {
+        return switch (value) {
+            .float => value.float,
+            .integer => @floatFromInt(value.integer),
+            else => 0,
+        };
+    }
+
+    if (obj.get("fields")) |fields_value| {
+        if (fields_value == .object) {
+            var it = fields_value.object.iterator();
+            while (it.next()) |entry| {
+                switch (entry.value_ptr.*) {
+                    .float => return entry.value_ptr.float,
+                    .integer => return @floatFromInt(entry.value_ptr.integer),
+                    else => {},
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
 fn collectMatchingSeriesIds(
     alloc: std.mem.Allocator,
     eng: *Engine,
@@ -696,47 +835,30 @@ fn handleIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Re
     while (true) {
         const slice = body_reader.*.takeDelimiterExclusive('\n') catch |err| switch (err) {
             error.StreamTooLong => {
-                _ = req.respond("line too long", .{ .status = .payload_too_large, .keep_alive = false }) catch {};
+                _ = respondJsonError(alloc, req, .payload_too_large, "line_too_long", "line too long") catch {};
                 return;
             },
             error.EndOfStream => break,
             else => return err,
         };
-        const trimmed = std.mem.trim(u8, slice, " \t\r\n");
-        if (trimmed.len == 0) continue;
-
-        const line = try alloc.dupe(u8, trimmed);
-        if (line.len == 0) continue;
-        defer alloc.free(line);
-
-        var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch continue;
-        defer parsed.deinit();
-        const obj = parsed.value.object;
-        const series = obj.get("series").?.string;
-        const ts: i64 = @intCast(obj.get("ts").?.integer);
-        const value: f64 = if (obj.get("value")) |v| switch (v) {
-            .float => v.float,
-            .integer => @floatFromInt(v.integer),
-            else => 0,
-        } else blk: {
-            if (obj.get("fields")) |fields_val| {
-                if (fields_val == .object) {
-                    var it = fields_val.object.iterator();
-                    while (it.next()) |e| switch (e.value_ptr.*) {
-                        .float => break :blk e.value_ptr.float,
-                        .integer => break :blk @floatFromInt(e.value_ptr.integer),
-                        else => {},
-                    };
-                }
-            }
-            break :blk 0;
+        const parsed = parseIngestLine(alloc, slice) catch |err| switch (err) {
+            error.EmptyLine,
+            error.InvalidRecord,
+            error.MissingSeries,
+            error.MissingTimestamp,
+            error.InvalidSeries,
+            error.InvalidTimestamp,
+            => continue,
+            else => return err,
         };
-        const tags = try extractTagsJson(alloc, obj.get("tags"));
-        defer if (tags.owned) |buf| alloc.free(buf);
-        const sid = types.seriesIdFrom(series, tags.value);
-        try eng.registerSeries(series, tags.value, sid);
-        try eng.ingest(.{ .series_id = sid, .ts = ts, .value = value, .tags_json = try alloc.dupe(u8, tags.value) });
-        eng.noteTags(sid, tags.value);
+        defer parsed.deinit(alloc);
+
+        _ = applyIngestLine(eng, parsed) catch |err| switch (err) {
+            error.MemoryLimitExceeded => {
+                return respondJsonError(alloc, req, .service_unavailable, "ingest_backpressure", "ingest backpressure: memory limit exceeded");
+            },
+            else => return err,
+        };
         count += 1;
     }
 
@@ -746,23 +868,44 @@ fn handleIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Re
     try req.respond(body, .{ .extra_headers = &headers });
 }
 
+test "parseIngestLine mirrors HTTP numeric and tags behavior" {
+    const alloc = std.testing.allocator;
+    const parsed = try parseIngestLine(alloc, "{\"series\":\"weather.room1\",\"ts\":10,\"fields\":{\"reading\":24,\"ignored\":\"x\"},\"tags\":{\"rack\":\"r1\",\"host\":\"web\"}}");
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqualStrings("weather.room1", parsed.series);
+    try std.testing.expectEqual(@as(i64, 10), parsed.ts);
+    try std.testing.expectApproxEqAbs(@as(f64, 24), parsed.value, 1e-9);
+    try std.testing.expectEqualStrings("{\"rack\":\"r1\",\"host\":\"web\"}", parsed.tags_json);
+}
+
+test "parseIngestLine accepts explicit integer values" {
+    const alloc = std.testing.allocator;
+    const parsed = try parseIngestLine(alloc, "{\"series\":\"weather.room1\",\"ts\":20,\"value\":3}");
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqual(@as(i64, 20), parsed.ts);
+    try std.testing.expectApproxEqAbs(@as(f64, 3), parsed.value, 1e-9);
+    try std.testing.expectEqualStrings("{}", parsed.tags_json);
+}
+
 fn handleQuery(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
     var body_buf: [1024]u8 = undefined;
     const body_reader = req.readerExpectNone(&body_buf);
     const content_len = req.head.content_length orelse {
-        try req.respond("length required", .{ .status = .length_required, .keep_alive = false });
-        return;
+        return respondJsonError(alloc, req, .length_required, "length_required", "length required");
     };
     if (content_len > 1024 * 64) {
-        try req.respond("payload too large", .{ .status = .payload_too_large, .keep_alive = false });
-        return;
+        return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large");
     }
     const alloc_len: usize = @intCast(content_len);
     const body_slice = try body_reader.*.take(alloc_len);
     const body = try alloc.dupe(u8, body_slice);
     defer alloc.free(body);
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch {
+        return respondJsonError(alloc, req, .bad_request, "invalid_json", "invalid json");
+    };
     defer parsed.deinit();
     const obj = parsed.value.object;
     const tags_value = obj.get("tags");
@@ -779,12 +922,10 @@ fn handleQuery(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Req
         series_id = types.seriesIdFrom(v.string, tags.value);
     }
     const start_val = obj.get("start") orelse {
-        try req.respond("missing start", .{ .status = .bad_request, .keep_alive = false });
-        return;
+        return respondJsonError(alloc, req, .bad_request, "missing_start", "missing start");
     };
     const end_val = obj.get("end") orelse {
-        try req.respond("missing end", .{ .status = .bad_request, .keep_alive = false });
-        return;
+        return respondJsonError(alloc, req, .bad_request, "missing_end", "missing end");
     };
     const start_ts: i64 = @intCast(start_val.integer);
     const end_ts: i64 = @intCast(end_val.integer);
@@ -792,16 +933,14 @@ fn handleQuery(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Req
         if (tags_value) |tag_selector| {
             return queryByTagsAndRespond(alloc, eng, req, tag_selector, op_and, start_ts, end_ts);
         }
-        try req.respond("missing series identifier", .{ .status = .bad_request, .keep_alive = false });
-        return;
+        return respondJsonError(alloc, req, .bad_request, "missing_series_identifier", "missing series identifier");
     };
     try queryAndRespond(alloc, eng, req, sid, start_ts, end_ts);
 }
 
 fn handleQueryGet(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request, query: []const u8) !void {
     if (query.len == 0) {
-        try req.respond("missing query parameters", .{ .status = .bad_request, .keep_alive = false });
-        return;
+        return respondJsonError(alloc, req, .bad_request, "missing_query_parameters", "missing query parameters");
     }
     var series_opt: ?[]const u8 = null;
     var series_id_opt: ?types.SeriesId = null;
@@ -816,8 +955,7 @@ fn handleQueryGet(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.
         const value = pair[eq + 1 ..];
         if (std.mem.eql(u8, key, "series_id")) {
             series_id_opt = std.fmt.parseInt(types.SeriesId, value, 10) catch {
-                try req.respond("invalid series_id", .{ .status = .bad_request, .keep_alive = false });
-                return;
+                return respondJsonError(alloc, req, .bad_request, "invalid_series_id", "invalid series_id");
             };
         } else if (std.mem.eql(u8, key, "series")) {
             series_opt = value;
@@ -830,16 +968,13 @@ fn handleQueryGet(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.
         }
     }
     const sid = series_id_opt orelse (if (series_opt) |name| types.seriesIdFrom(name, tags_opt orelse default_tags_json) else null) orelse {
-        try req.respond("missing series or series_id", .{ .status = .bad_request, .keep_alive = false });
-        return;
+        return respondJsonError(alloc, req, .bad_request, "missing_series", "missing series or series_id");
     };
     const start_ts = start_opt orelse {
-        try req.respond("missing start", .{ .status = .bad_request, .keep_alive = false });
-        return;
+        return respondJsonError(alloc, req, .bad_request, "missing_start", "missing start");
     };
     const end_ts = end_opt orelse {
-        try req.respond("missing end", .{ .status = .bad_request, .keep_alive = false });
-        return;
+        return respondJsonError(alloc, req, .bad_request, "missing_end", "missing end");
     };
     try queryAndRespond(alloc, eng, req, sid, start_ts, end_ts);
 }
@@ -919,19 +1054,19 @@ fn handleFind(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Requ
     var body_buf: [1024]u8 = undefined;
     const body_reader = req.readerExpectNone(&body_buf);
     const content_len = req.head.content_length orelse {
-        try req.respond("length required", .{ .status = .length_required, .keep_alive = false });
-        return;
+        return respondJsonError(alloc, req, .length_required, "length_required", "length required");
     };
     if (content_len > 64 * 1024) {
-        try req.respond("payload too large", .{ .status = .payload_too_large, .keep_alive = false });
-        return;
+        return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large");
     }
     const alloc_len: usize = @intCast(content_len);
     const body_slice = try body_reader.*.take(alloc_len);
     const body = try alloc.dupe(u8, body_slice);
     defer alloc.free(body);
 
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch {
+        return respondJsonError(alloc, req, .bad_request, "invalid_json", "invalid json");
+    };
     defer parsed.deinit();
     const obj = parsed.value.object;
     var op_and = true;
