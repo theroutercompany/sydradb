@@ -66,6 +66,19 @@ Notes
 
 - The flake integrates `mitchellh/zig-overlay` and pins Zig `0.15.1`.
 - To (re)pin: `nix flake lock --update-input nixpkgs --update-input zig-overlay` then commit the updated `flake.lock`.
+- For a one-shot command that always uses the pinned Zig, use `./scripts/zigw ...`.
+
+### macOS note
+
+On macOS, the global `zig` on your `PATH` may fail to link Zig's generated build runner even when Xcode is installed. If that happens, use the repo-pinned toolchain instead of the global one:
+
+```bash
+# one-shot build with the pinned Zig from the flake
+./scripts/zigw build -Doptimize=ReleaseSafe
+
+# or enter the shell explicitly
+nix develop -c zig build -Doptimize=ReleaseSafe
+```
 
 ## Direnv (auto-activate dev shell)
 
