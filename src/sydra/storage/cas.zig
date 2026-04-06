@@ -4581,9 +4581,7 @@ pub fn applyBundle(alloc: std.mem.Allocator, bundle_path: []const u8, dst_path: 
         dest.repository_id = manifest.repository_id;
         try writeRepositoryId(dest.store.root, dest.repository_id, dest.store.fsync);
     }
-    if (manifest.borrowed_repo_paths.len != 0) {
-        try dest.store.configureAlternates(alloc, manifest.borrowed_repo_paths);
-    }
+    try dest.store.configureAlternates(alloc, manifest.borrowed_repo_paths);
 
     if (manifest.reftable_files.len == 0 and manifest.loose_ref_files.len == 0 and manifest.refs.len > 0) {
         var updates = try alloc.alloc(RefTxnUpdate, manifest.refs.len);
@@ -10080,6 +10078,128 @@ test "bundle create, verify, and apply round-trip the CAS head" {
     defer manifest_view.deinit(talloc);
     try std.testing.expectEqual(@as(u16, 4), manifest_view.format_version);
     try std.testing.expect(manifest_view.pack_digests.len > 0);
+}
+
+test "bundle apply preserves symbolic HEAD target and borrowed repositories" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const donor_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/bundle-donor", .{tmp.sub_path});
+    defer talloc.free(donor_path);
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/bundle-head-data", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    const bundle_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/bundle-head-out", .{tmp.sub_path});
+    defer talloc.free(bundle_path);
+    const restore_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/bundle-head-restore", .{tmp.sub_path});
+    defer talloc.free(restore_path);
+    try std.fs.cwd().makePath(donor_path);
+    try std.fs.cwd().makePath(data_path);
+
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
+    defer series_catalog.deinit();
+
+    const sid = types.hash64("bundle.head.series");
+    _ = try series_catalog.register("bundle.head.series", "{}", sid);
+    const points = [_]types.Point{.{ .ts = 1_000, .value = 8.0 }};
+    const seg_path = try segment_mod.writeSegment(talloc, data_dir, sid, 0, points[0..]);
+    defer talloc.free(seg_path);
+    try manifest.add(data_dir, sid, 0, 1_000, 1_000, 1, seg_path);
+
+    var source = try CasManager.init(talloc, data_path, .none);
+    defer source.deinit();
+    const source_head = try source.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    const feature_ref = "heads/feature";
+    try source.refs.updateHeadAtomic(feature_ref, source_head);
+    try source.writeHeadSymRef(feature_ref);
+    try source.store.configureAlternates(talloc, &[_][]const u8{donor_path});
+    _ = try source.pack();
+
+    const created = try createBundle(talloc, data_path, bundle_path, .none, null);
+    try std.testing.expect(created.object_count > 0);
+
+    var manifest_view = try readBundleManifest(talloc, bundle_path);
+    defer manifest_view.deinit(talloc);
+    try std.testing.expectEqual(@as(usize, 1), manifest_view.borrowed_repo_paths.len);
+    try std.testing.expectEqualStrings(donor_path, manifest_view.borrowed_repo_paths[0]);
+    try std.testing.expect(manifest_view.symref_files.len > 0);
+
+    _ = try applyBundle(talloc, bundle_path, restore_path, .none);
+
+    var restored = try CasManager.init(talloc, restore_path, .none);
+    defer restored.deinit();
+    const restored_head_target = try restored.readHeadSymRef() orelse return error.MissingCasHead;
+    defer talloc.free(restored_head_target);
+    try std.testing.expectEqualStrings(feature_ref, restored_head_target);
+    try std.testing.expectEqual(@as(usize, 1), restored.store.alternates.repo_paths.len);
+    try std.testing.expectEqualStrings(donor_path, restored.store.alternates.repo_paths[0]);
+    const restored_feature = try restored.refs.readHead(feature_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(restored_feature.eql(source_head));
+    try std.testing.expect(try restored.store.hasLocalObject(talloc, source_head));
+}
+
+test "bundle apply clears stale borrowed repositories when manifest has none" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const stale_alt_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/bundle-stale-alt", .{tmp.sub_path});
+    defer talloc.free(stale_alt_path);
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/bundle-clean-data", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    const bundle_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/bundle-clean-out", .{tmp.sub_path});
+    defer talloc.free(bundle_path);
+    const restore_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/bundle-clean-restore", .{tmp.sub_path});
+    defer talloc.free(restore_path);
+    try std.fs.cwd().makePath(stale_alt_path);
+    try std.fs.cwd().makePath(data_path);
+    try std.fs.cwd().makePath(restore_path);
+
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
+    defer series_catalog.deinit();
+
+    const sid = types.hash64("bundle.clean.series");
+    _ = try series_catalog.register("bundle.clean.series", "{}", sid);
+    const points = [_]types.Point{.{ .ts = 1_000, .value = 3.5 }};
+    const seg_path = try segment_mod.writeSegment(talloc, data_dir, sid, 0, points[0..]);
+    defer talloc.free(seg_path);
+    try manifest.add(data_dir, sid, 0, 1_000, 1_000, 1, seg_path);
+
+    var source = try CasManager.init(talloc, data_path, .none);
+    defer source.deinit();
+    const source_head = try source.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+
+    const created = try createBundle(talloc, data_path, bundle_path, .none, null);
+    try std.testing.expect(created.object_count > 0);
+
+    {
+        var stale_dest = try CasManager.init(talloc, restore_path, .none);
+        defer stale_dest.deinit();
+        try stale_dest.store.configureAlternates(talloc, &[_][]const u8{stale_alt_path});
+        try std.testing.expectEqual(@as(usize, 1), stale_dest.store.alternates.repo_paths.len);
+    }
+
+    _ = try applyBundle(talloc, bundle_path, restore_path, .none);
+
+    var restored = try CasManager.init(talloc, restore_path, .none);
+    defer restored.deinit();
+    try std.testing.expectEqual(@as(usize, 0), restored.store.alternates.repo_paths.len);
+    const restored_head = try restored.refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(restored_head.eql(source_head));
 }
 
 test "local clone preserves pack files and reftable state" {
