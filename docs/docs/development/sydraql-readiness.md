@@ -25,7 +25,7 @@ See also:
 - [x] Lexer, parser, validator, planner, optimizer, and operator pipeline are present
 - [x] HTTP execution path exists at `POST /api/v1/sydraql`
 - [x] End-to-end scan/filter/project/aggregate/sort/limit flow exists for the implemented subset
-- [ ] Tag-filter syntax in the language surface is complete
+- [x] Selector `tag_filter` syntax is explicitly de-scoped from the `v0.4.0` public subset
 - [ ] Function execution coverage matches the current registry breadth
 - [ ] Rollup/downsampling planning is implemented rather than stubbed
 - [ ] Quotas and limits are enforced as a clear runtime contract

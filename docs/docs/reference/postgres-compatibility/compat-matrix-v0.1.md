@@ -51,6 +51,7 @@ Current hard limits / fail-fast behavior:
 - query text is capped at `65536` bytes
 - unsupported direct prepare/bind shapes fail with stable `0A000`
 - direct sydraQL execution failures currently map to a stable preview subset: `42601`, `22023`, `0A000`, and `XX000`
+- selector `tag_filter` syntax is not part of the preview SQL-core/direct-prepare contract; use `WHERE tag.<k> ...` predicates instead
 - binary bind parameters and binary result formats are rejected
 - `COPY`, broad catalog emulation, and wider ORM compatibility remain out of scope for this alpha
 

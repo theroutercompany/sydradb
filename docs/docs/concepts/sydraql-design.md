@@ -65,16 +65,17 @@ Supported and exercised today:
   - one `time_bucket(...)`
   - one selector tag such as `tag.host`
   - or the combination `time_bucket(...)` plus one selector tag
-- legacy fill on grouped time-bucket queries using:
+- native grouped time-bucket fill strategies using:
   - `fill(previous)`
-  - `fill(0)`
+  - `fill(null)`
+  - constant fills such as `fill(0)`
 - ordering by projection aliases or projected expressions on the supported raw-row path
 - `EXPLAIN BYTECODE` and `EXPLAIN TABLES_USED`
 
 Explicitly out of the current compiled subset:
 
 - selector `tag_filter` syntax on the `FROM` selector itself
-- `fill(...)` on the compiled path
+- interpolating fill strategies such as `fill(linear)`
 - broader window-function coverage (`moving_avg`, `ema`, `lag`, `lead`)
 - regex predicates as part of the compiled VM path
 - multi-series expressions / joins
@@ -89,10 +90,11 @@ Telemetry-first notes:
 
 ### Selectors
 ```
-selector := series_ref [tag_filter]
+selector := series_ref
 series_ref := by_id(<int>) | 'namespace.metric'
-tag_filter := where <tag_predicate>
 ```
+
+The older `selector [tag_filter]` grammar sketch remains a future design idea only. It is not part of the `v0.4.0` public subset; selector narrowing should use the regular `WHERE tag.<k> ...` predicate surface instead.
 
 ### Temporal Predicates
 ```
@@ -115,10 +117,12 @@ select avg(value), max(value), percentile(value, 0.99)
 ### Fill Policies
 ```
 fill(previous)      -- carry forward last value
-fill(linear)        -- interpolate between buckets
-fill(null)          -- default
+fill(null)          -- emit null buckets
 fill(0)             -- constant
+fill(linear)        -- interpolate between buckets
 ```
+
+For `v0.4.0`, only `fill(previous)`, `fill(null)`, and constant fills stay on the native path. `fill(linear)` is the stable unsupported exemplar used by demos, benchmarks, and fallback tests.
 
 ### Ordering & Limits
 ```
@@ -147,9 +151,8 @@ select_stmt    = "select" select_list "from" selector [where_clause] [group_clau
                  [fill_clause] [order_clause] [limit_clause] ;
 select_list    = select_item { "," select_item } ;
 select_item    = expr [ "as" ident ] ;
-selector       = series_ref [ tag_filter ] ;
+selector       = series_ref ;
 series_ref     = ident | "by_id" "(" int_lit ")" ;
-tag_filter     = "where" bool_expr ;
 where_clause   = "where" bool_expr ;
 group_clause   = "group" "by" group_item { "," group_item } ;
 group_item     = "time_bucket" "(" duration "," expr ["," expr] ")" | expr ;

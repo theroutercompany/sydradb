@@ -203,6 +203,7 @@ Diagnostics:
   - `22023` for validation failures and ambiguous selectors
   - `0A000` for compiler-deferred unsupported shapes
   - `XX000` for shadow mismatches and uncategorized runtime failures
+- Selector `tag_filter` syntax on the `FROM` selector remains outside the `v0.4.0` preview contract. The supported path is `WHERE tag.<k> ...`; compiler fallback reports `unsupported_tag_filter` when that older selector form is encountered.
 - Collects operator stats via `cursor.collectOperatorStats`.
 - Computes:
   - `rows_emitted` (from stream count)
