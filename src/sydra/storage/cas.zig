@@ -511,6 +511,8 @@ pub const RefStore = struct {
         try root.makePath("logs/refs/heads");
         try root.makePath("refs/txn");
         try root.makePath("reftable");
+        try root.makePath("reftable/info");
+        try root.makePath("symrefs");
         return .{ .alloc = alloc, .root = root, .fsync = fsync };
     }
 
@@ -520,6 +522,45 @@ pub const RefStore = struct {
 
     pub fn setBackend(self: *RefStore, backend: RefBackend) void {
         self.backend = backend;
+    }
+
+    pub fn readSymRef(self: *RefStore, name: []const u8) !?[]u8 {
+        const path = try std.fmt.allocPrint(self.alloc, "symrefs/{s}", .{name});
+        defer self.alloc.free(path);
+
+        const body = self.root.readFileAlloc(self.alloc, path, 4096) catch |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
+        };
+        defer self.alloc.free(body);
+        const trimmed = std.mem.trim(u8, body, " \t\r\n");
+        if (trimmed.len == 0) return null;
+        return try self.alloc.dupe(u8, trimmed);
+    }
+
+    pub fn writeSymRef(self: *RefStore, name: []const u8, target: []const u8) !void {
+        const path = try std.fmt.allocPrint(self.alloc, "symrefs/{s}", .{name});
+        defer self.alloc.free(path);
+        if (std.fs.path.dirname(path)) |dirname| try self.root.makePath(dirname);
+
+        const temp_path = try std.fmt.allocPrint(self.alloc, "{s}.tmp", .{path});
+        defer self.alloc.free(temp_path);
+        var file = try self.root.createFile(temp_path, .{ .truncate = true, .read = true });
+        defer file.close();
+        errdefer self.root.deleteFile(temp_path) catch {};
+        try file.writeAll(target);
+        try file.writeAll("\n");
+        if (self.fsync != .none) try file.sync();
+        self.root.rename(temp_path, path) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                self.root.deleteFile(path) catch {};
+                try self.root.rename(temp_path, path);
+            },
+            else => return err,
+        };
+        if (self.fsync != .none) {
+            try syncDir(&self.root);
+        }
     }
 
     pub fn readHead(self: *RefStore, ref_name: []const u8) !?object_store.ObjectId {
@@ -646,10 +687,10 @@ pub const RefStore = struct {
     }
 
     pub fn loadReflog(self: *RefStore, alloc: std.mem.Allocator, ref_name: []const u8, max_entries: usize) ![]ReflogEntry {
-        const all_entries = if (self.backend == .reftable and try self.hasReftableTables())
-            try loadReftableReflogEntries(alloc, self.root)
-        else
-            try loadLooseReflogEntriesForRef(alloc, self.root, ref_name);
+        if (self.backend == .reftable and try self.hasReftableTables()) {
+            return try loadReftableReflogEntriesForRef(alloc, self.root, ref_name, max_entries);
+        }
+        const all_entries = try loadLooseReflogEntriesForRef(alloc, self.root, ref_name);
         errdefer {
             for (all_entries) |*entry| entry.deinit(alloc);
             alloc.free(all_entries);
@@ -1000,10 +1041,12 @@ pub const RefStore = struct {
         }
 
         try self.root.makePath("reftable");
+        try self.root.makePath("reftable/info");
         try writeReftableTablesList(self.alloc, self.root, table_names, self.fsync);
         try writeReftableState(self.alloc, self.root, .{
             .next_update_index = try inferNextReftableUpdateIndexFromNames(table_names),
         }, self.fsync);
+        try rebuildReftableSummaryIndex(self.alloc, self.root, self.fsync);
         return .{
             .state_rebuilt = true,
             .tables_list_rebuilt = true,
@@ -1095,57 +1138,11 @@ pub const RefStore = struct {
     }
 
     fn readReftableRef(self: *RefStore, ref_name: []const u8) !?object_store.ObjectId {
-        const table_names = try loadReftableTableNames(self.alloc, self.root);
-        defer freeOwnedStrings(self.alloc, table_names);
-
-        var idx = table_names.len;
-        while (idx > 0) {
-            idx -= 1;
-            var table = try loadReftableTable(self.alloc, self.root, table_names[idx]);
-            defer table.deinit(self.alloc);
-            if (lookupReftableRefRecord(table.refs, ref_name)) |record| return record.id;
-        }
-        return null;
+        return try readReftableRefWithCursor(self.alloc, self.root, ref_name);
     }
 
     fn listReftableRefs(self: *RefStore, alloc: std.mem.Allocator) ![]RefEntry {
-        const table_names = try loadReftableTableNames(alloc, self.root);
-        defer freeOwnedStrings(alloc, table_names);
-
-        var refs = std.array_list.Managed(RefEntry).init(alloc);
-        errdefer {
-            for (refs.items) |*entry| entry.deinit(alloc);
-            refs.deinit();
-        }
-        var seen_names = std.array_list.Managed([]u8).init(alloc);
-        defer {
-            for (seen_names.items) |name| alloc.free(name);
-            seen_names.deinit();
-        }
-
-        var idx = table_names.len;
-        while (idx > 0) {
-            idx -= 1;
-            var table = try loadReftableTable(alloc, self.root, table_names[idx]);
-            defer table.deinit(alloc);
-            for (table.refs) |record| {
-                if (containsString(seen_names.items, record.name)) continue;
-                try seen_names.append(try alloc.dupe(u8, record.name));
-                if (record.id) |id| {
-                    try refs.append(.{
-                        .name = try alloc.dupe(u8, record.name),
-                        .id = id,
-                    });
-                }
-            }
-        }
-
-        std.sort.block(RefEntry, refs.items, {}, struct {
-            fn lessThan(_: void, lhs: RefEntry, rhs: RefEntry) bool {
-                return std.mem.lessThan(u8, lhs.name, rhs.name);
-            }
-        }.lessThan);
-        return try refs.toOwnedSlice();
+        return try listReftableRefsWithCursor(alloc, self.root);
     }
 
     fn collectReftableReflogObjectIds(self: *RefStore, alloc: std.mem.Allocator) ![]object_store.ObjectId {
@@ -1213,6 +1210,7 @@ pub const RefStore = struct {
         for (tables) |name| try next.append(try self.alloc.dupe(u8, name));
         try next.append(try self.alloc.dupe(u8, table_name));
         try writeReftableTablesList(self.alloc, self.root, next.items, self.fsync);
+        try rebuildReftableSummaryIndex(self.alloc, self.root, self.fsync);
     }
 
     fn writeReftableSnapshot(self: *RefStore, refs: []const RefEntry, reflogs: []const ReflogEntry) !void {
@@ -1242,6 +1240,7 @@ pub const RefStore = struct {
         try writeReftableTable(self.alloc, self.root, table_name, span, ref_records, reflogs, self.fsync);
         const names = [_][]const u8{table_name};
         try writeReftableTablesList(self.alloc, self.root, names[0..], self.fsync);
+        try rebuildReftableSummaryIndex(self.alloc, self.root, self.fsync);
     }
 
     fn replaceReftableSnapshot(self: *RefStore, refs: []const RefEntry, reflogs: []const ReflogEntry) !void {
@@ -1274,6 +1273,7 @@ pub const RefStore = struct {
         try writeReftableTable(self.alloc, self.root, table_name, span, ref_records, reflogs, self.fsync);
         const names = [_][]const u8{table_name};
         try writeReftableTablesList(self.alloc, self.root, names[0..], self.fsync);
+        try rebuildReftableSummaryIndex(self.alloc, self.root, self.fsync);
 
         for (existing_names) |name| {
             if (std.mem.eql(u8, name, table_name)) continue;
@@ -1317,6 +1317,7 @@ pub const RefStore = struct {
         for (table_names[0..start]) |name| try next.append(try self.alloc.dupe(u8, name));
         try next.append(try self.alloc.dupe(u8, merged_name));
         try writeReftableTablesList(self.alloc, self.root, next.items, self.fsync);
+        try rebuildReftableSummaryIndex(self.alloc, self.root, self.fsync);
         for (table_names[start..]) |name| self.root.deleteFile(name) catch {};
     }
 
@@ -2070,6 +2071,7 @@ pub const CasManager = struct {
         var writer = CommitWriter{ .alloc = self.alloc, .store = &self.store, .extent_chunk_bytes = self.format.extent_chunk_bytes };
         const commit_id = try writer.writeSnapshot(data_dir, manifest, tags, series_catalog, null, "bootstrap");
         try self.refs.compareAndSwapRef(main_ref, null, commit_id, "bootstrap");
+        try self.ensureHeadSymRef();
         try self.refreshCommitGraph();
         return commit_id;
     }
@@ -2131,6 +2133,7 @@ pub const CasManager = struct {
         self.format.version = current_repository_format_version;
         try writeRepositoryFormat(self.alloc, self.store.root, self.format, self.store.fsync);
         self.refs.setBackend(.reftable);
+        try self.ensureHeadSymRef();
         try self.refreshCommitGraph();
     }
 
@@ -2147,6 +2150,7 @@ pub const CasManager = struct {
             migrated_reftable = true;
         }
 
+        try self.ensureHeadSymRef();
         _ = try self.repairRepository(data_dir, .{});
         const pack_result = try self.pack();
         return .{
@@ -2156,6 +2160,14 @@ pub const CasManager = struct {
             .reachable_objects = pack_result.reachable_objects,
             .rewritten_objects = pack_result.rewritten_objects,
         };
+    }
+
+    pub fn readHeadSymRef(self: *CasManager) !?[]u8 {
+        return try self.refs.readSymRef("HEAD");
+    }
+
+    pub fn writeHeadSymRef(self: *CasManager, target: []const u8) !void {
+        try self.refs.writeSymRef("HEAD", target);
     }
 
     pub fn repairRepository(self: *CasManager, data_dir: std.fs.Dir, options: RepairOptions) !RepairReport {
@@ -2176,6 +2188,13 @@ pub const CasManager = struct {
         }
 
         return report;
+    }
+
+    fn ensureHeadSymRef(self: *CasManager) !void {
+        if (try self.refs.readHead(main_ref) == null) return;
+        if ((try self.refs.readSymRef("HEAD")) == null) {
+            try self.refs.writeSymRef("HEAD", main_ref);
+        }
     }
 
     pub fn expire(self: *CasManager, data_dir: std.fs.Dir, policy: MaintenancePolicy) !ExpiryReport {
@@ -3373,6 +3392,7 @@ const BundleManifest = struct {
     reftable_files: [][]u8,
     loose_ref_files: [][]u8,
     reflog_files: [][]u8,
+    symref_files: [][]u8,
     borrowed_repo_paths: [][]u8,
 
     fn deinit(self: *BundleManifest, alloc: std.mem.Allocator) void {
@@ -3388,6 +3408,7 @@ const BundleManifest = struct {
         freeOwnedStrings(alloc, self.reftable_files);
         freeOwnedStrings(alloc, self.loose_ref_files);
         freeOwnedStrings(alloc, self.reflog_files);
+        freeOwnedStrings(alloc, self.symref_files);
         freeOwnedStrings(alloc, self.borrowed_repo_paths);
     }
 };
@@ -3593,6 +3614,10 @@ fn writeBundleManifest(alloc: std.mem.Allocator, dst_path: []const u8, manifest:
         for (manifest.loose_ref_files) |path| try writer.print("{s}\n", .{path});
         try writer.print("reflog_files {d}\n", .{manifest.reflog_files.len});
         for (manifest.reflog_files) |path| try writer.print("{s}\n", .{path});
+        if (manifest.format_version >= 4) {
+            try writer.print("symref_files {d}\n", .{manifest.symref_files.len});
+            for (manifest.symref_files) |path| try writer.print("{s}\n", .{path});
+        }
         if (manifest.format_version >= 3) {
             try writer.print("borrowed_repositories {d}\n", .{manifest.borrowed_repo_paths.len});
             for (manifest.borrowed_repo_paths) |path| try writer.print("{s}\n", .{path});
@@ -3681,6 +3706,11 @@ fn readBundleManifest(alloc: std.mem.Allocator, bundle_path: []const u8) !Bundle
     else
         try alloc.alloc([]u8, 0);
     errdefer freeOwnedStrings(alloc, reflog_files);
+    const symref_files = if (format_version >= 4)
+        try readBundlePathList(alloc, &line_it, "symref_files")
+    else
+        try alloc.alloc([]u8, 0);
+    errdefer freeOwnedStrings(alloc, symref_files);
     const borrowed_repo_paths = if (format_version >= 3)
         try readBundlePathList(alloc, &line_it, "borrowed_repositories")
     else
@@ -3722,6 +3752,7 @@ fn readBundleManifest(alloc: std.mem.Allocator, bundle_path: []const u8) !Bundle
         .reftable_files = reftable_files,
         .loose_ref_files = loose_ref_files,
         .reflog_files = reflog_files,
+        .symref_files = symref_files,
         .borrowed_repo_paths = borrowed_repo_paths,
     };
 }
@@ -3925,6 +3956,10 @@ pub fn createBundle(alloc: std.mem.Allocator, src_path: []const u8, dst_path: []
     defer freeOwnedStrings(alloc, reflog_files);
     try copyRelativeFiles(source.refs.root, bundle_store.root, reflog_files);
 
+    const symref_files = try listFilesRecursive(alloc, source.refs.root, "symrefs");
+    defer freeOwnedStrings(alloc, symref_files);
+    try copyRelativeFiles(source.refs.root, bundle_store.root, symref_files);
+
     var selected = std.array_list.Managed(object_store.ObjectId).init(alloc);
     defer selected.deinit();
     var selected_pack_paths = std.array_list.Managed([]u8).init(alloc);
@@ -3991,6 +4026,7 @@ pub fn createBundle(alloc: std.mem.Allocator, src_path: []const u8, dst_path: []
         .reftable_files = try cloneOwnedStringsSlice(alloc, reftable_files),
         .loose_ref_files = try cloneOwnedStringsSlice(alloc, copied_loose_ref_files.items),
         .reflog_files = try cloneOwnedStringsSlice(alloc, reflog_files),
+        .symref_files = try cloneOwnedStringsSlice(alloc, symref_files),
         .borrowed_repo_paths = try cloneOwnedStringsSlice(alloc, source.store.alternates.repo_paths),
     };
     defer {
@@ -4040,6 +4076,7 @@ pub fn verifyBundle(alloc: std.mem.Allocator, bundle_path: []const u8) !BundleRe
     for (manifest.reftable_files) |path| _ = try root.statFile(path);
     for (manifest.loose_ref_files) |path| _ = try root.statFile(path);
     for (manifest.reflog_files) |path| _ = try root.statFile(path);
+    for (manifest.symref_files) |path| _ = try root.statFile(path);
 
     for (ids) |id| {
         const loaded = try store.get(alloc, id);
@@ -4145,6 +4182,16 @@ pub fn applyBundle(alloc: std.mem.Allocator, bundle_path: []const u8, dst_path: 
         try dest.refs.root.makePath("logs/refs/heads");
         try copyRelativeFiles(bundle_root, dest.refs.root, manifest.reflog_files);
     }
+    if (manifest.symref_files.len > 0) {
+        if (dest.refs.root.access("symrefs", .{})) |_| {
+            try dest.refs.root.deleteTree("symrefs");
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+        try dest.refs.root.makePath("symrefs");
+        try copyRelativeFiles(bundle_root, dest.refs.root, manifest.symref_files);
+    }
 
     if (manifest.format_version >= 2) {
         dest.format.version = manifest.repository_format_version;
@@ -4221,6 +4268,12 @@ pub fn cloneLocalRepositoryWithOptions(
             dest.repository_id = source.repository_id;
             try writeRepositoryId(dest.store.root, dest.repository_id, dest.store.fsync);
         }
+        if (try source.readHeadSymRef()) |head_target| {
+            defer alloc.free(head_target);
+            try dest.writeHeadSymRef(head_target);
+        } else {
+            try dest.ensureHeadSymRef();
+        }
         try dest.refreshCommitGraph();
         return .{
             .ref_count = refs.len,
@@ -4283,6 +4336,14 @@ pub fn fetchLocalRepositoryWithOptions(
         };
     }
     if (updates.len != 0) try dest.refs.updateRefTxn(updates, "fetch-local");
+    if (try source.readHeadSymRef()) |source_head_target| {
+        defer alloc.free(source_head_target);
+        const remote_head_name = try trackingHeadSymRefName(alloc, source.repository_id);
+        defer alloc.free(remote_head_name);
+        const remote_head_target = try trackingRefName(alloc, source.repository_id, source_head_target);
+        defer alloc.free(remote_head_target);
+        try dest.refs.writeSymRef(remote_head_name, remote_head_target);
+    }
     if (options.materialize) {
         _ = try dest.materializeBorrowedObjects();
     }
@@ -4353,6 +4414,11 @@ fn mergeRepositoryPaths(alloc: std.mem.Allocator, existing: []const []const u8, 
 fn trackingRefName(alloc: std.mem.Allocator, repository_id: RepositoryIdentity, ref_name: []const u8) ![]u8 {
     const repo_hex = repository_id.toHex();
     return try std.fmt.allocPrint(alloc, "remotes/{s}/{s}", .{ repo_hex[0..], ref_name });
+}
+
+fn trackingHeadSymRefName(alloc: std.mem.Allocator, repository_id: RepositoryIdentity) ![]u8 {
+    const repo_hex = repository_id.toHex();
+    return try std.fmt.allocPrint(alloc, "remotes/{s}/HEAD", .{repo_hex[0..]});
 }
 
 fn isZeroRepositoryId(identity: RepositoryIdentity) bool {
@@ -6432,6 +6498,8 @@ const reftable_magic = "SYDRTBL1";
 const reftable_tables_list_path = "reftable/tables.list";
 const reftable_state_path = "reftable/state";
 const reftable_state_magic = "SYDRTST1";
+const reftable_summary_path = "reftable/info/summary";
+const reftable_summary_magic = "SYDRSUM1";
 const reftable_current_version: u16 = 3;
 const reftable_ref_block_entries: usize = 128;
 const reftable_reflog_block_entries: usize = 64;
@@ -6452,12 +6520,52 @@ const ReftableState = struct {
     next_update_index: u64,
 };
 
+pub const SymRef = struct {
+    name: []u8,
+    target: []u8,
+
+    pub fn deinit(self: *SymRef, alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.target);
+    }
+};
+
 const ReftableRefRecord = struct {
     name: []u8,
     id: ?object_store.ObjectId,
 
     fn deinit(self: *ReftableRefRecord, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
+    }
+};
+
+pub const ReftableSummaryRecord = struct {
+    table_name: []u8,
+    min_update_index: u64,
+    max_update_index: u64,
+    min_ref_name: []u8,
+    max_ref_name: []u8,
+    min_reflog_ref_name: []u8,
+    max_reflog_ref_name: []u8,
+    min_reflog_ts: i64,
+    max_reflog_ts: i64,
+    has_tombstones: bool,
+
+    fn deinit(self: *ReftableSummaryRecord, alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        alloc.free(self.min_ref_name);
+        alloc.free(self.max_ref_name);
+        alloc.free(self.min_reflog_ref_name);
+        alloc.free(self.max_reflog_ref_name);
+    }
+};
+
+pub const ReftableSummaryIndex = struct {
+    records: []ReftableSummaryRecord,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.records) |*record| record.deinit(alloc);
+        alloc.free(self.records);
     }
 };
 
@@ -6708,6 +6816,188 @@ fn writeReftableTablesList(alloc: std.mem.Allocator, root: std.fs.Dir, names: []
         var root_for_sync = root;
         try syncDir(&root_for_sync);
     }
+}
+
+fn rebuildReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir, fsync: cfg.FsyncPolicy) !void {
+    var summary = try scanReftableSummaryIndex(alloc, root);
+    defer summary.deinit(alloc);
+    try writeReftableSummaryIndex(alloc, root, summary, fsync);
+}
+
+fn scanReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !ReftableSummaryIndex {
+    const table_names = try loadReftableTableNames(alloc, root);
+    defer freeOwnedStrings(alloc, table_names);
+
+    const records = try alloc.alloc(ReftableSummaryRecord, table_names.len);
+    var loaded_count: usize = 0;
+    errdefer {
+        for (records[0..loaded_count]) |*record| record.deinit(alloc);
+        alloc.free(records);
+    }
+
+    for (table_names, 0..) |table_name, idx| {
+        var table = try loadReftableTable(alloc, root, table_name);
+        defer table.deinit(alloc);
+
+        var min_ref_name: []u8 = try alloc.dupe(u8, "");
+        errdefer alloc.free(min_ref_name);
+        var max_ref_name: []u8 = try alloc.dupe(u8, "");
+        errdefer alloc.free(max_ref_name);
+        var min_reflog_ref_name: []u8 = try alloc.dupe(u8, "");
+        errdefer alloc.free(min_reflog_ref_name);
+        var max_reflog_ref_name: []u8 = try alloc.dupe(u8, "");
+        errdefer alloc.free(max_reflog_ref_name);
+        var min_reflog_ts: i64 = 0;
+        var max_reflog_ts: i64 = 0;
+        var has_tombstones = false;
+
+        if (table.refs.len != 0) {
+            alloc.free(min_ref_name);
+            alloc.free(max_ref_name);
+            min_ref_name = try alloc.dupe(u8, table.refs[0].name);
+            max_ref_name = try alloc.dupe(u8, table.refs[table.refs.len - 1].name);
+            for (table.refs) |record| {
+                if (record.id == null) has_tombstones = true;
+            }
+        }
+        if (table.reflogs.len != 0) {
+            alloc.free(min_reflog_ref_name);
+            alloc.free(max_reflog_ref_name);
+            min_reflog_ref_name = try alloc.dupe(u8, table.reflogs[0].ref_name);
+            max_reflog_ref_name = try alloc.dupe(u8, table.reflogs[table.reflogs.len - 1].ref_name);
+            min_reflog_ts = table.reflogs[0].timestamp_ms;
+            max_reflog_ts = table.reflogs[0].timestamp_ms;
+            for (table.reflogs) |entry| {
+                min_reflog_ts = @min(min_reflog_ts, entry.timestamp_ms);
+                max_reflog_ts = @max(max_reflog_ts, entry.timestamp_ms);
+            }
+        }
+
+        records[idx] = .{
+            .table_name = try alloc.dupe(u8, table_name),
+            .min_update_index = table.min_update_index,
+            .max_update_index = table.max_update_index,
+            .min_ref_name = min_ref_name,
+            .max_ref_name = max_ref_name,
+            .min_reflog_ref_name = min_reflog_ref_name,
+            .max_reflog_ref_name = max_reflog_ref_name,
+            .min_reflog_ts = min_reflog_ts,
+            .max_reflog_ts = max_reflog_ts,
+            .has_tombstones = has_tombstones,
+        };
+        loaded_count += 1;
+    }
+
+    return .{ .records = records };
+}
+
+fn writeReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir, summary: ReftableSummaryIndex, fsync: cfg.FsyncPolicy) !void {
+    var bytes = std.array_list.Managed(u8).init(alloc);
+    defer bytes.deinit();
+
+    try bytes.appendSlice(reftable_summary_magic);
+    try appendInt(&bytes, u16, 1);
+    try appendInt(&bytes, u32, @intCast(summary.records.len));
+    for (summary.records) |record| {
+        try appendString(&bytes, record.table_name);
+        try appendInt(&bytes, u64, record.min_update_index);
+        try appendInt(&bytes, u64, record.max_update_index);
+        try appendString(&bytes, record.min_ref_name);
+        try appendString(&bytes, record.max_ref_name);
+        try appendString(&bytes, record.min_reflog_ref_name);
+        try appendString(&bytes, record.max_reflog_ref_name);
+        try appendInt(&bytes, i64, record.min_reflog_ts);
+        try appendInt(&bytes, i64, record.max_reflog_ts);
+        try bytes.append(if (record.has_tombstones) 1 else 0);
+    }
+
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(bytes.items);
+    var checksum: [32]u8 = undefined;
+    hasher.final(checksum[0..]);
+    try bytes.appendSlice(checksum[0..]);
+
+    const temp_path = reftable_summary_path ++ ".tmp";
+    var file = try root.createFile(temp_path, .{ .truncate = true, .read = true });
+    defer file.close();
+    errdefer root.deleteFile(temp_path) catch {};
+    try file.writeAll(bytes.items);
+    if (fsync != .none) try file.sync();
+    root.rename(temp_path, reftable_summary_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            root.deleteFile(reftable_summary_path) catch {};
+            try root.rename(temp_path, reftable_summary_path);
+        },
+        else => return err,
+    };
+    if (fsync != .none) {
+        var root_for_sync = root;
+        try syncDir(&root_for_sync);
+    }
+}
+
+fn loadReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !ReftableSummaryIndex {
+    const bytes = try root.readFileAlloc(alloc, reftable_summary_path, 16 * 1024 * 1024);
+    defer alloc.free(bytes);
+    if (bytes.len < reftable_summary_magic.len + @sizeOf(u16) + @sizeOf(u32) + 32) return error.CorruptReftableSummary;
+    if (!std.mem.eql(u8, bytes[0..reftable_summary_magic.len], reftable_summary_magic)) return error.CorruptReftableSummary;
+
+    const checksum_start = bytes.len - 32;
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(bytes[0..checksum_start]);
+    var expected_checksum: [32]u8 = undefined;
+    hasher.final(expected_checksum[0..]);
+    if (!std.mem.eql(u8, expected_checksum[0..], bytes[checksum_start..])) return error.CorruptReftableSummary;
+
+    var cursor = Cursor{ .bytes = bytes[reftable_summary_magic.len..checksum_start] };
+    const version = try cursor.readInt(u16);
+    if (version != 1) return error.UnsupportedReftableSummaryVersion;
+    const record_count = try cursor.readInt(u32);
+    const records = try alloc.alloc(ReftableSummaryRecord, record_count);
+    var loaded_count: usize = 0;
+    errdefer {
+        for (records[0..loaded_count]) |*record| record.deinit(alloc);
+        alloc.free(records);
+    }
+    for (records) |*record| {
+        record.* = .{
+            .table_name = try cursor.readOwnedString(alloc),
+            .min_update_index = try cursor.readInt(u64),
+            .max_update_index = try cursor.readInt(u64),
+            .min_ref_name = try cursor.readOwnedString(alloc),
+            .max_ref_name = try cursor.readOwnedString(alloc),
+            .min_reflog_ref_name = try cursor.readOwnedString(alloc),
+            .max_reflog_ref_name = try cursor.readOwnedString(alloc),
+            .min_reflog_ts = try cursor.readInt(i64),
+            .max_reflog_ts = try cursor.readInt(i64),
+            .has_tombstones = (try cursor.readByte()) != 0,
+        };
+        loaded_count += 1;
+    }
+    try cursor.finish();
+    return .{ .records = records };
+}
+
+fn loadOrScanReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !ReftableSummaryIndex {
+    return loadReftableSummaryIndex(alloc, root) catch |err| switch (err) {
+        error.FileNotFound,
+        error.CorruptReftableSummary,
+        error.UnsupportedReftableSummaryVersion,
+        => try scanReftableSummaryIndex(alloc, root),
+        else => return err,
+    };
+}
+
+fn summaryContainsRef(record: ReftableSummaryRecord, ref_name: []const u8) bool {
+    if (record.min_ref_name.len == 0 and record.max_ref_name.len == 0) return true;
+    return std.mem.order(u8, ref_name, record.min_ref_name) != .lt and
+        std.mem.order(u8, ref_name, record.max_ref_name) != .gt;
+}
+
+fn summaryContainsReflog(record: ReftableSummaryRecord, ref_name: []const u8) bool {
+    if (record.min_reflog_ref_name.len == 0 and record.max_reflog_ref_name.len == 0) return true;
+    return std.mem.order(u8, ref_name, record.min_reflog_ref_name) != .lt and
+        std.mem.order(u8, ref_name, record.max_reflog_ref_name) != .gt;
 }
 
 fn writeReftableTable(
@@ -7100,6 +7390,273 @@ fn loadReftableTable(alloc: std.mem.Allocator, root: std.fs.Dir, table_path: []c
         .max_update_index = span.max_update_index,
         .size_bytes = bytes.len,
     };
+}
+
+fn readReftableRefWithCursor(alloc: std.mem.Allocator, root: std.fs.Dir, ref_name: []const u8) !?object_store.ObjectId {
+    var summary = try loadOrScanReftableSummaryIndex(alloc, root);
+    defer summary.deinit(alloc);
+
+    var idx = summary.records.len;
+    while (idx > 0) {
+        idx -= 1;
+        const record = summary.records[idx];
+        if (!summaryContainsRef(record, ref_name)) continue;
+        if (try readReftableRefFromTable(alloc, root, record.table_name, ref_name)) |id| return id;
+    }
+    return null;
+}
+
+fn listReftableRefsWithCursor(alloc: std.mem.Allocator, root: std.fs.Dir) ![]RefEntry {
+    var summary = try loadOrScanReftableSummaryIndex(alloc, root);
+    defer summary.deinit(alloc);
+
+    var refs = std.array_list.Managed(RefEntry).init(alloc);
+    errdefer {
+        for (refs.items) |*entry| entry.deinit(alloc);
+        refs.deinit();
+    }
+    var seen_names = std.array_list.Managed([]u8).init(alloc);
+    defer {
+        for (seen_names.items) |name| alloc.free(name);
+        seen_names.deinit();
+    }
+
+    var idx = summary.records.len;
+    while (idx > 0) {
+        idx -= 1;
+        const records = try loadReftableRefRecordsForTable(alloc, root, summary.records[idx].table_name);
+        defer {
+            for (records) |*entry| entry.deinit(alloc);
+            alloc.free(records);
+        }
+        for (records) |record| {
+            if (containsString(seen_names.items, record.name)) continue;
+            try seen_names.append(try alloc.dupe(u8, record.name));
+            if (record.id) |id| {
+                try refs.append(.{
+                    .name = try alloc.dupe(u8, record.name),
+                    .id = id,
+                });
+            }
+        }
+    }
+
+    std.sort.block(RefEntry, refs.items, {}, struct {
+        fn lessThan(_: void, lhs: RefEntry, rhs: RefEntry) bool {
+            return std.mem.lessThan(u8, lhs.name, rhs.name);
+        }
+    }.lessThan);
+    return try refs.toOwnedSlice();
+}
+
+fn loadReftableReflogEntriesForRef(
+    alloc: std.mem.Allocator,
+    root: std.fs.Dir,
+    ref_name: []const u8,
+    max_entries: usize,
+) ![]ReflogEntry {
+    var summary = try loadOrScanReftableSummaryIndex(alloc, root);
+    defer summary.deinit(alloc);
+
+    var entries = std.array_list.Managed(ReflogEntry).init(alloc);
+    errdefer {
+        for (entries.items) |*entry| entry.deinit(alloc);
+        entries.deinit();
+    }
+
+    var idx = summary.records.len;
+    while (idx > 0 and entries.items.len < max_entries) {
+        idx -= 1;
+        const record = summary.records[idx];
+        if (!summaryContainsReflog(record, ref_name)) continue;
+        const table_entries = try loadReftableReflogEntriesForRefInTable(alloc, root, record.table_name, ref_name);
+        defer {
+            for (table_entries) |*entry| entry.deinit(alloc);
+            alloc.free(table_entries);
+        }
+
+        var entry_idx = table_entries.len;
+        while (entry_idx > 0 and entries.items.len < max_entries) {
+            entry_idx -= 1;
+            const entry = table_entries[entry_idx];
+            try entries.append(.{
+                .ref_name = try alloc.dupe(u8, entry.ref_name),
+                .old_id = entry.old_id,
+                .new_id = entry.new_id,
+                .timestamp_ms = entry.timestamp_ms,
+                .reason = try alloc.dupe(u8, entry.reason),
+            });
+        }
+    }
+    return try entries.toOwnedSlice();
+}
+
+fn loadReftableRefRecordsForTable(alloc: std.mem.Allocator, root: std.fs.Dir, table_path: []const u8) ![]ReftableRefRecord {
+    const bytes = try root.readFileAlloc(alloc, table_path, 16 * 1024 * 1024);
+    defer alloc.free(bytes);
+    if (bytes.len < reftable_magic.len + @sizeOf(u16) + @sizeOf(u64) * 2) return error.CorruptReftable;
+    if (!std.mem.eql(u8, bytes[0..reftable_magic.len], reftable_magic)) return error.CorruptReftable;
+
+    const version = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(bytes[reftable_magic.len .. reftable_magic.len + 2].ptr)), .little);
+    if (version != reftable_current_version) {
+        var table = try loadReftableTable(alloc, root, table_path);
+        defer table.deinit(alloc);
+        return try cloneReftableRefRecords(alloc, table.refs);
+    }
+
+    const header = try loadReftableHeaderV3(bytes);
+    var cursor = Cursor{ .bytes = bytes, .index = @intCast(header.ref_index_offset) };
+    const ref_block_count = try cursor.readInt(u32);
+    const ref_index = try loadReftableBlockIndex(alloc, bytes[0..header.checksum_start], &cursor, ref_block_count);
+    defer {
+        for (ref_index) |*entry| entry.deinit(alloc);
+        alloc.free(ref_index);
+    }
+
+    var refs = std.array_list.Managed(ReftableRefRecord).init(alloc);
+    errdefer {
+        for (refs.items) |*entry| entry.deinit(alloc);
+        refs.deinit();
+    }
+    for (ref_index) |entry| {
+        const block_entries = try decodeReftableRefBlockAt(alloc, bytes[0..header.checksum_start], entry.block_offset);
+        defer {
+            for (block_entries) |*record| record.deinit(alloc);
+            alloc.free(block_entries);
+        }
+        for (block_entries) |record| {
+            try refs.append(.{
+                .name = try alloc.dupe(u8, record.name),
+                .id = record.id,
+            });
+        }
+    }
+    return try refs.toOwnedSlice();
+}
+
+fn readReftableRefFromTable(alloc: std.mem.Allocator, root: std.fs.Dir, table_path: []const u8, ref_name: []const u8) !?object_store.ObjectId {
+    const bytes = try root.readFileAlloc(alloc, table_path, 16 * 1024 * 1024);
+    defer alloc.free(bytes);
+    if (bytes.len < reftable_magic.len + @sizeOf(u16) + @sizeOf(u64) * 2) return error.CorruptReftable;
+    if (!std.mem.eql(u8, bytes[0..reftable_magic.len], reftable_magic)) return error.CorruptReftable;
+
+    const version = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(bytes[reftable_magic.len .. reftable_magic.len + 2].ptr)), .little);
+    if (version != reftable_current_version) {
+        var table = try loadReftableTable(alloc, root, table_path);
+        defer table.deinit(alloc);
+        if (lookupReftableRefRecord(table.refs, ref_name)) |record| return record.id;
+        return null;
+    }
+
+    const header = try loadReftableHeaderV3(bytes);
+    var cursor = Cursor{ .bytes = bytes, .index = @intCast(header.ref_index_offset) };
+    const ref_block_count = try cursor.readInt(u32);
+    const ref_index = try loadReftableBlockIndex(alloc, bytes[0..header.checksum_start], &cursor, ref_block_count);
+    defer {
+        for (ref_index) |*entry| entry.deinit(alloc);
+        alloc.free(ref_index);
+    }
+
+    var candidate_idx: ?usize = null;
+    for (ref_index, 0..) |entry, idx| {
+        if (std.mem.order(u8, entry.first_key, ref_name) == .gt) break;
+        candidate_idx = idx;
+    }
+    if (candidate_idx == null) return null;
+
+    const block_entries = try decodeReftableRefBlockAt(alloc, bytes[0..header.checksum_start], ref_index[candidate_idx.?].block_offset);
+    defer {
+        for (block_entries) |*record| record.deinit(alloc);
+        alloc.free(block_entries);
+    }
+    if (lookupReftableRefRecord(block_entries, ref_name)) |record| return record.id;
+    return null;
+}
+
+fn loadReftableReflogEntriesForRefInTable(
+    alloc: std.mem.Allocator,
+    root: std.fs.Dir,
+    table_path: []const u8,
+    ref_name: []const u8,
+) ![]ReflogEntry {
+    const bytes = try root.readFileAlloc(alloc, table_path, 16 * 1024 * 1024);
+    defer alloc.free(bytes);
+    if (bytes.len < reftable_magic.len + @sizeOf(u16) + @sizeOf(u64) * 2) return error.CorruptReftable;
+    if (!std.mem.eql(u8, bytes[0..reftable_magic.len], reftable_magic)) return error.CorruptReftable;
+
+    const version = std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(bytes[reftable_magic.len .. reftable_magic.len + 2].ptr)), .little);
+    if (version != reftable_current_version) {
+        var table = try loadReftableTable(alloc, root, table_path);
+        defer table.deinit(alloc);
+        var filtered = std.array_list.Managed(ReflogEntry).init(alloc);
+        errdefer {
+            for (filtered.items) |*entry| entry.deinit(alloc);
+            filtered.deinit();
+        }
+        for (table.reflogs) |entry| {
+            if (!std.mem.eql(u8, entry.ref_name, ref_name)) continue;
+            try filtered.append(.{
+                .ref_name = try alloc.dupe(u8, entry.ref_name),
+                .old_id = entry.old_id,
+                .new_id = entry.new_id,
+                .timestamp_ms = entry.timestamp_ms,
+                .reason = try alloc.dupe(u8, entry.reason),
+            });
+        }
+        return try filtered.toOwnedSlice();
+    }
+
+    const header = try loadReftableHeaderV3(bytes);
+    var cursor = Cursor{ .bytes = bytes, .index = @intCast(header.reflog_index_offset) };
+    const reflog_block_count = try cursor.readInt(u32);
+    const reflog_index = try loadReftableBlockIndex(alloc, bytes[0..header.checksum_start], &cursor, reflog_block_count);
+    defer {
+        for (reflog_index) |*entry| entry.deinit(alloc);
+        alloc.free(reflog_index);
+    }
+
+    var filtered = std.array_list.Managed(ReflogEntry).init(alloc);
+    errdefer {
+        for (filtered.items) |*entry| entry.deinit(alloc);
+        filtered.deinit();
+    }
+    for (reflog_index) |entry| {
+        if (std.mem.order(u8, entry.first_key, ref_name) == .gt) break;
+        const block_entries = try decodeReftableReflogBlockAt(alloc, bytes[0..header.checksum_start], entry.block_offset);
+        defer {
+            for (block_entries) |*record| record.deinit(alloc);
+            alloc.free(block_entries);
+        }
+        for (block_entries) |record| {
+            if (!std.mem.eql(u8, record.ref_name, ref_name)) continue;
+            try filtered.append(.{
+                .ref_name = try alloc.dupe(u8, record.ref_name),
+                .old_id = record.old_id,
+                .new_id = record.new_id,
+                .timestamp_ms = record.timestamp_ms,
+                .reason = try alloc.dupe(u8, record.reason),
+            });
+        }
+    }
+    return try filtered.toOwnedSlice();
+}
+
+fn cloneReftableRefRecords(alloc: std.mem.Allocator, records: []const ReftableRefRecord) ![]ReftableRefRecord {
+    const cloned = try alloc.alloc(ReftableRefRecord, records.len);
+    errdefer {
+        for (cloned[0..]) |*entry| {
+            if (entry.name.len != 0) entry.deinit(alloc);
+        }
+        alloc.free(cloned);
+    }
+    for (cloned) |*entry| entry.* = .{ .name = &[_]u8{}, .id = null };
+    for (records, 0..) |record, idx| {
+        cloned[idx] = .{
+            .name = try alloc.dupe(u8, record.name),
+            .id = record.id,
+        };
+    }
+    return cloned;
 }
 
 fn loadReftableReflogEntries(alloc: std.mem.Allocator, root: std.fs.Dir) ![]ReflogEntry {
@@ -8249,6 +8806,7 @@ test "reftable transactions assign update spans and compact older tables" {
     try std.testing.expect(sample_bytes.len > reftable_magic.len + 2);
     try std.testing.expect(std.mem.eql(u8, sample_bytes[0..reftable_magic.len], reftable_magic));
     try std.testing.expectEqual(reftable_current_version, std.mem.readInt(u16, @as(*const [2]u8, @ptrCast(sample_bytes[reftable_magic.len .. reftable_magic.len + 2].ptr)), .little));
+    _ = try refs.root.statFile(reftable_summary_path);
 
     const head = try refs.readHead(main_ref) orelse return error.MissingCasHead;
     try std.testing.expect(head.eql(previous.?));
@@ -8347,6 +8905,26 @@ test "reftable delete rename and reflog views work" {
     }
     try std.testing.expect(reflog.len >= 2);
     try std.testing.expect(std.mem.eql(u8, reflog[0].reason, "delete-ref") or std.mem.eql(u8, reflog[1].reason, "delete-ref"));
+}
+
+test "symrefs persist head targets alongside reftable refs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/symref-head", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+
+    var refs = try RefStore.init(std.testing.allocator, path, .none);
+    defer refs.deinit();
+    refs.setBackend(.reftable);
+
+    const head_id = object_store.computeId(.commit, "symref-head");
+    try refs.updateHeadAtomic(main_ref, head_id);
+    try refs.writeSymRef("HEAD", main_ref);
+
+    const restored = try refs.readSymRef("HEAD") orelse return error.MissingCasHead;
+    defer std.testing.allocator.free(restored);
+    try std.testing.expectEqualStrings(main_ref, restored);
 }
 
 test "checkpoints support diffing and rollback" {
@@ -9000,6 +9578,7 @@ test "local fetch borrows source repositories and tracks source refs" {
     var src = try CasManager.init(talloc, src_path, .none);
     defer src.deinit();
     const src_head = try src.bootstrapIfMissing(src_dir, &manifest, &tags, &series_catalog);
+    try src.writeHeadSymRef(main_ref);
     _ = try src.pack();
 
     const fetched = try fetchLocalRepository(talloc, src_path, dst_path, .none);
@@ -9013,6 +9592,11 @@ test "local fetch borrows source repositories and tracks source refs" {
     const tracked = try dst.refs.readHead(tracking_name) orelse return error.MissingCasHead;
     try std.testing.expect(tracked.eql(src_head));
     try std.testing.expect(try dst.store.hasObject(src_head));
+    const remote_head_name = try trackingHeadSymRefName(talloc, src.repository_id);
+    defer talloc.free(remote_head_name);
+    const remote_head = try dst.refs.readSymRef(remote_head_name) orelse return error.MissingCasHead;
+    defer talloc.free(remote_head);
+    try std.testing.expectEqualStrings(tracking_name, remote_head);
 }
 
 test "local fetch can materialize borrowed content" {
