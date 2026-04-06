@@ -1435,6 +1435,39 @@ test "socket server rejects unsupported protocol versions" {
     server_thread.join();
 }
 
+test "socket server requires hello before other requests" {
+    if (!std.net.has_unix_sockets) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/handshake-required", .{tmp.sub_path});
+    defer alloc.free(data_path);
+    const socket_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/handshake-required.sock", .{tmp.sub_path});
+    defer alloc.free(socket_path);
+
+    var eng = try Engine.init(alloc, try testConfig(alloc, data_path));
+    defer eng.deinit();
+
+    const server_thread = try std.Thread.spawn(.{}, testOneShotServer, .{ eng, socket_path, default_max_frame_bytes });
+    var stream = try connectRawWithRetry(socket_path, 20, 10);
+
+    var payload = std.array_list.Managed(u8).init(alloc);
+    defer payload.deinit();
+    try appendInt(&payload, u32, 1);
+    try encodeDeclareEntry(&payload, 1, .series, "svc.req", "{}", null);
+    try writeFrameWithVersion(stream, protocol_version, .declare_batch, 0, payload.items);
+
+    var frame = try readFrameFromStream(alloc, stream, default_max_frame_bytes);
+    defer frame.deinit(alloc);
+    try std.testing.expectEqual(MessageKind.error_message, frame.kind);
+    try std.testing.expectEqual(ErrorCode.handshake_required, try readErrorCode(frame.payload));
+
+    stream.close();
+    server_thread.join();
+}
+
 test "socket server rejects oversized frames before processing" {
     if (!std.net.has_unix_sockets) return;
 
@@ -1461,5 +1494,41 @@ test "socket server rejects oversized frames before processing" {
     try std.testing.expectEqual(ErrorCode.frame_too_large, try readErrorCode(frame.payload));
 
     stream.close();
+    server_thread.join();
+}
+
+test "socket flush_drain reports timeout when the queue is not yet drained" {
+    if (!std.net.has_unix_sockets) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/flush-timeout", .{tmp.sub_path});
+    defer alloc.free(data_path);
+    const socket_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/flush-timeout.sock", .{tmp.sub_path});
+    defer alloc.free(socket_path);
+
+    var eng = try Engine.init(alloc, try testConfig(alloc, data_path));
+    defer eng.deinit();
+
+    const server_thread = try std.Thread.spawn(.{}, testOneShotServer, .{ eng, socket_path, default_max_frame_bytes });
+    var client = try Client.connectWithRetry(alloc, socket_path, 20, 10);
+
+    const declared = try client.declareCachedBatch(&.{
+        .{
+            .decl_kind = .series,
+            .name = "svc.timeout",
+            .tags_json = "{}",
+        },
+    });
+    defer alloc.free(declared);
+
+    _ = try client.appendBatch(&.{
+        .{ .client_decl_id = declared[0].client_decl_id, .ts = 1, .value = 1.0 },
+    });
+    try std.testing.expectError(error.Timeout, client.flushAndDrain(0));
+
+    client.deinit();
     server_thread.join();
 }
