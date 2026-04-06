@@ -64,10 +64,15 @@ const mockState: DemoStateResponse = {
   ],
 };
 
+function clearCookie(name: string) {
+  document.cookie = `${name}=; Path=/; Max-Age=0; SameSite=Lax`;
+}
+
 describe("ShowcaseDashboard", () => {
   beforeEach(() => {
     vi.resetAllMocks();
     window.localStorage.clear();
+    clearCookie("sydra_showcase_launch_cards");
     delete document.documentElement.dataset.theme;
     document.documentElement.style.colorScheme = "";
   });
@@ -86,11 +91,16 @@ describe("ShowcaseDashboard", () => {
         runResult={null}
         theme="dark"
         error={null}
+        launchCardsVisible={false}
+        dismissedLaunchCardIds={[]}
         loading={false}
         running={false}
         onSelectScenario={vi.fn()}
         onThemeChange={vi.fn()}
         onToggleReleaseMode={onToggleReleaseMode}
+        onToggleLaunchCards={vi.fn()}
+        onDismissLaunchCard={vi.fn()}
+        onDismissAllLaunchCards={vi.fn()}
         onResetSession={vi.fn()}
         onRunScenario={vi.fn()}
       />,
@@ -124,5 +134,33 @@ describe("ShowcaseDashboard", () => {
 
     await waitFor(() => expect(screen.getByRole("button", { name: "Run" })).toBeInTheDocument());
     await waitFor(() => expect(document.documentElement.dataset.theme).toBe("light"));
+  });
+
+  it("shows launch notes on first load and persists dismissal in cookies", async () => {
+    vi.mocked(fetchState).mockResolvedValue(mockState);
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByText("Edge fleet story")).toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss launch notes" }));
+
+    await waitFor(() => expect(screen.queryByText("Edge fleet story")).not.toBeInTheDocument());
+    expect(document.cookie).toContain("sydra_showcase_launch_cards=hidden");
+    expect(screen.getByRole("button", { name: "Show launch notes" })).toBeInTheDocument();
+  });
+
+  it("keeps launch notes hidden after dismissal but allows manual reopen", async () => {
+    vi.mocked(fetchState).mockResolvedValue(mockState);
+    document.cookie = "sydra_showcase_launch_cards=hidden; Path=/; SameSite=Lax";
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "Show launch notes" })).toBeInTheDocument());
+    expect(screen.queryByText("Edge fleet story")).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Show launch notes" }));
+
+    await waitFor(() => expect(screen.getByText("Edge fleet story")).toBeInTheDocument());
+    expect(screen.getByRole("button", { name: "Hide launch notes" })).toBeInTheDocument();
   });
 });
