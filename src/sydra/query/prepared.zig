@@ -1387,6 +1387,20 @@ test "prepared VM supports scalar ordering and limit offset" {
     try std.testing.expectEqual(@as(i64, 20), offset_row.row[0].integer);
     try std.testing.expectApproxEqAbs(@as(f64, 2.0), try offset_row.row[1].asFloat(), 1e-9);
     try std.testing.expect((try offset_stmt.step()) == .done);
+
+    var constant_coalesce_stmt = try prepareSydraQL(alloc, engine, "select coalesce(null, 7)", .{});
+    defer constant_coalesce_stmt.finalize();
+    const constant_coalesce_row = try constant_coalesce_stmt.step();
+    try std.testing.expect(constant_coalesce_row == .row);
+    try std.testing.expectEqual(@as(i64, 7), constant_coalesce_row.row[0].integer);
+    try std.testing.expect((try constant_coalesce_stmt.step()) == .done);
+
+    var row_coalesce_stmt = try prepareSydraQL(alloc, engine, "select coalesce(value, 0) as value_or_zero from stage3.room1 where time >= 0 order by time asc limit 1", .{});
+    defer row_coalesce_stmt.finalize();
+    const row_coalesce = try row_coalesce_stmt.step();
+    try std.testing.expect(row_coalesce == .row);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), try row_coalesce.row[0].asFloat(), 1e-9);
+    try std.testing.expect((try row_coalesce_stmt.step()) == .done);
 }
 
 test "prepared VM supports aggregate reads and grouped time buckets" {
@@ -1441,6 +1455,31 @@ test "prepared VM supports aggregate reads and grouped time buckets" {
     try std.testing.expectEqual(@as(i64, 60), second_group.row[0].integer);
     try std.testing.expectApproxEqAbs(@as(f64, 3.5), try second_group.row[1].asFloat(), 1e-9);
     try std.testing.expect((try grouped_stmt.step()) == .done);
+
+    const tagged_sid = @import("../types.zig").seriesIdFrom("tagged.room1", "{\"host\":\"web\",\"rack\":\"r1\"}");
+    try engine.registerSeries("tagged.room1", "{\"host\":\"web\",\"rack\":\"r1\"}", tagged_sid);
+    try engine.ingest(.{ .series_id = tagged_sid, .ts = 10, .value = 1.0, .tags_json = "{\"host\":\"web\",\"rack\":\"r1\"}" });
+    try engine.ingest(.{ .series_id = tagged_sid, .ts = 70, .value = 3.0, .tags_json = "{\"host\":\"web\",\"rack\":\"r1\"}" });
+    try waitForQueryablePoints(alloc, engine, tagged_sid, 2, 1_000);
+
+    var grouped_tag_stmt = try prepareSydraQL(
+        alloc,
+        engine,
+        "select time_bucket(60, time) as bucket, tag.host as host, max(value) as max_value from tagged.room1 where time >= 0 group by time_bucket(60, time), tag.host",
+        .{},
+    );
+    defer grouped_tag_stmt.finalize();
+    const first_tag_group = try grouped_tag_stmt.step();
+    try std.testing.expect(first_tag_group == .row);
+    try std.testing.expectEqual(@as(i64, 0), first_tag_group.row[0].integer);
+    try std.testing.expectEqualStrings("web", try first_tag_group.row[1].asString());
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), try first_tag_group.row[2].asFloat(), 1e-9);
+    const second_tag_group = try grouped_tag_stmt.step();
+    try std.testing.expect(second_tag_group == .row);
+    try std.testing.expectEqual(@as(i64, 60), second_tag_group.row[0].integer);
+    try std.testing.expectEqualStrings("web", try second_tag_group.row[1].asString());
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), try second_tag_group.row[2].asFloat(), 1e-9);
+    try std.testing.expect((try grouped_tag_stmt.step()) == .done);
 }
 
 test "prepared bytecode snapshots stay stable for constant and scan plans" {
