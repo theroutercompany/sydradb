@@ -10331,6 +10331,117 @@ test "local fetch can materialize borrowed content" {
     try std.testing.expect(try dst.store.hasLocalObject(talloc, src_head));
 }
 
+test "materialized local fetch stays usable after source repository is removed" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const src_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/fetch-detach-src", .{tmp.sub_path});
+    defer talloc.free(src_path);
+    const dst_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/fetch-detach-dst", .{tmp.sub_path});
+    defer talloc.free(dst_path);
+    try std.fs.cwd().makePath(src_path);
+    try std.fs.cwd().makePath(dst_path);
+
+    var src_head: object_store.ObjectId = undefined;
+    var source_repo_id = RepositoryIdentity{ .bytes = [_]u8{0} ** 32 };
+
+    {
+        var src_dir = try std.fs.cwd().openDir(src_path, .{ .iterate = true });
+        defer src_dir.close();
+        var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+        defer manifest.deinit();
+        var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+        defer tags.deinit();
+        var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, src_dir, .none);
+        defer series_catalog.deinit();
+        const sid = types.hash64("fetch.detach.series");
+        _ = try series_catalog.register("fetch.detach.series", "{}", sid);
+        const points = [_]types.Point{.{ .ts = 1_000, .value = 4.5 }};
+        const seg_path = try segment_mod.writeSegment(talloc, src_dir, sid, 0, points[0..]);
+        defer talloc.free(seg_path);
+        try manifest.add(src_dir, sid, 0, 1_000, 1_000, 1, seg_path);
+
+        var src = try CasManager.init(talloc, src_path, .none);
+        defer src.deinit();
+        src_head = try src.bootstrapIfMissing(src_dir, &manifest, &tags, &series_catalog);
+        source_repo_id = src.repository_id;
+        _ = try src.pack();
+
+        const fetched = try fetchLocalRepositoryWithOptions(talloc, src_path, dst_path, .none, .{ .materialize = true });
+        try std.testing.expect(fetched.repository_id.eql(src.repository_id));
+        try std.testing.expectEqual(@as(usize, 0), fetched.borrowed_repositories);
+    }
+
+    try std.fs.cwd().deleteTree(src_path);
+
+    var dst = try CasManager.init(talloc, dst_path, .none);
+    defer dst.deinit();
+    try std.testing.expectEqual(@as(usize, 0), dst.store.alternates.repo_paths.len);
+    try std.testing.expect(try dst.store.hasLocalObject(talloc, src_head));
+    const dst_head = try dst.refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(dst_head.eql(src_head));
+    try std.testing.expect(dst.repository_id.eql(source_repo_id));
+}
+
+test "borrowed clone can detach and stay independent after source removal" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const src_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/borrow-detach-src", .{tmp.sub_path});
+    defer talloc.free(src_path);
+    const dst_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/borrow-detach-dst", .{tmp.sub_path});
+    defer talloc.free(dst_path);
+    try std.fs.cwd().makePath(src_path);
+    try std.fs.cwd().makePath(dst_path);
+
+    var src_head: object_store.ObjectId = undefined;
+
+    {
+        var src_dir = try std.fs.cwd().openDir(src_path, .{ .iterate = true });
+        defer src_dir.close();
+        var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+        defer manifest.deinit();
+        var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+        defer tags.deinit();
+        var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, src_dir, .none);
+        defer series_catalog.deinit();
+        const sid = types.hash64("borrow.detach.series");
+        _ = try series_catalog.register("borrow.detach.series", "{}", sid);
+        const points = [_]types.Point{.{ .ts = 1_000, .value = 9.0 }};
+        const seg_path = try segment_mod.writeSegment(talloc, src_dir, sid, 0, points[0..]);
+        defer talloc.free(seg_path);
+        try manifest.add(src_dir, sid, 0, 1_000, 1_000, 1, seg_path);
+
+        var src = try CasManager.init(talloc, src_path, .none);
+        defer src.deinit();
+        src_head = try src.bootstrapIfMissing(src_dir, &manifest, &tags, &series_catalog);
+        _ = try src.pack();
+
+        _ = try cloneLocalRepositoryWithOptions(talloc, src_path, dst_path, .none, .{ .borrow = true });
+    }
+
+    {
+        var dst = try CasManager.init(talloc, dst_path, .none);
+        defer dst.deinit();
+        try std.testing.expect(dst.store.alternates.repo_paths.len > 0);
+        const detached = try dst.materializeBorrowedObjects();
+        try std.testing.expect(detached > 0);
+        try std.testing.expectEqual(@as(usize, 0), dst.store.alternates.repo_paths.len);
+        try std.testing.expect(try dst.store.hasLocalObject(talloc, src_head));
+    }
+
+    try std.fs.cwd().deleteTree(src_path);
+
+    var detached_dst = try CasManager.init(talloc, dst_path, .none);
+    defer detached_dst.deinit();
+    try std.testing.expectEqual(@as(usize, 0), detached_dst.store.alternates.repo_paths.len);
+    try std.testing.expect(try detached_dst.store.hasLocalObject(talloc, src_head));
+    const dst_head = try detached_dst.refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(dst_head.eql(src_head));
+}
+
 test "local push enforces fast-forward and materializes owned content by default" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
