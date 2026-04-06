@@ -51,6 +51,7 @@ See also:
 - **sydraQL**:
   - HTTP [`POST /api/v1/sydraql`](../reference/http-api.md#post-apiv1sydraql) executes a query pipeline and returns columns, rows, and execution stats.
   - Design details: [sydraQL Design](../concepts/sydraql-design.md)
+  - Next user-facing surface direction: [Operator-first user-facing surface](./operator-first-surface.md)
   - Implementation notes (supplementary): [sydraDB Architecture & Engineering Design (Supplementary, Oct 18 2025)](./supplementary-design-2025-10-18.md)
 
 ```mermaid

@@ -9,6 +9,8 @@ tags:
 
 This document defines the initial design for sydraQL, the native time-series query language for SydraDB. It complements the engineering roadmap in [Development: sydraQL roadmap](../development/sydraql-roadmap.md) and sets the scope for lexer/parser, planning, and execution work.
 
+For the broader post-`v0.4.0` operator-facing product direction that should sit on top of these query primitives, see [Operator-first user-facing surface](../architecture/operator-first-surface.md).
+
 Implementation reference (current code):
 
 - HTTP surface: [HTTP API – `POST /api/v1/sydraql`](../reference/http-api.md#post-apiv1sydraql) and [`handleSydraql`](../reference/source/sydra/http.md#fn-handlesydraql-void)
@@ -192,7 +194,7 @@ Notes:
 - **Declared in metadata but not part of the supported compiled subset yet**
   - `percentile`, `rate`, `irate`, `delta`, `integral`, `moving_avg`, `ema`, `lag`, `lead`, `fill_forward`
 
-The source of truth for the registry is [`src/sydra/query/functions.zig`](/Users/rexliu/sydradb/src/sydra/query/functions.zig), but the supported compiled subset above is the public contract for this alpha.
+The source of truth for the registry is [Source reference: `src/sydra/query/functions.zig`](../reference/source/sydra/query/functions.md), but the supported compiled subset above is the public contract for this alpha.
 
 ## Execution Semantics
 - **Implicit ordering**: do not rely on implicit ordering as a stable contract; use `order by` when ordering matters.
@@ -239,3 +241,4 @@ Feedback welcome—update this document as decisions land or scope evolves.
 
 - [Source: query errors and diagnostics](../reference/source/sydra/query/errors.md)
 - [Development: sydraQL roadmap](../development/sydraql-roadmap.md)
+- [Architecture: operator-first user-facing surface](../architecture/operator-first-surface.md)
