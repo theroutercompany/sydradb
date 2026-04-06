@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+
+if [[ -n "${IN_NIX_SHELL:-}" ]]; then
+  exec zig "$@"
+fi
+
+if command -v nix >/dev/null 2>&1; then
+  exec nix develop "$repo_root" -c zig "$@"
+fi
+
+if command -v direnv >/dev/null 2>&1; then
+  exec direnv exec "$repo_root" zig "$@"
+fi
+
+cat >&2 <<'EOF'
+Unable to find a working Zig toolchain automatically.
+
+Expected one of:
+  - the repo's Nix dev shell (`nix develop`)
+  - direnv with nix-direnv configured for this repository
+
+On macOS, the global Zig in this environment may fail to link the build runner.
+Use `nix develop` first, or install/configure direnv and re-run.
+EOF
+exit 1
