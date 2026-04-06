@@ -2,6 +2,8 @@
 
 This roadmap translates the sydraQL language vision into a sequenced engineering plan. It assumes the repository is already migrated to Zig 0.15 and that the storage, WAL, and HTTP layers match the current `main` branch. Each phase lists goals, scope boundaries, detailed work items, interfaces, artefacts, validation gates, and fallback considerations. Milestones are intentionally granular so we can parallelise efforts while keeping tight feedback loops.
 
+For the next operator-facing product layer that should consume these query primitives once the current language/runtime work is in place, see [Operator-first user-facing surface](../architecture/operator-first-surface.md).
+
 ## Phase 0 – Specification Lockdown & Readiness (1–2 weeks, prerequisite for all build phases)
 
 - **Objectives**
