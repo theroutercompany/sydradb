@@ -346,6 +346,31 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         try cas.createRef(ref_name, spec);
         return;
     }
+    if (std.mem.eql(u8, sub, "delete-ref")) {
+        if (args.len < 4) return error.Invalid;
+        try cas.deleteRef(std.mem.sliceTo(args[3], 0));
+        return;
+    }
+    if (std.mem.eql(u8, sub, "rename-ref")) {
+        if (args.len < 5) return error.Invalid;
+        try cas.renameRef(std.mem.sliceTo(args[3], 0), std.mem.sliceTo(args[4], 0));
+        return;
+    }
+    if (std.mem.eql(u8, sub, "reflog")) {
+        if (args.len < 4) return error.Invalid;
+        const limit = if (args.len >= 5) try std.fmt.parseInt(usize, std.mem.sliceTo(args[4], 0), 10) else 32;
+        const entries = try cas.loadReflog(std.mem.sliceTo(args[3], 0), limit);
+        defer {
+            for (entries) |*entry| entry.deinit(alloc);
+            alloc.free(entries);
+        }
+        for (entries) |entry| {
+            const old_hex = if (entry.old_id) |id| id.toHex() else [_]u8{'0'} ** 64;
+            const new_hex = entry.new_id.toHex();
+            std.debug.print("{d} {s} {s} {s}\n", .{ entry.timestamp_ms, old_hex, new_hex, entry.reason });
+        }
+        return;
+    }
     if (std.mem.eql(u8, sub, "diff")) {
         if (args.len < 5) return error.Invalid;
         const lhs = std.mem.sliceTo(args[3], 0);

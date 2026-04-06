@@ -641,8 +641,6 @@ pub const RefStore = struct {
             alloc.free(all_entries);
         }
 
-        if (!(self.backend == .reftable and try self.hasReftableTables())) return all_entries;
-
         var filtered = std.array_list.Managed(ReflogEntry).init(alloc);
         errdefer {
             for (filtered.items) |*entry| entry.deinit(alloc);

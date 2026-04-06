@@ -108,6 +108,9 @@ Apache-2.0
 ./zig-out/bin/sydradb cas log [heads/main]
 ./zig-out/bin/sydradb cas branch <name> [spec]
 ./zig-out/bin/sydradb cas tag <name> [spec]
+./zig-out/bin/sydradb cas delete-ref <ref>
+./zig-out/bin/sydradb cas rename-ref <old_ref> <new_ref>
+./zig-out/bin/sydradb cas reflog <ref> [limit]
 ./zig-out/bin/sydradb cas diff <lhs> <rhs>
 ./zig-out/bin/sydradb cas rollback <spec>
 ./zig-out/bin/sydradb cas migrate-reftable
