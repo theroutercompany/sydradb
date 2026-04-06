@@ -1,9 +1,9 @@
 {
-  "name": "@sydra/showcase",
+  "name": "@sydra/trading-showcase",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Engineering-first showcase harness for SydraDB",
+  "description": "Trading walkthrough showcase for SydraDB",
   "scripts": {
     "dev": "concurrently -n runner,ui -c cyan,magenta \"npm:dev:runner\" \"npm:dev:ui\"",
     "dev:runner": "tsx watch runner/server.ts",
@@ -12,8 +12,7 @@
     "build:runner": "tsc -p runner/tsconfig.json",
     "build:ui": "vite build --config ui/vite.config.ts",
     "test": "vitest run",
-    "preview": "node dist/runner/showcase/runner/server.js",
-    "preview:all": "node ../start-showcases.mjs"
+    "preview": "node dist/runner/trading-showcase/runner/server.js"
   },
   "dependencies": {
     "express": "^4.21.2",
@@ -31,7 +30,6 @@
     "@vitejs/plugin-react": "^4.3.4",
     "concurrently": "^9.1.2",
     "jsdom": "^25.0.1",
-    "playwright-core": "^1.59.1",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3",
     "vite": "^6.0.11",

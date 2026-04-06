@@ -6,15 +6,15 @@ import { findRepoRoot, resolveDemoPaths, resolveDemoRoot, resolveSydraBinary } f
 const runnerEntry = fileURLToPath(import.meta.url);
 const runnerDir = path.dirname(runnerEntry);
 
-export function resolveShowcaseRoot(start = runnerDir): string {
+export function resolveTradingShowcaseRoot(start = runnerDir): string {
   return resolveDemoRoot(start);
 }
 
-const showcasePaths = resolveDemoPaths(import.meta.url);
+const tradingPaths = resolveDemoPaths(import.meta.url);
 
-export const showcaseRoot = showcasePaths.appRoot;
-export const scenariosDir = showcasePaths.scenariosDir;
-export const fixturesDir = showcasePaths.fixturesDir;
-export const uiRoot = showcasePaths.uiRoot;
+export const tradingShowcaseRoot = tradingPaths.appRoot;
+export const scenariosDir = tradingPaths.scenariosDir;
+export const fixturesDir = tradingPaths.fixturesDir;
+export const uiRoot = tradingPaths.uiRoot;
 
 export { findRepoRoot, resolveSydraBinary };

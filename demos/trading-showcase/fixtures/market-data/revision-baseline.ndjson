@@ -1,0 +1,4 @@
+{"metric":"market.trade","ts_ns":1712741400000000000,"columns":{"price":185.10,"size":100},"labels":{"symbol":"AAPL","venue":"XNAS"}}
+{"metric":"market.trade","ts_ns":1712741430000000000,"columns":{"price":185.30,"size":120},"labels":{"symbol":"AAPL","venue":"XNAS"}}
+{"metric":"market.quote","ts_ns":1712741400000000000,"columns":{"bid":185.00,"ask":185.20,"bid_size":500,"ask_size":450},"labels":{"symbol":"AAPL","venue":"XNAS"}}
+{"metric":"market.quote","ts_ns":1712741430000000000,"columns":{"bid":185.18,"ask":185.34,"bid_size":510,"ask_size":455},"labels":{"symbol":"AAPL","venue":"XNAS"}}

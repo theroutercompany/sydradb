@@ -1,0 +1,192 @@
+{
+  "schemaVersion": 1,
+  "id": "bars-and-signals",
+  "title": "Bars and Signals",
+  "summary": "Register a bar policy, rollup, and signal so the trading runtime becomes visible as more than raw rows.",
+  "maturity": "alpha",
+  "subsystems": ["market", "rollups", "signals", "trading"],
+  "requiredCapabilities": ["binary.present", "market.http", "trading.definitions"],
+  "minimumOutputs": ["rollups.runtime", "signals.runtime"],
+  "seedRoutine": "seedTradingDefinitions",
+  "cleanupRoutine": "cleanupWorkspaceSandbox",
+  "whySQLiteFallsShort": [
+    "SQLite can hold the raw rows, but it does not expose a native definition/runtime surface for bar policies, rollups, and signals.",
+    "SydraDB lets teams register local market logic close to the data and inspect whether that logic is active, lagging, or emitting.",
+    "That turns the database from passive storage into a trading runtime surface that ops and platform engineers can actually observe."
+  ],
+  "steps": [
+    {
+      "id": "register-trade-schema",
+      "title": "Register the trade schema",
+      "summary": "Keep the write contract explicit before runtime definitions are layered on top.",
+      "kind": "http_request",
+      "workspace": "trading-desk",
+      "method": "POST",
+      "path": "/api/v1/market/schema/register",
+      "contentType": "application/json",
+      "body": {
+        "metric": "market.trade",
+        "ordered_columns": ["price", "size"],
+        "required_labels": ["symbol", "venue"],
+        "storage_mapping": "fanout_v1"
+      },
+      "evidencePanels": [
+        { "id": "trade-schema", "title": "Trade schema", "kind": "json" }
+      ]
+    },
+    {
+      "id": "register-quote-schema",
+      "title": "Register the quote schema",
+      "summary": "Keep quote rows first-class in the same local engine.",
+      "kind": "http_request",
+      "workspace": "trading-desk",
+      "method": "POST",
+      "path": "/api/v1/market/schema/register",
+      "contentType": "application/json",
+      "body": {
+        "metric": "market.quote",
+        "ordered_columns": ["bid", "ask", "bid_size", "ask_size"],
+        "required_labels": ["symbol", "venue"],
+        "storage_mapping": "fanout_v1"
+      },
+      "evidencePanels": [
+        { "id": "quote-schema", "title": "Quote schema", "kind": "json" }
+      ]
+    },
+    {
+      "id": "register-policy",
+      "title": "Register a one-minute bar policy",
+      "summary": "Define how trade rows should be rolled into a bar series for runtime processing.",
+      "kind": "http_request",
+      "workspace": "trading-desk",
+      "method": "POST",
+      "path": "/api/v1/bar-policies/register",
+      "contentType": "application/json",
+      "body": {
+        "id": "regular-hours-1m",
+        "source_metric": "market.trade",
+        "interval_ns": 60000000000,
+        "session_rule": "regular_hours",
+        "no_trade_rule": "carry_forward_none",
+        "halt_rule": "skip_halts",
+        "correction_policy": "append_only"
+      },
+      "evidencePanels": [
+        { "id": "bar-policy", "title": "Bar policy", "kind": "json" }
+      ],
+      "assertions": [
+        { "path": "id", "operator": "equals", "value": "regular-hours-1m" }
+      ]
+    },
+    {
+      "id": "register-rollup",
+      "title": "Register trade-to-bar rollup",
+      "summary": "Tell SydraDB to materialize `market.bar` from the local trade stream.",
+      "kind": "http_request",
+      "workspace": "trading-desk",
+      "method": "POST",
+      "path": "/api/v1/rollups/register",
+      "contentType": "application/json",
+      "body": {
+        "id": "bars-1m",
+        "source_metric": "market.trade",
+        "target_metric": "market.bar",
+        "policy_id": "regular-hours-1m",
+        "transform_kind": "trade_to_bar"
+      },
+      "evidencePanels": [
+        { "id": "rollup-def", "title": "Rollup definition", "kind": "json" }
+      ]
+    },
+    {
+      "id": "register-signal",
+      "title": "Register EMA signal",
+      "summary": "Add a supported `ema-fast` signal so the runtime has something concrete to process after the feed lands.",
+      "kind": "http_request",
+      "workspace": "trading-desk",
+      "method": "POST",
+      "path": "/api/v1/signals/register",
+      "contentType": "application/json",
+      "body": {
+        "id": "ema-fast",
+        "input_metric": "market.bar",
+        "policy_id": "regular-hours-1m",
+        "expression_kind": "ema",
+        "params": { "period": 3 },
+        "emit_rule": "on_close"
+      },
+      "evidencePanels": [
+        { "id": "signal-def", "title": "Signal definition", "kind": "json" }
+      ]
+    },
+    {
+      "id": "ingest-baseline",
+      "title": "Write market rows into the runtime",
+      "summary": "Post the deterministic market slice so the new definitions have real rows to process.",
+      "kind": "http_request",
+      "workspace": "trading-desk",
+      "method": "POST",
+      "path": "/api/v1/market/ingest",
+      "contentType": "application/x-ndjson",
+      "body": "{{vars.baseline_ndjson}}",
+      "evidencePanels": [
+        { "id": "ingest-result", "title": "Ingest result", "kind": "json" }
+      ]
+    },
+    {
+      "id": "settle-runtime",
+      "title": "Let the runtime definitions catch up",
+      "summary": "Pause briefly so the bar policy, rollup, and signal runtime have time to process the market rows before we inspect their status.",
+      "kind": "wait",
+      "durationMs": 1200,
+      "evidencePanels": [
+        { "id": "settle-runtime", "title": "Settle window", "kind": "note" }
+      ]
+    },
+    {
+      "id": "list-rollups",
+      "title": "Inspect rollup runtime",
+      "summary": "Read back the rollup definition with runtime state so operators can see whether the derived path is alive.",
+      "kind": "http_request",
+      "workspace": "trading-desk",
+      "method": "GET",
+      "path": "/api/v1/rollups",
+      "evidencePanels": [
+        { "id": "rollup-runtime", "title": "Rollup runtime", "kind": "json", "sourcePath": "0.runtime" }
+      ],
+      "assertions": [
+        { "path": "0.runtime.status", "operator": "equals", "value": "active" }
+      ]
+    },
+    {
+      "id": "list-signals",
+      "title": "Inspect signal runtime",
+      "summary": "Read the signal definition and current runtime counters after the same market rows have passed through the engine.",
+      "kind": "http_request",
+      "workspace": "trading-desk",
+      "method": "GET",
+      "path": "/api/v1/signals",
+      "evidencePanels": [
+        { "id": "signal-runtime", "title": "Signal runtime", "kind": "json", "sourcePath": "0.runtime" }
+      ],
+      "assertions": [
+        { "path": "0.runtime.status", "operator": "equals", "value": "active" }
+      ]
+    },
+    {
+      "id": "signal-history",
+      "title": "Read signal history surface",
+      "summary": "Hit the signal-history endpoint directly so evaluators can see the exact API surface available to subscribers and post-trade readers today.",
+      "kind": "http_request",
+      "workspace": "trading-desk",
+      "method": "GET",
+      "path": "/api/v1/signals/history?name=ema-fast",
+      "evidencePanels": [
+        { "id": "signal-history", "title": "Signal history", "kind": "json" }
+      ],
+      "assertions": [
+        { "path": "name", "operator": "equals", "value": "ema-fast" }
+      ]
+    }
+  ]
+}

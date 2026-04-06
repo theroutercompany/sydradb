@@ -1,0 +1,135 @@
+{
+  "schemaVersion": 1,
+  "id": "feed-and-schema",
+  "title": "Feed and Schema",
+  "summary": "Register market families, ingest deterministic trade and quote rows, and query them back in the same structure a trading team would expect.",
+  "maturity": "candidate",
+  "subsystems": ["market", "trading", "engine"],
+  "requiredCapabilities": ["binary.present", "market.http"],
+  "minimumOutputs": ["query.rows", "ingest.rows"],
+  "seedRoutine": "seedTradingFeed",
+  "cleanupRoutine": "cleanupWorkspaceSandbox",
+  "whySQLiteFallsShort": [
+    "SQLite can store rows, but it does not give a trading team a first-class market-data contract with schema-aware ingest and revision labels built into the engine surface.",
+    "SydraDB makes the write path explicit: a feed handler can register a market family, post NDJSON rows, and query them back without inventing a separate row-to-timeseries fanout layer.",
+    "The same engine that stores the rows is the one later used for grouped analysis and storage-aware correction workflows."
+  ],
+  "steps": [
+    {
+      "id": "register-trade-schema",
+      "title": "Register the trade family",
+      "summary": "Define how a feed handler writes trade rows into SydraDB.",
+      "kind": "http_request",
+      "workspace": "trading-desk",
+      "method": "POST",
+      "path": "/api/v1/market/schema/register",
+      "contentType": "application/json",
+      "body": {
+        "metric": "market.trade",
+        "ordered_columns": ["price", "size"],
+        "required_labels": ["symbol", "venue"],
+        "storage_mapping": "fanout_v1"
+      },
+      "evidencePanels": [
+        { "id": "trade-schema", "title": "Trade schema", "kind": "json" }
+      ],
+      "assertions": [
+        { "path": "metric", "operator": "equals", "value": "market.trade" }
+      ]
+    },
+    {
+      "id": "register-quote-schema",
+      "title": "Register the quote family",
+      "summary": "Define the quote payload that the local market-data process writes into SydraDB.",
+      "kind": "http_request",
+      "workspace": "trading-desk",
+      "method": "POST",
+      "path": "/api/v1/market/schema/register",
+      "contentType": "application/json",
+      "body": {
+        "metric": "market.quote",
+        "ordered_columns": ["bid", "ask", "bid_size", "ask_size"],
+        "required_labels": ["symbol", "venue"],
+        "storage_mapping": "fanout_v1"
+      },
+      "evidencePanels": [
+        { "id": "quote-schema", "title": "Quote schema", "kind": "json" }
+      ],
+      "assertions": [
+        { "path": "metric", "operator": "equals", "value": "market.quote" }
+      ]
+    },
+    {
+      "id": "ingest-baseline",
+      "title": "Write baseline market rows",
+      "summary": "Post a focused AAPL/XNAS slice so the write contract and row shape are easy to read before we widen into grouped analysis.",
+      "kind": "http_request",
+      "workspace": "trading-desk",
+      "method": "POST",
+      "path": "/api/v1/market/ingest",
+      "contentType": "application/x-ndjson",
+      "body": "{{vars.revision_baseline_ndjson}}",
+      "evidencePanels": [
+        { "id": "ingest-result", "title": "Ingest result", "kind": "json" }
+      ],
+      "assertions": [
+        { "path": "rows", "operator": "gte", "value": 4 },
+        { "path": "writes", "operator": "gte", "value": 12 }
+      ]
+    },
+    {
+      "id": "settle-feed",
+      "title": "Let the local write path settle",
+      "summary": "Give the engine a moment to flush and index the focused market slice before the readback query runs.",
+      "kind": "wait",
+      "durationMs": 1200,
+      "evidencePanels": [
+        { "id": "settle-feed", "title": "Settle window", "kind": "note" }
+      ]
+    },
+    {
+      "id": "query-aapl-trades",
+      "title": "Read AAPL trades back",
+      "summary": "Query the local store back in row form so evaluators can see what the market family looks like after fanout and storage.",
+      "kind": "http_request",
+      "workspace": "trading-desk",
+      "method": "POST",
+      "path": "/api/v1/market/query",
+      "contentType": "application/json",
+      "body": {
+        "metric": "market.trade",
+        "labels": { "symbol": "AAPL", "venue": "XNAS" },
+        "start_ts_ns": 1712741400000000000,
+        "end_ts_ns": 1712741500000000000
+      },
+      "evidencePanels": [
+        { "id": "trade-rows", "title": "Trade rows", "kind": "rows", "sourcePath": "rows" }
+      ],
+      "assertions": [
+        { "path": "rows", "operator": "minLength", "value": 2 }
+      ]
+    },
+    {
+      "id": "query-aapl-quotes",
+      "title": "Read AAPL quotes back",
+      "summary": "Show the same contract for quotes so evaluators can see SydraDB storing structured market rows, not just anonymous telemetry points.",
+      "kind": "http_request",
+      "workspace": "trading-desk",
+      "method": "POST",
+      "path": "/api/v1/market/query",
+      "contentType": "application/json",
+      "body": {
+        "metric": "market.quote",
+        "labels": { "symbol": "AAPL", "venue": "XNAS" },
+        "start_ts_ns": 1712741400000000000,
+        "end_ts_ns": 1712741500000000000
+      },
+      "evidencePanels": [
+        { "id": "quote-rows", "title": "Quote rows", "kind": "rows", "sourcePath": "rows" }
+      ],
+      "assertions": [
+        { "path": "rows", "operator": "minLength", "value": 2 }
+      ]
+    }
+  ]
+}

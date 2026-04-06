@@ -26,18 +26,11 @@ ENV PATH="/opt/zig:${PATH}"
 
 COPY . .
 
-WORKDIR /src/demos/showcase
-RUN npm ci
-
 WORKDIR /src/demos/trading-showcase
 RUN npm ci
 
 WORKDIR /src
 RUN zig build -Doptimize=ReleaseSafe
-
-WORKDIR /src/demos/showcase
-RUN npm run build
-RUN npm prune --omit=dev
 
 WORKDIR /src/demos/trading-showcase
 RUN npm run build
@@ -46,8 +39,6 @@ RUN npm prune --omit=dev
 FROM node:22-bookworm-slim AS runtime
 
 ENV NODE_ENV=production
-ENV SHOWCASE_HOST=0.0.0.0
-ENV SHOWCASE_RUNNER_PORT=4177
 ENV TRADING_SHOWCASE_HOST=0.0.0.0
 ENV TRADING_SHOWCASE_RUNNER_PORT=4277
 ENV SYDRADB_BIN=/app/bin/sydradb
@@ -55,13 +46,6 @@ ENV SYDRADB_BIN=/app/bin/sydradb
 WORKDIR /app
 
 COPY --from=build /src/zig-out/bin/sydradb /app/bin/sydradb
-COPY --from=build /src/demos/showcase/package.json /app/demos/showcase/package.json
-COPY --from=build /src/demos/showcase/node_modules /app/demos/showcase/node_modules
-COPY --from=build /src/demos/showcase/dist/runner /app/demos/showcase/dist/runner
-COPY --from=build /src/demos/showcase/ui/dist /app/demos/showcase/dist/runner/showcase/ui/dist
-COPY --from=build /src/demos/showcase/scenarios /app/demos/showcase/dist/runner/showcase/scenarios
-COPY --from=build /src/demos/showcase/fixtures /app/demos/showcase/dist/runner/showcase/fixtures
-COPY --from=build /src/demos/start-showcases.mjs /app/demos/start-showcases.mjs
 COPY --from=build /src/demos/trading-showcase/package.json /app/demos/trading-showcase/package.json
 COPY --from=build /src/demos/trading-showcase/node_modules /app/demos/trading-showcase/node_modules
 COPY --from=build /src/demos/trading-showcase/dist/runner /app/demos/trading-showcase/dist/runner
@@ -69,8 +53,8 @@ COPY --from=build /src/demos/trading-showcase/ui/dist /app/demos/trading-showcas
 COPY --from=build /src/demos/trading-showcase/scenarios /app/demos/trading-showcase/dist/runner/trading-showcase/scenarios
 COPY --from=build /src/demos/trading-showcase/fixtures /app/demos/trading-showcase/dist/runner/trading-showcase/fixtures
 
-WORKDIR /app
+WORKDIR /app/demos/trading-showcase
 
-EXPOSE 4177 4277
+EXPOSE 4277
 
-CMD ["node", "demos/start-showcases.mjs"]
+CMD ["node", "dist/runner/trading-showcase/runner/server.js"]

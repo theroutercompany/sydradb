@@ -8,9 +8,23 @@ type TabId = "evidence" | "context" | "model";
 type LaunchCardId = "edge-story" | "maintenance-lane" | "compiler-lane";
 
 const THEME_STORAGE_KEY = "sydra-showcase-theme";
+const CORE_ROUTE = "/core";
 const LAUNCH_CARDS_COOKIE = "sydra_showcase_launch_cards";
 const LAUNCH_CARDS_COOKIE_VALUE = "hidden";
 const LAUNCH_CARDS_COOKIE_MAX_AGE = 60 * 60 * 24 * 365;
+const DEFAULT_TRADING_SHOWCASE_PORT = import.meta.env.VITE_TRADING_SHOWCASE_PORT ?? "4277";
+
+function resolveTradingShowcaseUrl() {
+  if (import.meta.env.VITE_TRADING_SHOWCASE_URL) {
+    return import.meta.env.VITE_TRADING_SHOWCASE_URL;
+  }
+  if (typeof window === "undefined") {
+    return `http://127.0.0.1:${DEFAULT_TRADING_SHOWCASE_PORT}/`;
+  }
+  return `${window.location.protocol}//${window.location.hostname}:${DEFAULT_TRADING_SHOWCASE_PORT}/`;
+}
+
+const TRADING_SHOWCASE_URL = resolveTradingShowcaseUrl();
 
 interface LaunchCardDefinition {
   id: LaunchCardId;
@@ -223,6 +237,16 @@ const STEP_KIND_GUIDES: Record<ScenarioStepResult["kind"], StepReadingGuide> = {
       "This is evidence about continuity and recoverability, not just about data format correctness.",
     operatorLens:
       "Read it like a restart drill. A clean control action only counts if the subsequent validation still looks healthy.",
+  },
+  wait: {
+    meaning:
+      "This step gives the local engine time to flush or materialize the writes that just landed before the next read or analysis step runs.",
+    lookFor:
+      "Read it as part of the operational sequence, not as a separate feature. The real evidence is in the read or analysis step that follows.",
+    managerLens:
+      "This helps explain that local processing is part of the system behavior, and the demo is waiting for that state to become visible before it judges the result.",
+    operatorLens:
+      "Treat this like a short settle window after writes or lifecycle changes. If later reads still look wrong, the problem is not just timing.",
   },
 };
 
@@ -1026,7 +1050,50 @@ export function ShowcaseDashboard({
   );
 }
 
-export default function App() {
+function ShowcaseCategoryHome({
+  onOpenCore,
+}: {
+  onOpenCore: () => void;
+}) {
+  return (
+    <div className="showcase-home-shell">
+      <div className="showcase-home-hero">
+        <p className="home-eyebrow">SydraDB demo launcher</p>
+        <h1>Choose the story you want to walk through first</h1>
+        <p>
+          The core showcase stays focused on CAS, sydraQL, compiler rollout, and engine lifecycle. The trading showcase
+          starts from market rows, grouped analysis, and correction-aware revision work for trading engineers.
+        </p>
+      </div>
+      <div className="showcase-home-grid">
+        <article className="showcase-home-card">
+          <span className="showcase-home-label">Core platform</span>
+          <h2>Storage, query, compiler, and lifecycle</h2>
+          <p>
+            Use this when the audience cares about why SydraDB is different from SQLite at the storage and operational
+            layer.
+          </p>
+          <button type="button" className="home-primary-button" onClick={onOpenCore}>
+            Open core showcase
+          </button>
+        </article>
+        <article className="showcase-home-card trading">
+          <span className="showcase-home-label">Trading</span>
+          <h2>Market data in, analysis and revisions out</h2>
+          <p>
+            Use this when the audience is closer to market-data, platform, or post-trade analysis work and wants to see
+            how SydraDB fits into a trading workflow.
+          </p>
+          <a className="home-secondary-link" href={TRADING_SHOWCASE_URL}>
+            Open trading showcase
+          </a>
+        </article>
+      </div>
+    </div>
+  );
+}
+
+export function CoreShowcaseApp() {
   const [state, setState] = useState<DemoStateResponse | null>(null);
   const [selectedScenarioId, setSelectedScenarioId] = useState<string | null>(null);
   const [runResult, setRunResult] = useState<ScenarioRunResult | null>(null);
@@ -1169,6 +1236,41 @@ export default function App() {
       }}
       onResetSession={handleResetSession}
       onRunScenario={handleRunScenario}
+    />
+  );
+}
+
+export default function App() {
+  const [pathname, setPathname] = useState(() => window.location.pathname);
+
+  useEffect(() => {
+    const storedTheme = (() => {
+      try {
+        return window.localStorage.getItem(THEME_STORAGE_KEY) === "light" ? "light" : "dark";
+      } catch {
+        return "dark";
+      }
+    })();
+    document.documentElement.dataset.theme = storedTheme;
+    document.documentElement.style.colorScheme = storedTheme;
+  }, []);
+
+  useEffect(() => {
+    const handlePopState = () => setPathname(window.location.pathname);
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, []);
+
+  if (pathname.startsWith(CORE_ROUTE)) {
+    return <CoreShowcaseApp />;
+  }
+
+  return (
+    <ShowcaseCategoryHome
+      onOpenCore={() => {
+        window.history.pushState({}, "", CORE_ROUTE);
+        setPathname(CORE_ROUTE);
+      }}
     />
   );
 }

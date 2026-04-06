@@ -69,12 +69,12 @@ In built/preview mode, the runner serves the compiled frontend itself, so the UI
 
 ## Docker
 
-The showcase can run as a single container that includes:
+The showcase Docker image now packages the full demo bundle in one container:
 
 - the built `sydradb` binary
-- the built showcase runner
-- the built static UI
-- scenario manifests and fixtures
+- the core showcase runner and UI
+- the trading showcase runner and UI
+- scenario manifests and fixtures for both apps
 
 Build from the repo root:
 
@@ -85,7 +85,7 @@ docker build -f demos/showcase/Dockerfile -t sydradb-showcase .
 Run it:
 
 ```bash
-docker run --rm -p 4177:4177 sydradb-showcase
+docker run --rm -p 4177:4177 -p 4277:4277 sydradb-showcase
 ```
 
 Then open:
@@ -94,11 +94,14 @@ Then open:
 http://127.0.0.1:4177/
 ```
 
+The core launcher on `4177` links to the trading showcase on `4277` using the same browser host by default.
+
 Container notes:
 
-- The container runs the Express runner, which also serves the built UI.
-- The runner binds to `0.0.0.0` inside the container through `SHOWCASE_HOST=0.0.0.0`.
-- The runner uses `SYDRADB_BIN=/app/bin/sydradb`.
+- The container starts both Express runners together.
+- The core showcase binds to `0.0.0.0:4177`.
+- The trading showcase binds to `0.0.0.0:4277`.
+- Both runners use `SYDRADB_BIN=/app/bin/sydradb`.
 - Scenario temp workspaces are still ephemeral and live inside the container filesystem.
 
 ## Expectations

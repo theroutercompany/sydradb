@@ -1,0 +1,201 @@
+{
+  "schemaVersion": 1,
+  "id": "analysis-and-replay",
+  "title": "Analysis and Replay",
+  "summary": "Write a corrected market slice, keep the earlier head alive, and compare grouped post-trade analysis across revisions.",
+  "maturity": "alpha",
+  "subsystems": ["market", "analysis", "cas", "trading"],
+  "requiredCapabilities": ["binary.present", "market.http", "trading.analysis", "trading.cas.revisions"],
+  "minimumOutputs": ["before.groups", "after.groups", "diff.wal_chunks_added"],
+  "seedRoutine": "seedTradingAnalysis",
+  "cleanupRoutine": "cleanupWorkspaceSandbox",
+  "whySQLiteFallsShort": [
+    "SQLite can hold the rows, but correction-aware analysis across named storage revisions is not a built-in workflow.",
+    "SydraDB lets a team keep the earlier head, write the corrected slice, and then query both revisions without inventing a separate replay database.",
+    "That makes data-correction drills and post-trade reruns easier to explain to reviewers, ops teams, and managers."
+  ],
+  "steps": [
+    {
+      "id": "register-trade-schema",
+      "title": "Register the trade schema",
+      "summary": "Keep the market-data contract explicit inside the CAS-backed workspace.",
+      "kind": "http_request",
+      "workspace": "trading-desk",
+      "method": "POST",
+      "path": "/api/v1/market/schema/register",
+      "contentType": "application/json",
+      "body": {
+        "metric": "market.trade",
+        "ordered_columns": ["price", "size"],
+        "required_labels": ["symbol", "venue"],
+        "storage_mapping": "fanout_v1"
+      },
+      "evidencePanels": [
+        { "id": "trade-schema", "title": "Trade schema", "kind": "json" }
+      ]
+    },
+    {
+      "id": "register-quote-schema",
+      "title": "Register the quote schema",
+      "summary": "Keep the quote family explicit before the corrected slice arrives.",
+      "kind": "http_request",
+      "workspace": "trading-desk",
+      "method": "POST",
+      "path": "/api/v1/market/schema/register",
+      "contentType": "application/json",
+      "body": {
+        "metric": "market.quote",
+        "ordered_columns": ["bid", "ask", "bid_size", "ask_size"],
+        "required_labels": ["symbol", "venue"],
+        "storage_mapping": "fanout_v1"
+      },
+      "evidencePanels": [
+        { "id": "quote-schema", "title": "Quote schema", "kind": "json" }
+      ]
+    },
+    {
+      "id": "ingest-baseline",
+      "title": "Write the original market slice",
+      "summary": "Seed the original cross-venue trade and quote rows that the desk first saw before a correction was published.",
+      "kind": "http_request",
+      "workspace": "trading-desk",
+      "method": "POST",
+      "path": "/api/v1/market/ingest",
+      "contentType": "application/x-ndjson",
+      "body": "{{vars.baseline_ndjson}}",
+      "evidencePanels": [
+        { "id": "baseline-ingest", "title": "Baseline ingest", "kind": "json" }
+      ]
+    },
+    {
+      "id": "settle-baseline",
+      "title": "Let the original slice settle",
+      "summary": "Give the local engine time to flush the original rows before we name the earlier storage head.",
+      "kind": "wait",
+      "durationMs": 1200,
+      "evidencePanels": [
+        { "id": "settle-baseline", "title": "Settle window", "kind": "note" }
+      ]
+    },
+    {
+      "id": "capture-head",
+      "title": "Capture the original head",
+      "summary": "Name the current storage head before the correction arrives so the desk can compare analysis across both versions later.",
+      "kind": "shell_command",
+      "workspace": "trading-desk",
+      "args": ["cas", "branch", "before-correction"],
+      "evidencePanels": [
+        { "id": "capture-command", "title": "Capture command", "kind": "command" }
+      ]
+    },
+    {
+      "id": "ingest-corrected",
+      "title": "Write the corrected market slice",
+      "summary": "Post the corrected cross-venue rows into the active head while keeping the earlier storage revision named and queryable.",
+      "kind": "http_request",
+      "workspace": "trading-desk",
+      "method": "POST",
+      "path": "/api/v1/market/ingest",
+      "contentType": "application/x-ndjson",
+      "body": "{{vars.corrected_ndjson}}",
+      "evidencePanels": [
+        { "id": "corrected-ingest", "title": "Corrected ingest", "kind": "json" }
+      ]
+    },
+    {
+      "id": "settle-correction",
+      "title": "Let the corrected slice settle",
+      "summary": "Pause before replay analysis so the corrected rows and their active head are visible to the analysis endpoints.",
+      "kind": "wait",
+      "durationMs": 1200,
+      "evidencePanels": [
+        { "id": "settle-correction", "title": "Settle window", "kind": "note" }
+      ]
+    },
+    {
+      "id": "markout-before",
+      "title": "Run markout on the earlier revision",
+      "summary": "Compute post-trade markout against the original head before the correction landed.",
+      "kind": "http_request",
+      "workspace": "trading-desk",
+      "method": "POST",
+      "path": "/api/v1/analysis/markout",
+      "contentType": "application/json",
+      "body": {
+        "venue": "XNAS",
+        "group_by": "symbol",
+        "start_ts_ns": 1712741400000000000,
+        "end_ts_ns": 1712741500000000000,
+        "horizons_ns": [30000000000],
+        "revision": "heads/before-correction"
+      },
+      "evidencePanels": [
+        { "id": "markout-before", "title": "Earlier revision markout", "kind": "json" }
+      ],
+      "assertions": [
+        { "path": "groups", "operator": "minLength", "value": 2 }
+      ]
+    },
+    {
+      "id": "markout-after",
+      "title": "Run markout on the current head",
+      "summary": "Recompute the same markout request against the corrected head so the difference is explicit.",
+      "kind": "http_request",
+      "workspace": "trading-desk",
+      "method": "POST",
+      "path": "/api/v1/analysis/markout",
+      "contentType": "application/json",
+      "body": {
+        "venue": "XNAS",
+        "group_by": "symbol",
+        "start_ts_ns": 1712741400000000000,
+        "end_ts_ns": 1712741500000000000,
+        "horizons_ns": [30000000000],
+        "revision": "heads/main"
+      },
+      "evidencePanels": [
+        { "id": "markout-after", "title": "Current head markout", "kind": "json" }
+      ],
+      "assertions": [
+        { "path": "groups", "operator": "minLength", "value": 2 }
+      ]
+    },
+    {
+      "id": "quote-quality-after",
+      "title": "Inspect grouped quote quality by venue on the corrected head",
+      "summary": "Keep a second post-trade lens visible on the corrected head so the revision story shows venue-level quote quality, not just one slippage view.",
+      "kind": "http_request",
+      "workspace": "trading-desk",
+      "method": "POST",
+      "path": "/api/v1/analysis/quote-quality",
+      "contentType": "application/json",
+      "body": {
+        "symbol": "AAPL",
+        "group_by": "venue",
+        "start_ts_ns": 1712741400000000000,
+        "end_ts_ns": 1712741500000000000,
+        "revision": "heads/main"
+      },
+      "evidencePanels": [
+        { "id": "quote-quality", "title": "Grouped quote quality", "kind": "json" }
+      ],
+      "assertions": [
+        { "path": "groups", "operator": "minLength", "value": 2 }
+      ]
+    },
+    {
+      "id": "diff-revisions",
+      "title": "Inspect what changed in storage",
+      "summary": "Compare the named original head and the current head so the correction is visible at the storage layer too.",
+      "kind": "cas_command",
+      "workspace": "trading-desk",
+      "args": ["diff", "heads/before-correction", "heads/main"],
+      "evidencePanels": [
+        { "id": "revision-diff", "title": "Storage diff", "kind": "json" }
+      ],
+      "assertions": [
+        { "path": "wal_chunks_added", "operator": "gte", "value": 1 }
+      ]
+    }
+  ]
+}

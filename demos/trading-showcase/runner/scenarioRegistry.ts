@@ -2,7 +2,6 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 import { buildScenarioAvailability, buildScenarioSummaries } from "../../shared/runtime/scenarioRegistry.js";
-
 import { scenariosDir } from "./paths.js";
 import { scenarioManifestSchema } from "./scenarioSchemas.js";
 

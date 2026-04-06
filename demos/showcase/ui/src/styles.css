@@ -1150,3 +1150,111 @@ pre, code {
     transition-duration: 1ms !important;
   }
 }
+
+.showcase-home-shell {
+  min-height: 100vh;
+  padding: 40px 32px;
+  background:
+    radial-gradient(circle at top left, rgba(83, 208, 217, 0.14), transparent 32%),
+    radial-gradient(circle at top right, rgba(18, 123, 134, 0.22), transparent 28%),
+    var(--bg);
+}
+
+.showcase-home-hero {
+  max-width: 72ch;
+  margin-bottom: 28px;
+}
+
+.showcase-home-hero h1 {
+  margin: 10px 0 12px;
+  font-size: clamp(2.2rem, 4vw, 4rem);
+  line-height: 0.98;
+}
+
+.showcase-home-hero p {
+  margin: 0;
+  color: var(--muted);
+  line-height: 1.7;
+}
+
+.home-eyebrow {
+  margin: 0;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  font-size: 0.76rem;
+  color: var(--accent);
+}
+
+.showcase-home-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px;
+}
+
+.showcase-home-card {
+  padding: 24px;
+  border-radius: 24px;
+  border: 1px solid var(--border);
+  background: rgba(14, 26, 35, 0.84);
+  box-shadow: var(--shadow);
+}
+
+:root[data-theme="light"] .showcase-home-card {
+  background: rgba(255, 255, 255, 0.92);
+}
+
+.showcase-home-card h2 {
+  margin: 8px 0 10px;
+}
+
+.showcase-home-card p {
+  margin: 0 0 18px;
+  color: var(--muted);
+  line-height: 1.65;
+}
+
+.showcase-home-card.trading {
+  border-color: rgba(83, 208, 217, 0.35);
+}
+
+.showcase-home-label {
+  display: inline-flex;
+  padding: 0.3rem 0.65rem;
+  border-radius: 999px;
+  background: rgba(83, 208, 217, 0.12);
+  color: var(--accent);
+  font-size: 0.76rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.home-primary-button,
+.home-secondary-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 48px;
+  padding: 0 1rem;
+  border-radius: 14px;
+  text-decoration: none;
+  font-weight: 700;
+}
+
+.home-primary-button {
+  border: none;
+  cursor: pointer;
+  background: linear-gradient(135deg, var(--accent), var(--accent-strong));
+  color: #071117;
+}
+
+.home-secondary-link {
+  border: 1px solid var(--border);
+  background: var(--surface-strong);
+  color: var(--text-primary);
+}
+
+@media (max-width: 900px) {
+  .showcase-home-grid {
+    grid-template-columns: 1fr;
+  }
+}

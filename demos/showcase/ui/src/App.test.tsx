@@ -128,6 +128,7 @@ describe("ShowcaseDashboard", () => {
   beforeEach(() => {
     vi.resetAllMocks();
     window.localStorage.clear();
+    window.history.pushState({}, "", "/core");
     clearCookie("sydra_showcase_launch_cards");
     delete document.documentElement.dataset.theme;
     document.documentElement.style.colorScheme = "";
@@ -165,6 +166,17 @@ describe("ShowcaseDashboard", () => {
     expect(screen.getByText("Experimental scenario")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("checkbox"));
     expect(onToggleReleaseMode).toHaveBeenCalledWith(true);
+  });
+
+  it("renders the category launcher at the default route", async () => {
+    window.history.pushState({}, "", "/");
+    vi.mocked(fetchState).mockResolvedValue(mockState);
+
+    render(<App />);
+
+    expect(screen.getByText("Choose the story you want to walk through first")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open core showcase" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "Open trading showcase" })).toHaveAttribute("href", "http://localhost:4277/");
   });
 
   it("defaults to dark mode and persists theme changes", async () => {

@@ -36,30 +36,6 @@ const shellCommandStepSchema = stepBaseSchema.extend({
   args: z.array(z.string()).min(1),
 });
 
-const sydraqlStepSchema = stepBaseSchema.extend({
-  kind: z.literal("sydraql_query"),
-  workspace: z.string().min(1),
-  query: z.string().min(1),
-});
-
-const queryRangeStepSchema = stepBaseSchema.extend({
-  kind: z.literal("query_range"),
-  workspace: z.string().min(1),
-  payload: z.record(z.unknown()),
-});
-
-const metricsStepSchema = stepBaseSchema.extend({
-  kind: z.literal("metrics_snapshot"),
-  workspace: z.string().min(1),
-  counters: z.array(z.string()).min(1),
-});
-
-const serverControlStepSchema = stepBaseSchema.extend({
-  kind: z.literal("server_control"),
-  workspace: z.string().min(1),
-  action: z.enum(["start", "stop", "restart"]),
-});
-
 const waitStepSchema = stepBaseSchema.extend({
   kind: z.literal("wait"),
   durationMs: z.number().int().positive(),
@@ -91,10 +67,6 @@ export const scenarioManifestSchema = z.object({
     z.discriminatedUnion("kind", [
       casCommandStepSchema,
       shellCommandStepSchema,
-      sydraqlStepSchema,
-      queryRangeStepSchema,
-      metricsStepSchema,
-      serverControlStepSchema,
       waitStepSchema,
       httpRequestStepSchema,
     ]),

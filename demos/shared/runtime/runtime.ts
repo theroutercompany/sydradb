@@ -1,0 +1,515 @@
+import fs from "node:fs/promises";
+import net from "node:net";
+import path from "node:path";
+import { randomUUID } from "node:crypto";
+import { spawn, type ChildProcessByStdio } from "node:child_process";
+import type { Readable } from "node:stream";
+
+export type CompilerMode = "compiled" | "legacy" | "shadow";
+
+type ServerProcess = ChildProcessByStdio<null, Readable, Readable>;
+
+export interface WorkspaceRuntime {
+  name: string;
+  dir: string;
+  dataDir: string;
+  configPath: string;
+  compilerMode: CompilerMode;
+  port: number;
+  baseUrl: string;
+  configOverrides?: Partial<WorkspaceConfig>;
+  server?: ServerProcess;
+}
+
+export interface WorkspaceConfig {
+  casMode: "off" | "dual_write";
+  metadataReadMode: "legacy" | "shadow" | "primary";
+  queryCompilerMode: CompilerMode;
+  enableProm: boolean;
+}
+
+export interface ScenarioSandbox {
+  rootDir: string;
+  workspaces: Record<string, WorkspaceRuntime>;
+  vars: Record<string, string>;
+}
+
+export interface ProcessResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+  combined: string;
+}
+
+export interface WorkspaceHttpRequestOptions {
+  method: "GET" | "POST";
+  path: string;
+  body?: string | Record<string, unknown>;
+  contentType?: string;
+  responseType?: "json" | "text";
+}
+
+async function terminateChildProcess(child: ServerProcess): Promise<void> {
+  if (child.exitCode !== null) {
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    child.once("close", () => resolve());
+    child.kill("SIGTERM");
+    setTimeout(() => {
+      if (child.exitCode === null) {
+        child.kill("SIGKILL");
+      }
+    }, 2_000).unref();
+  });
+}
+
+export async function allocatePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.unref();
+    server.on("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const address = server.address();
+      if (!address || typeof address === "string") {
+        server.close();
+        reject(new Error("Unable to allocate a local port"));
+        return;
+      }
+      const { port } = address;
+      server.close((error) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        resolve(port);
+      });
+    });
+  });
+}
+
+export async function createWorkspace(
+  rootDir: string,
+  name: string,
+  compilerMode: CompilerMode = "compiled",
+  configOverrides: Partial<WorkspaceConfig> = {},
+): Promise<WorkspaceRuntime> {
+  const dir = path.join(rootDir, name);
+  const dataDir = path.join(dir, "data");
+  const configPath = path.join(dir, "sydradb.toml");
+  const port = await allocatePort();
+  const resolvedConfig: WorkspaceConfig = {
+    casMode: configOverrides.casMode ?? "dual_write",
+    metadataReadMode:
+      configOverrides.metadataReadMode ?? (configOverrides.casMode === "off" ? "legacy" : "primary"),
+    queryCompilerMode: configOverrides.queryCompilerMode ?? compilerMode,
+    enableProm: configOverrides.enableProm ?? true,
+  };
+
+  await fs.mkdir(dataDir, { recursive: true });
+  await fs.writeFile(
+    configPath,
+    [
+      'data_dir = "./data"',
+      `http_port = ${port}`,
+      'fsync = "none"',
+      "flush_interval_ms = 25",
+      "memtable_max_bytes = 32768",
+      "mem_limit_bytes = 268435456",
+      'auth_token = ""',
+      "enable_influx = false",
+      `enable_prom = ${resolvedConfig.enableProm ? "true" : "false"}`,
+      `cas_mode = "${resolvedConfig.casMode}"`,
+      `metadata_read_mode = "${resolvedConfig.metadataReadMode}"`,
+      `query_compiler_mode = "${resolvedConfig.queryCompilerMode}"`,
+      "retention_days = 0",
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  return {
+    name,
+    dir,
+    dataDir,
+    configPath,
+    compilerMode,
+    configOverrides: resolvedConfig,
+    port,
+    baseUrl: `http://127.0.0.1:${port}`,
+  };
+}
+
+export async function runBinary(
+  workspace: WorkspaceRuntime,
+  binaryPath: string,
+  args: string[],
+  options: { stdin?: string } = {},
+): Promise<ProcessResult> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(binaryPath, args, {
+      cwd: workspace.dir,
+      env: process.env,
+      stdio: "pipe",
+    });
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
+      stdout += chunk;
+    });
+    child.stderr.on("data", (chunk: string) => {
+      stderr += chunk;
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      const result = {
+        code: code ?? 1,
+        stdout,
+        stderr,
+        combined: [stdout.trim(), stderr.trim()].filter(Boolean).join("\n"),
+      };
+      if ((code ?? 1) !== 0) {
+        reject(new Error(`Command failed in ${workspace.name}: sydradb ${args.join(" ")}\n${result.combined}`));
+        return;
+      }
+      resolve(result);
+    });
+
+    if (options.stdin) {
+      child.stdin.write(options.stdin);
+    }
+    child.stdin.end();
+  });
+}
+
+export async function waitForHttp(url: string, timeoutMs = 10_000): Promise<void> {
+  const startedAt = Date.now();
+  let lastError: unknown = null;
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      const response = await fetch(url);
+      if (response.ok) {
+        return;
+      }
+      lastError = new Error(`Unexpected status ${response.status}`);
+    } catch (error) {
+      lastError = error;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  throw lastError instanceof Error ? lastError : new Error(`Timed out waiting for ${url}`);
+}
+
+export async function startWorkspaceServer(workspace: WorkspaceRuntime, binaryPath: string): Promise<void> {
+  if (workspace.server && workspace.server.exitCode === null) {
+    return;
+  }
+
+  const child = spawn(binaryPath, [], {
+    cwd: workspace.dir,
+    env: process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let recentOutput = "";
+  const captureOutput = (chunk: string) => {
+    recentOutput = `${recentOutput}${chunk}`;
+    if (recentOutput.length > 4_000) {
+      recentOutput = recentOutput.slice(-4_000);
+    }
+  };
+  child.stdout.setEncoding("utf8");
+  child.stderr.setEncoding("utf8");
+  child.stdout.on("data", captureOutput);
+  child.stderr.on("data", captureOutput);
+  workspace.server = child;
+
+  const startupResult = Promise.race([
+    waitForHttp(`${workspace.baseUrl}/status`),
+    new Promise<never>((_, reject) => {
+      child.once("error", reject);
+      child.once("exit", (code, signal) => {
+        if (code === 0) {
+          reject(new Error(`${workspace.name} exited before becoming ready.`));
+          return;
+        }
+        if (code != null) {
+          reject(new Error(`${workspace.name} exited before becoming ready with code ${code}.`));
+          return;
+        }
+        if (signal) {
+          reject(new Error(`${workspace.name} exited before becoming ready via signal ${signal}.`));
+          return;
+        }
+        reject(new Error(`${workspace.name} exited before becoming ready.`));
+      });
+    }),
+  ]);
+
+  try {
+    await startupResult;
+  } catch (error) {
+    if (workspace.server === child) {
+      workspace.server = undefined;
+    }
+    await terminateChildProcess(child).catch(() => {});
+    const recentOutputBlock = recentOutput.trim()
+      ? `\nRecent server output:\n${recentOutput.trim()}`
+      : "";
+    throw new Error(
+      `Failed to start ${workspace.name} server: ${
+        error instanceof Error ? error.message : String(error)
+      }${recentOutputBlock}`,
+    );
+  }
+
+  child.once("close", () => {
+    if (workspace.server === child) {
+      workspace.server = undefined;
+    }
+  });
+}
+
+export async function stopWorkspaceServer(workspace: WorkspaceRuntime): Promise<void> {
+  if (!workspace.server || workspace.server.exitCode !== null) {
+    workspace.server = undefined;
+    return;
+  }
+
+  const child = workspace.server;
+  await terminateChildProcess(child);
+  workspace.server = undefined;
+}
+
+export async function restartWorkspaceServer(workspace: WorkspaceRuntime, binaryPath: string): Promise<void> {
+  await stopWorkspaceServer(workspace);
+  await startWorkspaceServer(workspace, binaryPath);
+}
+
+export async function requestWorkspace(
+  workspace: WorkspaceRuntime,
+  options: WorkspaceHttpRequestOptions,
+): Promise<unknown> {
+  const response = await fetch(`${workspace.baseUrl}${options.path}`, {
+    method: options.method,
+    headers: options.contentType ? { "Content-Type": options.contentType } : undefined,
+    body:
+      options.body == null
+        ? undefined
+        : typeof options.body === "string" || options.contentType === "application/x-ndjson"
+          ? String(options.body)
+          : JSON.stringify(options.body),
+  });
+
+  const responseType =
+    options.responseType ??
+    (options.contentType === "application/x-ndjson" ? "json" : "json");
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`${options.method} ${options.path} failed for ${workspace.name}: ${response.status} ${text}`);
+  }
+  if (responseType === "text") {
+    return text;
+  }
+  return text.length === 0 ? {} : (JSON.parse(text) as unknown);
+}
+
+export async function seedWorkspaceFromFixtures(
+  workspace: WorkspaceRuntime,
+  binaryPath: string,
+  fixtureFiles: string[],
+): Promise<void> {
+  await startWorkspaceServer(workspace, binaryPath);
+  const baselineMetrics = await fetchMetricsCounters(workspace, [
+    "sydradb_ingest_total",
+    "sydradb_flush_total",
+    "sydradb_flush_points_total",
+    "sydradb_queue_depth",
+  ]);
+  const payloadChunks = await Promise.all(fixtureFiles.map((filePath) => fs.readFile(filePath, "utf8")));
+  const records = payloadChunks.flatMap((chunk) =>
+    chunk
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean),
+  );
+  const payload = records.join("\n") + "\n";
+  const response = await fetch(`${workspace.baseUrl}/api/v1/ingest`, {
+    method: "POST",
+    body: payload,
+    headers: { "Content-Type": "application/x-ndjson" },
+  });
+  if (!response.ok) {
+    throw new Error(`Failed to seed ${workspace.name}: ${response.status} ${await response.text()}`);
+  }
+  await waitForWorkspaceFlush(workspace, {
+    binaryPath,
+    expectedPoints: records.length,
+    baselineMetrics: baselineMetrics.counters,
+  });
+  await new Promise((resolve) => setTimeout(resolve, 400));
+  await stopWorkspaceServer(workspace);
+  await waitForCasCliCanary(workspace, binaryPath);
+}
+
+async function waitForWorkspaceFlush(
+  workspace: WorkspaceRuntime,
+  {
+    binaryPath,
+    expectedPoints,
+    baselineMetrics,
+    timeoutMs = 5_000,
+  }: {
+    binaryPath: string;
+    expectedPoints: number;
+    baselineMetrics: Record<string, number>;
+    timeoutMs?: number;
+  },
+): Promise<void> {
+  const startedAt = Date.now();
+  let lastObserved: Record<string, number> | null = null;
+  let lastCanaryError: string | null = null;
+  while (Date.now() - startedAt < timeoutMs) {
+    const snapshot = await fetchMetricsCounters(workspace, [
+      "sydradb_ingest_total",
+      "sydradb_flush_total",
+      "sydradb_flush_points_total",
+      "sydradb_queue_depth",
+    ]);
+    lastObserved = snapshot.counters;
+
+    const ingestDelta =
+      snapshot.counters.sydradb_ingest_total - (baselineMetrics.sydradb_ingest_total ?? 0);
+    const flushDelta =
+      snapshot.counters.sydradb_flush_total - (baselineMetrics.sydradb_flush_total ?? 0);
+    const flushPointsDelta =
+      snapshot.counters.sydradb_flush_points_total - (baselineMetrics.sydradb_flush_points_total ?? 0);
+    const queueDepth = snapshot.counters.sydradb_queue_depth;
+
+    if (
+      Number.isFinite(ingestDelta) &&
+      Number.isFinite(flushDelta) &&
+      Number.isFinite(flushPointsDelta) &&
+      Number.isFinite(queueDepth) &&
+      ingestDelta >= expectedPoints &&
+      flushDelta >= 1 &&
+      flushPointsDelta >= expectedPoints &&
+      queueDepth === 0
+    ) {
+      try {
+        await runBinary(workspace, binaryPath, ["cas", "--json", "fsck", "--connectivity-only"]);
+        return;
+      } catch (error) {
+        lastCanaryError = error instanceof Error ? error.message : String(error);
+      }
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+
+  throw new Error(
+    `Timed out waiting for ${workspace.name} to flush seeded ingest. Last metrics: ${JSON.stringify(lastObserved)}${
+      lastCanaryError ? `\nLast CAS canary error: ${lastCanaryError}` : ""
+    }`,
+  );
+}
+
+async function waitForCasCliCanary(
+  workspace: WorkspaceRuntime,
+  binaryPath: string,
+  timeoutMs = 2_500,
+): Promise<void> {
+  const startedAt = Date.now();
+  let lastError: string | null = null;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      await runBinary(workspace, binaryPath, ["cas", "--json", "log"]);
+      await runBinary(workspace, binaryPath, ["cas", "--json", "fsck", "--connectivity-only"]);
+      return;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+
+  throw new Error(
+    `Timed out waiting for ${workspace.name} CAS state to settle after shutdown.${
+      lastError ? `\nLast CAS canary error: ${lastError}` : ""
+    }`,
+  );
+}
+
+export async function postSydraqlQuery(workspace: WorkspaceRuntime, query: string): Promise<unknown> {
+  return requestWorkspace(workspace, {
+    method: "POST",
+    path: "/api/v1/sydraql",
+    body: query,
+    contentType: "text/plain",
+  });
+}
+
+export async function postRangeQuery(
+  workspace: WorkspaceRuntime,
+  payload: Record<string, unknown>,
+): Promise<unknown> {
+  return requestWorkspace(workspace, {
+    method: "POST",
+    path: "/api/v1/query/range",
+    body: payload,
+    contentType: "application/json",
+  });
+}
+
+export async function fetchMetricsCounters(
+  workspace: WorkspaceRuntime,
+  counters: string[],
+): Promise<{ counters: Record<string, number>; raw: string }> {
+  const response = await fetch(`${workspace.baseUrl}/metrics`);
+  if (!response.ok) {
+    throw new Error(`Metrics fetch failed for ${workspace.name}: ${response.status} ${await response.text()}`);
+  }
+  const raw = await response.text();
+  const values: Record<string, number> = {};
+  for (const counter of counters) {
+    const pattern = new RegExp(`^${counter}\\s+([0-9]+(?:\\.[0-9]+)?)$`, "m");
+    const match = raw.match(pattern);
+    values[counter] = match ? Number(match[1]) : Number.NaN;
+  }
+  return { counters: values, raw };
+}
+
+export async function runCasJson(
+  workspace: WorkspaceRuntime,
+  binaryPath: string,
+  args: string[],
+): Promise<unknown> {
+  const result = await runBinary(workspace, binaryPath, ["cas", "--json", ...args]);
+  return JSON.parse(result.stdout) as unknown;
+}
+
+export async function warmWorkspace(workspace: WorkspaceRuntime, binaryPath: string): Promise<void> {
+  await startWorkspaceServer(workspace, binaryPath);
+  await stopWorkspaceServer(workspace);
+}
+
+export function createSandbox(rootDir: string, workspaces: Record<string, WorkspaceRuntime>): ScenarioSandbox {
+  const vars: Record<string, string> = { run_id: randomUUID() };
+  for (const [name, workspace] of Object.entries(workspaces)) {
+    vars[`${name.replaceAll("-", "_")}_dir`] = workspace.dir;
+    vars[`${name.replaceAll("-", "_")}_data_dir`] = workspace.dataDir;
+  }
+  return { rootDir, workspaces, vars };
+}
+
+export async function cleanupSandbox(sandbox: ScenarioSandbox, preserveArtifacts = true): Promise<void> {
+  await Promise.all(Object.values(sandbox.workspaces).map((workspace) => stopWorkspaceServer(workspace)));
+  if (!preserveArtifacts) {
+    await fs.rm(sandbox.rootDir, { recursive: true, force: true });
+  }
+}
