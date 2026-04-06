@@ -34,7 +34,7 @@ export class ShowcaseSessionManager {
   async reset(): Promise<DemoStateResponse> {
     await this.close();
 
-    const repoRoot = findRepoRoot();
+    const repoRoot = process.env.SYDRADB_BIN ? process.cwd() : findRepoRoot();
     const binaryPath = resolveSydraBinary(repoRoot);
     const sessionId = randomUUID();
     const sessionRoot = path.join(os.tmpdir(), `sydra-showcase-${sessionId}`);
@@ -208,13 +208,16 @@ export class ShowcaseSessionManager {
 
       try {
         await startWorkspaceServer(shadowWorkspace, binaryPath);
-        const shadowResult = (await postSydraqlQuery(shadowWorkspace, "select abs(-1)")) as {
+        const shadowResult = (await postSydraqlQuery(
+          shadowWorkspace,
+          "select time_bucket(60, time) as bucket, avg(value) as avg_value from edge.power_kw where time >= 0 group by time_bucket(60, time) fill(previous) order by bucket desc",
+        )) as {
           stats?: { execution_mode?: string; legacy_fallback?: boolean; fallback_reason?: string };
         };
         capabilities["compiler.modes"] =
           shadowResult.stats?.execution_mode === "shadow" &&
           shadowResult.stats?.legacy_fallback === true &&
-          typeof shadowResult.stats?.fallback_reason === "string";
+          shadowResult.stats?.fallback_reason === "unsupported_fill";
       } catch {
         capabilities["compiler.modes"] = false;
       } finally {

@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "sydraql-compiler",
   "title": "Compiler Modes and Fallbacks",
-  "summary": "Exercise compiled, shadow, and legacy execution paths while surfacing the fallback counters that matter during rapid compiler iteration.",
+  "summary": "Exercise compiled and shadow execution paths while surfacing when work falls back to the legacy path during rapid compiler iteration.",
   "maturity": "alpha",
   "subsystems": ["sydraql", "compiler", "engine"],
   "requiredCapabilities": ["binary.present", "sydraql.http", "compiler.telemetry", "compiler.modes"],
@@ -33,26 +33,26 @@
     {
       "id": "compiled-fallback",
       "title": "Trigger a compiled fallback",
-      "summary": "Run an unsupported function shape to prove compiled mode reports a clean legacy fallback instead of failing opaquely.",
+      "summary": "Run a fill clause that the compiler does not yet own so compiled mode reports a clean legacy fallback instead of failing opaquely.",
       "kind": "sydraql_query",
       "workspace": "compiled",
-      "query": "select abs(-1)",
+      "query": "select time_bucket(60, time) as bucket, avg(value) as avg_value from edge.power_kw where time >= 0 group by time_bucket(60, time) fill(previous) order by bucket desc",
       "evidencePanels": [
         { "id": "compiled-fallback-stats", "title": "Fallback stats", "kind": "query-stats", "sourcePath": "stats" }
       ],
       "assertions": [
         { "path": "stats.execution_mode", "operator": "equals", "value": "compiled" },
         { "path": "stats.legacy_fallback", "operator": "equals", "value": true },
-        { "path": "stats.fallback_reason", "operator": "equals", "value": "unsupported_function" }
+        { "path": "stats.fallback_reason", "operator": "equals", "value": "unsupported_fill" }
       ]
     },
     {
       "id": "shadow-fallback",
       "title": "Compare shadow-mode fallback behavior",
-      "summary": "Run the same unsupported query under shadow mode so the UI can highlight mode-specific behavior during compiler rollout.",
+      "summary": "Run the same fill query under shadow mode so the UI can highlight mode-specific fallback behavior during compiler rollout.",
       "kind": "sydraql_query",
       "workspace": "shadow",
-      "query": "select abs(-1)",
+      "query": "select time_bucket(60, time) as bucket, avg(value) as avg_value from edge.power_kw where time >= 0 group by time_bucket(60, time) fill(previous) order by bucket desc",
       "evidencePanels": [
         { "id": "shadow-stats", "title": "Shadow stats", "kind": "query-stats", "sourcePath": "stats" }
       ],

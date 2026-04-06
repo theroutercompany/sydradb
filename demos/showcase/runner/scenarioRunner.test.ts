@@ -40,6 +40,12 @@ describe("scenario runner", () => {
     }
   });
 
+  runIfBinary("detects compiler modes when shadow fallback telemetry is available", async () => {
+    const state = await manager.reset();
+    expect(state.capabilities["compiler.telemetry"]).toBe(true);
+    expect(state.capabilities["compiler.modes"]).toBe(true);
+  });
+
   runIfBinary("blocks the reserved multi-writer scenario when the capability is missing", async () => {
     await manager.reset();
     const result = await manager.runScenario("multi-writer-heads");

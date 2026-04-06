@@ -100,20 +100,16 @@ export const seedRoutines: Record<string, SeedRoutine> = {
   async seedSydraqlCompiler(rootDir, binaryPath) {
     const compiled = await createWorkspace(rootDir, "compiled", "compiled");
     const shadow = await createWorkspace(rootDir, "shadow", "shadow");
-    const legacy = await createWorkspace(rootDir, "legacy", "legacy");
 
     await seedWorkspaceFromFixtures(compiled, binaryPath, [eastBaseline]);
     await seedWorkspaceFromFixtures(shadow, binaryPath, [eastBaseline]);
-    await seedWorkspaceFromFixtures(legacy, binaryPath, [eastBaseline]);
 
     await startWorkspaceServer(compiled, binaryPath);
     await startWorkspaceServer(shadow, binaryPath);
-    await startWorkspaceServer(legacy, binaryPath);
 
     return createSandbox(rootDir, {
       compiled,
       shadow,
-      legacy,
     });
   },
 
