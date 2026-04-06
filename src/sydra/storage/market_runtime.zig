@@ -30,6 +30,10 @@ pub const Checkpoint = struct {
     definition_version: u32,
     series_key: []u8,
     highwater_ts: i64,
+    pending: bool = false,
+    last_event_sequence: ?u64 = null,
+    last_output_ts: ?i64 = null,
+    state_json: ?[]u8 = null,
 
     pub fn clone(self: Checkpoint, alloc: std.mem.Allocator) !Checkpoint {
         return .{
@@ -38,6 +42,10 @@ pub const Checkpoint = struct {
             .definition_version = self.definition_version,
             .series_key = try alloc.dupe(u8, self.series_key),
             .highwater_ts = self.highwater_ts,
+            .pending = self.pending,
+            .last_event_sequence = self.last_event_sequence,
+            .last_output_ts = self.last_output_ts,
+            .state_json = if (self.state_json) |value| try alloc.dupe(u8, value) else null,
         };
     }
 
@@ -45,6 +53,7 @@ pub const Checkpoint = struct {
         alloc.free(self.namespace);
         alloc.free(self.definition_id);
         alloc.free(self.series_key);
+        if (self.state_json) |value| alloc.free(value);
         self.* = undefined;
     }
 };
@@ -89,6 +98,7 @@ pub const ProcessingReport = struct {
     rows_processed: u64 = 0,
     emissions_total: u64 = 0,
     last_event_id: ?[]const u8 = null,
+    last_output_ts: ?i64 = null,
     success: bool = true,
     error_message: ?[]const u8 = null,
 };
@@ -181,6 +191,99 @@ pub const State = struct {
             .highwater_ts = highwater_ts,
         });
         try self.rewriteLocked();
+    }
+
+    pub fn setPending(
+        self: *State,
+        namespace: []const u8,
+        definition_id: []const u8,
+        definition_version: u32,
+        series_key: []const u8,
+        pending: bool,
+    ) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const checkpoint = try self.ensureCheckpointLocked(namespace, definition_id, definition_version, series_key);
+        if (checkpoint.pending == pending) return;
+        checkpoint.pending = pending;
+        try self.rewriteLocked();
+    }
+
+    pub fn recordInstanceOutput(
+        self: *State,
+        namespace: []const u8,
+        definition_id: []const u8,
+        definition_version: u32,
+        series_key: []const u8,
+        output_ts: i64,
+        last_event_sequence: ?u64,
+        state_json: ?[]const u8,
+    ) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const checkpoint = try self.ensureCheckpointLocked(namespace, definition_id, definition_version, series_key);
+        checkpoint.last_output_ts = output_ts;
+        checkpoint.pending = false;
+        checkpoint.last_event_sequence = last_event_sequence;
+        if (checkpoint.state_json) |value| self.alloc.free(value);
+        checkpoint.state_json = if (state_json) |value| try self.alloc.dupe(u8, value) else null;
+        try self.rewriteLocked();
+    }
+
+    pub fn latestCheckpointTs(
+        self: *State,
+        namespace: []const u8,
+        definition_id: []const u8,
+        definition_version: u32,
+    ) ?i64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var latest: ?i64 = null;
+        for (self.checkpoints.items) |entry| {
+            if (!std.mem.eql(u8, entry.namespace, namespace)) continue;
+            if (!std.mem.eql(u8, entry.definition_id, definition_id)) continue;
+            if (entry.definition_version != definition_version) continue;
+            if (latest == null or entry.highwater_ts > latest.?) latest = entry.highwater_ts;
+        }
+        return latest;
+    }
+
+    pub fn latestEventSequence(
+        self: *State,
+        namespace: []const u8,
+        definition_id: []const u8,
+        definition_version: u32,
+    ) ?u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var latest: ?u64 = null;
+        for (self.checkpoints.items) |entry| {
+            if (!std.mem.eql(u8, entry.namespace, namespace)) continue;
+            if (!std.mem.eql(u8, entry.definition_id, definition_id)) continue;
+            if (entry.definition_version != definition_version) continue;
+            if (entry.last_event_sequence) |sequence| {
+                if (latest == null or sequence > latest.?) latest = sequence;
+            }
+        }
+        return latest;
+    }
+
+    pub fn pendingInstanceCount(
+        self: *State,
+        namespace: []const u8,
+        definition_id: []const u8,
+        definition_version: u32,
+    ) usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var count: usize = 0;
+        for (self.checkpoints.items) |entry| {
+            if (!std.mem.eql(u8, entry.namespace, namespace)) continue;
+            if (!std.mem.eql(u8, entry.definition_id, definition_id)) continue;
+            if (entry.definition_version != definition_version) continue;
+            if (entry.pending) count += 1;
+        }
+        return count;
     }
 
     pub fn reportStart(
@@ -337,6 +440,30 @@ pub const State = struct {
         return &self.runtimes.items[self.runtimes.items.len - 1];
     }
 
+    fn ensureCheckpointLocked(
+        self: *State,
+        namespace: []const u8,
+        definition_id: []const u8,
+        definition_version: u32,
+        series_key: []const u8,
+    ) !*Checkpoint {
+        for (self.checkpoints.items) |*entry| {
+            if (!std.mem.eql(u8, entry.namespace, namespace)) continue;
+            if (!std.mem.eql(u8, entry.definition_id, definition_id)) continue;
+            if (entry.definition_version != definition_version) continue;
+            if (!std.mem.eql(u8, entry.series_key, series_key)) continue;
+            return entry;
+        }
+        try self.checkpoints.append(.{
+            .namespace = try self.alloc.dupe(u8, namespace),
+            .definition_id = try self.alloc.dupe(u8, definition_id),
+            .definition_version = definition_version,
+            .series_key = try self.alloc.dupe(u8, series_key),
+            .highwater_ts = std.math.minInt(i64),
+        });
+        return &self.checkpoints.items[self.checkpoints.items.len - 1];
+    }
+
     fn loadFromJson(self: *State, body: []const u8) !void {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, body, .{});
         defer parsed.deinit();
@@ -358,6 +485,10 @@ pub const State = struct {
                     .definition_version = parseU32(version_value) catch return error.InvalidMarketRuntime,
                     .series_key = try self.alloc.dupe(u8, key_value.string),
                     .highwater_ts = parseI64(highwater_value) catch return error.InvalidMarketRuntime,
+                    .pending = if (obj.get("pending")) |entry| parseBool(entry) catch return error.InvalidMarketRuntime else false,
+                    .last_event_sequence = if (obj.get("last_event_sequence")) |entry| parseOptionalU64(entry) catch return error.InvalidMarketRuntime else null,
+                    .last_output_ts = if (obj.get("last_output_ts")) |entry| parseOptionalI64(entry) catch return error.InvalidMarketRuntime else null,
+                    .state_json = if (obj.get("state_json")) |entry| parseOptionalString(self.alloc, entry) catch return error.InvalidMarketRuntime else null,
                 });
             }
         }
@@ -412,6 +543,14 @@ pub const State = struct {
             try jw.write(entry.series_key);
             try jw.objectField("highwater_ts");
             try jw.write(entry.highwater_ts);
+            try jw.objectField("pending");
+            try jw.write(entry.pending);
+            try jw.objectField("last_event_sequence");
+            if (entry.last_event_sequence) |value| try jw.write(value) else try jw.write(null);
+            try jw.objectField("last_output_ts");
+            if (entry.last_output_ts) |value| try jw.write(value) else try jw.write(null);
+            try jw.objectField("state_json");
+            if (entry.state_json) |value| try jw.write(value) else try jw.write(null);
             try jw.endObject();
         }
         try jw.endArray();
@@ -470,9 +609,24 @@ fn parseU64(value: std.json.Value) !u64 {
     };
 }
 
+fn parseOptionalU64(value: std.json.Value) !?u64 {
+    return switch (value) {
+        .null => null,
+        .integer => |int| @intCast(int),
+        else => error.InvalidMarketRuntime,
+    };
+}
+
 fn parseI64(value: std.json.Value) !i64 {
     return switch (value) {
         .integer => |int| int,
+        else => error.InvalidMarketRuntime,
+    };
+}
+
+fn parseBool(value: std.json.Value) !bool {
+    return switch (value) {
+        .bool => |v| v,
         else => error.InvalidMarketRuntime,
     };
 }
@@ -530,10 +684,13 @@ test "market runtime persists lifecycle state across reload" {
             .rows_processed = 12,
             .emissions_total = 3,
             .last_event_id = "bars-1m:{}:120",
+            .last_output_ts = 119,
             .success = true,
         });
         try state.setStatus("rollup", "bars-1m", 2, .paused);
         try state.upsertHighwater("rollup", "bars-1m", 2, "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}", 120);
+        try state.setPending("rollup", "bars-1m", 2, "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}", true);
+        try state.recordInstanceOutput("rollup", "bars-1m", 2, "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}", 119, 7, "{\"ema\":42}");
     }
 
     {
@@ -546,6 +703,9 @@ test "market runtime persists lifecycle state across reload" {
         try std.testing.expectEqual(@as(?i64, 120), runtime.last_success_ts);
         try std.testing.expectEqualStrings("bars-1m:{}:120", runtime.last_event_id.?);
         try std.testing.expectEqual(@as(?i64, 120), reloaded.getHighwater("rollup", "bars-1m", 2, "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}"));
+        try std.testing.expectEqual(@as(?i64, 120), reloaded.latestCheckpointTs("rollup", "bars-1m", 2));
+        try std.testing.expectEqual(@as(?u64, 7), reloaded.latestEventSequence("rollup", "bars-1m", 2));
+        try std.testing.expectEqual(@as(usize, 0), reloaded.pendingInstanceCount("rollup", "bars-1m", 2));
 
         try reloaded.deleteDefinition("rollup", "bars-1m", null);
         try std.testing.expect(reloaded.runtimeFor("rollup", "bars-1m", 2) == null);
