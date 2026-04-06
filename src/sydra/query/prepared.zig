@@ -1175,7 +1175,7 @@ fn trailingSegment(slice: []const u8) []const u8 {
 
 fn hasTagPrefix(slice: []const u8) bool {
     const dot = std.mem.indexOfScalar(u8, slice, '.') orelse return false;
-    return std.ascii.eqlIgnoreCase(slice[0..dot], "tag");
+    return std.ascii.eqlIgnoreCase(slice[0..dot], "tag") or std.ascii.eqlIgnoreCase(slice[0..dot], "label");
 }
 
 test "prepared statement disassembles bytecode programs" {
@@ -1415,6 +1415,20 @@ test "prepared VM supports scalar ordering and limit offset" {
     try std.testing.expect(hidden_value == .row);
     try std.testing.expectEqual(@as(i64, 20), hidden_value.row[0].integer);
     try std.testing.expect((try hidden_value_stmt.step()) == .done);
+
+    const tagged_sid = @import("../types.zig").seriesIdFrom("tagged.room1", "{\"host\":\"a\"}");
+    const tagged_json = "{\"host\":\"a\"}";
+    try engine.registerSeries("tagged.room1", tagged_json, tagged_sid);
+    try engine.ingest(.{ .series_id = tagged_sid, .ts = 30, .value = 4.5, .tags_json = tagged_json });
+    try waitForQueryablePoints(alloc, engine, tagged_sid, 1, 1_000);
+
+    var tag_stmt = try prepareSydraQL(alloc, engine, "select tag.host as host, value from tagged.room1 where time >= 0 order by time asc limit 1", .{});
+    defer tag_stmt.finalize();
+    const tag_row = try tag_stmt.step();
+    try std.testing.expect(tag_row == .row);
+    try std.testing.expectEqualStrings("a", tag_row.row[0].string);
+    try std.testing.expectApproxEqAbs(@as(f64, 4.5), try tag_row.row[1].asFloat(), 1e-9);
+    try std.testing.expect((try tag_stmt.step()) == .done);
 }
 
 test "prepared VM supports aggregate reads and grouped time buckets" {

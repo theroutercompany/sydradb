@@ -3,6 +3,7 @@ const cfg = @import("config.zig");
 const types = @import("types.zig");
 const AtomicU64 = @import("atomic_util.zig").AtomicU64;
 const manifest_mod = @import("storage/manifest.zig");
+const metric_catalog_mod = @import("storage/metric_catalog.zig");
 const object_store = @import("storage/object_store.zig");
 const series_catalog_mod = @import("storage/series_catalog.zig");
 const wal_mod = @import("storage/wal.zig");
@@ -48,11 +49,20 @@ pub const Engine = struct {
         },
     };
 
+    pub const SeriesDescriptor = struct {
+        series_id: types.SeriesId,
+        metric: []const u8,
+        labels_json: []const u8,
+        first_ts: ?i64 = null,
+        last_ts: ?i64 = null,
+    };
+
     pub const MetadataState = struct {
         alloc: std.mem.Allocator,
         manifest: manifest_mod.Manifest,
         tags: tags_mod.TagIndex,
         series_catalog: series_catalog_mod.SeriesCatalog,
+        metric_catalog: metric_catalog_mod.MetricCatalog,
         cas_index: ?cas_mod.SnapshotIndex = null,
         cas_index_mu: std.Thread.Mutex = .{},
 
@@ -60,6 +70,7 @@ pub const Engine = struct {
             self.manifest.deinit();
             self.tags.deinit();
             self.series_catalog.deinit();
+            self.metric_catalog.deinit();
             self.cas_index_mu.lock();
             defer self.cas_index_mu.unlock();
             if (self.cas_index) |*index| {
@@ -77,7 +88,7 @@ pub const Engine = struct {
         ) !MetadataState {
             if (config.metadata_read_mode == .primary and cas_manager != null) {
                 if (try cas_manager.?.refs.readHead(cas_mod.main_ref) != null) {
-                    return try loadFromCas(alloc, config.fsync, cas_manager.?);
+                    return try loadFromCas(alloc, data_dir, config.fsync, cas_manager.?);
                 }
             }
             return try loadFromLegacy(alloc, data_dir, config.fsync, wal, cas_manager);
@@ -192,20 +203,25 @@ pub const Engine = struct {
             errdefer tags.deinit();
             var series_catalog = try loadSeriesCatalogWithRepair(alloc, data_dir, fsync, &manifest, wal, cas_manager);
             errdefer series_catalog.deinit();
+            var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(alloc, data_dir, fsync);
+            errdefer metric_catalog.deinit();
             return .{
                 .alloc = alloc,
                 .manifest = manifest,
                 .tags = tags,
                 .series_catalog = series_catalog,
+                .metric_catalog = metric_catalog,
                 .cas_index = null,
             };
         }
 
         fn loadFromCas(
             alloc: std.mem.Allocator,
+            data_dir: std.fs.Dir,
             fsync: cfg.FsyncPolicy,
             cas_manager: *cas_mod.CasManager,
         ) !MetadataState {
+            _ = data_dir;
             var index = try cas_manager.loadHeadIndex();
             errdefer index.deinit();
             var manifest = try manifestFromSnapshot(alloc, index.snapshot.segment_descriptors);
@@ -214,11 +230,14 @@ pub const Engine = struct {
             errdefer tags.deinit();
             var series_catalog = try seriesCatalogFromSnapshot(alloc, fsync, index.snapshot.series_catalog_snapshot);
             errdefer series_catalog.deinit();
+            var metric_catalog = try metricCatalogFromSnapshot(alloc, fsync, index.snapshot.metric_catalog_snapshot);
+            errdefer metric_catalog.deinit();
             return .{
                 .alloc = alloc,
                 .manifest = manifest,
                 .tags = tags,
                 .series_catalog = series_catalog,
+                .metric_catalog = metric_catalog,
                 .cas_index = index,
             };
         }
@@ -537,7 +556,7 @@ pub const Engine = struct {
             engine.alloc.destroy(engine.queue);
         }
         if (engine.cas) |*cas| {
-            _ = try cas.bootstrapIfMissing(engine.data_dir, &engine.metadata.manifest, &engine.metadata.tags, &engine.metadata.series_catalog);
+            _ = try cas.bootstrapIfMissing(engine.data_dir, &engine.metadata.manifest, &engine.metadata.tags, &engine.metadata.series_catalog, &engine.metadata.metric_catalog);
             try engine.metadata.refreshCasIndex(cas);
         }
         try engine.recover();
@@ -933,6 +952,21 @@ pub const Engine = struct {
         try self.registerSeriesInternal(series, tags, series_id, true);
     }
 
+    pub fn registerMetricDescriptor(self: *Engine, input: metric_catalog_mod.DescriptorInput) !metric_catalog_mod.RegisterResult {
+        return try self.metadata.metric_catalog.register(input);
+    }
+
+    pub fn metricDescriptor(self: *Engine, metric: []const u8) ?metric_catalog_mod.Descriptor {
+        return self.metadata.metric_catalog.get(metric);
+    }
+
+    pub fn metricKindOrDefault(self: *Engine, metric: []const u8) metric_catalog_mod.MetricKind {
+        if (self.metricDescriptor(metric)) |descriptor| {
+            if (descriptor.kind) |kind| return kind;
+        }
+        return .gauge;
+    }
+
     pub fn resolveSelector(self: *Engine, lookup: SelectorLookup) !series_catalog_mod.Resolution {
         const legacy_view = self.metadata.legacyView();
         switch (lookup) {
@@ -993,6 +1027,68 @@ pub const Engine = struct {
 
     pub fn resolveExactSeries(self: *Engine, series: []const u8, tags_json: []const u8) !series_catalog_mod.Match {
         return (try self.resolveSelector(.{ .exact = .{ .series = series, .tags_json = tags_json } })).toMatch();
+    }
+
+    pub fn seriesDescriptorsForMetric(
+        self: *Engine,
+        alloc: std.mem.Allocator,
+        metric: []const u8,
+        labels_value: ?std.json.Value,
+        op_and: bool,
+        limit: ?usize,
+    ) ![]SeriesDescriptor {
+        var matches = std.AutoHashMap(types.SeriesId, void).init(alloc);
+        defer matches.deinit();
+
+        if (labels_value) |labels| {
+            var ids = try self.collectMatchingSeriesIds(alloc, labels, op_and);
+            defer ids.deinit();
+            for (ids.items) |sid| try matches.put(sid, {});
+        }
+
+        var descriptors = std.array_list.Managed(SeriesDescriptor).init(alloc);
+        errdefer descriptors.deinit();
+
+        self.metadata.series_catalog.mutex.lock();
+        defer self.metadata.series_catalog.mutex.unlock();
+
+        for (self.metadata.series_catalog.entries.items) |entry| {
+            if (!std.mem.eql(u8, entry.series, metric)) continue;
+            if (labels_value != null and !matches.contains(entry.series_id)) continue;
+            const bounds = self.seriesTimeBounds(entry.series_id);
+            try descriptors.append(.{
+                .series_id = entry.series_id,
+                .metric = entry.series,
+                .labels_json = entry.canonical_tags,
+                .first_ts = bounds.first_ts,
+                .last_ts = bounds.last_ts,
+            });
+            if (limit) |bounded| {
+                if (descriptors.items.len >= bounded) break;
+            }
+        }
+
+        return try descriptors.toOwnedSlice();
+    }
+
+    pub fn seriesTimeBounds(self: *Engine, series_id: types.SeriesId) struct { first_ts: ?i64, last_ts: ?i64 } {
+        var first_ts: ?i64 = null;
+        var last_ts: ?i64 = null;
+
+        for (self.metadata.manifest.entries.items) |entry| {
+            if (entry.series_id != series_id) continue;
+            if (first_ts == null or entry.start_ts < first_ts.?) first_ts = entry.start_ts;
+            if (last_ts == null or entry.end_ts > last_ts.?) last_ts = entry.end_ts;
+        }
+
+        if (self.mem.series.get(series_id)) |points| {
+            for (points.items) |point| {
+                if (first_ts == null or point.ts < first_ts.?) first_ts = point.ts;
+                if (last_ts == null or point.ts > last_ts.?) last_ts = point.ts;
+            }
+        }
+
+        return .{ .first_ts = first_ts, .last_ts = last_ts };
     }
 
     pub fn currentCompatibilityDebt(self: *Engine) !cas_mod.CompatibilityDebtReport {
@@ -1102,7 +1198,7 @@ pub const Engine = struct {
 
     pub fn verifyCasState(self: *Engine) !void {
         if (self.cas) |*cas| {
-            return try cas.verifyHeadMatchesLegacy(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog);
+            return try cas.verifyHeadMatchesLegacy(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog, &self.metadata.metric_catalog);
         }
         return error.CasDisabled;
     }
@@ -1175,7 +1271,7 @@ pub const Engine = struct {
         if (self.cas) |*cas| {
             const start_ns = std.time.nanoTimestamp();
             errdefer _ = self.metrics.cas_sync_failed_total.fetchAdd(1, .monotonic);
-            _ = try cas.syncLegacySnapshot(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog, reason);
+            _ = try cas.syncLegacySnapshot(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog, &self.metadata.metric_catalog, reason);
             try self.metadata.refreshCasIndex(cas);
             const elapsed_ns_i128 = std.time.nanoTimestamp() - start_ns;
             const elapsed_ns: u64 = @intCast(elapsed_ns_i128);
@@ -1187,9 +1283,9 @@ pub const Engine = struct {
     fn ensureSnapshotBundleHead(self: *Engine) !void {
         if (self.cas) |*cas| {
             if (try cas.refs.readHead(cas_mod.main_ref) == null) {
-                _ = try cas.bootstrapIfMissing(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog);
+                _ = try cas.bootstrapIfMissing(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog, &self.metadata.metric_catalog);
             } else {
-                _ = try cas.syncLegacySnapshot(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog, "snapshot");
+                _ = try cas.syncLegacySnapshot(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog, &self.metadata.metric_catalog, "snapshot");
             }
             try self.metadata.refreshCasIndex(cas);
             return;
@@ -1198,9 +1294,9 @@ pub const Engine = struct {
         var temp = try cas_mod.CasManager.init(self.alloc, self.config.data_dir, self.config.fsync);
         defer temp.deinit();
         if (try temp.refs.readHead(cas_mod.main_ref) == null) {
-            _ = try temp.bootstrapIfMissing(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog);
+            _ = try temp.bootstrapIfMissing(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog, &self.metadata.metric_catalog);
         } else {
-            _ = try temp.syncLegacySnapshot(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog, "snapshot");
+            _ = try temp.syncLegacySnapshot(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog, &self.metadata.metric_catalog, "snapshot");
         }
     }
 
@@ -1641,6 +1737,27 @@ fn seriesCatalogFromSnapshot(
 
     for (snapshot.entries) |entry| {
         _ = try catalog.register(entry.series, entry.canonical_tags, entry.series_id);
+    }
+    return catalog;
+}
+
+fn metricCatalogFromSnapshot(
+    alloc: std.mem.Allocator,
+    fsync: cfg.FsyncPolicy,
+    snapshot: cas_mod.MetricCatalogSnapshot,
+) !metric_catalog_mod.MetricCatalog {
+    var catalog = metric_catalog_mod.MetricCatalog.initEmpty(alloc, fsync);
+    errdefer catalog.deinit();
+
+    for (snapshot.entries) |entry| {
+        _ = try catalog.register(.{
+            .metric = entry.metric,
+            .kind = entry.kind,
+            .unit = entry.unit,
+            .description = entry.description,
+            .source_metric = entry.source_metric,
+            .source_field = entry.source_field,
+        });
     }
     return catalog;
 }
@@ -2313,10 +2430,12 @@ test "engine replays only the uncaptured current wal tail after CAS snapshot rec
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, data_dir, .none);
+    defer metric_catalog.deinit();
 
     var cas_manager = try cas_mod.CasManager.init(talloc, data_path, .none);
     defer cas_manager.deinit();
-    _ = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    _ = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
 
     _ = try wal.append(sid, 2_000, 20.0);
 

@@ -49,7 +49,8 @@ fn buildPhysicalPlan(
                 .output = final_columns,
                 .child = current,
                 .requires_hash = typed_query.groupings.len != 0,
-                .has_fill_clause = false,
+                .has_fill_clause = typed_query.select.fill != null,
+                .fill = typed_query.select.fill,
             },
         });
     } else {
@@ -117,6 +118,8 @@ fn buildInputNode(
             .output = scan_columns,
             .rollup_hint = null,
             .time_bounds = lowerTimeBounds(typed_query.time_range),
+            .label_constraints = &.{},
+            .require_exact_series = false,
         },
     });
 }

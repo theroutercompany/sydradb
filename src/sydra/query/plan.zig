@@ -322,6 +322,10 @@ fn spanUnion(a: common.Span, b: common.Span) common.Span {
     return common.Span.init(start, end);
 }
 
+pub fn selectNeedsAggregation(select: *const ast.Select) bool {
+    return needsAggregation(select);
+}
+
 fn needsAggregation(select: *const ast.Select) bool {
     if (select.groupings.len != 0) return true;
     for (select.projections) |projection| {
