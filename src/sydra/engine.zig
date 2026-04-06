@@ -10,7 +10,6 @@ const segment_mod = @import("storage/segment.zig");
 const tags_mod = @import("storage/tags.zig");
 const retention = @import("storage/retention.zig");
 const cas_mod = @import("storage/cas.zig");
-const extents = @import("storage/extents.zig");
 const query_ast = @import("query/ast.zig");
 const query_expression = @import("query/expression.zig");
 const query_plan = @import("query/plan.zig");
@@ -1051,27 +1050,21 @@ pub const Engine = struct {
                 if (entry.contentRef()) |content| {
                     switch (content) {
                         .blob => |content_id| {
-                            const loaded = try cas.store.get(self.alloc, content_id);
-                            defer self.alloc.free(loaded.payload);
-                            if (loaded.obj_type != .blob) return error.InvalidWalChunkObject;
-
-                            if (stat.size > entry.captured_bytes and try wal_mod.filePrefixMatches(self.data_dir, path, loaded.payload)) {
+                            if (stat.size > entry.captured_bytes and try wal_mod.ContentPrefixComparator.blobObjectMatchesFile(self.alloc, self.data_dir, &cas.store, path, content_id)) {
                                 try self.wal.replayFileFromOffset(self.alloc, name, entry.captured_bytes, ctx);
                                 continue;
                             }
 
-                            if (stat.size == entry.captured_bytes and try wal_mod.filePrefixMatches(self.data_dir, path, loaded.payload)) {
+                            if (stat.size == entry.captured_bytes and try wal_mod.ContentPrefixComparator.blobObjectMatchesFile(self.alloc, self.data_dir, &cas.store, path, content_id)) {
                                 continue;
                             }
                         },
                         .extent_tree => |tree| {
-                            const bytes = try extents.readAll(self.alloc, &cas.store, tree);
-                            defer self.alloc.free(bytes);
-                            if (stat.size > entry.captured_bytes and try wal_mod.filePrefixMatches(self.data_dir, path, bytes)) {
+                            if (stat.size > entry.captured_bytes and try wal_mod.ContentPrefixComparator.extentTreeMatchesFile(self.alloc, self.data_dir, &cas.store, path, tree)) {
                                 try self.wal.replayFileFromOffset(self.alloc, name, entry.captured_bytes, ctx);
                                 continue;
                             }
-                            if (stat.size == entry.captured_bytes and try wal_mod.filePrefixMatches(self.data_dir, path, bytes)) {
+                            if (stat.size == entry.captured_bytes and try wal_mod.ContentPrefixComparator.extentTreeMatchesFile(self.alloc, self.data_dir, &cas.store, path, tree)) {
                                 continue;
                             }
                         },
@@ -1094,19 +1087,8 @@ pub const Engine = struct {
 
         if (entry.contentRef()) |content| {
             switch (content) {
-                .blob => |content_id| {
-                    const loaded = try store.get(self.alloc, content_id);
-                    defer self.alloc.free(loaded.payload);
-                    if (loaded.obj_type != .blob) return error.InvalidWalChunkObject;
-                    const captured_len = @min(loaded.payload.len, @as(usize, @intCast(captured_bytes)));
-                    try wal_mod.replayBytes(self.alloc, loaded.payload[0..captured_len], ctx);
-                },
-                .extent_tree => |tree| {
-                    const bytes = try extents.readAll(self.alloc, store, tree);
-                    defer self.alloc.free(bytes);
-                    const captured_len = @min(bytes.len, @as(usize, @intCast(captured_bytes)));
-                    try wal_mod.replayBytes(self.alloc, bytes[0..captured_len], ctx);
-                },
+                .blob => |content_id| try wal_mod.replayBlobObject(self.alloc, store, content_id, ctx),
+                .extent_tree => |tree| try wal_mod.replayExtentTree(self.alloc, store, tree, ctx),
             }
             return;
         }

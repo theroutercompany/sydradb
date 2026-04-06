@@ -681,6 +681,24 @@ pub fn appendDescriptorPoints(
     try out.appendSlice(points);
 }
 
+pub fn validateDescriptorContent(
+    alloc: std.mem.Allocator,
+    data_dir: std.fs.Dir,
+    store: *object_store.ObjectStore,
+    descriptor: anytype,
+) !void {
+    const Descriptor = @TypeOf(descriptor);
+    if (@hasField(Descriptor, "segment_root")) {
+        if (descriptor.segment_root) |segment_root| {
+            try validateSegmentRoot(alloc, store, segment_root);
+            return;
+        }
+    }
+
+    const points = try readAllDescriptor(alloc, data_dir, store, descriptor);
+    alloc.free(points);
+}
+
 fn decodeZigZagVarint(reader: anytype) !i64 {
     var shift: u6 = 0;
     var result: u64 = 0;
@@ -1111,6 +1129,35 @@ fn appendSegmentRootPoints(
     if (maybe_start_ts == null and maybe_end_ts == null and appended_count != cursor.metadata.count) {
         return error.CorruptSegmentRoot;
     }
+}
+
+fn validateSegmentRoot(
+    alloc: std.mem.Allocator,
+    store: *object_store.ObjectStore,
+    root_id: object_store.ObjectId,
+) !void {
+    var cursor = try SegmentBlockCursor.open(alloc, store, root_id);
+    defer cursor.deinit();
+
+    var counted: usize = 0;
+    while (try cursor.next()) |block| {
+        var ts_reader = try extents.openReader(alloc, store, block.ts_tree);
+        defer ts_reader.deinit();
+        const ts_list = try @import("../codec/gorilla.zig").decodeTsDoD(alloc, &ts_reader, block.stats.count, block.stats.first_ts);
+        defer alloc.free(ts_list);
+        try ts_reader.finish();
+
+        var values_reader = try extents.openReader(alloc, store, block.values_tree);
+        defer values_reader.deinit();
+        const values = try @import("../codec/gorilla.zig").decodeF64(alloc, &values_reader, block.stats.count);
+        defer alloc.free(values);
+        try values_reader.finish();
+
+        if (ts_list.len != block.stats.count or values.len != block.stats.count) return error.CorruptSegmentRoot;
+        counted += block.stats.count;
+    }
+
+    if (counted != cursor.metadata.count) return error.CorruptSegmentRoot;
 }
 
 fn encodeBlockTimestamps(alloc: std.mem.Allocator, points: []const types.Point) ![]u8 {

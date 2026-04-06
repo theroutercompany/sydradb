@@ -2680,22 +2680,8 @@ pub const CasManager = struct {
             defer snapshot.deinit();
 
             for (snapshot.snapshot.segment_descriptors) |descriptor| {
-                if (descriptor.contentRef()) |content| {
-                    switch (content) {
-                        .blob => |content_id| {
-                            const loaded = try self.store.get(self.alloc, content_id);
-                            defer self.alloc.free(loaded.payload);
-                            if (loaded.obj_type != .blob) return error.InvalidSegmentContentObject;
-                            const points = try segment_mod.readAllFromBytes(self.alloc, loaded.payload);
-                            self.alloc.free(points);
-                        },
-                        .extent_tree => |tree| {
-                            const bytes = try extents.readAll(self.alloc, &self.store, tree);
-                            defer self.alloc.free(bytes);
-                            const points = try segment_mod.readAllFromBytes(self.alloc, bytes);
-                            self.alloc.free(points);
-                        },
-                    }
+                if (descriptor.contentRef() != null or descriptor.segmentRoot() != null or descriptor.mirrorPath().len != 0) {
+                    try segment_mod.validateDescriptorContent(self.alloc, data_dir, &self.store, descriptor);
                     report.segment_contents_checked += 1;
                 }
                 if (descriptor.mirrorPath().len != 0) {
@@ -2713,17 +2699,8 @@ pub const CasManager = struct {
                         pub fn onRecord(_: *@This(), _: types.SeriesId, _: i64, _: f64) !void {}
                     }{};
                     switch (content) {
-                        .blob => |content_id| {
-                            const loaded = try self.store.get(self.alloc, content_id);
-                            defer self.alloc.free(loaded.payload);
-                            if (loaded.obj_type != .blob) return error.InvalidWalChunkObject;
-                            try wal_mod.replayBytes(self.alloc, loaded.payload, &noop_ctx);
-                        },
-                        .extent_tree => |tree| {
-                            const bytes = try extents.readAll(self.alloc, &self.store, tree);
-                            defer self.alloc.free(bytes);
-                            try wal_mod.replayBytes(self.alloc, bytes, &noop_ctx);
-                        },
+                        .blob => |content_id| try wal_mod.replayBlobObject(self.alloc, &self.store, content_id, &noop_ctx),
+                        .extent_tree => |tree| try wal_mod.replayExtentTree(self.alloc, &self.store, tree, &noop_ctx),
                     }
                     report.wal_contents_checked += 1;
                 }
@@ -5428,17 +5405,14 @@ fn verifyWalFiles(alloc: std.mem.Allocator, wal_index: WalIndex, data_dir: std.f
         } else if (entry.contentRef()) |content| {
             switch (content) {
                 .blob => |content_id| {
-                    const loaded = try store.get(alloc, content_id);
-                    defer alloc.free(loaded.payload);
-                    if (loaded.obj_type != .blob) return error.InvalidWalChunkObject;
-                    if (loaded.payload.len != entry.captured_bytes) return error.CasVerificationFailed;
-                    if (!try wal_mod.filePrefixMatches(data_dir, path, loaded.payload)) return error.CasVerificationFailed;
+                    if (!try wal_mod.ContentPrefixComparator.blobObjectMatchesFile(alloc, data_dir, store, path, content_id)) {
+                        return error.CasVerificationFailed;
+                    }
                 },
                 .extent_tree => |tree| {
-                    const bytes = try extents.readAll(alloc, store, tree);
-                    defer alloc.free(bytes);
-                    if (bytes.len != entry.captured_bytes) return error.CasVerificationFailed;
-                    if (!try wal_mod.filePrefixMatches(data_dir, path, bytes)) return error.CasVerificationFailed;
+                    if (!try wal_mod.ContentPrefixComparator.extentTreeMatchesFile(alloc, data_dir, store, path, tree)) {
+                        return error.CasVerificationFailed;
+                    }
                 },
             }
         }
@@ -7108,18 +7082,6 @@ fn writeSeriesCatalogFile(alloc: std.mem.Allocator, data_dir: std.fs.Dir, series
     try data_dir.rename(temp_name, "series_catalog.jsonl");
 }
 
-fn readContentBytes(alloc: std.mem.Allocator, store: *object_store.ObjectStore, content: ContentRef) ![]u8 {
-    return switch (content) {
-        .blob => |content_id| blk: {
-            const loaded = try store.get(alloc, content_id);
-            defer alloc.free(loaded.payload);
-            if (loaded.obj_type != .blob) return error.InvalidContentBlobObject;
-            break :blk try alloc.dupe(u8, loaded.payload);
-        },
-        .extent_tree => |tree| try extents.readAll(alloc, store, tree),
-    };
-}
-
 fn materializeSnapshotMirrors(
     alloc: std.mem.Allocator,
     data_dir: std.fs.Dir,
@@ -7149,9 +7111,6 @@ fn writeContentRefToPath(
     path: []const u8,
     content: ContentRef,
 ) !void {
-    const bytes = try readContentBytes(alloc, store, content);
-    defer alloc.free(bytes);
-
     if (std.fs.path.dirname(path)) |dirname| try data_dir.makePath(dirname);
     const temp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
     defer alloc.free(temp_path);
@@ -7159,7 +7118,41 @@ fn writeContentRefToPath(
     var file = try data_dir.createFile(temp_path, .{ .truncate = true, .read = true });
     defer file.close();
     errdefer data_dir.deleteFile(temp_path) catch {};
-    try file.writeAll(bytes);
+    var write_buf: [4096]u8 = undefined;
+    var writer_state = file.writer(&write_buf);
+    const writer = &writer_state.interface;
+    switch (content) {
+        .blob => |content_id| {
+            if (try store.openPackedBlobReader(alloc, content_id)) |packed_reader| {
+                var reader = packed_reader;
+                defer reader.deinit();
+                var scratch: [8192]u8 = undefined;
+                while (true) {
+                    const read_len = try reader.read(scratch[0..]);
+                    if (read_len == 0) break;
+                    try writer.writeAll(scratch[0..read_len]);
+                }
+                try reader.finish();
+            } else {
+                const loaded = try store.get(alloc, content_id);
+                defer alloc.free(loaded.payload);
+                if (loaded.obj_type != .blob) return error.InvalidContentBlobObject;
+                try writer.writeAll(loaded.payload);
+            }
+        },
+        .extent_tree => |tree| {
+            var reader = try extents.openReader(alloc, store, tree);
+            defer reader.deinit();
+            var scratch: [8192]u8 = undefined;
+            while (true) {
+                const read_len = try reader.read(scratch[0..]);
+                if (read_len == 0) break;
+                try writer.writeAll(scratch[0..read_len]);
+            }
+            try reader.finish();
+        },
+    }
+    try writer_state.end();
     try file.sync();
     data_dir.rename(temp_path, path) catch |err| switch (err) {
         error.PathAlreadyExists => {
