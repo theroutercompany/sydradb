@@ -6545,10 +6545,10 @@ fn writeReftableTable(
         try appendInt(&bytes, u64, entry.block_offset);
     }
 
-    std.mem.writeInt(u32, bytes.items[(reftable_magic.len + @sizeOf(u16) + @sizeOf(u64) * 2) ..][0..4], @intCast(ref_index.items.len), .little);
-    std.mem.writeInt(u32, bytes.items[(reftable_magic.len + @sizeOf(u16) + @sizeOf(u64) * 2 + @sizeOf(u32)) ..][0..4], @intCast(reflog_index.items.len), .little);
-    std.mem.writeInt(u64, bytes.items[ref_index_offset_pos .. ref_index_offset_pos + @sizeOf(u64)], @intCast(ref_index_offset), .little);
-    std.mem.writeInt(u64, bytes.items[reflog_index_offset_pos .. reflog_index_offset_pos + @sizeOf(u64)], @intCast(reflog_index_offset), .little);
+    std.mem.writeInt(u32, @as(*[4]u8, @ptrCast(bytes.items[(reftable_magic.len + @sizeOf(u16) + @sizeOf(u64) * 2) ..][0..4].ptr)), @intCast(ref_index.items.len), .little);
+    std.mem.writeInt(u32, @as(*[4]u8, @ptrCast(bytes.items[(reftable_magic.len + @sizeOf(u16) + @sizeOf(u64) * 2 + @sizeOf(u32)) ..][0..4].ptr)), @intCast(reflog_index.items.len), .little);
+    std.mem.writeInt(u64, @as(*[8]u8, @ptrCast(bytes.items[ref_index_offset_pos .. ref_index_offset_pos + @sizeOf(u64)].ptr)), @intCast(ref_index_offset), .little);
+    std.mem.writeInt(u64, @as(*[8]u8, @ptrCast(bytes.items[reflog_index_offset_pos .. reflog_index_offset_pos + @sizeOf(u64)].ptr)), @intCast(reflog_index_offset), .little);
 
     var hasher = std.crypto.hash.Blake3.init(.{});
     hasher.update(bytes.items);
