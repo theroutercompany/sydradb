@@ -121,6 +121,9 @@ fn handleRequest(handle: *alloc_mod.AllocatorHandle, alloc: std.mem.Allocator, e
     if (std.mem.eql(u8, path, "/api/v1/market/ingest") and method == .POST) {
         return try handleMarketIngest(alloc, eng, req);
     }
+    if (std.mem.eql(u8, path, "/api/v1/market/query") and method == .POST) {
+        return try handleMarketQuery(alloc, eng, req);
+    }
     if (std.mem.eql(u8, path, "/api/v1/bar-policies/register") and method == .POST) {
         return try handleBarPolicyRegister(alloc, eng, req);
     }
@@ -141,6 +144,9 @@ fn handleRequest(handle: *alloc_mod.AllocatorHandle, alloc: std.mem.Allocator, e
     }
     if (std.mem.eql(u8, path, "/api/v1/signals") and method == .GET) {
         return try handleSignalList(alloc, eng, req);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/signals/history") and method == .GET) {
+        return try handleSignalHistory(alloc, eng, req, query);
     }
     if (std.mem.startsWith(u8, path, "/api/v1/signals/") and !std.mem.eql(u8, path, "/api/v1/signals/subscribe")) {
         return try handleSignalAction(alloc, eng, req, method, path["/api/v1/signals/".len..]);
@@ -168,6 +174,9 @@ fn handleRequest(handle: *alloc_mod.AllocatorHandle, alloc: std.mem.Allocator, e
     }
     if (std.mem.eql(u8, path, "/api/v1/analysis/quote-quality") and method == .POST) {
         return try handleAnalysisQuoteQuality(alloc, eng, req);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/analysis/catalog") and method == .GET) {
+        return try handleAnalysisCatalog(req);
     }
     if (std.mem.eql(u8, path, "/api/v1/query/range") and method == .POST) {
         return try handleQuery(alloc, eng, req);
@@ -1969,7 +1978,7 @@ fn handleRollupList(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Serve
     for (entries) |entry| {
         var runtime = eng.rollupRuntime(entry.id, entry.version);
         defer if (runtime) |*value| value.deinit(alloc);
-        try writeRollupWithRuntime(&jw, entry, runtime);
+        try writeRollupWithRuntimeAndStats(&jw, eng, entry, runtime);
     }
     try jw.endArray();
     try response.end();
@@ -2033,7 +2042,7 @@ fn handleSignalList(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Serve
     for (entries) |entry| {
         var runtime = eng.signalRuntime(entry.id, entry.version);
         defer if (runtime) |*value| value.deinit(alloc);
-        try writeSignalWithRuntime(&jw, entry, runtime);
+        try writeSignalWithRuntimeAndStats(&jw, eng, entry, runtime);
     }
     try jw.endArray();
     try response.end();
@@ -2046,6 +2055,12 @@ fn handleRollupAction(
     method: std.http.Method,
     remainder: []const u8,
 ) !void {
+    if (method == .GET and std.mem.indexOfScalar(u8, remainder, '/') != null) {
+        return respondJsonError(alloc, req, .not_found, "not_found", "not found");
+    }
+    if (method == .GET) {
+        return try handleRollupDetail(alloc, eng, req, remainder);
+    }
     if (std.mem.endsWith(u8, remainder, "/pause") and method == .POST) {
         const id = remainder[0 .. remainder.len - "/pause".len];
         try eng.pauseRollup(id);
@@ -2071,6 +2086,12 @@ fn handleSignalAction(
     method: std.http.Method,
     remainder: []const u8,
 ) !void {
+    if (method == .GET and std.mem.indexOfScalar(u8, remainder, '/') != null) {
+        return respondJsonError(alloc, req, .not_found, "not_found", "not found");
+    }
+    if (method == .GET) {
+        return try handleSignalDetail(alloc, eng, req, remainder);
+    }
     if (std.mem.endsWith(u8, remainder, "/pause") and method == .POST) {
         const id = remainder[0 .. remainder.len - "/pause".len];
         try eng.pauseSignal(id);
@@ -2087,6 +2108,38 @@ fn handleSignalAction(
         return try respondActionOk(req, "deleted");
     }
     return respondJsonError(alloc, req, .not_found, "not_found", "not found");
+}
+
+fn handleRollupDetail(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request, id: []const u8) !void {
+    var entry = try eng.latestRollup(id) orelse return respondJsonError(alloc, req, .not_found, "rollup_not_found", "rollup not found");
+    defer entry.deinit(alloc);
+    var runtime = eng.rollupRuntime(entry.id, entry.version);
+    defer if (runtime) |*value| value.deinit(alloc);
+
+    var send_buffer: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try writeRollupWithRuntimeAndStats(&jw, eng, entry, runtime);
+    try response.end();
+}
+
+fn handleSignalDetail(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request, id: []const u8) !void {
+    var entry = try eng.latestSignal(id) orelse return respondJsonError(alloc, req, .not_found, "signal_not_found", "signal not found");
+    defer entry.deinit(alloc);
+    var runtime = eng.signalRuntime(entry.id, entry.version);
+    defer if (runtime) |*value| value.deinit(alloc);
+
+    var send_buffer: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try writeSignalWithRuntimeAndStats(&jw, eng, entry, runtime);
+    try response.end();
 }
 
 fn respondActionOk(req: *std.http.Server.Request, status_text: []const u8) !void {
@@ -2108,6 +2161,15 @@ fn writeRollupWithRuntime(
     entry: market_catalog_mod.RollupDefinition,
     runtime: ?market_runtime_mod.DefinitionRuntime,
 ) !void {
+    try writeRollupWithRuntimeAndStats(jw, null, entry, runtime);
+}
+
+fn writeRollupWithRuntimeAndStats(
+    jw: *std.json.Stringify,
+    eng: ?*Engine,
+    entry: market_catalog_mod.RollupDefinition,
+    runtime: ?market_runtime_mod.DefinitionRuntime,
+) !void {
     try jw.beginObject();
     try jw.objectField("id");
     try jw.write(entry.id);
@@ -2122,12 +2184,21 @@ fn writeRollupWithRuntime(
     try jw.objectField("transform_kind");
     try jw.write(entry.transform_kind.text());
     try jw.objectField("runtime");
-    try writeRuntimeState(jw, runtime);
+    try writeRuntimeState(jw, runtime, if (eng) |engine| engine.pendingStatsForMetric(entry.source_metric) else .{ .pending_instances = 0, .max_lag_ns = null });
     try jw.endObject();
 }
 
 fn writeSignalWithRuntime(
     jw: *std.json.Stringify,
+    entry: market_catalog_mod.SignalDefinition,
+    runtime: ?market_runtime_mod.DefinitionRuntime,
+) !void {
+    try writeSignalWithRuntimeAndStats(jw, null, entry, runtime);
+}
+
+fn writeSignalWithRuntimeAndStats(
+    jw: *std.json.Stringify,
+    eng: ?*Engine,
     entry: market_catalog_mod.SignalDefinition,
     runtime: ?market_runtime_mod.DefinitionRuntime,
 ) !void {
@@ -2149,13 +2220,14 @@ fn writeSignalWithRuntime(
     try jw.objectField("emit_rule");
     try jw.write(entry.emit_rule);
     try jw.objectField("runtime");
-    try writeRuntimeState(jw, runtime);
+    try writeRuntimeState(jw, runtime, if (eng) |engine| engine.pendingStatsForMetric(entry.input_metric) else .{ .pending_instances = 0, .max_lag_ns = null });
     try jw.endObject();
 }
 
 fn writeRuntimeState(
     jw: *std.json.Stringify,
     runtime: ?market_runtime_mod.DefinitionRuntime,
+    pending_stats: Engine.PendingStats,
 ) !void {
     try jw.beginObject();
     if (runtime) |value| {
@@ -2189,6 +2261,10 @@ fn writeRuntimeState(
         try jw.objectField("last_event_id");
         try jw.write(null);
     }
+    try jw.objectField("pending_instances");
+    try jw.write(pending_stats.pending_instances);
+    try jw.objectField("max_lag_ns");
+    if (pending_stats.max_lag_ns) |lag| try jw.write(lag) else try jw.write(null);
     try jw.endObject();
 }
 
@@ -2259,6 +2335,7 @@ fn handleMarketIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Ser
         }
         try eng.ingestBatch(batch[0..batch_len]);
         for (batch[0..batch_len]) |item| eng.noteTags(item.series_id, labels_json.value);
+        try eng.scheduleDerivedMetric(metric_value.string, labels_json.value);
         rows += 1;
     }
 
@@ -2273,6 +2350,97 @@ fn handleMarketIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Ser
     try jw.write(rows);
     try jw.objectField("writes");
     try jw.write(writes);
+    try jw.endObject();
+    try response.end();
+}
+
+fn handleMarketQuery(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    var parsed = readJsonBody(alloc, req, 64 * 1024) catch |err| switch (err) {
+        error.LengthRequired => return respondJsonError(alloc, req, .length_required, "length_required", "length required"),
+        error.PayloadTooLarge => return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large"),
+        else => return respondJsonError(alloc, req, .bad_request, "invalid_json", "invalid json"),
+    };
+    defer parsed.deinit(alloc);
+    if (parsed.parsed.value != .object) return respondJsonError(alloc, req, .bad_request, "invalid_market_query", "invalid market query");
+    const obj = parsed.parsed.value.object;
+    const metric = jsonRequiredString(obj, "metric") orelse return respondJsonError(alloc, req, .bad_request, "missing_metric", "missing metric");
+    const labels = obj.get("labels") orelse return respondJsonError(alloc, req, .bad_request, "missing_labels", "missing labels");
+    if (labels != .object) return respondJsonError(alloc, req, .bad_request, "invalid_labels", "invalid labels");
+    const start_ts_ns = jsonRequiredInt(obj, "start_ts_ns") orelse return respondJsonError(alloc, req, .bad_request, "missing_start_ts_ns", "missing start_ts_ns");
+    const end_ts_ns = jsonRequiredInt(obj, "end_ts_ns") orelse return respondJsonError(alloc, req, .bad_request, "missing_end_ts_ns", "missing end_ts_ns");
+    const revision = if (obj.get("revision")) |value| if (value == .string) value.string else null else null;
+    const requested_columns = if (obj.get("columns")) |value| try jsonStringArrayConst(alloc, value) else null;
+    defer if (requested_columns) |columns| alloc.free(columns);
+
+    const rows = try queryMarketRows(alloc, eng, metric, labels, start_ts_ns, end_ts_ns, requested_columns, revision);
+    defer freeMarketQueryRows(alloc, rows);
+    const revision_label = try resolvedRevisionLabel(alloc, eng, revision);
+    defer alloc.free(revision_label);
+
+    var send_buffer: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try jw.beginObject();
+    try jw.objectField("metric");
+    try jw.write(metric);
+    try jw.objectField("data_revision");
+    try jw.write(revision_label);
+    try jw.objectField("rows");
+    try jw.beginArray();
+    for (rows) |row| try writeMarketQueryRow(&jw, row);
+    try jw.endArray();
+    try jw.endObject();
+    try response.end();
+}
+
+fn handleSignalHistory(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request, query: []const u8) !void {
+    const name = queryParam(query, "name") orelse return respondJsonError(alloc, req, .bad_request, "missing_name", "missing name");
+    const start_ts_ns = if (queryParam(query, "start_ts_ns")) |value| std.fmt.parseInt(i64, value, 10) catch return respondJsonError(alloc, req, .bad_request, "invalid_start_ts_ns", "invalid start_ts_ns") else std.math.minInt(i64);
+    const end_ts_ns = if (queryParam(query, "end_ts_ns")) |value| std.fmt.parseInt(i64, value, 10) catch return respondJsonError(alloc, req, .bad_request, "invalid_end_ts_ns", "invalid end_ts_ns") else std.math.maxInt(i64);
+    const revision = queryParam(query, "revision");
+    var signal = try eng.latestSignal(name) orelse return respondJsonError(alloc, req, .not_found, "signal_not_found", "signal not found");
+    defer signal.deinit(alloc);
+    const rows = try querySignalHistoryRows(alloc, eng, signal.id, signal.version, start_ts_ns, end_ts_ns, revision);
+    defer freeSignalHistoryRows(alloc, rows);
+
+    var send_buffer: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try jw.beginObject();
+    try jw.objectField("name");
+    try jw.write(signal.id);
+    try jw.objectField("definition_version");
+    try jw.write(signal.version);
+    try jw.objectField("rows");
+    try jw.beginArray();
+    for (rows) |row| try writeSignalHistoryRow(&jw, row);
+    try jw.endArray();
+    try jw.endObject();
+    try response.end();
+}
+
+fn handleAnalysisCatalog(req: *std.http.Server.Request) !void {
+    var send_buffer: [768]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try jw.beginObject();
+    try jw.objectField("group_by");
+    try jw.write(&[_][]const u8{ "none", "venue", "symbol" });
+    try jw.objectField("execution_side");
+    try jw.write(&[_][]const u8{ "auto", "buy", "sell" });
+    try jw.objectField("entry_price_source");
+    try jw.write(&[_][]const u8{ "trade", "mid" });
+    try jw.objectField("benchmark_source");
+    try jw.write(&[_][]const u8{ "mid", "trade" });
     try jw.endObject();
     try response.end();
 }
@@ -2377,14 +2545,14 @@ fn handleCasDiff(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
 
 fn handleSignalSubscribe(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request, query: []const u8) !void {
     const name = queryParam(query, "name") orelse return respondJsonError(alloc, req, .bad_request, "missing_name", "missing name");
-    const from_ts = if (findHeader(req, "last-event-id")) |value|
-        eventIdTimestamp(value) orelse 0
-    else if (queryParam(query, "from_ts")) |value|
-        std.fmt.parseInt(i64, value, 10) catch 0
+    var signal = try eng.latestSignal(name) orelse return respondJsonError(alloc, req, .not_found, "signal_not_found", "signal not found");
+    defer signal.deinit(alloc);
+    const after_sequence = if (findHeader(req, "last-event-id")) |value|
+        eventIdSequence(value)
+    else if (queryParam(query, "after_sequence")) |value|
+        std.fmt.parseInt(u64, value, 10) catch 0
     else
         0;
-    const metric = try std.fmt.allocPrint(alloc, "_signal.{s}", .{name});
-    defer alloc.free(metric);
 
     var send_buffer: [1024]u8 = undefined;
     var response = try req.respondStreaming(&send_buffer, .{
@@ -2397,53 +2565,49 @@ fn handleSignalSubscribe(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.
     });
     errdefer response.end() catch {};
 
-    var last_seen_ts = from_ts;
+    var last_seen_sequence = after_sequence;
+    var last_epoch = eng.currentSignalEventEpoch();
     while (true) {
-        const series = eng.seriesDescriptorsForMetric(alloc, metric, null, true, null) catch |err| switch (err) {
+        const events = eng.listSignalEvents(signal.id, signal.version, last_seen_sequence, null, null, 512) catch |err| switch (err) {
             else => {
-                std.log.warn("signal subscribe series lookup failed: {s}", .{@errorName(err)});
+                std.log.warn("signal subscribe event lookup failed: {s}", .{@errorName(err)});
                 break;
             },
         };
-        defer alloc.free(series);
+        defer {
+            for (events) |*event| event.deinit(alloc);
+            alloc.free(events);
+        }
 
-        var emitted = false;
-        for (series) |descriptor| {
-            var points = std.array_list.Managed(types.Point).init(alloc);
-            defer points.deinit();
-            eng.queryRange(descriptor.series_id, last_seen_ts + 1, std.math.maxInt(i64), &points) catch continue;
-            for (points.items) |point| {
-                const event_id = try std.fmt.allocPrint(alloc, "{d}:{d}", .{ descriptor.series_id, point.ts });
-                defer alloc.free(event_id);
-                const payload = try std.fmt.allocPrint(alloc, "{{\"metric\":\"{s}\",\"ts\":{d},\"value\":{d},\"labels\":{s}}}", .{
-                    metric,
-                    point.ts,
-                    point.value,
-                    descriptor.labels_json,
-                });
-                defer alloc.free(payload);
+        if (events.len != 0) {
+            for (events) |event| {
                 try response.writer.writeAll("id: ");
-                try response.writer.writeAll(event_id);
+                try response.writer.writeAll(event.event_id);
                 try response.writer.writeAll("\n");
                 try response.writer.writeAll("event: signal\n");
                 try response.writer.writeAll("data: ");
-                try response.writer.writeAll(payload);
+                try writeSignalEventPayload(&response.writer, event);
                 try response.writer.writeAll("\n\n");
-                if (point.ts > last_seen_ts) last_seen_ts = point.ts;
-                emitted = true;
+                last_seen_sequence = event.sequence;
             }
+            last_epoch = eng.currentSignalEventEpoch();
+            continue;
         }
-        if (!emitted) {
-            try response.writer.writeAll(": keep-alive\n\n");
-        }
-        std.Thread.sleep(std.time.ns_per_s);
+        _ = eng.waitForSignalEvents(last_epoch, std.time.ns_per_s);
+        const next_epoch = eng.currentSignalEventEpoch();
+        if (next_epoch == last_epoch) try response.writer.writeAll(": keep-alive\n\n");
+        last_epoch = next_epoch;
     }
     try response.end();
 }
 
-fn eventIdTimestamp(event_id: []const u8) ?i64 {
-    const colon = std.mem.lastIndexOfScalar(u8, event_id, ':') orelse return null;
-    return std.fmt.parseInt(i64, event_id[colon + 1 ..], 10) catch null;
+fn eventIdSequence(event_id: []const u8) u64 {
+    var parts = std.mem.splitScalar(u8, event_id, '/');
+    _ = parts.next() orelse return 0;
+    _ = parts.next() orelse return 0;
+    _ = parts.next() orelse return 0;
+    const sequence_text = parts.next() orelse return 0;
+    return std.fmt.parseInt(u64, sequence_text, 10) catch 0;
 }
 
 fn handleAnalysisMarkout(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
@@ -2456,8 +2620,8 @@ fn handleAnalysisMarkout(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.
     const obj = parsed.parsed.value.object;
     const symbol = jsonRequiredString(obj, "symbol") orelse return respondJsonError(alloc, req, .bad_request, "missing_symbol", "missing symbol");
     const venue = jsonRequiredString(obj, "venue") orelse return respondJsonError(alloc, req, .bad_request, "missing_venue", "missing venue");
-    const start_ts = jsonRequiredInt(obj, "start") orelse return respondJsonError(alloc, req, .bad_request, "missing_start", "missing start");
-    const end_ts = jsonRequiredInt(obj, "end") orelse return respondJsonError(alloc, req, .bad_request, "missing_end", "missing end");
+    const start_ts = jsonRequiredInt(obj, "start_ts_ns") orelse jsonRequiredInt(obj, "start") orelse return respondJsonError(alloc, req, .bad_request, "missing_start_ts_ns", "missing start_ts_ns");
+    const end_ts = jsonRequiredInt(obj, "end_ts_ns") orelse jsonRequiredInt(obj, "end") orelse return respondJsonError(alloc, req, .bad_request, "missing_end_ts_ns", "missing end_ts_ns");
     const single_horizon_ns = if (obj.get("horizon_ns")) |value| if (value == .integer) value.integer else return respondJsonError(alloc, req, .bad_request, "invalid_horizon_ns", "invalid horizon_ns") else null;
     const horizons_ns = if (obj.get("horizons_ns")) |value|
         try jsonIntArray(alloc, value)
@@ -2469,6 +2633,13 @@ fn handleAnalysisMarkout(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.
     const revision = if (obj.get("revision")) |value| if (value == .string) value.string else null else null;
     const signal_name = if (obj.get("signal_name")) |value| if (value == .string) value.string else null else null;
     const bar_policy_id = if (obj.get("bar_policy_id")) |value| if (value == .string) value.string else null else null;
+    const group_by = if (obj.get("group_by")) |value|
+        if (value == .string and (std.mem.eql(u8, value.string, "none") or std.mem.eql(u8, value.string, "venue") or std.mem.eql(u8, value.string, "symbol")))
+            value.string
+        else
+            return respondJsonError(alloc, req, .bad_request, "invalid_group_by", "invalid group_by")
+    else
+        "none";
     const labels_json = try canonicalLabelsForMarket(alloc, symbol, venue, null, null);
     defer alloc.free(labels_json);
 
@@ -2478,12 +2649,14 @@ fn handleAnalysisMarkout(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.
     }
     const prices = try queryMetricPoints(alloc, eng, "market.trade.price", labels_json, start_ts, end_ts + max_horizon, revision);
     defer alloc.free(prices);
-    const entry_points = if (signal_name) |signal_id| blk: {
-        const signal_metric = try std.fmt.allocPrint(alloc, "_signal.{s}", .{signal_id});
-        defer alloc.free(signal_metric);
-        break :blk try queryMetricPoints(alloc, eng, signal_metric, labels_json, start_ts, end_ts, revision);
-    } else try alloc.dupe(types.Point, prices);
-    defer alloc.free(entry_points);
+    var signal_version: ?u32 = null;
+    const signal_rows = if (signal_name) |signal_id| blk: {
+        var signal = try eng.latestSignal(signal_id) orelse return respondJsonError(alloc, req, .not_found, "signal_not_found", "signal not found");
+        defer signal.deinit(alloc);
+        signal_version = signal.version;
+        break :blk try querySignalHistoryRows(alloc, eng, signal_id, signal.version, start_ts, end_ts, revision);
+    } else try alloc.alloc(SignalHistoryRow, 0);
+    defer if (signal_name != null) freeSignalHistoryRows(alloc, signal_rows) else alloc.free(signal_rows);
 
     var send_buffer: [1024]u8 = undefined;
     var response = try req.respondStreaming(&send_buffer, .{
@@ -2498,14 +2671,47 @@ fn handleAnalysisMarkout(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.
     const revision_label = try resolvedRevisionLabel(alloc, eng, revision);
     defer alloc.free(revision_label);
     try jw.write(revision_label);
+    try jw.objectField("group_by");
+    try jw.write(group_by);
+    try jw.objectField("definition_refs");
+    try jw.beginArray();
     if (signal_name) |value| {
-        try jw.objectField("signal_name");
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write("signal");
+        try jw.objectField("id");
         try jw.write(value);
+        try jw.objectField("version");
+        try jw.write(signal_version.?);
+        try jw.endObject();
     }
+    if (bar_policy_id) |value| {
+        var policy = eng.latestBarPolicy(value) orelse return respondJsonError(alloc, req, .not_found, "bar_policy_not_found", "bar policy not found");
+        defer policy.deinit(alloc);
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write("bar_policy");
+        try jw.objectField("id");
+        try jw.write(value);
+        try jw.objectField("version");
+        try jw.write(policy.version);
+        try jw.endObject();
+    }
+    try jw.endArray();
     if (bar_policy_id) |value| {
         try jw.objectField("bar_policy_id");
         try jw.write(value);
     }
+    try jw.objectField("groups");
+    try jw.beginArray();
+    try jw.beginObject();
+    try jw.objectField("key");
+    try jw.beginObject();
+    try jw.objectField("symbol");
+    try jw.write(symbol);
+    try jw.objectField("venue");
+    try jw.write(venue);
+    try jw.endObject();
     try jw.objectField("horizons");
     try jw.beginArray();
     for (horizons_ns) |horizon_ns| {
@@ -2513,27 +2719,50 @@ fn handleAnalysisMarkout(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.
         var total: f64 = 0;
         var dropped: usize = 0;
         var future_idx: usize = 0;
-        for (entry_points) |point| {
-            if (point.ts < start_ts or point.ts > end_ts) continue;
-            while (future_idx < prices.len and prices[future_idx].ts < point.ts + horizon_ns) : (future_idx += 1) {}
-            if (future_idx >= prices.len) {
-                dropped += 1;
-                break;
+        if (signal_name) |_| {
+            for (signal_rows) |row| {
+                if (row.ts_ns < start_ts or row.ts_ns > end_ts) continue;
+                while (future_idx < prices.len and prices[future_idx].ts < row.ts_ns + horizon_ns) : (future_idx += 1) {}
+                if (future_idx >= prices.len) {
+                    dropped += 1;
+                    continue;
+                }
+                const entry_idx = findPriceIndexAtOrAfter(prices, row.ts_ns) orelse {
+                    dropped += 1;
+                    continue;
+                };
+                total += prices[future_idx].value - prices[entry_idx].value;
+                count += 1;
             }
-            total += prices[future_idx].value - point.value;
-            count += 1;
+        } else {
+            for (prices) |point| {
+                if (point.ts < start_ts or point.ts > end_ts) continue;
+                while (future_idx < prices.len and prices[future_idx].ts < point.ts + horizon_ns) : (future_idx += 1) {}
+                if (future_idx >= prices.len) {
+                    dropped += 1;
+                    continue;
+                }
+                total += prices[future_idx].value - point.value;
+                count += 1;
+            }
         }
         try jw.beginObject();
         try jw.objectField("horizon_ns");
         try jw.write(horizon_ns);
-        try jw.objectField("samples");
+        try jw.objectField("sample_count");
         try jw.write(count);
         try jw.objectField("dropped_samples");
         try jw.write(dropped);
+        try jw.objectField("dropped_reasons");
+        try jw.beginArray();
+        if (dropped != 0) try jw.write("missing_future_price");
+        try jw.endArray();
         try jw.objectField("value");
         if (count != 0) try jw.write(total / @as(f64, @floatFromInt(count))) else try jw.write(null);
         try jw.endObject();
     }
+    try jw.endArray();
+    try jw.endObject();
     try jw.endArray();
     try jw.endObject();
     try response.end();
@@ -2549,12 +2778,19 @@ fn handleAnalysisSlippage(alloc: std.mem.Allocator, eng: *Engine, req: *std.http
     const obj = parsed.parsed.value.object;
     const symbol = jsonRequiredString(obj, "symbol") orelse return respondJsonError(alloc, req, .bad_request, "missing_symbol", "missing symbol");
     const venue = jsonRequiredString(obj, "venue") orelse return respondJsonError(alloc, req, .bad_request, "missing_venue", "missing venue");
-    const start_ts = jsonRequiredInt(obj, "start") orelse return respondJsonError(alloc, req, .bad_request, "missing_start", "missing start");
-    const end_ts = jsonRequiredInt(obj, "end") orelse return respondJsonError(alloc, req, .bad_request, "missing_end", "missing end");
+    const start_ts = jsonRequiredInt(obj, "start_ts_ns") orelse jsonRequiredInt(obj, "start") orelse return respondJsonError(alloc, req, .bad_request, "missing_start_ts_ns", "missing start_ts_ns");
+    const end_ts = jsonRequiredInt(obj, "end_ts_ns") orelse jsonRequiredInt(obj, "end") orelse return respondJsonError(alloc, req, .bad_request, "missing_end_ts_ns", "missing end_ts_ns");
     const revision = if (obj.get("revision")) |value| if (value == .string) value.string else null else null;
     const execution_side = if (obj.get("execution_side")) |value| if (value == .string) value.string else "auto" else "auto";
     const entry_price_source = if (obj.get("entry_price_source")) |value| if (value == .string) value.string else "trade" else "trade";
     const benchmark_source = if (obj.get("benchmark_source")) |value| if (value == .string) value.string else "mid" else "mid";
+    const group_by = if (obj.get("group_by")) |value|
+        if (value == .string and (std.mem.eql(u8, value.string, "none") or std.mem.eql(u8, value.string, "venue") or std.mem.eql(u8, value.string, "symbol")))
+            value.string
+        else
+            return respondJsonError(alloc, req, .bad_request, "invalid_group_by", "invalid group_by")
+    else
+        "none";
     const labels_json = try canonicalLabelsForMarket(alloc, symbol, venue, null, null);
     defer alloc.free(labels_json);
 
@@ -2569,6 +2805,7 @@ fn handleAnalysisSlippage(alloc: std.mem.Allocator, eng: *Engine, req: *std.http
     var ask_idx: usize = 0;
     var signed_total: f64 = 0;
     var abs_total: f64 = 0;
+    var spread_capture_total: f64 = 0;
     var count: usize = 0;
     var dropped_samples: usize = 0;
     for (trades) |trade| {
@@ -2585,6 +2822,7 @@ fn handleAnalysisSlippage(alloc: std.mem.Allocator, eng: *Engine, req: *std.http
         if (std.mem.eql(u8, execution_side, "sell")) slip = -slip;
         signed_total += slip;
         abs_total += @abs(slip);
+        spread_capture_total += -slip;
         count += 1;
     }
 
@@ -2601,10 +2839,29 @@ fn handleAnalysisSlippage(alloc: std.mem.Allocator, eng: *Engine, req: *std.http
     const revision_label = try resolvedRevisionLabel(alloc, eng, revision);
     defer alloc.free(revision_label);
     try jw.write(revision_label);
-    try jw.objectField("samples");
+    try jw.objectField("group_by");
+    try jw.write(group_by);
+    try jw.objectField("definition_refs");
+    try jw.beginArray();
+    try jw.endArray();
+    try jw.objectField("groups");
+    try jw.beginArray();
+    try jw.beginObject();
+    try jw.objectField("key");
+    try jw.beginObject();
+    try jw.objectField("symbol");
+    try jw.write(symbol);
+    try jw.objectField("venue");
+    try jw.write(venue);
+    try jw.endObject();
+    try jw.objectField("sample_count");
     try jw.write(count);
     try jw.objectField("dropped_samples");
     try jw.write(dropped_samples);
+    try jw.objectField("dropped_reasons");
+    try jw.beginArray();
+    if (dropped_samples != 0) try jw.write("missing_quote_benchmark");
+    try jw.endArray();
     try jw.objectField("execution_side");
     try jw.write(execution_side);
     try jw.objectField("entry_price_source");
@@ -2615,6 +2872,10 @@ fn handleAnalysisSlippage(alloc: std.mem.Allocator, eng: *Engine, req: *std.http
     if (count != 0) try jw.write(signed_total / @as(f64, @floatFromInt(count))) else try jw.write(null);
     try jw.objectField("abs_avg");
     if (count != 0) try jw.write(abs_total / @as(f64, @floatFromInt(count))) else try jw.write(null);
+    try jw.objectField("spread_capture_avg");
+    if (count != 0) try jw.write(spread_capture_total / @as(f64, @floatFromInt(count))) else try jw.write(null);
+    try jw.endObject();
+    try jw.endArray();
     try jw.endObject();
     try response.end();
 }
@@ -2629,10 +2890,17 @@ fn handleAnalysisQuoteQuality(alloc: std.mem.Allocator, eng: *Engine, req: *std.
     const obj = parsed.parsed.value.object;
     const symbol = jsonRequiredString(obj, "symbol") orelse return respondJsonError(alloc, req, .bad_request, "missing_symbol", "missing symbol");
     const venue = jsonRequiredString(obj, "venue") orelse return respondJsonError(alloc, req, .bad_request, "missing_venue", "missing venue");
-    const start_ts = jsonRequiredInt(obj, "start") orelse return respondJsonError(alloc, req, .bad_request, "missing_start", "missing start");
-    const end_ts = jsonRequiredInt(obj, "end") orelse return respondJsonError(alloc, req, .bad_request, "missing_end", "missing end");
+    const start_ts = jsonRequiredInt(obj, "start_ts_ns") orelse jsonRequiredInt(obj, "start") orelse return respondJsonError(alloc, req, .bad_request, "missing_start_ts_ns", "missing start_ts_ns");
+    const end_ts = jsonRequiredInt(obj, "end_ts_ns") orelse jsonRequiredInt(obj, "end") orelse return respondJsonError(alloc, req, .bad_request, "missing_end_ts_ns", "missing end_ts_ns");
     const stale_after_ns = if (obj.get("stale_after_ns")) |value| if (value == .integer) value.integer else 5 * std.time.ns_per_s else 5 * std.time.ns_per_s;
     const revision = if (obj.get("revision")) |value| if (value == .string) value.string else null else null;
+    const group_by = if (obj.get("group_by")) |value|
+        if (value == .string and (std.mem.eql(u8, value.string, "none") or std.mem.eql(u8, value.string, "venue") or std.mem.eql(u8, value.string, "symbol")))
+            value.string
+        else
+            return respondJsonError(alloc, req, .bad_request, "invalid_group_by", "invalid group_by")
+    else
+        "none";
     const labels_json = try canonicalLabelsForMarket(alloc, symbol, venue, null, null);
     defer alloc.free(labels_json);
 
@@ -2659,7 +2927,54 @@ fn handleAnalysisQuoteQuality(alloc: std.mem.Allocator, eng: *Engine, req: *std.
             stale_count += 1;
         }
     }
-    try respondQuoteQualityResult(alloc, eng, req, revision, paired, avg_spread_total, stale_count, crossed_count, locked_count, dropped_samples);
+    var send_buffer: [768]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try jw.beginObject();
+    try jw.objectField("analysis");
+    try jw.write("quote-quality");
+    try jw.objectField("data_revision");
+    const revision_label = try resolvedRevisionLabel(alloc, eng, revision);
+    defer alloc.free(revision_label);
+    try jw.write(revision_label);
+    try jw.objectField("group_by");
+    try jw.write(group_by);
+    try jw.objectField("definition_refs");
+    try jw.beginArray();
+    try jw.endArray();
+    try jw.objectField("groups");
+    try jw.beginArray();
+    try jw.beginObject();
+    try jw.objectField("key");
+    try jw.beginObject();
+    try jw.objectField("symbol");
+    try jw.write(symbol);
+    try jw.objectField("venue");
+    try jw.write(venue);
+    try jw.endObject();
+    try jw.objectField("sample_count");
+    try jw.write(paired);
+    try jw.objectField("dropped_samples");
+    try jw.write(dropped_samples);
+    try jw.objectField("dropped_reasons");
+    try jw.beginArray();
+    if (dropped_samples != 0) try jw.write("unpaired_quote_samples");
+    try jw.endArray();
+    try jw.objectField("avg_spread");
+    if (paired != 0) try jw.write(avg_spread_total / @as(f64, @floatFromInt(paired))) else try jw.write(null);
+    try jw.objectField("stale_count");
+    try jw.write(stale_count);
+    try jw.objectField("crossed_count");
+    try jw.write(crossed_count);
+    try jw.objectField("locked_count");
+    try jw.write(locked_count);
+    try jw.endObject();
+    try jw.endArray();
+    try jw.endObject();
+    try response.end();
 }
 
 fn jsonStringArrayConst(alloc: std.mem.Allocator, value: std.json.Value) ![][]const u8 {
@@ -2734,6 +3049,491 @@ fn jsonIntArray(alloc: std.mem.Allocator, value: std.json.Value) ![]i64 {
         out[idx] = item.integer;
     }
     return out;
+}
+
+const QuerySeriesDescriptor = struct {
+    series_id: types.SeriesId,
+    metric: []u8,
+    labels_json: []u8,
+
+    fn deinit(self: *QuerySeriesDescriptor, alloc: std.mem.Allocator) void {
+        alloc.free(self.metric);
+        alloc.free(self.labels_json);
+        self.* = undefined;
+    }
+};
+
+const ClientLabelInfo = struct {
+    labels_json: []u8,
+    data_revision: ?[]u8 = null,
+    definition_id: ?[]u8 = null,
+    definition_version: ?[]u8 = null,
+
+    fn deinit(self: *ClientLabelInfo, alloc: std.mem.Allocator) void {
+        alloc.free(self.labels_json);
+        if (self.data_revision) |value| alloc.free(value);
+        if (self.definition_id) |value| alloc.free(value);
+        if (self.definition_version) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+const MarketQueryRow = struct {
+    ts_ns: i64,
+    columns_json: []u8,
+    labels_json: []u8,
+    data_revision: []u8,
+
+    fn deinit(self: *MarketQueryRow, alloc: std.mem.Allocator) void {
+        alloc.free(self.columns_json);
+        alloc.free(self.labels_json);
+        alloc.free(self.data_revision);
+        self.* = undefined;
+    }
+};
+
+const SignalHistoryRow = struct {
+    ts_ns: i64,
+    value: f64,
+    labels_json: []u8,
+    data_revision: []u8,
+    definition_id: []u8,
+    definition_version: u32,
+
+    fn deinit(self: *SignalHistoryRow, alloc: std.mem.Allocator) void {
+        alloc.free(self.labels_json);
+        alloc.free(self.data_revision);
+        alloc.free(self.definition_id);
+        self.* = undefined;
+    }
+};
+
+fn freeMarketQueryRows(alloc: std.mem.Allocator, rows: []MarketQueryRow) void {
+    for (rows) |*row| row.deinit(alloc);
+    alloc.free(rows);
+}
+
+fn freeSignalHistoryRows(alloc: std.mem.Allocator, rows: []SignalHistoryRow) void {
+    for (rows) |*row| row.deinit(alloc);
+    alloc.free(rows);
+}
+
+fn writeMarketQueryRow(jw: *std.json.Stringify, row: MarketQueryRow) !void {
+    try jw.beginObject();
+    try jw.objectField("ts_ns");
+    try jw.write(row.ts_ns);
+    try jw.objectField("columns");
+    try writeCanonicalJsonObject(jw, row.columns_json);
+    try jw.objectField("labels");
+    try writeCanonicalJsonObject(jw, row.labels_json);
+    try jw.objectField("data_revision");
+    try jw.write(row.data_revision);
+    try jw.endObject();
+}
+
+fn writeSignalHistoryRow(jw: *std.json.Stringify, row: SignalHistoryRow) !void {
+    try jw.beginObject();
+    try jw.objectField("ts_ns");
+    try jw.write(row.ts_ns);
+    try jw.objectField("value");
+    try jw.write(row.value);
+    try jw.objectField("labels");
+    try writeCanonicalJsonObject(jw, row.labels_json);
+    try jw.objectField("data_revision");
+    try jw.write(row.data_revision);
+    try jw.objectField("definition_id");
+    try jw.write(row.definition_id);
+    try jw.objectField("definition_version");
+    try jw.write(row.definition_version);
+    try jw.endObject();
+}
+
+fn writeSignalEventPayload(writer: anytype, event: anytype) !void {
+    var jw = std.json.Stringify{ .writer = writer };
+    try jw.beginObject();
+    try jw.objectField("event_id");
+    try jw.write(event.event_id);
+    try jw.objectField("definition_id");
+    try jw.write(event.definition_id);
+    try jw.objectField("definition_version");
+    try jw.write(event.definition_version);
+    try jw.objectField("data_revision");
+    try jw.write(event.data_revision);
+    try jw.objectField("labels");
+    var info = try extractClientLabelInfo(std.heap.c_allocator, event.labels_json);
+    defer info.deinit(std.heap.c_allocator);
+    try writeCanonicalJsonObject(&jw, info.labels_json);
+    try jw.objectField("ts_ns");
+    try jw.write(event.ts_ns);
+    try jw.objectField("value");
+    try jw.write(event.value);
+    try jw.endObject();
+}
+
+fn queryMarketRows(
+    alloc: std.mem.Allocator,
+    eng: *Engine,
+    metric: []const u8,
+    labels_value: std.json.Value,
+    start_ts_ns: i64,
+    end_ts_ns: i64,
+    requested_columns: ?[][]const u8,
+    revision: ?[]const u8,
+) ![]MarketQueryRow {
+    var schema = eng.marketSchema(metric) orelse return error.MarketSchemaNotFound;
+    defer schema.deinit(alloc);
+
+    const columns = if (requested_columns) |value| blk: {
+        for (value) |column| {
+            var found = false;
+            for (schema.ordered_columns) |allowed| {
+                if (std.mem.eql(u8, column, allowed)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return error.InvalidMarketColumns;
+        }
+        break :blk value;
+    } else blk: {
+        var all_columns = try alloc.alloc([]const u8, schema.ordered_columns.len);
+        for (schema.ordered_columns, 0..) |column, idx| all_columns[idx] = column;
+        break :blk all_columns;
+    };
+    defer if (requested_columns == null) alloc.free(columns);
+
+    var snapshot_index: ?cas_mod.SnapshotIndex = null;
+    if (revision) |spec| {
+        var cas = eng.cas orelse return error.CasDisabled;
+        const snapshot = try cas.loadSnapshotForSpec(spec);
+        snapshot_index = cas_mod.SnapshotIndex.init(alloc, &cas.store, snapshot);
+    }
+    defer if (snapshot_index) |*index| index.deinit();
+
+    var descriptor_sets = try alloc.alloc([]QuerySeriesDescriptor, columns.len);
+    defer {
+        for (descriptor_sets) |set| {
+            for (set) |*entry| entry.deinit(alloc);
+            alloc.free(set);
+        }
+        alloc.free(descriptor_sets);
+    }
+
+    for (columns, 0..) |column, idx| {
+        const metric_name = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ metric, column });
+        defer alloc.free(metric_name);
+        descriptor_sets[idx] = try querySeriesDescriptors(alloc, eng, snapshot_index, metric_name, labels_value, revision);
+    }
+    if (descriptor_sets.len == 0 or descriptor_sets[0].len == 0) return try alloc.alloc(MarketQueryRow, 0);
+
+    const default_revision = try resolvedRevisionLabel(alloc, eng, revision);
+    defer alloc.free(default_revision);
+
+    var rows = std.array_list.Managed(MarketQueryRow).init(alloc);
+    errdefer freeMarketQueryRows(alloc, rows.items);
+    for (descriptor_sets[0]) |anchor| {
+        var info = try extractClientLabelInfo(alloc, anchor.labels_json);
+        defer info.deinit(alloc);
+
+        var series_ids = try alloc.alloc(types.SeriesId, columns.len);
+        defer alloc.free(series_ids);
+        series_ids[0] = anchor.series_id;
+        var complete = true;
+        for (columns[1..], 1..) |_, column_idx| {
+            const match = findDescriptorByLabels(descriptor_sets[column_idx], anchor.labels_json) orelse {
+                complete = false;
+                break;
+            };
+            series_ids[column_idx] = match.series_id;
+        }
+        if (!complete) continue;
+
+        var column_points = try alloc.alloc([]types.Point, columns.len);
+        defer {
+            for (column_points) |points| alloc.free(points);
+            alloc.free(column_points);
+        }
+        for (series_ids, 0..) |sid, idx| {
+            column_points[idx] = try queryPointsForSeriesId(alloc, eng, snapshot_index, sid, start_ts_ns, end_ts_ns);
+        }
+        if (column_points[0].len == 0) continue;
+
+        var offsets = try alloc.alloc(usize, columns.len);
+        defer alloc.free(offsets);
+        @memset(offsets, 0);
+        var values = try alloc.alloc(f64, columns.len);
+        defer alloc.free(values);
+
+        for (column_points[0]) |anchor_point| {
+            values[0] = anchor_point.value;
+            var row_complete = true;
+            for (1..columns.len) |column_idx| {
+                while (offsets[column_idx] < column_points[column_idx].len and column_points[column_idx][offsets[column_idx]].ts < anchor_point.ts) : (offsets[column_idx] += 1) {}
+                if (offsets[column_idx] >= column_points[column_idx].len or column_points[column_idx][offsets[column_idx]].ts != anchor_point.ts) {
+                    row_complete = false;
+                    break;
+                }
+                values[column_idx] = column_points[column_idx][offsets[column_idx]].value;
+            }
+            if (!row_complete) continue;
+            try rows.append(.{
+                .ts_ns = anchor_point.ts,
+                .columns_json = try buildColumnsJson(alloc, columns, values),
+                .labels_json = try alloc.dupe(u8, info.labels_json),
+                .data_revision = try alloc.dupe(u8, info.data_revision orelse default_revision),
+            });
+        }
+    }
+    std.sort.block(MarketQueryRow, rows.items, {}, struct {
+        fn lessThan(_: void, lhs: MarketQueryRow, rhs: MarketQueryRow) bool {
+            if (lhs.ts_ns != rhs.ts_ns) return lhs.ts_ns < rhs.ts_ns;
+            return std.mem.lessThan(u8, lhs.labels_json, rhs.labels_json);
+        }
+    }.lessThan);
+    return try rows.toOwnedSlice();
+}
+
+fn querySignalHistoryRows(
+    alloc: std.mem.Allocator,
+    eng: *Engine,
+    definition_id: []const u8,
+    definition_version: u32,
+    start_ts_ns: i64,
+    end_ts_ns: i64,
+    revision: ?[]const u8,
+) ![]SignalHistoryRow {
+    const metric = try std.fmt.allocPrint(alloc, "_signal.{s}", .{definition_id});
+    defer alloc.free(metric);
+
+    var snapshot_index: ?cas_mod.SnapshotIndex = null;
+    if (revision) |spec| {
+        var cas = eng.cas orelse return error.CasDisabled;
+        const snapshot = try cas.loadSnapshotForSpec(spec);
+        snapshot_index = cas_mod.SnapshotIndex.init(alloc, &cas.store, snapshot);
+    }
+    defer if (snapshot_index) |*index| index.deinit();
+
+    var all_labels = std.json.Value{ .object = std.json.ObjectMap.init(alloc) };
+    defer all_labels.object.deinit();
+    const descriptors = try querySeriesDescriptors(alloc, eng, snapshot_index, metric, all_labels, revision);
+    defer {
+        for (descriptors) |*entry| entry.deinit(alloc);
+        alloc.free(descriptors);
+    }
+
+    const default_revision = try resolvedRevisionLabel(alloc, eng, revision);
+    defer alloc.free(default_revision);
+
+    var rows = std.array_list.Managed(SignalHistoryRow).init(alloc);
+    errdefer freeSignalHistoryRows(alloc, rows.items);
+    for (descriptors) |descriptor| {
+        var info = try extractClientLabelInfo(alloc, descriptor.labels_json);
+        defer info.deinit(alloc);
+        const points = try queryPointsForSeriesId(alloc, eng, snapshot_index, descriptor.series_id, start_ts_ns, end_ts_ns);
+        defer alloc.free(points);
+        for (points) |point| {
+            try rows.append(.{
+                .ts_ns = point.ts,
+                .value = point.value,
+                .labels_json = try alloc.dupe(u8, info.labels_json),
+                .data_revision = try alloc.dupe(u8, info.data_revision orelse default_revision),
+                .definition_id = try alloc.dupe(u8, info.definition_id orelse definition_id),
+                .definition_version = if (info.definition_version) |value| std.fmt.parseInt(u32, value, 10) catch definition_version else definition_version,
+            });
+        }
+    }
+    std.sort.block(SignalHistoryRow, rows.items, {}, struct {
+        fn lessThan(_: void, lhs: SignalHistoryRow, rhs: SignalHistoryRow) bool {
+            if (lhs.ts_ns != rhs.ts_ns) return lhs.ts_ns < rhs.ts_ns;
+            return std.mem.lessThan(u8, lhs.labels_json, rhs.labels_json);
+        }
+    }.lessThan);
+    return try rows.toOwnedSlice();
+}
+
+fn buildColumnsJson(alloc: std.mem.Allocator, columns: []const []const u8, values: []const f64) ![]u8 {
+    var buffer = std.array_list.Managed(u8).init(alloc);
+    errdefer buffer.deinit();
+    var writer = buffer.writer();
+    var tmp: [256]u8 = undefined;
+    var adapter = writer.adaptToNewApi(&tmp);
+    var iface = &adapter.new_interface;
+    var jw = std.json.Stringify{ .writer = iface };
+    try jw.beginObject();
+    for (columns, 0..) |column, idx| {
+        try jw.objectField(column);
+        try jw.write(values[idx]);
+    }
+    try jw.endObject();
+    try iface.flush();
+    if (adapter.err) |err| return err;
+    return try buffer.toOwnedSlice();
+}
+
+fn findDescriptorByLabels(descriptors: []const QuerySeriesDescriptor, labels_json: []const u8) ?QuerySeriesDescriptor {
+    for (descriptors) |descriptor| {
+        if (std.mem.eql(u8, descriptor.labels_json, labels_json)) return descriptor;
+    }
+    return null;
+}
+
+fn querySeriesDescriptors(
+    alloc: std.mem.Allocator,
+    eng: *Engine,
+    snapshot_index: ?cas_mod.SnapshotIndex,
+    metric: []const u8,
+    labels_value: std.json.Value,
+    revision: ?[]const u8,
+) ![]QuerySeriesDescriptor {
+    var descriptors = std.array_list.Managed(QuerySeriesDescriptor).init(alloc);
+    errdefer {
+        for (descriptors.items) |*entry| entry.deinit(alloc);
+        descriptors.deinit();
+    }
+
+    if (snapshot_index) |index| {
+        for (index.snapshot.series_catalog_snapshot.entries) |entry| {
+            if (!std.mem.eql(u8, entry.series, metric)) continue;
+            if (labels_value == .object and labels_value.object.count() != 0 and !(try descriptorMatchesLabels(entry.canonical_tags, labels_value, true))) continue;
+            try descriptors.append(.{
+                .series_id = entry.series_id,
+                .metric = try alloc.dupe(u8, entry.series),
+                .labels_json = try alloc.dupe(u8, entry.canonical_tags),
+            });
+        }
+    } else {
+        const live = try eng.seriesDescriptorsForMetric(alloc, metric, labels_value, true, null);
+        defer alloc.free(live);
+        for (live) |entry| {
+            try descriptors.append(.{
+                .series_id = entry.series_id,
+                .metric = try alloc.dupe(u8, entry.metric),
+                .labels_json = try alloc.dupe(u8, entry.labels_json),
+            });
+        }
+    }
+
+    const current_revision = if (revision) |value|
+        try resolvedRevisionLabel(alloc, eng, value)
+    else
+        try resolvedRevisionLabel(alloc, eng, null);
+    defer alloc.free(current_revision);
+
+    var saw_revision = false;
+    for (descriptors.items) |descriptor| {
+        const revision_value = try labelValueFromJson(alloc, descriptor.labels_json, "data_revision");
+        defer if (revision_value) |value| alloc.free(value);
+        if (revision_value != null) {
+            saw_revision = true;
+            break;
+        }
+    }
+    if (!saw_revision) return try descriptors.toOwnedSlice();
+
+    var filtered = std.array_list.Managed(QuerySeriesDescriptor).init(alloc);
+    errdefer {
+        for (filtered.items) |*entry| entry.deinit(alloc);
+        filtered.deinit();
+    }
+    for (descriptors.items) |*descriptor| {
+        const revision_value = try labelValueFromJson(alloc, descriptor.labels_json, "data_revision");
+        defer if (revision_value) |value| alloc.free(value);
+        if (revision_value == null or !std.mem.eql(u8, revision_value.?, current_revision)) {
+            descriptor.deinit(alloc);
+            continue;
+        }
+        try filtered.append(descriptor.*);
+        descriptor.* = undefined;
+    }
+    descriptors.deinit();
+    return try filtered.toOwnedSlice();
+}
+
+fn queryPointsForSeriesId(
+    alloc: std.mem.Allocator,
+    eng: *Engine,
+    snapshot_index: ?cas_mod.SnapshotIndex,
+    series_id: types.SeriesId,
+    start_ts_ns: i64,
+    end_ts_ns: i64,
+) ![]types.Point {
+    var points = std.array_list.Managed(types.Point).init(alloc);
+    defer points.deinit();
+    if (snapshot_index) |*index| {
+        try index.queryRange(alloc, eng.data_dir, series_id, start_ts_ns, end_ts_ns, &points);
+    } else {
+        try eng.queryRange(series_id, start_ts_ns, end_ts_ns, &points);
+    }
+    return try alloc.dupe(types.Point, points.items);
+}
+
+fn extractClientLabelInfo(alloc: std.mem.Allocator, labels_json: []const u8) !ClientLabelInfo {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, labels_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{ .labels_json = try alloc.dupe(u8, "{}") };
+    const obj = parsed.value.object;
+
+    var keys = std.array_list.Managed([]const u8).init(alloc);
+    defer keys.deinit();
+    var info = ClientLabelInfo{ .labels_json = undefined };
+    errdefer info.deinit(alloc);
+
+    var it = obj.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "data_revision")) {
+            if (entry.value_ptr.* == .string) info.data_revision = try alloc.dupe(u8, entry.value_ptr.string);
+            continue;
+        }
+        if (std.mem.eql(u8, entry.key_ptr.*, "definition_id")) {
+            if (entry.value_ptr.* == .string) info.definition_id = try alloc.dupe(u8, entry.value_ptr.string);
+            continue;
+        }
+        if (std.mem.eql(u8, entry.key_ptr.*, "definition_version")) {
+            if (entry.value_ptr.* == .string) info.definition_version = try alloc.dupe(u8, entry.value_ptr.string);
+            continue;
+        }
+        try keys.append(entry.key_ptr.*);
+    }
+    std.sort.block([]const u8, keys.items, {}, struct {
+        fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+            return std.mem.lessThan(u8, lhs, rhs);
+        }
+    }.lessThan);
+
+    var buffer = std.array_list.Managed(u8).init(alloc);
+    errdefer buffer.deinit();
+    var writer = buffer.writer();
+    var tmp: [256]u8 = undefined;
+    var adapter = writer.adaptToNewApi(&tmp);
+    var iface = &adapter.new_interface;
+    var jw = std.json.Stringify{ .writer = iface };
+    try jw.beginObject();
+    for (keys.items) |key| {
+        try jw.objectField(key);
+        try jw.write(obj.get(key).?);
+    }
+    try jw.endObject();
+    try iface.flush();
+    if (adapter.err) |err| return err;
+    info.labels_json = try buffer.toOwnedSlice();
+    return info;
+}
+
+fn labelValueFromJson(alloc: std.mem.Allocator, labels_json: []const u8, key: []const u8) !?[]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, labels_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    if (parsed.value.object.get(key)) |value| {
+        if (value == .string) return try alloc.dupe(u8, value.string);
+    }
+    return null;
+}
+
+fn findPriceIndexAtOrAfter(points: []const types.Point, ts_ns: i64) ?usize {
+    for (points, 0..) |point, idx| {
+        if (point.ts >= ts_ns) return idx;
+    }
+    return null;
 }
 
 fn canonicalLabelsForMarket(
