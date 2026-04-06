@@ -6,6 +6,7 @@ import { ShowcaseSessionManager } from "./sessionManager.js";
 import { uiRoot } from "./paths.js";
 
 const runnerPort = Number(process.env.SHOWCASE_RUNNER_PORT ?? 4177);
+const runnerHost = process.env.SHOWCASE_HOST ?? "127.0.0.1";
 
 export function createShowcaseApp(manager = new ShowcaseSessionManager()) {
   const app = express();
@@ -59,13 +60,14 @@ export function createShowcaseApp(manager = new ShowcaseSessionManager()) {
   return { app, manager };
 }
 
-export async function startShowcaseServer(port = runnerPort) {
+export async function startShowcaseServer(port = runnerPort, host = runnerHost) {
   const { app, manager } = createShowcaseApp();
   const server = await new Promise<import("node:http").Server>((resolve) => {
-    const httpServer = app.listen(port, "127.0.0.1", () => resolve(httpServer));
+    const httpServer = app.listen(port, host, () => resolve(httpServer));
   });
   return {
     port,
+    host,
     manager,
     close: async () => {
       await manager.close();
@@ -83,8 +85,8 @@ export async function startShowcaseServer(port = runnerPort) {
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
-  startShowcaseServer().then(({ port }) => {
-    console.log(`Sydra showcase runner listening on http://127.0.0.1:${port}`);
+  startShowcaseServer().then(({ port, host }) => {
+    console.log(`Sydra showcase runner listening on http://${host}:${port}`);
   }).catch((error) => {
     console.error(error);
     process.exitCode = 1;

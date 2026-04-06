@@ -1,8 +1,9 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { spawn, type ChildProcessByStdio } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import net from "node:net";
+import type { Readable } from "node:stream";
 
 export type CompilerMode = "compiled" | "legacy" | "shadow";
 
@@ -14,7 +15,7 @@ export interface WorkspaceRuntime {
   compilerMode: CompilerMode;
   port: number;
   baseUrl: string;
-  server?: ChildProcessWithoutNullStreams;
+  server?: ServerProcess;
 }
 
 export interface ScenarioSandbox {
@@ -28,6 +29,24 @@ export interface ProcessResult {
   stdout: string;
   stderr: string;
   combined: string;
+}
+
+type ServerProcess = ChildProcessByStdio<null, Readable, Readable>;
+
+async function terminateChildProcess(child: ServerProcess): Promise<void> {
+  if (child.exitCode !== null) {
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    child.once("close", () => resolve());
+    child.kill("SIGTERM");
+    setTimeout(() => {
+      if (child.exitCode === null) {
+        child.kill("SIGKILL");
+      }
+    }, 2_000).unref();
+  });
 }
 
 export async function allocatePort(): Promise<number> {
@@ -169,12 +188,65 @@ export async function startWorkspaceServer(workspace: WorkspaceRuntime, binaryPa
   const child = spawn(binaryPath, [], {
     cwd: workspace.dir,
     env: process.env,
-    stdio: "pipe",
+    stdio: ["ignore", "pipe", "pipe"],
   });
+  let recentOutput = "";
+  const captureOutput = (chunk: string) => {
+    recentOutput = `${recentOutput}${chunk}`;
+    if (recentOutput.length > 4_000) {
+      recentOutput = recentOutput.slice(-4_000);
+    }
+  };
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
+  child.stdout.on("data", captureOutput);
+  child.stderr.on("data", captureOutput);
   workspace.server = child;
-  await waitForHttp(`${workspace.baseUrl}/status`);
+
+  const startupResult = Promise.race([
+    waitForHttp(`${workspace.baseUrl}/status`),
+    new Promise<never>((_, reject) => {
+      child.once("error", reject);
+      child.once("exit", (code, signal) => {
+        if (code === 0) {
+          reject(new Error(`${workspace.name} exited before becoming ready.`));
+          return;
+        }
+        if (code != null) {
+          reject(new Error(`${workspace.name} exited before becoming ready with code ${code}.`));
+          return;
+        }
+        if (signal) {
+          reject(new Error(`${workspace.name} exited before becoming ready via signal ${signal}.`));
+          return;
+        }
+        reject(new Error(`${workspace.name} exited before becoming ready.`));
+      });
+    }),
+  ]);
+
+  try {
+    await startupResult;
+  } catch (error) {
+    if (workspace.server === child) {
+      workspace.server = undefined;
+    }
+    await terminateChildProcess(child).catch(() => {});
+    const recentOutputBlock = recentOutput.trim()
+      ? `\nRecent server output:\n${recentOutput.trim()}`
+      : "";
+    throw new Error(
+      `Failed to start ${workspace.name} server: ${
+        error instanceof Error ? error.message : String(error)
+      }${recentOutputBlock}`,
+    );
+  }
+
+  child.once("close", () => {
+    if (workspace.server === child) {
+      workspace.server = undefined;
+    }
+  });
 }
 
 export async function stopWorkspaceServer(workspace: WorkspaceRuntime): Promise<void> {
@@ -184,15 +256,7 @@ export async function stopWorkspaceServer(workspace: WorkspaceRuntime): Promise<
   }
 
   const child = workspace.server;
-  await new Promise<void>((resolve) => {
-    child.once("close", () => resolve());
-    child.kill("SIGTERM");
-    setTimeout(() => {
-      if (child.exitCode === null) {
-        child.kill("SIGKILL");
-      }
-    }, 2_000).unref();
-  });
+  await terminateChildProcess(child);
   workspace.server = undefined;
 }
 
@@ -234,7 +298,9 @@ export async function seedWorkspaceFromFixtures(
     expectedPoints: records.length,
     baselineMetrics: baselineMetrics.counters,
   });
+  await new Promise((resolve) => setTimeout(resolve, 400));
   await stopWorkspaceServer(workspace);
+  await waitForCasCliCanary(workspace, binaryPath);
 }
 
 async function waitForWorkspaceFlush(
@@ -295,6 +361,33 @@ async function waitForWorkspaceFlush(
   throw new Error(
     `Timed out waiting for ${workspace.name} to flush seeded ingest. Last metrics: ${JSON.stringify(lastObserved)}${
       lastCanaryError ? `\nLast CAS canary error: ${lastCanaryError}` : ""
+    }`,
+  );
+}
+
+async function waitForCasCliCanary(
+  workspace: WorkspaceRuntime,
+  binaryPath: string,
+  timeoutMs = 2_500,
+): Promise<void> {
+  const startedAt = Date.now();
+  let lastError: string | null = null;
+
+  while (Date.now() - startedAt < timeoutMs) {
+    try {
+      await runBinary(workspace, binaryPath, ["cas", "--json", "log"]);
+      await runBinary(workspace, binaryPath, ["cas", "--json", "fsck", "--connectivity-only"]);
+      return;
+    } catch (error) {
+      lastError = error instanceof Error ? error.message : String(error);
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+
+  throw new Error(
+    `Timed out waiting for ${workspace.name} CAS state to settle after shutdown.${
+      lastError ? `\nLast CAS canary error: ${lastError}` : ""
     }`,
   );
 }

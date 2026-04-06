@@ -6,7 +6,7 @@ import path from "node:path";
 import { describe, expect, test } from "vitest";
 
 import { fixturesDir, findRepoRoot, resolveSydraBinary } from "./paths.js";
-import { createWorkspace, runBinary, seedWorkspaceFromFixtures } from "./runtime.js";
+import { createWorkspace, runBinary, seedWorkspaceFromFixtures, startWorkspaceServer } from "./runtime.js";
 
 const repoRoot = findRepoRoot();
 const binaryPath = resolveSydraBinary(repoRoot);
@@ -30,6 +30,19 @@ describe("runtime seeding", () => {
       } finally {
         await rm(rootDir, { recursive: true, force: true });
       }
+    }
+  });
+
+  test("cleans up failed server startups when the binary path is invalid", async () => {
+    const rootDir = path.join(os.tmpdir(), `sydra-showcase-runtime-invalid-${Date.now()}`);
+    const workspace = await createWorkspace(rootDir, "bad-binary");
+    try {
+      await expect(startWorkspaceServer(workspace, path.join(rootDir, "missing-sydradb"))).rejects.toThrow(
+        /Failed to start bad-binary server/,
+      );
+      expect(workspace.server).toBeUndefined();
+    } finally {
+      await rm(rootDir, { recursive: true, force: true });
     }
   });
 });
