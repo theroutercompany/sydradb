@@ -1,7 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import type { DemoStateResponse } from "../../shared/contracts.js";
+import type { DemoStateResponse, ScenarioRunResult } from "../../shared/contracts.js";
 import App, { ShowcaseDashboard } from "./App.js";
 import { fetchState } from "./api.js";
 
@@ -60,6 +60,50 @@ const mockState: DemoStateResponse = {
         whySQLiteFallsShort: ["Needs multi-writer heads."],
         steps: [],
       },
+    },
+  ],
+};
+
+const guidedState: DemoStateResponse = {
+  ...mockState,
+  scenarios: [
+    {
+      availability: { id: "cas-history", available: true, missingCapabilities: [] },
+      manifest: {
+        schemaVersion: 1,
+        id: "cas-history",
+        title: "CAS History and Recovery",
+        summary: "Inspect Git-like history, compare snapshots, and roll back an edge-site incident using SydraDB's immutable metadata model.",
+        maturity: "alpha",
+        subsystems: ["cas", "git-model", "engine"],
+        requiredCapabilities: ["cas.json"],
+        minimumOutputs: ["refs.entries"],
+        seedRoutine: "seed",
+        cleanupRoutine: "cleanup",
+        whySQLiteFallsShort: ["History is first-class."],
+        steps: [],
+      },
+    },
+  ],
+};
+
+const guidedRunResult: ScenarioRunResult = {
+  scenarioId: "cas-history",
+  status: "passed",
+  startedAt: "2026-04-05T23:00:00.000Z",
+  finishedAt: "2026-04-05T23:00:02.000Z",
+  sessionId: "session-1",
+  workspaceRoot: "/tmp/session-1",
+  summaryEvidence: { rollback: "verified" },
+  steps: [
+    {
+      id: "log",
+      title: "Read commit history",
+      summary: "Show the CAS log for heads/main so the incident and rollback context are visible as commit history.",
+      kind: "cas_command",
+      status: "failed",
+      output: { entries: [{ commit_id: "abc" }, { commit_id: "def" }] },
+      assertions: [],
     },
   ],
 };
@@ -162,5 +206,35 @@ describe("ShowcaseDashboard", () => {
 
     await waitFor(() => expect(screen.getByText("Edge fleet story")).toBeInTheDocument());
     expect(screen.getByRole("button", { name: "Hide launch notes" })).toBeInTheDocument();
+  });
+
+  it("adds a guided reading layer when a scenario has run", () => {
+    render(
+      <ShowcaseDashboard
+        state={guidedState}
+        selectedScenarioId="cas-history"
+        releaseMode={false}
+        runResult={guidedRunResult}
+        theme="dark"
+        error={null}
+        launchCardsVisible={false}
+        dismissedLaunchCardIds={[]}
+        loading={false}
+        running={false}
+        onSelectScenario={vi.fn()}
+        onThemeChange={vi.fn()}
+        onToggleReleaseMode={vi.fn()}
+        onToggleLaunchCards={vi.fn()}
+        onDismissLaunchCard={vi.fn()}
+        onDismissAllLaunchCards={vi.fn()}
+        onResetSession={vi.fn()}
+        onRunScenario={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("How to read this run")).toBeInTheDocument();
+    expect(screen.getByText("If you are a manager")).toBeInTheDocument();
+    expect(screen.getByText("What this step means")).toBeInTheDocument();
+    expect(screen.getByText(/one site in the fleet takes on a bad state/i)).toBeInTheDocument();
   });
 });
