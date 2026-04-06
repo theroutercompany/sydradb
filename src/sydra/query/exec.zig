@@ -1056,6 +1056,82 @@ test "compiled and legacy parity holds across metadata modes for public query cl
     }
 }
 
+test "execution snapshots stay stable for supported and fallback query classes" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/execution-snapshots", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .compiled,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try engine_mod.Engine.init(talloc, config);
+    defer engine.deinit();
+    try seedParityDataset(&engine);
+
+    var read_cursor = try executeWithMode(talloc, &engine, "select time, value from parity.room1 where time >= 0 order by time asc", .compiled);
+    defer read_cursor.deinit();
+    const read_snapshot = try collectCursorContractSnapshot(talloc, &read_cursor);
+    defer talloc.free(read_snapshot);
+    try std.testing.expectEqualStrings(
+        \\mode=compiled|legacy_fallback=false|fallback_reason=
+        \\time|value
+        \\10|1.5
+        \\20|2
+        \\70|3.5
+        \\
+    , read_snapshot);
+
+    var aggregate_cursor = try executeWithMode(talloc, &engine, "select time_bucket(60, time) as bucket, max(value) as max_value from parity.room1 where time >= 0 group by time_bucket(60, time) order by bucket asc", .compiled);
+    defer aggregate_cursor.deinit();
+    const aggregate_snapshot = try collectCursorContractSnapshot(talloc, &aggregate_cursor);
+    defer talloc.free(aggregate_snapshot);
+    try std.testing.expectEqualStrings(
+        \\mode=compiled|legacy_fallback=false|fallback_reason=
+        \\bucket|max_value
+        \\0|2
+        \\60|3.5
+        \\
+    , aggregate_snapshot);
+
+    var selector_cursor = try executeWithMode(talloc, &engine, "select tag.host as host, avg(value) as avg_value from tagged.room1 where tag.host = 'web' group by tag.host", .compiled);
+    defer selector_cursor.deinit();
+    const selector_snapshot = try collectCursorContractSnapshot(talloc, &selector_cursor);
+    defer talloc.free(selector_snapshot);
+    try std.testing.expectEqualStrings(
+        \\mode=compiled|legacy_fallback=false|fallback_reason=
+        \\host|avg_value
+        \\web|2
+        \\
+    , selector_snapshot);
+
+    var fallback_cursor = try executeWithMode(talloc, &engine, "select abs(-1)", .compiled);
+    defer fallback_cursor.deinit();
+    const fallback_snapshot = try collectCursorContractSnapshot(talloc, &fallback_cursor);
+    defer talloc.free(fallback_snapshot);
+    try std.testing.expectEqualStrings(
+        \\mode=compiled|legacy_fallback=true|fallback_reason=unsupported_function
+        \\_col0
+        \\1
+        \\
+    , fallback_snapshot);
+}
+
 fn waitForFlushForTest(engine: *engine_mod.Engine, min_flushes: u64, timeout_ms: u64) !void {
     const start = std.time.milliTimestamp();
     while (std.time.milliTimestamp() - start < timeout_ms) {
@@ -1107,6 +1183,17 @@ fn collectCursorSnapshot(alloc: std.mem.Allocator, cursor: *executor.ExecutionCu
     }
 
     return try buffer.toOwnedSlice();
+}
+
+fn collectCursorContractSnapshot(alloc: std.mem.Allocator, cursor: *executor.ExecutionCursor) ![]u8 {
+    const rows_snapshot = try collectCursorSnapshot(alloc, cursor);
+    defer alloc.free(rows_snapshot);
+
+    return try std.fmt.allocPrint(
+        alloc,
+        "mode={s}|legacy_fallback={}|fallback_reason={s}\n{s}",
+        .{ cursor.stats.execution_mode, cursor.stats.legacy_fallback, cursor.stats.fallback_reason, rows_snapshot },
+    );
 }
 
 fn appendSnapshotValue(buffer: *std.array_list.Managed(u8), value: executor.Value) !void {
