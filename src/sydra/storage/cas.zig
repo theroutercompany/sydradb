@@ -3347,6 +3347,16 @@ const BundleRef = struct {
     }
 };
 
+pub const PackDigest = struct {
+    pack_path: []u8,
+    pack_checksum: [32]u8,
+    object_count: u64,
+
+    fn deinit(self: *PackDigest, alloc: std.mem.Allocator) void {
+        alloc.free(self.pack_path);
+    }
+};
+
 const BundleManifest = struct {
     format_version: u16,
     repository_format_version: u16 = legacy_repository_format_version,
@@ -3355,8 +3365,10 @@ const BundleManifest = struct {
     incremental: bool,
     refs: []BundleRef,
     prerequisites: []object_store.ObjectId,
+    prerequisite_refs: []BundleRef,
     object_count: usize,
     pack_files: [][]u8,
+    pack_digests: []PackDigest,
     info_files: [][]u8,
     reftable_files: [][]u8,
     loose_ref_files: [][]u8,
@@ -3367,7 +3379,11 @@ const BundleManifest = struct {
         for (self.refs) |*entry| entry.deinit(alloc);
         alloc.free(self.refs);
         alloc.free(self.prerequisites);
+        for (self.prerequisite_refs) |*entry| entry.deinit(alloc);
+        alloc.free(self.prerequisite_refs);
         freeOwnedStrings(alloc, self.pack_files);
+        for (self.pack_digests) |*entry| entry.deinit(alloc);
+        alloc.free(self.pack_digests);
         freeOwnedStrings(alloc, self.info_files);
         freeOwnedStrings(alloc, self.reftable_files);
         freeOwnedStrings(alloc, self.loose_ref_files);
@@ -3433,6 +3449,18 @@ pub const LocalExchangeResult = struct {
     borrowed_repositories: usize,
 };
 
+pub const LocalFetchOptions = struct {
+    materialize: bool = false,
+};
+
+pub const LocalPushOptions = struct {
+    borrow: bool = false,
+};
+
+pub const LocalCloneOptions = struct {
+    borrow: bool = false,
+};
+
 const bundle_manifest_name = "bundle.manifest";
 const bundle_manifest_magic = "SYDBUNDLE1";
 
@@ -3453,6 +3481,57 @@ fn cloneBundleRefs(alloc: std.mem.Allocator, refs: []const RefEntry) ![]BundleRe
         };
     }
     return cloned;
+}
+
+fn cloneBundleRefsSlice(alloc: std.mem.Allocator, refs: []const BundleRef) ![]BundleRef {
+    const cloned = try alloc.alloc(BundleRef, refs.len);
+    errdefer {
+        for (cloned[0..]) |*entry| {
+            if (entry.name.len != 0) entry.deinit(alloc);
+        }
+        alloc.free(cloned);
+    }
+    for (cloned) |*entry| entry.* = .{ .name = &[_]u8{}, .id = undefined };
+    for (refs, 0..) |ref, idx| {
+        cloned[idx] = .{
+            .name = try alloc.dupe(u8, ref.name),
+            .id = ref.id,
+        };
+    }
+    return cloned;
+}
+
+fn clonePackDigests(alloc: std.mem.Allocator, digests: []const PackDigest) ![]PackDigest {
+    const cloned = try alloc.alloc(PackDigest, digests.len);
+    errdefer {
+        for (cloned[0..]) |*entry| {
+            if (entry.pack_path.len != 0) entry.deinit(alloc);
+        }
+        alloc.free(cloned);
+    }
+    for (cloned) |*entry| entry.* = .{ .pack_path = &[_]u8{}, .pack_checksum = [_]u8{0} ** 32, .object_count = 0 };
+    for (digests, 0..) |digest, idx| {
+        cloned[idx] = .{
+            .pack_path = try alloc.dupe(u8, digest.pack_path),
+            .pack_checksum = digest.pack_checksum,
+            .object_count = digest.object_count,
+        };
+    }
+    return cloned;
+}
+
+fn findPackDigest(digests: []const object_store.PackInventoryRecord, pack_path: []const u8) ?object_store.PackInventoryRecord {
+    for (digests) |digest| {
+        if (std.mem.eql(u8, digest.pack_path, pack_path)) return digest;
+    }
+    return null;
+}
+
+fn findBundlePackDigest(digests: []const PackDigest, pack_path: []const u8) ?PackDigest {
+    for (digests) |digest| {
+        if (std.mem.eql(u8, digest.pack_path, pack_path)) return digest;
+    }
+    return null;
 }
 
 fn cloneOwnedStringsSlice(alloc: std.mem.Allocator, values: []const []const u8) ![][]u8 {
@@ -3499,6 +3578,13 @@ fn writeBundleManifest(alloc: std.mem.Allocator, dst_path: []const u8, manifest:
     if (manifest.format_version >= 2) {
         try writer.print("packs {d}\n", .{manifest.pack_files.len});
         for (manifest.pack_files) |path| try writer.print("{s}\n", .{path});
+        if (manifest.format_version >= 4) {
+            try writer.print("pack_digests {d}\n", .{manifest.pack_digests.len});
+            for (manifest.pack_digests) |digest| {
+                const checksum_hex = std.fmt.bytesToHex(digest.pack_checksum, .lower);
+                try writer.print("{s} {s} {d}\n", .{ digest.pack_path, checksum_hex, digest.object_count });
+            }
+        }
         try writer.print("info_files {d}\n", .{manifest.info_files.len});
         for (manifest.info_files) |path| try writer.print("{s}\n", .{path});
         try writer.print("reftable_files {d}\n", .{manifest.reftable_files.len});
@@ -3516,6 +3602,13 @@ fn writeBundleManifest(alloc: std.mem.Allocator, dst_path: []const u8, manifest:
     for (manifest.prerequisites) |prerequisite| {
         const hex = prerequisite.toHex();
         try writer.print("{s}\n", .{hex});
+    }
+    if (manifest.format_version >= 4) {
+        try writer.print("prerequisite_refs {d}\n", .{manifest.prerequisite_refs.len});
+        for (manifest.prerequisite_refs) |entry| {
+            const hex = entry.id.toHex();
+            try writer.print("{s} {s}\n", .{ entry.name, hex });
+        }
     }
     try writer.print("refs {d}\n", .{manifest.refs.len});
     for (manifest.refs) |entry| {
@@ -3539,7 +3632,7 @@ fn readBundleManifest(alloc: std.mem.Allocator, bundle_path: []const u8) !Bundle
     if (!std.mem.eql(u8, magic, bundle_manifest_magic)) return error.InvalidBundle;
 
     const format_version = try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "format_version");
-    if (format_version != 1 and format_version != 2 and format_version != 3) return error.UnsupportedBundleFormatVersion;
+    if (format_version != 1 and format_version != 2 and format_version != 3 and format_version != 4) return error.UnsupportedBundleFormatVersion;
     const repository_format_version = if (format_version >= 2)
         try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "repository_format_version")
     else
@@ -3560,6 +3653,14 @@ fn readBundleManifest(alloc: std.mem.Allocator, bundle_path: []const u8) !Bundle
     else
         try alloc.alloc([]u8, 0);
     errdefer freeOwnedStrings(alloc, pack_files);
+    const pack_digests = if (format_version >= 4)
+        try readBundlePackDigests(alloc, &line_it)
+    else
+        try alloc.alloc(PackDigest, 0);
+    errdefer {
+        for (pack_digests) |*entry| entry.deinit(alloc);
+        alloc.free(pack_digests);
+    }
     const info_files = if (format_version >= 2)
         try readBundlePathList(alloc, &line_it, "info_files")
     else
@@ -3594,24 +3695,16 @@ fn readBundleManifest(alloc: std.mem.Allocator, bundle_path: []const u8) !Bundle
         const line = line_it.next() orelse return error.InvalidBundle;
         entry.* = try object_store.ObjectId.fromHex(line);
     }
-
-    const ref_count = try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "refs");
-    const refs = try alloc.alloc(BundleRef, ref_count);
+    const prerequisite_refs = if (format_version >= 4)
+        try readBundleRefs(alloc, &line_it, "prerequisite_refs")
+    else
+        try alloc.alloc(BundleRef, 0);
     errdefer {
-        for (refs[0..]) |*entry| {
-            if (entry.name.len != 0) entry.deinit(alloc);
-        }
-        alloc.free(refs);
+        for (prerequisite_refs) |*entry| entry.deinit(alloc);
+        alloc.free(prerequisite_refs);
     }
-    for (refs) |*entry| entry.* = .{ .name = &[_]u8{}, .id = undefined };
-    for (refs) |*entry| {
-        const line = line_it.next() orelse return error.InvalidBundle;
-        const sep = std.mem.indexOfScalar(u8, line, ' ') orelse return error.InvalidBundle;
-        entry.* = .{
-            .name = try alloc.dupe(u8, line[0..sep]),
-            .id = try object_store.ObjectId.fromHex(line[sep + 1 ..]),
-        };
-    }
+
+    const refs = try readBundleRefs(alloc, &line_it, "refs");
 
     return .{
         .format_version = @intCast(format_version),
@@ -3621,8 +3714,10 @@ fn readBundleManifest(alloc: std.mem.Allocator, bundle_path: []const u8) !Bundle
         .incremental = incremental_value != 0,
         .refs = refs,
         .prerequisites = prerequisites,
+        .prerequisite_refs = prerequisite_refs,
         .object_count = object_count,
         .pack_files = pack_files,
+        .pack_digests = pack_digests,
         .info_files = info_files,
         .reftable_files = reftable_files,
         .loose_ref_files = loose_ref_files,
@@ -3664,6 +3759,51 @@ fn readBundlePathList(alloc: std.mem.Allocator, line_it: *std.mem.TokenIterator(
     return paths;
 }
 
+fn readBundleRefs(alloc: std.mem.Allocator, line_it: *std.mem.TokenIterator(u8, .any), key: []const u8) ![]BundleRef {
+    const count = try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, key);
+    const refs = try alloc.alloc(BundleRef, count);
+    errdefer {
+        for (refs[0..]) |*entry| {
+            if (entry.name.len != 0) entry.deinit(alloc);
+        }
+        alloc.free(refs);
+    }
+    for (refs) |*entry| entry.* = .{ .name = &[_]u8{}, .id = undefined };
+    for (refs) |*entry| {
+        const line = line_it.next() orelse return error.InvalidBundle;
+        const sep = std.mem.lastIndexOfScalar(u8, line, ' ') orelse return error.InvalidBundle;
+        entry.* = .{
+            .name = try alloc.dupe(u8, line[0..sep]),
+            .id = try object_store.ObjectId.fromHex(line[sep + 1 ..]),
+        };
+    }
+    return refs;
+}
+
+fn readBundlePackDigests(alloc: std.mem.Allocator, line_it: *std.mem.TokenIterator(u8, .any)) ![]PackDigest {
+    const count = try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "pack_digests");
+    const digests = try alloc.alloc(PackDigest, count);
+    errdefer {
+        for (digests[0..]) |*entry| {
+            if (entry.pack_path.len != 0) entry.deinit(alloc);
+        }
+        alloc.free(digests);
+    }
+    for (digests) |*entry| entry.* = .{ .pack_path = &[_]u8{}, .pack_checksum = [_]u8{0} ** 32, .object_count = 0 };
+    for (digests) |*entry| {
+        const line = line_it.next() orelse return error.InvalidBundle;
+        const first_sep = std.mem.indexOfScalar(u8, line, ' ') orelse return error.InvalidBundle;
+        const second_sep_rel = std.mem.indexOfScalar(u8, line[first_sep + 1 ..], ' ') orelse return error.InvalidBundle;
+        const second_sep = first_sep + 1 + second_sep_rel;
+        entry.pack_path = try alloc.dupe(u8, line[0..first_sep]);
+        var checksum: [32]u8 = undefined;
+        _ = try std.fmt.hexToBytes(checksum[0..], line[first_sep + 1 .. second_sep]);
+        entry.pack_checksum = checksum;
+        entry.object_count = try std.fmt.parseInt(u64, line[second_sep + 1 ..], 10);
+    }
+    return digests;
+}
+
 fn copyRelativeFile(src_root: std.fs.Dir, dst_root: std.fs.Dir, rel_path: []const u8) !void {
     if (std.fs.path.dirname(rel_path)) |dirname| try dst_root.makePath(dirname);
     dst_root.deleteFile(rel_path) catch |err| switch (err) {
@@ -3689,8 +3829,20 @@ fn copyPackCompanionFiles(alloc: std.mem.Allocator, src_root: std.fs.Dir, dst_ro
     defer alloc.free(idx_path);
     const manifest_path = try std.fmt.allocPrint(alloc, "{s}.manifest", .{base});
     defer alloc.free(manifest_path);
+    const rev_path = try std.fmt.allocPrint(alloc, "{s}.rev", .{base});
+    defer alloc.free(rev_path);
     try copyRelativeFile(src_root, dst_root, idx_path);
     try copyRelativeFile(src_root, dst_root, manifest_path);
+    try copyRelativeFile(src_root, dst_root, rev_path);
+}
+
+fn packFileMatchesDigest(root: std.fs.Dir, alloc: std.mem.Allocator, digest: PackDigest) !bool {
+    _ = root.statFile(digest.pack_path) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    const checksum = try hashRelativePath(root, alloc, digest.pack_path);
+    return std.mem.eql(u8, checksum[0..], digest.pack_checksum[0..]);
 }
 
 pub fn createBundle(alloc: std.mem.Allocator, src_path: []const u8, dst_path: []const u8, fsync: cfg.FsyncPolicy, since_spec: ?[]const u8) !BundleResult {
@@ -3724,27 +3876,22 @@ pub fn createBundle(alloc: std.mem.Allocator, src_path: []const u8, dst_path: []
     var bundle_store = try object_store.ObjectStore.init(alloc, dst_path, .none);
     defer bundle_store.deinit();
 
-    const pack_files = try listFilesRecursive(alloc, source.store.root, "objects/packs");
-    defer freeOwnedStrings(alloc, pack_files);
+    const pack_inventory = try source.store.loadPackInventory(alloc);
+    defer object_store.freePackInventoryRecords(alloc, pack_inventory);
     var copied_pack_files = std.array_list.Managed([]u8).init(alloc);
     defer {
         for (copied_pack_files.items) |path| alloc.free(path);
         copied_pack_files.deinit();
     }
-    for (pack_files) |path| {
-        if (!std.mem.endsWith(u8, path, ".pack")) continue;
-        try copyPackCompanionFiles(alloc, source.store.root, bundle_store.root, path);
-        try copied_pack_files.append(try alloc.dupe(u8, path));
+    var copied_pack_digests = std.array_list.Managed(PackDigest).init(alloc);
+    defer {
+        for (copied_pack_digests.items) |*entry| entry.deinit(alloc);
+        copied_pack_digests.deinit();
     }
 
     const info_candidates = [_][]const u8{
         store_format_path,
         repository_id_path,
-        "objects/info/alternates",
-        "objects/info/multi-pack-index",
-        commit_graph_path,
-        reachability_bitmap_path,
-        object_refs_index_path,
     };
     var copied_info_files = std.array_list.Managed([]u8).init(alloc);
     defer {
@@ -3780,31 +3927,66 @@ pub fn createBundle(alloc: std.mem.Allocator, src_path: []const u8, dst_path: []
 
     var selected = std.array_list.Managed(object_store.ObjectId).init(alloc);
     defer selected.deinit();
+    var selected_pack_paths = std.array_list.Managed([]u8).init(alloc);
+    defer {
+        for (selected_pack_paths.items) |path| alloc.free(path);
+        selected_pack_paths.deinit();
+    }
+    var prerequisite_refs = std.array_list.Managed(BundleRef).init(alloc);
+    defer {
+        for (prerequisite_refs.items) |*entry| entry.deinit(alloc);
+        prerequisite_refs.deinit();
+    }
+    if (since_spec) |spec| {
+        if (prerequisite_ids.items.len == 1) {
+            try prerequisite_refs.append(.{
+                .name = try alloc.dupe(u8, spec),
+                .id = prerequisite_ids.items[0],
+            });
+        }
+    }
     var it = reachable.keyIterator();
     while (it.next()) |id_ptr| {
         if (base_reachable) |*base| {
             if (base.contains(id_ptr.*)) continue;
         }
-        if (try source.store.hasLooseObject(id_ptr.*)) {
+        if (try source.store.findLocalPackPathForObject(alloc, id_ptr.*)) |pack_path| {
+            defer alloc.free(pack_path);
+            if (!containsString(selected_pack_paths.items, pack_path)) {
+                try copyPackCompanionFiles(alloc, source.store.root, bundle_store.root, pack_path);
+                try copied_pack_files.append(try alloc.dupe(u8, pack_path));
+                try selected_pack_paths.append(try alloc.dupe(u8, pack_path));
+                const digest = findPackDigest(pack_inventory, pack_path) orelse return error.MissingPackManifest;
+                try copied_pack_digests.append(.{
+                    .pack_path = try alloc.dupe(u8, digest.pack_path),
+                    .pack_checksum = digest.pack_checksum,
+                    .object_count = digest.object_count,
+                });
+            }
+        } else if (try source.store.hasLooseObject(id_ptr.*)) {
             const path = try looseObjectPath(alloc, id_ptr.*);
             defer alloc.free(path);
             try copyRelativeFile(source.store.root, bundle_store.root, path);
         }
         try selected.append(id_ptr.*);
     }
+
+    try bundle_store.rebuildPackInventory(alloc);
     const bundle_ids = try bundle_store.listIds(alloc);
     defer alloc.free(bundle_ids);
 
     const manifest = BundleManifest{
-        .format_version = 3,
+        .format_version = 4,
         .repository_format_version = source.format.version,
         .ref_backend = source.format.ref_backend,
         .repository_id = source.repository_id,
         .incremental = since_spec != null,
         .refs = try cloneBundleRefs(alloc, refs),
         .prerequisites = try alloc.dupe(object_store.ObjectId, prerequisite_ids.items),
+        .prerequisite_refs = try cloneBundleRefsSlice(alloc, prerequisite_refs.items),
         .object_count = bundle_ids.len,
         .pack_files = try cloneOwnedStringsSlice(alloc, copied_pack_files.items),
+        .pack_digests = try clonePackDigests(alloc, copied_pack_digests.items),
         .info_files = try cloneOwnedStringsSlice(alloc, copied_info_files.items),
         .reftable_files = try cloneOwnedStringsSlice(alloc, reftable_files),
         .loose_ref_files = try cloneOwnedStringsSlice(alloc, copied_loose_ref_files.items),
@@ -3844,8 +4026,15 @@ pub fn verifyBundle(alloc: std.mem.Allocator, bundle_path: []const u8) !BundleRe
         defer alloc.free(idx_path);
         const manifest_path = try std.fmt.allocPrint(alloc, "{s}.manifest", .{base});
         defer alloc.free(manifest_path);
+        const rev_path = try std.fmt.allocPrint(alloc, "{s}.rev", .{base});
+        defer alloc.free(rev_path);
         _ = try root.statFile(idx_path);
         _ = try root.statFile(manifest_path);
+        _ = try root.statFile(rev_path);
+        if (manifest.format_version >= 4) {
+            const digest = findBundlePackDigest(manifest.pack_digests, path) orelse return error.InvalidBundle;
+            if (!try packFileMatchesDigest(root, alloc, digest)) return error.InvalidBundle;
+        }
     }
     for (manifest.info_files) |path| _ = try root.statFile(path);
     for (manifest.reftable_files) |path| _ = try root.statFile(path);
@@ -3891,8 +4080,24 @@ pub fn applyBundle(alloc: std.mem.Allocator, bundle_path: []const u8, dst_path: 
         alloc.free(loaded.payload);
     }
 
-    for (manifest.pack_files) |path| try copyPackCompanionFiles(alloc, bundle_root, dest.store.root, path);
-    for (manifest.info_files) |path| try copyRelativeFile(bundle_root, dest.store.root, path);
+    for (manifest.pack_files) |path| {
+        if (manifest.format_version >= 4) {
+            const digest = findBundlePackDigest(manifest.pack_digests, path) orelse return error.InvalidBundle;
+            if (try packFileMatchesDigest(dest.store.root, alloc, digest)) continue;
+        }
+        try copyPackCompanionFiles(alloc, bundle_root, dest.store.root, path);
+    }
+    for (manifest.info_files) |path| {
+        if (std.mem.eql(u8, path, "objects/info/multi-pack-index") or
+            std.mem.eql(u8, path, commit_graph_path) or
+            std.mem.eql(u8, path, reachability_bitmap_path) or
+            std.mem.eql(u8, path, object_refs_index_path) or
+            std.mem.eql(u8, path, "objects/info/pack-inventory"))
+        {
+            continue;
+        }
+        try copyRelativeFile(bundle_root, dest.store.root, path);
+    }
 
     const ids = try bundle_store.listIds(alloc);
     defer alloc.free(ids);
@@ -3966,6 +4171,7 @@ pub fn applyBundle(alloc: std.mem.Allocator, bundle_path: []const u8, dst_path: 
         }
         try dest.refs.updateRefTxn(updates, "bundle-apply");
     }
+    try dest.store.rebuildPackInventory(alloc);
     try dest.refreshCommitGraph();
 
     return .{
@@ -3978,6 +4184,53 @@ pub fn applyBundle(alloc: std.mem.Allocator, bundle_path: []const u8, dst_path: 
 }
 
 pub fn cloneLocalRepository(alloc: std.mem.Allocator, src_path: []const u8, dst_path: []const u8, fsync: cfg.FsyncPolicy) !BundleResult {
+    return try cloneLocalRepositoryWithOptions(alloc, src_path, dst_path, fsync, .{});
+}
+
+pub fn cloneLocalRepositoryWithOptions(
+    alloc: std.mem.Allocator,
+    src_path: []const u8,
+    dst_path: []const u8,
+    fsync: cfg.FsyncPolicy,
+    options: LocalCloneOptions,
+) !BundleResult {
+    if (options.borrow) {
+        var source = try CasManager.init(alloc, src_path, fsync);
+        defer source.deinit();
+        var dest = try CasManager.init(alloc, dst_path, fsync);
+        defer dest.deinit();
+
+        const refs = try source.refs.listRefs(alloc);
+        defer {
+            for (refs) |*entry| entry.deinit(alloc);
+            alloc.free(refs);
+        }
+        var updates = try alloc.alloc(RefTxnUpdate, refs.len);
+        defer alloc.free(updates);
+        for (refs, 0..) |entry, idx| {
+            updates[idx] = .{
+                .ref_name = entry.name,
+                .new_id = entry.id,
+            };
+        }
+        if (updates.len != 0) try dest.refs.updateRefTxn(updates, "clone-local");
+        try dest.store.configureAlternates(alloc, &[_][]const u8{src_path});
+        dest.format = source.format;
+        try writeRepositoryFormat(alloc, dest.store.root, dest.format, dest.store.fsync);
+        if (!isZeroRepositoryId(source.repository_id)) {
+            dest.repository_id = source.repository_id;
+            try writeRepositoryId(dest.store.root, dest.repository_id, dest.store.fsync);
+        }
+        try dest.refreshCommitGraph();
+        return .{
+            .ref_count = refs.len,
+            .prerequisite_count = 0,
+            .object_count = 0,
+            .pack_count = 0,
+            .reftable_file_count = 0,
+        };
+    }
+
     const temp_bundle_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/local-clone-{d}", .{std.time.nanoTimestamp()});
     defer alloc.free(temp_bundle_path);
     std.fs.cwd().deleteTree(temp_bundle_path) catch {};
@@ -3988,6 +4241,16 @@ pub fn cloneLocalRepository(alloc: std.mem.Allocator, src_path: []const u8, dst_
 }
 
 pub fn fetchLocalRepository(alloc: std.mem.Allocator, src_path: []const u8, dst_path: []const u8, fsync: cfg.FsyncPolicy) !LocalExchangeResult {
+    return try fetchLocalRepositoryWithOptions(alloc, src_path, dst_path, fsync, .{});
+}
+
+pub fn fetchLocalRepositoryWithOptions(
+    alloc: std.mem.Allocator,
+    src_path: []const u8,
+    dst_path: []const u8,
+    fsync: cfg.FsyncPolicy,
+    options: LocalFetchOptions,
+) !LocalExchangeResult {
     var source = try CasManager.init(alloc, src_path, fsync);
     defer source.deinit();
     var dest = try CasManager.init(alloc, dst_path, fsync);
@@ -4020,6 +4283,9 @@ pub fn fetchLocalRepository(alloc: std.mem.Allocator, src_path: []const u8, dst_
         };
     }
     if (updates.len != 0) try dest.refs.updateRefTxn(updates, "fetch-local");
+    if (options.materialize) {
+        _ = try dest.materializeBorrowedObjects();
+    }
     try dest.refreshCommitGraph();
 
     return .{
@@ -4030,6 +4296,16 @@ pub fn fetchLocalRepository(alloc: std.mem.Allocator, src_path: []const u8, dst_
 }
 
 pub fn pushLocalRepository(alloc: std.mem.Allocator, src_path: []const u8, dst_path: []const u8, fsync: cfg.FsyncPolicy) !LocalExchangeResult {
+    return try pushLocalRepositoryWithOptions(alloc, src_path, dst_path, fsync, .{});
+}
+
+pub fn pushLocalRepositoryWithOptions(
+    alloc: std.mem.Allocator,
+    src_path: []const u8,
+    dst_path: []const u8,
+    fsync: cfg.FsyncPolicy,
+    options: LocalPushOptions,
+) !LocalExchangeResult {
     var source = try CasManager.init(alloc, src_path, fsync);
     defer source.deinit();
     var dest = try CasManager.init(alloc, dst_path, fsync);
@@ -4046,6 +4322,9 @@ pub fn pushLocalRepository(alloc: std.mem.Allocator, src_path: []const u8, dst_p
     try dest.store.configureAlternates(alloc, merged_paths);
 
     try dest.refs.compareAndSwapRef(main_ref, dst_head, src_head, "push-local");
+    if (!options.borrow) {
+        _ = try dest.materializeBorrowedObjects();
+    }
     try dest.refreshCommitGraph();
 
     return .{
@@ -5430,6 +5709,23 @@ fn buildParentSlice(alloc: std.mem.Allocator, parent: ?object_store.ObjectId) ![
 
 fn hashFile(data_dir: std.fs.Dir, path: []const u8) ![32]u8 {
     var file = try data_dir.openFile(path, .{});
+    defer file.close();
+
+    var buf: [8192]u8 = undefined;
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    while (true) {
+        const bytes_read = try file.read(buf[0..]);
+        if (bytes_read == 0) break;
+        hasher.update(buf[0..bytes_read]);
+    }
+    var out: [32]u8 = undefined;
+    hasher.final(out[0..]);
+    return out;
+}
+
+fn hashRelativePath(root: std.fs.Dir, alloc: std.mem.Allocator, path: []const u8) ![32]u8 {
+    _ = alloc;
+    var file = try root.openFile(path, .{ .mode = .read_only });
     defer file.close();
 
     var buf: [8192]u8 = undefined;
@@ -8615,6 +8911,11 @@ test "bundle create, verify, and apply round-trip the CAS head" {
     try std.testing.expectEqual(@as(usize, 1), restored_snapshot.snapshot.tag_snapshot.entries.len);
     try std.testing.expectEqual(@as(usize, 1), restored_snapshot.snapshot.series_catalog_snapshot.entries.len);
     try std.testing.expect(restored.repository_id.eql(cas_manager.repository_id));
+
+    var manifest_view = try readBundleManifest(talloc, bundle_path);
+    defer manifest_view.deinit(talloc);
+    try std.testing.expectEqual(@as(u16, 4), manifest_view.format_version);
+    try std.testing.expect(manifest_view.pack_digests.len > 0);
 }
 
 test "local clone preserves pack files and reftable state" {
@@ -8714,7 +9015,49 @@ test "local fetch borrows source repositories and tracks source refs" {
     try std.testing.expect(try dst.store.hasObject(src_head));
 }
 
-test "local push enforces fast-forward and borrows source packs" {
+test "local fetch can materialize borrowed content" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const src_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/fetch-materialize-src", .{tmp.sub_path});
+    defer talloc.free(src_path);
+    const dst_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/fetch-materialize-dst", .{tmp.sub_path});
+    defer talloc.free(dst_path);
+    try std.fs.cwd().makePath(src_path);
+    try std.fs.cwd().makePath(dst_path);
+
+    var src_dir = try std.fs.cwd().openDir(src_path, .{ .iterate = true });
+    defer src_dir.close();
+    var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, src_dir, .none);
+    defer series_catalog.deinit();
+    const sid = types.hash64("fetch.materialize.series");
+    _ = try series_catalog.register("fetch.materialize.series", "{}", sid);
+    const points = [_]types.Point{.{ .ts = 1_000, .value = 1.5 }};
+    const seg_path = try segment_mod.writeSegment(talloc, src_dir, sid, 0, points[0..]);
+    defer talloc.free(seg_path);
+    try manifest.add(src_dir, sid, 0, 1_000, 1_000, 1, seg_path);
+
+    var src = try CasManager.init(talloc, src_path, .none);
+    defer src.deinit();
+    const src_head = try src.bootstrapIfMissing(src_dir, &manifest, &tags, &series_catalog);
+    _ = try src.pack();
+
+    const fetched = try fetchLocalRepositoryWithOptions(talloc, src_path, dst_path, .none, .{ .materialize = true });
+    try std.testing.expect(fetched.repository_id.eql(src.repository_id));
+    try std.testing.expectEqual(@as(usize, 0), fetched.borrowed_repositories);
+
+    var dst = try CasManager.init(talloc, dst_path, .none);
+    defer dst.deinit();
+    try std.testing.expectEqual(@as(usize, 0), dst.store.alternates.repo_paths.len);
+    try std.testing.expect(try dst.store.hasLocalObject(talloc, src_head));
+}
+
+test "local push enforces fast-forward and materializes owned content by default" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -8768,11 +9111,12 @@ test "local push enforces fast-forward and borrows source packs" {
 
     const pushed = try pushLocalRepository(talloc, src_path, dst_path, .none);
     try std.testing.expect(pushed.repository_id.eql(src.repository_id));
+    try std.testing.expectEqual(@as(usize, 0), pushed.borrowed_repositories);
 
     const pushed_head = try dst.refs.readHead(main_ref) orelse return error.MissingCasHead;
     try std.testing.expect(pushed_head.eql(src_head));
     try std.testing.expect(!pushed_head.eql(dst_head));
-    try std.testing.expect(try dst.store.hasObject(src_head));
+    try std.testing.expect(try dst.store.hasLocalObject(talloc, src_head));
 }
 
 test "incremental bundle apply requires its prerequisite head" {

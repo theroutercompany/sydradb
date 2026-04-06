@@ -72,6 +72,16 @@ pub const PackReverseIndex = struct {
     }
 };
 
+pub const PackInventoryRecord = struct {
+    pack_path: []u8,
+    pack_checksum: [32]u8,
+    object_count: u64,
+
+    pub fn deinit(self: *PackInventoryRecord, alloc: std.mem.Allocator) void {
+        alloc.free(self.pack_path);
+    }
+};
+
 pub const AlternateStoreSet = struct {
     repo_paths: [][]u8,
 
@@ -228,6 +238,27 @@ pub const ObjectStore = struct {
             error.FileNotFound => return false,
             else => return err,
         }
+    }
+
+    pub fn findLocalPackPathForObject(self: *ObjectStore, allocator: std.mem.Allocator, id: ObjectId) !?[]u8 {
+        if (try self.findPackedLocation(id)) |location| {
+            defer location.deinit(self.allocator);
+            return try allocator.dupe(u8, location.pack_path);
+        }
+        return null;
+    }
+
+    pub fn loadPackInventory(self: *ObjectStore, allocator: std.mem.Allocator) ![]PackInventoryRecord {
+        return readPackInventory(allocator, self.root) catch |err| switch (err) {
+            error.FileNotFound => try scanPackInventory(allocator, self.root),
+            else => return err,
+        };
+    }
+
+    pub fn rebuildPackInventory(self: *ObjectStore, allocator: std.mem.Allocator) !void {
+        const records = try scanPackInventory(allocator, self.root);
+        defer freePackInventoryRecords(allocator, records);
+        try writePackInventory(allocator, self.root, records, self.fsync);
     }
 
     pub fn configureAlternates(self: *ObjectStore, allocator: std.mem.Allocator, repo_paths: []const []const u8) !void {
@@ -498,6 +529,7 @@ pub const ObjectStore = struct {
         }
         if (refresh_active_indexes) {
             try self.rebuildMultiPackIndex(allocator);
+            try self.rebuildPackInventory(allocator);
         }
 
         if (delete_loose_after) {
@@ -601,6 +633,7 @@ pub const ObjectStore = struct {
         }
 
         try self.rebuildMultiPackIndex(allocator);
+        try self.rebuildPackInventory(allocator);
         return rebuilt;
     }
 
@@ -919,6 +952,8 @@ const midxMagic = "SYDMIDX1";
 const manifestMagic = "SYDPMAN1";
 const revMagic = "SYDREV1\x00";
 const midxPath = "objects/info/multi-pack-index";
+const packInventoryMagic = "SYDPINV1";
+const packInventoryPath = "objects/info/pack-inventory";
 const alternatesPath = "objects/info/alternates";
 
 const PackLocation = struct {
@@ -1515,6 +1550,138 @@ fn writePackManifestFile(
         var root_for_sync = root;
         try syncDir(&root_for_sync);
     }
+}
+
+fn encodePackInventory(alloc: std.mem.Allocator, records: []const PackInventoryRecord) ![]u8 {
+    var bytes = std.array_list.Managed(u8).init(alloc);
+    errdefer bytes.deinit();
+
+    try bytes.appendSlice(packInventoryMagic[0..]);
+    try appendInt(&bytes, u16, 1);
+    try appendInt(&bytes, u64, @intCast(records.len));
+    for (records) |record| {
+        try appendInt(&bytes, u16, @intCast(record.pack_path.len));
+        try bytes.appendSlice(record.pack_path);
+        try bytes.appendSlice(record.pack_checksum[0..]);
+        try appendInt(&bytes, u64, record.object_count);
+    }
+
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(bytes.items);
+    var checksum: [32]u8 = undefined;
+    hasher.final(checksum[0..]);
+    try bytes.appendSlice(checksum[0..]);
+    return try bytes.toOwnedSlice();
+}
+
+fn readPackInventory(alloc: std.mem.Allocator, root: std.fs.Dir) ![]PackInventoryRecord {
+    const bytes = try root.readFileAlloc(alloc, packInventoryPath, 32 * 1024 * 1024);
+    defer alloc.free(bytes);
+    if (bytes.len < packInventoryMagic.len + @sizeOf(u16) + @sizeOf(u64) + 32) return error.CorruptPackInventory;
+    if (!std.mem.eql(u8, bytes[0..packInventoryMagic.len], packInventoryMagic[0..])) return error.CorruptPackInventory;
+
+    const checksum_start = bytes.len - 32;
+    var hasher = std.crypto.hash.Blake3.init(.{});
+    hasher.update(bytes[0..checksum_start]);
+    var expected_checksum: [32]u8 = undefined;
+    hasher.final(expected_checksum[0..]);
+    if (!std.mem.eql(u8, expected_checksum[0..], bytes[checksum_start..])) return error.CorruptPackInventory;
+
+    var cursor: usize = packInventoryMagic.len;
+    const version = readIntAt(bytes[0..checksum_start], &cursor, u16);
+    if (version != 1) return error.UnsupportedPackInventoryVersion;
+    const record_count = readIntAt(bytes[0..checksum_start], &cursor, u64);
+    const records = try alloc.alloc(PackInventoryRecord, @intCast(record_count));
+    var loaded_count: usize = 0;
+    errdefer {
+        for (records[0..loaded_count]) |*record| record.deinit(alloc);
+        alloc.free(records);
+    }
+    for (records) |*record| {
+        const path_len = readIntAt(bytes[0..checksum_start], &cursor, u16);
+        if (cursor + path_len + 32 + @sizeOf(u64) > checksum_start) return error.CorruptPackInventory;
+        const pack_path = try alloc.dupe(u8, bytes[cursor .. cursor + path_len]);
+        cursor += path_len;
+        record.* = .{
+            .pack_path = pack_path,
+            .pack_checksum = try readHashAt(bytes, &cursor, checksum_start),
+            .object_count = readIntAt(bytes[0..checksum_start], &cursor, u64),
+        };
+        loaded_count += 1;
+    }
+    if (cursor != checksum_start) return error.CorruptPackInventory;
+    return records;
+}
+
+fn scanPackInventory(alloc: std.mem.Allocator, root: std.fs.Dir) ![]PackInventoryRecord {
+    var pack_dir = root.openDir("objects/packs", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return try alloc.alloc(PackInventoryRecord, 0),
+        else => return err,
+    };
+    defer pack_dir.close();
+
+    var records = std.array_list.Managed(PackInventoryRecord).init(alloc);
+    errdefer {
+        for (records.items) |*record| record.deinit(alloc);
+        records.deinit();
+    }
+
+    var it = pack_dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".manifest")) continue;
+        const manifest_path = try std.fmt.allocPrint(alloc, "objects/packs/{s}", .{entry.name});
+        defer alloc.free(manifest_path);
+        var loaded = try loadPackManifest(alloc, root, manifest_path);
+        defer loaded.deinit(alloc);
+        try records.append(.{
+            .pack_path = try alloc.dupe(u8, loaded.manifest.pack_path),
+            .pack_checksum = loaded.manifest.pack_checksum,
+            .object_count = loaded.manifest.object_count,
+        });
+    }
+
+    std.sort.block(PackInventoryRecord, records.items, {}, struct {
+        fn lessThan(_: void, lhs: PackInventoryRecord, rhs: PackInventoryRecord) bool {
+            return std.mem.lessThan(u8, lhs.pack_path, rhs.pack_path);
+        }
+    }.lessThan);
+    return try records.toOwnedSlice();
+}
+
+fn writePackInventory(
+    alloc: std.mem.Allocator,
+    root: std.fs.Dir,
+    records: []const PackInventoryRecord,
+    fsync: cfg.FsyncPolicy,
+) !void {
+    const bytes = try encodePackInventory(alloc, records);
+    defer alloc.free(bytes);
+
+    const temp_path = packInventoryPath ++ ".tmp";
+    var file = try root.createFile(temp_path, .{ .truncate = true, .read = true });
+    defer file.close();
+    errdefer root.deleteFile(temp_path) catch {};
+    try file.writeAll(bytes);
+    if (shouldSync(fsync)) {
+        try file.sync();
+    }
+    root.rename(temp_path, packInventoryPath) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            root.deleteFile(packInventoryPath) catch {};
+            try root.rename(temp_path, packInventoryPath);
+        },
+        else => return err,
+    };
+    if (shouldSync(fsync)) {
+        var root_for_sync = root;
+        try syncDir(&root_for_sync);
+    }
+}
+
+pub fn freePackInventoryRecords(alloc: std.mem.Allocator, records: []PackInventoryRecord) void {
+    for (records) |*record| record.deinit(alloc);
+    alloc.free(records);
 }
 
 fn freeOwnedStrings(alloc: std.mem.Allocator, items: [][]u8) void {
