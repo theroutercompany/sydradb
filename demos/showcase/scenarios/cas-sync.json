@@ -92,7 +92,7 @@
       "summary": "Fast-forward another repository while keeping the destination independent of the source after transfer.",
       "kind": "cas_command",
       "workspace": "edge-east",
-      "args": ["push-local", "{{vars.push_target_data_dir}}"],
+      "args": ["push-local", "{{vars.hq_data_dir}}"],
       "evidencePanels": [
         { "id": "push-output", "title": "Push local", "kind": "json" }
       ],

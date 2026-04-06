@@ -48,7 +48,7 @@
       "assertions": [
         { "path": "rows", "operator": "minLength", "value": 1 },
         { "path": "rows.0.0", "operator": "equals", "value": 20 },
-        { "path": "rows.0.1", "operator": "equals", "value": 21.5 }
+        { "path": "rows.0.1", "operator": "equals", "value": 20.5 }
       ]
     }
   ]

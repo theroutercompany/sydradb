@@ -15,7 +15,6 @@ export function buildSummaryEvidence(result: ScenarioRunResult): Record<string, 
         rows?: Array<[number, number]>;
       };
       return {
-        host: hostAvg?.rows?.[0]?.[0],
         avgValue: hostAvg?.rows?.[0]?.[1],
         executionMode: hostAvg?.stats?.execution_mode,
         legacyFallback: hostAvg?.stats?.legacy_fallback,
