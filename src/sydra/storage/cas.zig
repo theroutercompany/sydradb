@@ -18,6 +18,8 @@ pub const current_repository_format_version: u16 = 2;
 pub const default_extent_chunk_bytes: u32 = 64 * 1024;
 const store_format_path = "objects/info/store-format";
 const store_format_magic = "SYDSTORE1";
+const repository_id_path = "objects/info/repository-id";
+const repository_id_magic = "SYDREPO1";
 
 pub const RefBackend = enum(u8) {
     loose = 1,
@@ -28,6 +30,18 @@ pub const RepositoryFormat = struct {
     version: u16 = current_repository_format_version,
     ref_backend: RefBackend = .reftable,
     extent_chunk_bytes: u32 = default_extent_chunk_bytes,
+};
+
+pub const RepositoryIdentity = struct {
+    bytes: [32]u8,
+
+    pub fn eql(self: RepositoryIdentity, other: RepositoryIdentity) bool {
+        return std.mem.eql(u8, self.bytes[0..], other.bytes[0..]);
+    }
+
+    pub fn toHex(self: RepositoryIdentity) [64]u8 {
+        return std.fmt.bytesToHex(self.bytes, .lower);
+    }
 };
 
 pub const StartupDefaults = struct {
@@ -1808,25 +1822,31 @@ const ReachabilityInputs = struct {
 
 pub const CasManager = struct {
     alloc: std.mem.Allocator,
+    path: []u8,
     store: object_store.ObjectStore,
     refs: RefStore,
     format: RepositoryFormat,
+    repository_id: RepositoryIdentity,
 
     pub fn init(alloc: std.mem.Allocator, path: []const u8, fsync: cfg.FsyncPolicy) !CasManager {
         var store = try object_store.ObjectStore.init(alloc, path, fsync);
         errdefer store.deinit();
         const format = try loadOrInitRepositoryFormat(alloc, store.root, fsync);
+        const repository_id = try loadOrInitRepositoryId(store.root, fsync);
         var refs = try RefStore.init(alloc, path, fsync);
         refs.setBackend(format.ref_backend);
         return .{
             .alloc = alloc,
+            .path = try alloc.dupe(u8, path),
             .store = store,
             .refs = refs,
             .format = format,
+            .repository_id = repository_id,
         };
     }
 
     pub fn deinit(self: *CasManager) void {
+        self.alloc.free(self.path);
         self.refs.deinit();
         self.store.deinit();
     }
@@ -3011,6 +3031,7 @@ const BundleManifest = struct {
     format_version: u16,
     repository_format_version: u16 = legacy_repository_format_version,
     ref_backend: RefBackend = .loose,
+    repository_id: RepositoryIdentity = .{ .bytes = [_]u8{0} ** 32 },
     incremental: bool,
     refs: []BundleRef,
     prerequisites: []object_store.ObjectId,
@@ -3020,6 +3041,7 @@ const BundleManifest = struct {
     reftable_files: [][]u8,
     loose_ref_files: [][]u8,
     reflog_files: [][]u8,
+    borrowed_repo_paths: [][]u8,
 
     fn deinit(self: *BundleManifest, alloc: std.mem.Allocator) void {
         for (self.refs) |*entry| entry.deinit(alloc);
@@ -3030,6 +3052,7 @@ const BundleManifest = struct {
         freeOwnedStrings(alloc, self.reftable_files);
         freeOwnedStrings(alloc, self.loose_ref_files);
         freeOwnedStrings(alloc, self.reflog_files);
+        freeOwnedStrings(alloc, self.borrowed_repo_paths);
     }
 };
 
@@ -3053,6 +3076,12 @@ pub const VacuumResult = struct {
     fsck: FsckReport,
     pack: PackResult,
     gc: GcResult,
+};
+
+pub const LocalExchangeResult = struct {
+    repository_id: RepositoryIdentity,
+    ref_count: usize,
+    borrowed_repositories: usize,
 };
 
 const bundle_manifest_name = "bundle.manifest";
@@ -3112,6 +3141,10 @@ fn writeBundleManifest(alloc: std.mem.Allocator, dst_path: []const u8, manifest:
         try writer.print("repository_format_version {d}\n", .{manifest.repository_format_version});
         try writer.print("ref_backend {d}\n", .{@intFromEnum(manifest.ref_backend)});
     }
+    if (manifest.format_version >= 3) {
+        const repo_hex = manifest.repository_id.toHex();
+        try writer.print("repository_id {s}\n", .{repo_hex});
+    }
     try writer.print("incremental {d}\n", .{@intFromBool(manifest.incremental)});
     try writer.print("object_count {d}\n", .{manifest.object_count});
     if (manifest.format_version >= 2) {
@@ -3125,6 +3158,10 @@ fn writeBundleManifest(alloc: std.mem.Allocator, dst_path: []const u8, manifest:
         for (manifest.loose_ref_files) |path| try writer.print("{s}\n", .{path});
         try writer.print("reflog_files {d}\n", .{manifest.reflog_files.len});
         for (manifest.reflog_files) |path| try writer.print("{s}\n", .{path});
+        if (manifest.format_version >= 3) {
+            try writer.print("borrowed_repositories {d}\n", .{manifest.borrowed_repo_paths.len});
+            for (manifest.borrowed_repo_paths) |path| try writer.print("{s}\n", .{path});
+        }
     }
     try writer.print("prerequisites {d}\n", .{manifest.prerequisites.len});
     for (manifest.prerequisites) |prerequisite| {
@@ -3153,7 +3190,7 @@ fn readBundleManifest(alloc: std.mem.Allocator, bundle_path: []const u8) !Bundle
     if (!std.mem.eql(u8, magic, bundle_manifest_magic)) return error.InvalidBundle;
 
     const format_version = try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "format_version");
-    if (format_version != 1 and format_version != 2) return error.UnsupportedBundleFormatVersion;
+    if (format_version != 1 and format_version != 2 and format_version != 3) return error.UnsupportedBundleFormatVersion;
     const repository_format_version = if (format_version >= 2)
         try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "repository_format_version")
     else
@@ -3162,6 +3199,10 @@ fn readBundleManifest(alloc: std.mem.Allocator, bundle_path: []const u8) !Bundle
         std.meta.intToEnum(RefBackend, @as(u8, @intCast(try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "ref_backend")))) catch return error.InvalidBundle
     else
         RefBackend.loose;
+    const repository_id = if (format_version >= 3)
+        try parseBundleRepositoryId(line_it.next() orelse return error.InvalidBundle)
+    else
+        RepositoryIdentity{ .bytes = [_]u8{0} ** 32 };
     const incremental_value = try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "incremental");
     const object_count = try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "object_count");
 
@@ -3190,6 +3231,11 @@ fn readBundleManifest(alloc: std.mem.Allocator, bundle_path: []const u8) !Bundle
     else
         try alloc.alloc([]u8, 0);
     errdefer freeOwnedStrings(alloc, reflog_files);
+    const borrowed_repo_paths = if (format_version >= 3)
+        try readBundlePathList(alloc, &line_it, "borrowed_repositories")
+    else
+        try alloc.alloc([]u8, 0);
+    errdefer freeOwnedStrings(alloc, borrowed_repo_paths);
 
     const prerequisite_count = try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "prerequisites");
 
@@ -3222,6 +3268,7 @@ fn readBundleManifest(alloc: std.mem.Allocator, bundle_path: []const u8) !Bundle
         .format_version = @intCast(format_version),
         .repository_format_version = @intCast(repository_format_version),
         .ref_backend = ref_backend,
+        .repository_id = repository_id,
         .incremental = incremental_value != 0,
         .refs = refs,
         .prerequisites = prerequisites,
@@ -3231,6 +3278,7 @@ fn readBundleManifest(alloc: std.mem.Allocator, bundle_path: []const u8) !Bundle
         .reftable_files = reftable_files,
         .loose_ref_files = loose_ref_files,
         .reflog_files = reflog_files,
+        .borrowed_repo_paths = borrowed_repo_paths,
     };
 }
 
@@ -3239,6 +3287,15 @@ fn parseBundleCountLine(line: []const u8, key: []const u8) !usize {
         return error.InvalidBundle;
     }
     return try std.fmt.parseInt(usize, line[key.len + 1 ..], 10);
+}
+
+fn parseBundleRepositoryId(line: []const u8) !RepositoryIdentity {
+    if (!std.mem.startsWith(u8, line, "repository_id ")) return error.InvalidBundle;
+    const raw = line["repository_id ".len..];
+    if (raw.len != 64) return error.InvalidBundle;
+    var out: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(out[0..], raw);
+    return .{ .bytes = out };
 }
 
 fn readBundlePathList(alloc: std.mem.Allocator, line_it: *std.mem.TokenIterator(u8, .any), key: []const u8) ![][]u8 {
@@ -3333,6 +3390,8 @@ pub fn createBundle(alloc: std.mem.Allocator, src_path: []const u8, dst_path: []
 
     const info_candidates = [_][]const u8{
         store_format_path,
+        repository_id_path,
+        "objects/info/alternates",
         "objects/info/multi-pack-index",
         commit_graph_path,
         reachability_bitmap_path,
@@ -3388,9 +3447,10 @@ pub fn createBundle(alloc: std.mem.Allocator, src_path: []const u8, dst_path: []
     defer alloc.free(bundle_ids);
 
     const manifest = BundleManifest{
-        .format_version = 2,
+        .format_version = 3,
         .repository_format_version = source.format.version,
         .ref_backend = source.format.ref_backend,
+        .repository_id = source.repository_id,
         .incremental = since_spec != null,
         .refs = try cloneBundleRefs(alloc, refs),
         .prerequisites = try alloc.dupe(object_store.ObjectId, prerequisite_ids.items),
@@ -3400,6 +3460,7 @@ pub fn createBundle(alloc: std.mem.Allocator, src_path: []const u8, dst_path: []
         .reftable_files = try cloneOwnedStringsSlice(alloc, reftable_files),
         .loose_ref_files = try cloneOwnedStringsSlice(alloc, copied_loose_ref_files.items),
         .reflog_files = try cloneOwnedStringsSlice(alloc, reflog_files),
+        .borrowed_repo_paths = try cloneOwnedStringsSlice(alloc, source.store.alternates.repo_paths),
     };
     defer {
         var owned = manifest;
@@ -3537,6 +3598,13 @@ pub fn applyBundle(alloc: std.mem.Allocator, bundle_path: []const u8, dst_path: 
         try writeRepositoryFormat(alloc, dest.store.root, dest.format, dest.store.fsync);
         dest.refs.setBackend(manifest.ref_backend);
     }
+    if (manifest.format_version >= 3 and !isZeroRepositoryId(manifest.repository_id)) {
+        dest.repository_id = manifest.repository_id;
+        try writeRepositoryId(dest.store.root, dest.repository_id, dest.store.fsync);
+    }
+    if (manifest.borrowed_repo_paths.len != 0) {
+        try dest.store.configureAlternates(alloc, manifest.borrowed_repo_paths);
+    }
 
     if (manifest.reftable_files.len == 0 and manifest.loose_ref_files.len == 0 and manifest.refs.len > 0) {
         var updates = try alloc.alloc(RefTxnUpdate, manifest.refs.len);
@@ -3568,6 +3636,133 @@ pub fn cloneLocalRepository(alloc: std.mem.Allocator, src_path: []const u8, dst_
 
     _ = try createBundle(alloc, src_path, temp_bundle_path, fsync, null);
     return try applyBundle(alloc, temp_bundle_path, dst_path, fsync);
+}
+
+pub fn fetchLocalRepository(alloc: std.mem.Allocator, src_path: []const u8, dst_path: []const u8, fsync: cfg.FsyncPolicy) !LocalExchangeResult {
+    var source = try CasManager.init(alloc, src_path, fsync);
+    defer source.deinit();
+    var dest = try CasManager.init(alloc, dst_path, fsync);
+    defer dest.deinit();
+
+    const merged_paths = try mergeRepositoryPaths(alloc, dest.store.alternates.repo_paths, src_path);
+    defer freeOwnedStrings(alloc, merged_paths);
+    try dest.store.configureAlternates(alloc, merged_paths);
+
+    const refs = try source.refs.listRefs(alloc);
+    defer {
+        for (refs) |*entry| entry.deinit(alloc);
+        alloc.free(refs);
+    }
+    var updates = try alloc.alloc(RefTxnUpdate, refs.len);
+    defer alloc.free(updates);
+    var update_names = std.array_list.Managed([]u8).init(alloc);
+    defer {
+        for (update_names.items) |name| alloc.free(name);
+        update_names.deinit();
+    }
+    for (refs, 0..) |entry, idx| {
+        const tracking_name = try trackingRefName(alloc, source.repository_id, entry.name);
+        defer alloc.free(tracking_name);
+        const owned_name = try alloc.dupe(u8, tracking_name);
+        try update_names.append(owned_name);
+        updates[idx] = .{
+            .ref_name = owned_name,
+            .new_id = entry.id,
+        };
+    }
+    if (updates.len != 0) try dest.refs.updateRefTxn(updates, "fetch-local");
+    try dest.refreshCommitGraph();
+
+    return .{
+        .repository_id = source.repository_id,
+        .ref_count = refs.len,
+        .borrowed_repositories = dest.store.alternates.repo_paths.len,
+    };
+}
+
+pub fn pushLocalRepository(alloc: std.mem.Allocator, src_path: []const u8, dst_path: []const u8, fsync: cfg.FsyncPolicy) !LocalExchangeResult {
+    var source = try CasManager.init(alloc, src_path, fsync);
+    defer source.deinit();
+    var dest = try CasManager.init(alloc, dst_path, fsync);
+    defer dest.deinit();
+
+    const src_head = try source.refs.readHead(main_ref) orelse return error.MissingCasHead;
+    const dst_head = try dest.refs.readHead(main_ref);
+    if (dst_head) |current_dst_head| {
+        if (!try isAncestorInStore(alloc, &source.store, current_dst_head, src_head)) return error.NonFastForwardPush;
+    }
+
+    const merged_paths = try mergeRepositoryPaths(alloc, dest.store.alternates.repo_paths, src_path);
+    defer freeOwnedStrings(alloc, merged_paths);
+    try dest.store.configureAlternates(alloc, merged_paths);
+
+    try dest.refs.compareAndSwapRef(main_ref, dst_head, src_head, "push-local");
+    try dest.refreshCommitGraph();
+
+    return .{
+        .repository_id = source.repository_id,
+        .ref_count = 1,
+        .borrowed_repositories = dest.store.alternates.repo_paths.len,
+    };
+}
+
+fn mergeRepositoryPaths(alloc: std.mem.Allocator, existing: []const []const u8, additional: []const u8) ![][]u8 {
+    var merged = std.array_list.Managed([]u8).init(alloc);
+    errdefer {
+        for (merged.items) |path| alloc.free(path);
+        merged.deinit();
+    }
+    for (existing) |path| {
+        try merged.append(try alloc.dupe(u8, path));
+    }
+    for (merged.items) |path| {
+        if (std.mem.eql(u8, path, additional)) return try merged.toOwnedSlice();
+    }
+    try merged.append(try alloc.dupe(u8, additional));
+    return try merged.toOwnedSlice();
+}
+
+fn trackingRefName(alloc: std.mem.Allocator, repository_id: RepositoryIdentity, ref_name: []const u8) ![]u8 {
+    const repo_hex = repository_id.toHex();
+    return try std.fmt.allocPrint(alloc, "remotes/{s}/{s}", .{ repo_hex[0..], ref_name });
+}
+
+fn isZeroRepositoryId(identity: RepositoryIdentity) bool {
+    for (identity.bytes) |byte| {
+        if (byte != 0) return false;
+    }
+    return true;
+}
+
+fn isAncestorInStore(
+    alloc: std.mem.Allocator,
+    store: *object_store.ObjectStore,
+    ancestor: object_store.ObjectId,
+    tip: object_store.ObjectId,
+) !bool {
+    if (ancestor.eql(tip)) return true;
+    var stack = std.array_list.Managed(object_store.ObjectId).init(alloc);
+    defer stack.deinit();
+    var seen = std.AutoHashMap(object_store.ObjectId, void).init(alloc);
+    defer seen.deinit();
+    try stack.append(tip);
+    while (stack.pop()) |id| {
+        const gop = try seen.getOrPut(id);
+        if (gop.found_existing) continue;
+        if (id.eql(ancestor)) return true;
+
+        const loaded = store.get(alloc, id) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+        defer alloc.free(loaded.payload);
+        if (loaded.obj_type != .commit) continue;
+
+        var commit = try decodeCommit(alloc, loaded.payload);
+        defer commit.deinit(alloc);
+        for (commit.parents) |parent| try stack.append(parent);
+    }
+    return false;
 }
 
 const MirrorGcResult = struct {
@@ -4447,6 +4642,19 @@ fn loadOrInitRepositoryFormat(alloc: std.mem.Allocator, root: std.fs.Dir, fsync:
     };
 }
 
+fn loadOrInitRepositoryId(root: std.fs.Dir, fsync: cfg.FsyncPolicy) !RepositoryIdentity {
+    return loadRepositoryId(root) catch |err| switch (err) {
+        error.FileNotFound => blk: {
+            var bytes: [32]u8 = undefined;
+            std.crypto.random.bytes(bytes[0..]);
+            const identity = RepositoryIdentity{ .bytes = bytes };
+            try writeRepositoryId(root, identity, fsync);
+            break :blk identity;
+        },
+        else => return err,
+    };
+}
+
 pub fn recommendedStartupDefaults(root: std.fs.Dir, data_dir_path: []const u8) !StartupDefaults {
     var data_dir = root.openDir(data_dir_path, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return primary_startup_defaults,
@@ -4524,6 +4732,18 @@ fn loadRepositoryFormat(root: std.fs.Dir) !RepositoryFormat {
         .ref_backend = ref_backend,
         .extent_chunk_bytes = extent_chunk_bytes,
     };
+}
+
+fn loadRepositoryId(root: std.fs.Dir) !RepositoryIdentity {
+    const bytes = try root.readFileAlloc(std.heap.page_allocator, repository_id_path, 1024);
+    defer std.heap.page_allocator.free(bytes);
+    if (bytes.len < repository_id_magic.len + 64) return error.CorruptRepositoryId;
+    if (!std.mem.eql(u8, bytes[0..repository_id_magic.len], repository_id_magic)) return error.CorruptRepositoryId;
+    const trimmed = std.mem.trim(u8, bytes[repository_id_magic.len..], " \t\r\n");
+    if (trimmed.len != 64) return error.CorruptRepositoryId;
+    var out: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(out[0..], trimmed);
+    return .{ .bytes = out };
 }
 
 fn writeRepositoryFormat(alloc: std.mem.Allocator, root: std.fs.Dir, format: RepositoryFormat, fsync: cfg.FsyncPolicy) !void {
@@ -5694,6 +5914,30 @@ fn writeReftableState(alloc: std.mem.Allocator, root: std.fs.Dir, state: Reftabl
     }
 }
 
+fn writeRepositoryId(root: std.fs.Dir, identity: RepositoryIdentity, fsync: cfg.FsyncPolicy) !void {
+    const temp_path = repository_id_path ++ ".tmp";
+    var file = try root.createFile(temp_path, .{ .truncate = true, .read = true });
+    defer file.close();
+    errdefer root.deleteFile(temp_path) catch {};
+
+    const hex = identity.toHex();
+    try file.writeAll(repository_id_magic);
+    try file.writeAll(hex[0..]);
+    try file.writeAll("\n");
+    if (fsync != .none) try file.sync();
+    root.rename(temp_path, repository_id_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            root.deleteFile(repository_id_path) catch {};
+            try root.rename(temp_path, repository_id_path);
+        },
+        else => return err,
+    };
+    if (fsync != .none) {
+        var root_for_sync = root;
+        try syncDir(&root_for_sync);
+    }
+}
+
 fn inferNextReftableUpdateIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !u64 {
     const table_names = try loadReftableTableNames(alloc, root);
     defer freeOwnedStrings(alloc, table_names);
@@ -6583,6 +6827,23 @@ test "cas manager initializes a repository format marker for fresh repositories"
     try std.testing.expectEqual(cas_manager.format.version, loaded.version);
     try std.testing.expectEqual(cas_manager.format.ref_backend, loaded.ref_backend);
     try std.testing.expectEqual(cas_manager.format.extent_chunk_bytes, loaded.extent_chunk_bytes);
+}
+
+test "cas manager persists repository identities across reopen" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repo-id", .{tmp_dir.sub_path});
+    defer alloc.free(data_path);
+
+    var first = try CasManager.init(alloc, data_path, .none);
+    const initial_id = first.repository_id;
+    first.deinit();
+
+    var reopened = try CasManager.init(alloc, data_path, .none);
+    defer reopened.deinit();
+    try std.testing.expect(initial_id.eql(reopened.repository_id));
 }
 
 test "cas manager keeps legacy-compatible repository format defaults for existing legacy data" {
@@ -7734,6 +7995,7 @@ test "bundle create, verify, and apply round-trip the CAS head" {
     try std.testing.expectEqual(@as(usize, 1), restored_snapshot.snapshot.segment_descriptors.len);
     try std.testing.expectEqual(@as(usize, 1), restored_snapshot.snapshot.tag_snapshot.entries.len);
     try std.testing.expectEqual(@as(usize, 1), restored_snapshot.snapshot.series_catalog_snapshot.entries.len);
+    try std.testing.expect(restored.repository_id.eql(cas_manager.repository_id));
 }
 
 test "local clone preserves pack files and reftable state" {
@@ -7786,6 +8048,112 @@ test "local clone preserves pack files and reftable state" {
         if (std.mem.endsWith(u8, path, ".pack")) pack_count += 1;
     }
     try std.testing.expect(pack_count > 0);
+}
+
+test "local fetch borrows source repositories and tracks source refs" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const src_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/fetch-src", .{tmp.sub_path});
+    defer talloc.free(src_path);
+    const dst_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/fetch-dst", .{tmp.sub_path});
+    defer talloc.free(dst_path);
+    try std.fs.cwd().makePath(src_path);
+    try std.fs.cwd().makePath(dst_path);
+
+    var src_dir = try std.fs.cwd().openDir(src_path, .{ .iterate = true });
+    defer src_dir.close();
+    var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, src_dir, .none);
+    defer series_catalog.deinit();
+    const sid = types.hash64("fetch.series");
+    _ = try series_catalog.register("fetch.series", "{}", sid);
+    const points = [_]types.Point{.{ .ts = 1_000, .value = 1.0 }};
+    const seg_path = try segment_mod.writeSegment(talloc, src_dir, sid, 0, points[0..]);
+    defer talloc.free(seg_path);
+    try manifest.add(src_dir, sid, 0, 1_000, 1_000, 1, seg_path);
+
+    var src = try CasManager.init(talloc, src_path, .none);
+    defer src.deinit();
+    const src_head = try src.bootstrapIfMissing(src_dir, &manifest, &tags, &series_catalog);
+    _ = try src.pack();
+
+    const fetched = try fetchLocalRepository(talloc, src_path, dst_path, .none);
+    try std.testing.expect(fetched.repository_id.eql(src.repository_id));
+    try std.testing.expect(fetched.borrowed_repositories > 0);
+
+    var dst = try CasManager.init(talloc, dst_path, .none);
+    defer dst.deinit();
+    const tracking_name = try trackingRefName(talloc, src.repository_id, main_ref);
+    defer talloc.free(tracking_name);
+    const tracked = try dst.refs.readHead(tracking_name) orelse return error.MissingCasHead;
+    try std.testing.expect(tracked.eql(src_head));
+    try std.testing.expect(try dst.store.hasObject(src_head));
+}
+
+test "local push enforces fast-forward and borrows source packs" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const src_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/push-src", .{tmp.sub_path});
+    defer talloc.free(src_path);
+    const dst_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/push-dst", .{tmp.sub_path});
+    defer talloc.free(dst_path);
+    try std.fs.cwd().makePath(src_path);
+    try std.fs.cwd().makePath(dst_path);
+
+    var src_dir = try std.fs.cwd().openDir(src_path, .{ .iterate = true });
+    defer src_dir.close();
+    var dst_dir = try std.fs.cwd().openDir(dst_path, .{ .iterate = true });
+    defer dst_dir.close();
+
+    var src_manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+    defer src_manifest.deinit();
+    var dst_manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+    defer dst_manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+    defer tags.deinit();
+    var src_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, src_dir, .none);
+    defer src_catalog.deinit();
+    var dst_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, dst_dir, .none);
+    defer dst_catalog.deinit();
+    const sid = types.hash64("push.series");
+    _ = try src_catalog.register("push.series", "{}", sid);
+    _ = try dst_catalog.register("push.series", "{}", sid);
+
+    const base_points = [_]types.Point{.{ .ts = 1_000, .value = 2.0 }};
+    const base_src_path = try segment_mod.writeSegment(talloc, src_dir, sid, 0, base_points[0..]);
+    defer talloc.free(base_src_path);
+    try src_manifest.add(src_dir, sid, 0, 1_000, 1_000, 1, base_src_path);
+    const base_dst_path = try segment_mod.writeSegment(talloc, dst_dir, sid, 0, base_points[0..]);
+    defer talloc.free(base_dst_path);
+    try dst_manifest.add(dst_dir, sid, 0, 1_000, 1_000, 1, base_dst_path);
+
+    var src = try CasManager.init(talloc, src_path, .none);
+    defer src.deinit();
+    var dst = try CasManager.init(talloc, dst_path, .none);
+    defer dst.deinit();
+    _ = try src.bootstrapIfMissing(src_dir, &src_manifest, &tags, &src_catalog);
+    const dst_head = try dst.bootstrapIfMissing(dst_dir, &dst_manifest, &tags, &dst_catalog);
+
+    const next_points = [_]types.Point{.{ .ts = 2_000, .value = 3.0 }};
+    const next_src_path = try segment_mod.writeSegment(talloc, src_dir, sid, 0, next_points[0..]);
+    defer talloc.free(next_src_path);
+    try src_manifest.add(src_dir, sid, 0, 2_000, 2_000, 1, next_src_path);
+    const src_head = try src.syncLegacySnapshot(src_dir, &src_manifest, &tags, &src_catalog, "advance-push");
+
+    const pushed = try pushLocalRepository(talloc, src_path, dst_path, .none);
+    try std.testing.expect(pushed.repository_id.eql(src.repository_id));
+
+    const pushed_head = try dst.refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(pushed_head.eql(src_head));
+    try std.testing.expect(!pushed_head.eql(dst_head));
+    try std.testing.expect(try dst.store.hasObject(src_head));
 }
 
 test "incremental bundle apply requires its prerequisite head" {

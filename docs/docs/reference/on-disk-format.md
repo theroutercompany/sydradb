@@ -34,6 +34,8 @@ Under `data_dir`, the engine uses:
 - `objects/packs/*.rev` – reverse indexes that preserve physical pack object order
 - `objects/packs/*.manifest` – per-pack manifests with checksums and per-type object counts
 - `objects/info/store-format` – repository-wide storage format marker and feature defaults
+- `objects/info/repository-id` – stable repository identity used by local bundle/fetch/push workflows
+- `objects/info/alternates` – optional list of borrowed local repositories searched after local object lookup
 - `objects/info/multi-pack-index` – optional pack-set fanout index across all active packs
 - `objects/info/commit-graph` – optional commit ancestry side index with generation numbers and logical changed-path Bloom filters
 - `objects/info/reachability-bitmap` – optional ref-keyed reachable-object side index for CAS maintenance fast paths
@@ -154,6 +156,7 @@ See [`src/sydra/storage/manifest.zig`](./source/sydra/storage/manifest.md) for t
 A bundle directory currently contains:
 
 - `bundle.manifest` – versioned bundle manifest with exported refs, prerequisite commits, repository-format metadata, preserved pack paths, and copied ref metadata files
+- bundle manifests version 3 also carry the source repository id and any borrowed local repositories referenced by the source bundle
 - `objects/` – bundle-local reachable loose objects plus preserved active pack/index/manifest files
 - `objects/packs/*.pack`, `*.idx`, `*.manifest` – immutable active-pack payloads plus indexes and manifests copied directly from the source repository
 - `objects/info/*` – copied store-format and side-index files when present
@@ -166,6 +169,7 @@ Operational notes:
 - `restore` is a thin wrapper over `cas bundle apply <src_dir>`.
 - Applying a bundle now preserves pack files and ref metadata directly instead of re-inserting every object through the loose-object path.
 - Restoring a bundle reapplies `objects/`, `objects/info/*`, and whichever ref backend snapshot (`reftable/` or loose `refs/`) the bundle was created from; it still does not recreate `MANIFEST`, `tags.json`, or `series_catalog.jsonl` unless an explicit CAS export command is run afterward.
+- Borrowed repositories are configured through `objects/info/alternates`; object lookup stays local-first and falls back to borrowed repositories only when a local object is missing.
 - Incremental bundles list prerequisite commits in `bundle.manifest`; `cas bundle apply` rejects them unless the destination store already contains those prerequisite objects.
 
 ## Integrity and cleanup

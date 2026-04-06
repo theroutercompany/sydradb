@@ -72,6 +72,15 @@ pub const PackReverseIndex = struct {
     }
 };
 
+pub const AlternateStoreSet = struct {
+    repo_paths: [][]u8,
+
+    pub fn deinit(self: *AlternateStoreSet, alloc: std.mem.Allocator) void {
+        for (self.repo_paths) |path| alloc.free(path);
+        alloc.free(self.repo_paths);
+    }
+};
+
 pub const PackedBlobReader = struct {
     file: std.fs.File,
     remaining: usize,
@@ -126,6 +135,7 @@ pub const ObjectStore = struct {
     allocator: std.mem.Allocator,
     root: std.fs.Dir,
     fsync: cfg.FsyncPolicy,
+    alternates: AlternateStoreSet,
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8, fsync: cfg.FsyncPolicy) !ObjectStore {
         var cwd = std.fs.cwd();
@@ -135,10 +145,16 @@ pub const ObjectStore = struct {
         try root.makePath("objects/packs");
         try root.makePath("objects/info");
         try root.makePath("refs");
-        return .{ .allocator = allocator, .root = root, .fsync = fsync };
+        return .{
+            .allocator = allocator,
+            .root = root,
+            .fsync = fsync,
+            .alternates = try loadAlternateStoreSet(allocator, root),
+        };
     }
 
     pub fn deinit(self: *ObjectStore) void {
+        self.alternates.deinit(self.allocator);
         self.root.close();
     }
 
@@ -187,10 +203,27 @@ pub const ObjectStore = struct {
     }
 
     pub fn get(self: *ObjectStore, allocator: std.mem.Allocator, id: ObjectId) !LoadedObject {
-        return self.getLoose(allocator, id) catch |err| switch (err) {
-            error.FileNotFound => try self.getPacked(allocator, id),
+        return self.getLocal(allocator, id) catch |err| switch (err) {
+            error.FileNotFound => try self.getFromAlternates(allocator, id),
             else => return err,
         };
+    }
+
+    pub fn hasObject(self: *ObjectStore, id: ObjectId) !bool {
+        if (self.getLocal(self.allocator, id)) |loaded| {
+            self.allocator.free(loaded.payload);
+            return true;
+        } else |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        }
+        return try self.hasAlternateObject(id);
+    }
+
+    pub fn configureAlternates(self: *ObjectStore, allocator: std.mem.Allocator, repo_paths: []const []const u8) !void {
+        try writeAlternatesFile(allocator, self.root, repo_paths, self.fsync);
+        self.alternates.deinit(self.allocator);
+        self.alternates = try loadAlternateStoreSet(self.allocator, self.root);
     }
 
     fn getLoose(self: *ObjectStore, allocator: std.mem.Allocator, id: ObjectId) !LoadedObject {
@@ -230,6 +263,13 @@ pub const ObjectStore = struct {
             .id = id,
             .obj_type = obj_type,
             .payload = payload,
+        };
+    }
+
+    fn getLocal(self: *ObjectStore, allocator: std.mem.Allocator, id: ObjectId) !LoadedObject {
+        return self.getLoose(allocator, id) catch |err| switch (err) {
+            error.FileNotFound => try self.getPacked(allocator, id),
+            else => return err,
         };
     }
 
@@ -776,6 +816,35 @@ pub const ObjectStore = struct {
     fn loadMultiPackIndex(self: *ObjectStore, allocator: std.mem.Allocator) !MultiPackIndex {
         return try readMultiPackIndex(allocator, self.root);
     }
+
+    fn getFromAlternates(self: *ObjectStore, allocator: std.mem.Allocator, id: ObjectId) !LoadedObject {
+        for (self.alternates.repo_paths) |repo_path| {
+            var alternate = try openAlternateStore(self.allocator, repo_path);
+            defer alternate.deinit();
+            if (alternate.getLocal(allocator, id)) |loaded| {
+                return loaded;
+            } else |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            }
+        }
+        return error.FileNotFound;
+    }
+
+    fn hasAlternateObject(self: *ObjectStore, id: ObjectId) !bool {
+        for (self.alternates.repo_paths) |repo_path| {
+            var alternate = try openAlternateStore(self.allocator, repo_path);
+            defer alternate.deinit();
+            if (alternate.getLocal(self.allocator, id)) |loaded| {
+                self.allocator.free(loaded.payload);
+                return true;
+            } else |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            }
+        }
+        return false;
+    }
 };
 
 pub fn computeId(obj_type: ObjectType, payload: []const u8) ObjectId {
@@ -807,6 +876,7 @@ const midxMagic = "SYDMIDX1";
 const manifestMagic = "SYDPMAN1";
 const revMagic = "SYDREV1\x00";
 const midxPath = "objects/info/multi-pack-index";
+const alternatesPath = "objects/info/alternates";
 
 const PackLocation = struct {
     pack_path: []u8,
@@ -1347,6 +1417,72 @@ fn pathExists(root: std.fs.Dir, path: []const u8) !bool {
     return true;
 }
 
+fn loadAlternateStoreSet(alloc: std.mem.Allocator, root: std.fs.Dir) !AlternateStoreSet {
+    const body = root.readFileAlloc(alloc, alternatesPath, 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => return .{ .repo_paths = try alloc.alloc([]u8, 0) },
+        else => return err,
+    };
+    defer alloc.free(body);
+
+    var repo_paths = std.array_list.Managed([]u8).init(alloc);
+    errdefer {
+        for (repo_paths.items) |path| alloc.free(path);
+        repo_paths.deinit();
+    }
+    var line_it = std.mem.tokenizeScalar(u8, body, '\n');
+    while (line_it.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len == 0) continue;
+        try repo_paths.append(try alloc.dupe(u8, line));
+    }
+    return .{ .repo_paths = try repo_paths.toOwnedSlice() };
+}
+
+fn writeAlternatesFile(
+    alloc: std.mem.Allocator,
+    root: std.fs.Dir,
+    repo_paths: []const []const u8,
+    fsync: cfg.FsyncPolicy,
+) !void {
+    _ = alloc;
+    const temp_path = alternatesPath ++ ".tmp";
+    var file = try root.createFile(temp_path, .{ .truncate = true, .read = true });
+    defer file.close();
+    errdefer root.deleteFile(temp_path) catch {};
+
+    var write_buf: [1024]u8 = undefined;
+    var writer_state = file.writer(&write_buf);
+    const writer = &writer_state.interface;
+    for (repo_paths) |repo_path| {
+        try writer.writeAll(repo_path);
+        try writer.writeAll("\n");
+    }
+    try writer_state.end();
+    if (shouldSync(fsync)) try file.sync();
+    root.rename(temp_path, alternatesPath) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            root.deleteFile(alternatesPath) catch {};
+            try root.rename(temp_path, alternatesPath);
+        },
+        else => return err,
+    };
+    if (shouldSync(fsync)) {
+        var root_for_sync = root;
+        try syncDir(&root_for_sync);
+    }
+}
+
+fn openAlternateStore(alloc: std.mem.Allocator, repo_path: []const u8) !ObjectStore {
+    var cwd = std.fs.cwd();
+    const root = try cwd.openDir(repo_path, .{ .iterate = true });
+    return .{
+        .allocator = alloc,
+        .root = root,
+        .fsync = .none,
+        .alternates = .{ .repo_paths = try alloc.alloc([]u8, 0) },
+    };
+}
+
 test "object store write/read round-trip" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
@@ -1598,4 +1734,27 @@ test "object store falls back to pack indexes when the multi-pack index is corru
     const loaded_second = try store.get(std.testing.allocator, second);
     defer std.testing.allocator.free(loaded_second.payload);
     try std.testing.expectEqualStrings("second-pack", loaded_second.payload);
+}
+
+test "object store alternates provide borrowed object reads" {
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    const src_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/object-store-alt-src", .{tmp_dir.sub_path});
+    defer std.testing.allocator.free(src_path);
+    const dst_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/object-store-alt-dst", .{tmp_dir.sub_path});
+    defer std.testing.allocator.free(dst_path);
+
+    var src = try ObjectStore.init(std.testing.allocator, src_path, .none);
+    defer src.deinit();
+    const borrowed_id = try src.put(.blob, "borrowed-pack-object");
+
+    var dst = try ObjectStore.init(std.testing.allocator, dst_path, .none);
+    defer dst.deinit();
+    try dst.configureAlternates(std.testing.allocator, &[_][]const u8{src_path});
+
+    try std.testing.expect(try dst.hasObject(borrowed_id));
+    const loaded = try dst.get(std.testing.allocator, borrowed_id);
+    defer std.testing.allocator.free(loaded.payload);
+    try std.testing.expectEqualStrings("borrowed-pack-object", loaded.payload);
 }
