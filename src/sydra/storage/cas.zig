@@ -5,6 +5,7 @@ const manifest_mod = @import("manifest.zig");
 const compact_mod = @import("compact.zig");
 const object_store = @import("object_store.zig");
 const extents = @import("extents.zig");
+const metric_catalog_mod = @import("metric_catalog.zig");
 const segment_mod = @import("segment.zig");
 const series_catalog_mod = @import("series_catalog.zig");
 const tags_mod = @import("tags.zig");
@@ -202,6 +203,45 @@ pub const SeriesCatalogSnapshot = struct {
     }
 };
 
+pub const MetricCatalogSnapshotEntry = struct {
+    metric: []u8,
+    kind: ?metric_catalog_mod.MetricKind = null,
+    unit: ?[]u8 = null,
+    description: ?[]u8 = null,
+    source_metric: ?[]u8 = null,
+    source_field: ?[]u8 = null,
+
+    pub fn deinit(self: *MetricCatalogSnapshotEntry, alloc: std.mem.Allocator) void {
+        alloc.free(self.metric);
+        if (self.unit) |unit| alloc.free(unit);
+        if (self.description) |description| alloc.free(description);
+        if (self.source_metric) |source_metric| alloc.free(source_metric);
+        if (self.source_field) |source_field| alloc.free(source_field);
+    }
+
+    pub fn eql(self: MetricCatalogSnapshotEntry, other: MetricCatalogSnapshotEntry) bool {
+        return std.mem.eql(u8, self.metric, other.metric) and
+            self.kind == other.kind and
+            optionalStringEql(self.unit, other.unit) and
+            optionalStringEql(self.description, other.description) and
+            optionalStringEql(self.source_metric, other.source_metric) and
+            optionalStringEql(self.source_field, other.source_field);
+    }
+};
+
+pub const MetricCatalogSnapshot = struct {
+    entries: []MetricCatalogSnapshotEntry,
+
+    pub fn empty(alloc: std.mem.Allocator) !MetricCatalogSnapshot {
+        return .{ .entries = try alloc.alloc(MetricCatalogSnapshotEntry, 0) };
+    }
+
+    pub fn deinit(self: *MetricCatalogSnapshot, alloc: std.mem.Allocator) void {
+        for (self.entries) |*entry| entry.deinit(alloc);
+        alloc.free(self.entries);
+    }
+};
+
 pub const CheckpointSeriesHighwater = struct {
     series_id: types.SeriesId,
     highwater_ts: i64,
@@ -334,6 +374,7 @@ pub const LegacySnapshot = struct {
     segment_descriptors: []SegmentDescriptor,
     tag_snapshot: TagSnapshot,
     series_catalog_snapshot: SeriesCatalogSnapshot,
+    metric_catalog_snapshot: MetricCatalogSnapshot,
     wal_index: WalIndex,
     checkpoint_state: CheckpointState,
 
@@ -342,6 +383,7 @@ pub const LegacySnapshot = struct {
         alloc.free(self.segment_descriptors);
         self.tag_snapshot.deinit(alloc);
         self.series_catalog_snapshot.deinit(alloc);
+        self.metric_catalog_snapshot.deinit(alloc);
         self.wal_index.deinit(alloc);
         self.checkpoint_state.deinit(alloc);
     }
@@ -354,6 +396,7 @@ pub const Snapshot = struct {
     segment_descriptors: []SegmentDescriptor,
     tag_snapshot: TagSnapshot,
     series_catalog_snapshot: SeriesCatalogSnapshot,
+    metric_catalog_snapshot: MetricCatalogSnapshot,
     wal_index: WalIndex,
     checkpoint_state: CheckpointState,
 
@@ -363,6 +406,7 @@ pub const Snapshot = struct {
         alloc.free(self.segment_descriptors);
         self.tag_snapshot.deinit(alloc);
         self.series_catalog_snapshot.deinit(alloc);
+        self.metric_catalog_snapshot.deinit(alloc);
         self.wal_index.deinit(alloc);
         self.checkpoint_state.deinit(alloc);
     }
@@ -532,6 +576,7 @@ test "snapshot index compatibility debt counts legacy descriptors" {
 
     const tag_snapshot = try TagSnapshot.empty(alloc);
     const series_catalog_snapshot = try SeriesCatalogSnapshot.empty(alloc);
+    const metric_catalog_snapshot = try MetricCatalogSnapshot.empty(alloc);
     const checkpoint_state = try CheckpointState.empty(alloc);
     const parents = try alloc.alloc(object_store.ObjectId, 0);
     const reason = try alloc.dupe(u8, "test");
@@ -550,6 +595,7 @@ test "snapshot index compatibility debt counts legacy descriptors" {
         .segment_descriptors = segment_descriptors,
         .tag_snapshot = tag_snapshot,
         .series_catalog_snapshot = series_catalog_snapshot,
+        .metric_catalog_snapshot = metric_catalog_snapshot,
         .wal_index = .{ .entries = wal_entries },
         .checkpoint_state = checkpoint_state,
     });
@@ -1448,10 +1494,11 @@ pub const CommitWriter = struct {
         manifest: *const manifest_mod.Manifest,
         tags: *const tags_mod.TagIndex,
         series_catalog: *const series_catalog_mod.SeriesCatalog,
+        metric_catalog: *const metric_catalog_mod.MetricCatalog,
         parent: ?object_store.ObjectId,
         reason: []const u8,
     ) !object_store.ObjectId {
-        var snapshot = try buildLegacySnapshot(self.alloc, data_dir, manifest, tags, series_catalog, self.store, self.extent_chunk_bytes);
+        var snapshot = try buildLegacySnapshot(self.alloc, data_dir, manifest, tags, series_catalog, metric_catalog, self.store, self.extent_chunk_bytes);
         defer snapshot.deinit(self.alloc);
         return try self.writePreparedSnapshot(&snapshot, parent, reason);
     }
@@ -1492,6 +1539,10 @@ pub const CommitWriter = struct {
         defer self.alloc.free(series_payload);
         const series_blob_id = try self.store.put(.blob, series_payload);
 
+        const metric_payload = try encodeMetricCatalogSnapshot(self.alloc, snapshot.metric_catalog_snapshot);
+        defer self.alloc.free(metric_payload);
+        const metric_blob_id = try self.store.put(.blob, metric_payload);
+
         const wal_payload = try encodeWalIndex(self.alloc, snapshot.wal_index);
         defer self.alloc.free(wal_payload);
         const wal_blob_id = try self.store.put(.blob, wal_payload);
@@ -1516,6 +1567,11 @@ pub const CommitWriter = struct {
             .name = try self.alloc.dupe(u8, "series_catalog"),
             .object_type = .blob,
             .object_id = series_blob_id,
+        });
+        try metadata_entries.append(.{
+            .name = try self.alloc.dupe(u8, "metric_catalog"),
+            .object_type = .blob,
+            .object_id = metric_blob_id,
         });
         try metadata_entries.append(.{
             .name = try self.alloc.dupe(u8, "tags"),
@@ -1769,6 +1825,8 @@ pub const CommitReader = struct {
         errdefer tag_snapshot.deinit(self.alloc);
         var series_catalog_snapshot = try SeriesCatalogSnapshot.empty(self.alloc);
         errdefer series_catalog_snapshot.deinit(self.alloc);
+        var metric_catalog_snapshot = try MetricCatalogSnapshot.empty(self.alloc);
+        errdefer metric_catalog_snapshot.deinit(self.alloc);
         var wal_index = try WalIndex.empty(self.alloc);
         errdefer wal_index.deinit(self.alloc);
         var checkpoint_state = try CheckpointState.empty(self.alloc);
@@ -1798,6 +1856,14 @@ pub const CommitReader = struct {
                 if (loaded.obj_type != .blob) return error.InvalidSeriesCatalogSnapshotObject;
                 series_catalog_snapshot.deinit(self.alloc);
                 series_catalog_snapshot = try decodeSeriesCatalogSnapshot(self.alloc, loaded.payload);
+            }
+
+            if (findBlobEntry(metadata_tree.entries, "metric_catalog")) |metric_blob_id| {
+                const loaded = try self.store.get(self.alloc, metric_blob_id);
+                defer self.alloc.free(loaded.payload);
+                if (loaded.obj_type != .blob) return error.InvalidMetricCatalogSnapshotObject;
+                metric_catalog_snapshot.deinit(self.alloc);
+                metric_catalog_snapshot = try decodeMetricCatalogSnapshot(self.alloc, loaded.payload);
             }
 
             if (findTreeEntry(metadata_tree.entries, "segments")) |segments_tree_id| {
@@ -1839,6 +1905,7 @@ pub const CommitReader = struct {
             .segment_descriptors = try descriptors.toOwnedSlice(),
             .tag_snapshot = tag_snapshot,
             .series_catalog_snapshot = series_catalog_snapshot,
+            .metric_catalog_snapshot = metric_catalog_snapshot,
             .wal_index = wal_index,
             .checkpoint_state = checkpoint_state,
         };
@@ -1850,8 +1917,9 @@ pub const CommitReader = struct {
         manifest: *const manifest_mod.Manifest,
         tags: *const tags_mod.TagIndex,
         series_catalog: *const series_catalog_mod.SeriesCatalog,
+        metric_catalog: *const metric_catalog_mod.MetricCatalog,
     ) !void {
-        var live = try buildLegacySnapshot(self.alloc, data_dir, manifest, tags, series_catalog, self.store, default_extent_chunk_bytes);
+        var live = try buildLegacySnapshot(self.alloc, data_dir, manifest, tags, series_catalog, metric_catalog, self.store, default_extent_chunk_bytes);
         defer live.deinit(self.alloc);
 
         var stored = try self.loadHeadSnapshot();
@@ -2197,10 +2265,11 @@ pub const CasManager = struct {
         manifest: *const manifest_mod.Manifest,
         tags: *const tags_mod.TagIndex,
         series_catalog: *const series_catalog_mod.SeriesCatalog,
+        metric_catalog: *const metric_catalog_mod.MetricCatalog,
     ) !object_store.ObjectId {
         if (try self.refs.readHead(main_ref)) |head| return head;
         var writer = CommitWriter{ .alloc = self.alloc, .store = &self.store, .extent_chunk_bytes = self.format.extent_chunk_bytes };
-        const commit_id = try writer.writeSnapshot(data_dir, manifest, tags, series_catalog, null, "bootstrap");
+        const commit_id = try writer.writeSnapshot(data_dir, manifest, tags, series_catalog, metric_catalog, null, "bootstrap");
         try self.refs.compareAndSwapRef(main_ref, null, commit_id, "bootstrap");
         try self.ensureHeadSymRef();
         try self.refreshCommitGraph();
@@ -2213,11 +2282,12 @@ pub const CasManager = struct {
         manifest: *const manifest_mod.Manifest,
         tags: *const tags_mod.TagIndex,
         series_catalog: *const series_catalog_mod.SeriesCatalog,
+        metric_catalog: *const metric_catalog_mod.MetricCatalog,
         reason: []const u8,
     ) !object_store.ObjectId {
         const parent = try self.refs.readHead(main_ref);
         var writer = CommitWriter{ .alloc = self.alloc, .store = &self.store, .extent_chunk_bytes = self.format.extent_chunk_bytes };
-        const commit_id = try writer.writeSnapshot(data_dir, manifest, tags, series_catalog, parent, reason);
+        const commit_id = try writer.writeSnapshot(data_dir, manifest, tags, series_catalog, metric_catalog, parent, reason);
         try self.refs.compareAndSwapRef(main_ref, parent, commit_id, reason);
         try self.refreshCommitGraph();
         return commit_id;
@@ -2229,9 +2299,10 @@ pub const CasManager = struct {
         manifest: *const manifest_mod.Manifest,
         tags: *const tags_mod.TagIndex,
         series_catalog: *const series_catalog_mod.SeriesCatalog,
+        metric_catalog: *const metric_catalog_mod.MetricCatalog,
     ) !void {
         var reader = CommitReader{ .alloc = self.alloc, .store = &self.store, .refs = &self.refs };
-        try reader.verifyHeadMatchesLegacy(data_dir, manifest, tags, series_catalog);
+        try reader.verifyHeadMatchesLegacy(data_dir, manifest, tags, series_catalog, metric_catalog);
     }
 
     pub fn loadHeadIndex(self: *CasManager) !SnapshotIndex {
@@ -2239,8 +2310,15 @@ pub const CasManager = struct {
         return SnapshotIndex.init(self.alloc, &self.store, try reader.loadHeadSnapshot());
     }
 
-    pub fn verifyHead(self: *CasManager, data_dir: std.fs.Dir, manifest: *const manifest_mod.Manifest, tags: *const tags_mod.TagIndex, series_catalog: *const series_catalog_mod.SeriesCatalog) !void {
-        try self.verifyHeadMatchesLegacy(data_dir, manifest, tags, series_catalog);
+    pub fn verifyHead(
+        self: *CasManager,
+        data_dir: std.fs.Dir,
+        manifest: *const manifest_mod.Manifest,
+        tags: *const tags_mod.TagIndex,
+        series_catalog: *const series_catalog_mod.SeriesCatalog,
+        metric_catalog: *const metric_catalog_mod.MetricCatalog,
+    ) !void {
+        try self.verifyHeadMatchesLegacy(data_dir, manifest, tags, series_catalog, metric_catalog);
         const refs = try self.refs.listRefs(self.alloc);
         defer {
             for (refs) |*entry| entry.deinit(self.alloc);
@@ -2654,6 +2732,7 @@ pub const CasManager = struct {
         try writeManifestFile(self.alloc, data_dir, snapshot.segment_descriptors);
         try writeTagsFile(self.alloc, data_dir, snapshot.tag_snapshot);
         try writeSeriesCatalogFile(self.alloc, data_dir, snapshot.series_catalog_snapshot);
+        try writeMetricCatalogFile(self.alloc, data_dir, snapshot.metric_catalog_snapshot);
         _ = try cleanupStaleMirrors(self.alloc, data_dir, snapshot, false);
     }
 
@@ -3217,6 +3296,8 @@ pub const CasManager = struct {
         errdefer tag_snapshot.deinit(self.alloc);
         var series_catalog_snapshot = try cloneSeriesCatalogSnapshot(self.alloc, snapshot.series_catalog_snapshot);
         errdefer series_catalog_snapshot.deinit(self.alloc);
+        var metric_catalog_snapshot = try cloneMetricCatalogSnapshot(self.alloc, snapshot.metric_catalog_snapshot);
+        errdefer metric_catalog_snapshot.deinit(self.alloc);
 
         const wal_entries = try self.alloc.alloc(WalChunkDescriptor, snapshot.wal_index.entries.len);
         errdefer {
@@ -3245,6 +3326,7 @@ pub const CasManager = struct {
                 .segment_descriptors = descriptors,
                 .tag_snapshot = tag_snapshot,
                 .series_catalog_snapshot = series_catalog_snapshot,
+                .metric_catalog_snapshot = metric_catalog_snapshot,
                 .wal_index = wal_index,
                 .checkpoint_state = checkpoint_state,
             },
@@ -5885,6 +5967,7 @@ pub fn buildLegacySnapshot(
     manifest: *const manifest_mod.Manifest,
     tags: *const tags_mod.TagIndex,
     series_catalog: *const series_catalog_mod.SeriesCatalog,
+    metric_catalog: *const metric_catalog_mod.MetricCatalog,
     store: ?*object_store.ObjectStore,
     extent_chunk_bytes: u32,
 ) !LegacySnapshot {
@@ -5940,6 +6023,9 @@ pub fn buildLegacySnapshot(
     var series_catalog_snapshot = try buildSeriesCatalogSnapshot(alloc, series_catalog);
     errdefer series_catalog_snapshot.deinit(alloc);
 
+    var metric_catalog_snapshot = try buildMetricCatalogSnapshot(alloc, metric_catalog);
+    errdefer metric_catalog_snapshot.deinit(alloc);
+
     var wal_index = try buildWalIndex(alloc, data_dir, store, extent_chunk_bytes);
     errdefer wal_index.deinit(alloc);
 
@@ -5950,6 +6036,7 @@ pub fn buildLegacySnapshot(
         .segment_descriptors = segment_descriptors,
         .tag_snapshot = tag_snapshot,
         .series_catalog_snapshot = series_catalog_snapshot,
+        .metric_catalog_snapshot = metric_catalog_snapshot,
         .wal_index = wal_index,
         .checkpoint_state = checkpoint_state,
     };
@@ -5968,6 +6055,11 @@ pub fn verifyLegacySnapshot(live: LegacySnapshot, stored: Snapshot) !void {
 
     if (live.series_catalog_snapshot.entries.len != stored.series_catalog_snapshot.entries.len) return error.CasVerificationFailed;
     for (live.series_catalog_snapshot.entries, stored.series_catalog_snapshot.entries) |lhs, rhs| {
+        if (!lhs.eql(rhs)) return error.CasVerificationFailed;
+    }
+
+    if (live.metric_catalog_snapshot.entries.len != stored.metric_catalog_snapshot.entries.len) return error.CasVerificationFailed;
+    for (live.metric_catalog_snapshot.entries, stored.metric_catalog_snapshot.entries) |lhs, rhs| {
         if (!lhs.eql(rhs)) return error.CasVerificationFailed;
     }
 }
@@ -6028,6 +6120,32 @@ fn buildSeriesCatalogSnapshot(alloc: std.mem.Allocator, series_catalog: *const s
     }
 
     sortSeriesCatalogEntries(entries.items);
+    return .{ .entries = try entries.toOwnedSlice() };
+}
+
+fn buildMetricCatalogSnapshot(alloc: std.mem.Allocator, metric_catalog: *const metric_catalog_mod.MetricCatalog) !MetricCatalogSnapshot {
+    var catalog = @constCast(metric_catalog);
+    catalog.mutex.lock();
+    defer catalog.mutex.unlock();
+
+    var entries = std.array_list.Managed(MetricCatalogSnapshotEntry).init(alloc);
+    errdefer {
+        for (entries.items) |*entry| entry.deinit(alloc);
+        entries.deinit();
+    }
+
+    for (catalog.entries.items) |entry| {
+        try entries.append(.{
+            .metric = try alloc.dupe(u8, entry.metric),
+            .kind = entry.kind,
+            .unit = try dupeOptionalString(alloc, entry.unit),
+            .description = try dupeOptionalString(alloc, entry.description),
+            .source_metric = try dupeOptionalString(alloc, entry.source_metric),
+            .source_field = try dupeOptionalString(alloc, entry.source_field),
+        });
+    }
+
+    sortMetricCatalogEntries(entries.items);
     return .{ .entries = try entries.toOwnedSlice() };
 }
 
@@ -6385,6 +6503,51 @@ fn decodeSeriesCatalogSnapshot(alloc: std.mem.Allocator, payload: []const u8) !S
     return .{ .entries = entries };
 }
 
+fn encodeMetricCatalogSnapshot(alloc: std.mem.Allocator, snapshot: MetricCatalogSnapshot) ![]u8 {
+    var bytes = std.array_list.Managed(u8).init(alloc);
+    errdefer bytes.deinit();
+
+    try bytes.append(1);
+    try appendInt(&bytes, u32, @intCast(snapshot.entries.len));
+    for (snapshot.entries) |entry| {
+        try appendString(&bytes, entry.metric);
+        try appendOptionalEnum(&bytes, metric_catalog_mod.MetricKind, entry.kind);
+        try appendOptionalString(&bytes, entry.unit);
+        try appendOptionalString(&bytes, entry.description);
+        try appendOptionalString(&bytes, entry.source_metric);
+        try appendOptionalString(&bytes, entry.source_field);
+    }
+    return try bytes.toOwnedSlice();
+}
+
+fn decodeMetricCatalogSnapshot(alloc: std.mem.Allocator, payload: []const u8) !MetricCatalogSnapshot {
+    var cursor = Cursor{ .bytes = payload };
+    const version = try cursor.readByte();
+    if (version != 1) return error.UnsupportedMetricCatalogSnapshotVersion;
+
+    const entry_count = try cursor.readInt(u32);
+    var entries = try alloc.alloc(MetricCatalogSnapshotEntry, entry_count);
+    errdefer {
+        for (entries[0..@min(entries.len, cursor.objects_read)]) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+
+    var i: usize = 0;
+    while (i < entry_count) : (i += 1) {
+        entries[i] = .{
+            .metric = try cursor.readOwnedString(alloc),
+            .kind = try cursor.readOptionalEnum(metric_catalog_mod.MetricKind),
+            .unit = try cursor.readOptionalOwnedString(alloc),
+            .description = try cursor.readOptionalOwnedString(alloc),
+            .source_metric = try cursor.readOptionalOwnedString(alloc),
+            .source_field = try cursor.readOptionalOwnedString(alloc),
+        };
+        cursor.objects_read += 1;
+    }
+    try cursor.finish();
+    return .{ .entries = entries };
+}
+
 fn encodeCheckpointState(alloc: std.mem.Allocator, checkpoint: CheckpointState) ![]u8 {
     var bytes = std.array_list.Managed(u8).init(alloc);
     errdefer bytes.deinit();
@@ -6605,6 +6768,16 @@ fn appendString(bytes: *std.array_list.Managed(u8), value: []const u8) !void {
     try bytes.appendSlice(value);
 }
 
+fn appendOptionalString(bytes: *std.array_list.Managed(u8), maybe_value: ?[]const u8) !void {
+    try bytes.append(if (maybe_value != null) 1 else 0);
+    if (maybe_value) |value| try appendString(bytes, value);
+}
+
+fn appendOptionalEnum(bytes: *std.array_list.Managed(u8), comptime T: type, maybe_value: ?T) !void {
+    try bytes.append(if (maybe_value != null) 1 else 0);
+    if (maybe_value) |value| try bytes.append(@intFromEnum(value));
+}
+
 fn encodeContentRef(bytes: *std.array_list.Managed(u8), content: ContentRef) !void {
     switch (content) {
         .blob => |id| {
@@ -6674,6 +6847,22 @@ const Cursor = struct {
         return try self.readBytes(alloc, len);
     }
 
+    fn readOptionalOwnedString(self: *Cursor, alloc: std.mem.Allocator) !?[]u8 {
+        return switch (try self.readByte()) {
+            0 => null,
+            1 => try self.readOwnedString(alloc),
+            else => error.InvalidOptionalStringFlag,
+        };
+    }
+
+    fn readOptionalEnum(self: *Cursor, comptime T: type) !?T {
+        return switch (try self.readByte()) {
+            0 => null,
+            1 => std.meta.intToEnum(T, try self.readByte()) catch return error.InvalidOptionalEnumValue,
+            else => error.InvalidOptionalEnumFlag,
+        };
+    }
+
     fn readOptionalObjectId(self: *Cursor) !?object_store.ObjectId {
         return switch (try self.readByte()) {
             0 => null,
@@ -6698,6 +6887,17 @@ fn decodeContentRef(cursor: *Cursor) !?ContentRef {
         } },
         else => error.UnsupportedContentRefVersion,
     };
+}
+
+fn optionalStringEql(lhs: ?[]const u8, rhs: ?[]const u8) bool {
+    if (lhs == null and rhs == null) return true;
+    if (lhs == null or rhs == null) return false;
+    return std.mem.eql(u8, lhs.?, rhs.?);
+}
+
+fn dupeOptionalString(alloc: std.mem.Allocator, value: ?[]const u8) !?[]u8 {
+    if (value) |slice| return try alloc.dupe(u8, slice);
+    return null;
 }
 
 fn optionalObjectIdEql(lhs: ?object_store.ObjectId, rhs: ?object_store.ObjectId) bool {
@@ -6864,6 +7064,37 @@ fn cloneSeriesCatalogSnapshot(alloc: std.mem.Allocator, snapshot: SeriesCatalogS
     return .{ .entries = entries };
 }
 
+fn cloneMetricCatalogSnapshot(alloc: std.mem.Allocator, snapshot: MetricCatalogSnapshot) !MetricCatalogSnapshot {
+    const entries = try alloc.alloc(MetricCatalogSnapshotEntry, snapshot.entries.len);
+    errdefer {
+        for (entries[0..]) |*entry| {
+            if (entry.metric.len != 0) entry.deinit(alloc);
+        }
+        alloc.free(entries);
+    }
+    for (entries) |*entry| {
+        entry.* = .{
+            .metric = &[_]u8{},
+            .kind = null,
+            .unit = null,
+            .description = null,
+            .source_metric = null,
+            .source_field = null,
+        };
+    }
+    for (snapshot.entries, 0..) |entry, idx| {
+        entries[idx] = .{
+            .metric = try alloc.dupe(u8, entry.metric),
+            .kind = entry.kind,
+            .unit = try dupeOptionalString(alloc, entry.unit),
+            .description = try dupeOptionalString(alloc, entry.description),
+            .source_metric = try dupeOptionalString(alloc, entry.source_metric),
+            .source_field = try dupeOptionalString(alloc, entry.source_field),
+        };
+    }
+    return .{ .entries = entries };
+}
+
 fn sortDescriptors(descriptors: []SegmentDescriptor) void {
     std.sort.block(SegmentDescriptor, descriptors, {}, struct {
         fn lessThan(_: void, lhs: SegmentDescriptor, rhs: SegmentDescriptor) bool {
@@ -6881,6 +7112,14 @@ fn sortSeriesCatalogEntries(entries: []SeriesCatalogSnapshotEntry) void {
             if (!std.mem.eql(u8, lhs.series, rhs.series)) return std.mem.lessThan(u8, lhs.series, rhs.series);
             if (!std.mem.eql(u8, lhs.canonical_tags, rhs.canonical_tags)) return std.mem.lessThan(u8, lhs.canonical_tags, rhs.canonical_tags);
             return lhs.series_id < rhs.series_id;
+        }
+    }.lessThan);
+}
+
+fn sortMetricCatalogEntries(entries: []MetricCatalogSnapshotEntry) void {
+    std.sort.block(MetricCatalogSnapshotEntry, entries, {}, struct {
+        fn lessThan(_: void, lhs: MetricCatalogSnapshotEntry, rhs: MetricCatalogSnapshotEntry) bool {
+            return std.mem.lessThan(u8, lhs.metric, rhs.metric);
         }
     }.lessThan);
 }
@@ -8413,6 +8652,50 @@ fn writeSeriesCatalogFile(alloc: std.mem.Allocator, data_dir: std.fs.Dir, series
     try data_dir.rename(temp_name, "series_catalog.jsonl");
 }
 
+fn writeMetricCatalogFile(alloc: std.mem.Allocator, data_dir: std.fs.Dir, metric_catalog_snapshot: MetricCatalogSnapshot) !void {
+    _ = alloc;
+    const temp_name = "metric_catalog.jsonl.tmp";
+    var file = try data_dir.createFile(temp_name, .{ .truncate = true, .read = true });
+    defer file.close();
+    errdefer data_dir.deleteFile(temp_name) catch {};
+
+    var write_buf: [4096]u8 = undefined;
+    var writer_state = file.writer(&write_buf);
+    const writer = &writer_state.interface;
+
+    for (metric_catalog_snapshot.entries) |entry| {
+        var jw = std.json.Stringify{ .writer = writer };
+        try jw.beginObject();
+        try jw.objectField("metric");
+        try jw.write(entry.metric);
+        if (entry.kind) |kind| {
+            try jw.objectField("kind");
+            try jw.write(kind.text());
+        }
+        if (entry.unit) |unit| {
+            try jw.objectField("unit");
+            try jw.write(unit);
+        }
+        if (entry.description) |description| {
+            try jw.objectField("description");
+            try jw.write(description);
+        }
+        if (entry.source_metric) |source_metric| {
+            try jw.objectField("source_metric");
+            try jw.write(source_metric);
+        }
+        if (entry.source_field) |source_field| {
+            try jw.objectField("source_field");
+            try jw.write(source_field);
+        }
+        try jw.endObject();
+        try writer.writeAll("\n");
+    }
+    try writer_state.end();
+    try file.sync();
+    try data_dir.rename(temp_name, "metric_catalog.jsonl");
+}
+
 fn materializeSnapshotMirrors(
     alloc: std.mem.Allocator,
     data_dir: std.fs.Dir,
@@ -8768,6 +9051,7 @@ test "upgrade normalizes active commits to canonical roots and clears compatibil
         .segment_descriptors = legacy_descriptors,
         .tag_snapshot = try cloneTagSnapshot(talloc, snapshot.tag_snapshot),
         .series_catalog_snapshot = try cloneSeriesCatalogSnapshot(talloc, snapshot.series_catalog_snapshot),
+        .metric_catalog_snapshot = try cloneMetricCatalogSnapshot(talloc, snapshot.metric_catalog_snapshot),
         .wal_index = .{ .entries = legacy_wal_entries },
         .checkpoint_state = try buildCheckpointState(talloc, legacy_descriptors, legacy_wal_entries),
     };

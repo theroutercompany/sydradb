@@ -26,6 +26,8 @@ pub const Scan = struct {
     output: []const plan.ColumnInfo,
     rollup_hint: ?plan.RollupHint,
     time_bounds: TimeBounds,
+    label_constraints: []const LabelConstraint,
+    require_exact_series: bool,
 };
 
 pub const BoundSelectorSource = enum {
@@ -72,6 +74,7 @@ pub const Aggregate = struct {
     child: *Node,
     requires_hash: bool,
     has_fill_clause: bool,
+    fill: ?ast.FillClause,
 };
 
 pub const Sort = struct {
@@ -95,8 +98,14 @@ pub const TimeBounds = struct {
     max_inclusive: bool = true,
 };
 
+pub const LabelConstraint = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
 const Context = struct {
     time_bounds: TimeBounds = .{},
+    label_constraints: []const LabelConstraint = &.{},
 };
 
 pub fn build(allocator: std.mem.Allocator, logical: *plan.Node) BuildError!PhysicalPlan {
@@ -125,6 +134,8 @@ fn buildNode(allocator: std.mem.Allocator, logical: *plan.Node, ctx: Context) Bu
                 .output = scan.output,
                 .rollup_hint = detectScanRollup(scan),
                 .time_bounds = ctx.time_bounds,
+                .label_constraints = ctx.label_constraints,
+                .require_exact_series = !plan.selectNeedsAggregation(scan.source),
             } };
         },
         .one_row => |one_row| {
@@ -132,7 +143,11 @@ fn buildNode(allocator: std.mem.Allocator, logical: *plan.Node, ctx: Context) Bu
         },
         .filter => |filter| {
             const extracted = extractTimeBounds(filter.conjunctive_predicates);
-            const merged_ctx = Context{ .time_bounds = mergeTimeBounds(ctx.time_bounds, extracted) };
+            const extracted_labels = try extractLabelConstraints(allocator, filter.conjunctive_predicates);
+            const merged_ctx = Context{
+                .time_bounds = mergeTimeBounds(ctx.time_bounds, extracted),
+                .label_constraints = try mergeLabelConstraints(allocator, ctx.label_constraints, extracted_labels),
+            };
             const child = try buildNode(allocator, filter.input, merged_ctx);
             node.* = .{ .filter = .{ .predicate = filter.predicate, .output = filter.output, .child = child, .conjunction_count = filter.conjunctive_predicates.len, .time_bounds = extracted } };
         },
@@ -142,7 +157,7 @@ fn buildNode(allocator: std.mem.Allocator, logical: *plan.Node, ctx: Context) Bu
         },
         .aggregate => |aggregate| {
             const child = try buildNode(allocator, aggregate.input, ctx);
-            node.* = .{ .aggregate = .{ .groupings = aggregate.groupings, .rollup_hint = aggregate.rollup_hint, .output = aggregate.output, .child = child, .requires_hash = aggregate.groupings.len != 0, .has_fill_clause = aggregate.fill != null } };
+            node.* = .{ .aggregate = .{ .groupings = aggregate.groupings, .rollup_hint = aggregate.rollup_hint, .output = aggregate.output, .child = child, .requires_hash = aggregate.groupings.len != 0, .has_fill_clause = aggregate.fill != null, .fill = aggregate.fill } };
         },
         .sort => |sort| {
             const child = try buildNode(allocator, sort.input, ctx);
@@ -159,6 +174,60 @@ fn buildNode(allocator: std.mem.Allocator, logical: *plan.Node, ctx: Context) Bu
 fn detectScanRollup(scan: plan.Scan) ?plan.RollupHint {
     _ = scan;
     return null;
+}
+
+fn mergeLabelConstraints(
+    allocator: std.mem.Allocator,
+    lhs: []const LabelConstraint,
+    rhs: []const LabelConstraint,
+) ![]const LabelConstraint {
+    if (lhs.len == 0 and rhs.len == 0) return &.{};
+    const merged = try allocator.alloc(LabelConstraint, lhs.len + rhs.len);
+    @memcpy(merged[0..lhs.len], lhs);
+    @memcpy(merged[lhs.len..], rhs);
+    return merged;
+}
+
+fn extractLabelConstraints(
+    allocator: std.mem.Allocator,
+    predicates: []const *const ast.Expr,
+) ![]const LabelConstraint {
+    var list = std.array_list.Managed(LabelConstraint).init(allocator);
+    defer list.deinit();
+    for (predicates) |expr| {
+        if (labelConstraintFromExpr(expr)) |constraint| {
+            try list.append(constraint);
+        }
+    }
+    return try list.toOwnedSlice();
+}
+
+fn labelConstraintFromExpr(expr: *const ast.Expr) ?LabelConstraint {
+    if (expr.* != .binary) return null;
+    const binary = expr.binary;
+    if (binary.op != .equal) return null;
+
+    if (identifierConstraint(binary.left, binary.right)) |constraint| return constraint;
+    if (identifierConstraint(binary.right, binary.left)) |constraint| return constraint;
+    return null;
+}
+
+fn identifierConstraint(identifier_expr: *const ast.Expr, value_expr: *const ast.Expr) ?LabelConstraint {
+    if (identifier_expr.* != .identifier or value_expr.* != .literal) return null;
+    const ident = identifier_expr.identifier;
+    const literal = value_expr.literal;
+    const key = labelIdentifierKey(ident.value) orelse return null;
+    return switch (literal.value) {
+        .string => |value| LabelConstraint{ .key = key, .value = value },
+        else => null,
+    };
+}
+
+fn labelIdentifierKey(name: []const u8) ?[]const u8 {
+    const dot = std.mem.indexOfScalar(u8, name, '.') orelse return null;
+    const prefix = name[0..dot];
+    if (!std.ascii.eqlIgnoreCase(prefix, "tag") and !std.ascii.eqlIgnoreCase(prefix, "label")) return null;
+    return name[dot + 1 ..];
 }
 
 fn extractTimeBounds(predicates: []const *const ast.Expr) TimeBounds {

@@ -856,7 +856,9 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         defer tags.deinit();
         var series_catalog = try @import("storage/series_catalog.zig").SeriesCatalog.loadOrInit(alloc, data_dir, cfg.fsync);
         defer series_catalog.deinit();
-        try cas.verifyHead(data_dir, &manifest, &tags, &series_catalog);
+        var metric_catalog = try @import("storage/metric_catalog.zig").MetricCatalog.loadOrInit(alloc, data_dir, cfg.fsync);
+        defer metric_catalog.deinit();
+        try cas.verifyHead(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
         if (json_output) {
             try writeJsonBufferToStdout("{\"schema_version\":1,\"command\":\"verify\",\"ok\":true}");
         } else {
