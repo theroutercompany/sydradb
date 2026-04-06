@@ -23,6 +23,21 @@ interface LaunchCardDefinition {
   scenarioId: string;
 }
 
+interface ScenarioReadingGuide {
+  story: string;
+  manager: string;
+  engineer: string;
+  operator: string;
+  summaryEvidence: string;
+}
+
+interface StepReadingGuide {
+  meaning: string;
+  lookFor: string;
+  managerLens: string;
+  operatorLens: string;
+}
+
 const LAUNCH_CARDS: LaunchCardDefinition[] = [
   {
     id: "edge-story",
@@ -68,6 +83,213 @@ const LAUNCH_CARDS: LaunchCardDefinition[] = [
   },
 ];
 
+const SCENARIO_READING_GUIDES: Record<string, ScenarioReadingGuide> = {
+  "cas-history": {
+    story:
+      "This run is the most relatable operational story in the showcase: one site in the fleet takes on a bad state, the team inspects exactly what changed, and the active head is moved back to a safe checkpoint. It is incident response, but in a form mid-level engineers and managers can read as evidence instead of tribal knowledge.",
+    manager:
+      "Read this as proof that SydraDB can explain a production-facing problem in plain operational terms: what changed, what was rolled back, and whether the live view returned to normal.",
+    engineer:
+      "Read the refs, log, diff, and reflog as the storage-side timeline. Each step is showing that rollback is grounded in repository history rather than an ad hoc restore script.",
+    operator:
+      "Treat this like an incident drill. The important signals are that the baseline checkpoint exists, the diff shows the bad change, and the post-rollback range query confirms the bad state is no longer live.",
+    summaryEvidence:
+      "The summary evidence is the executive readout. It should tell you whether the rollback path completed and whether the active query view now matches the expected safe state.",
+  },
+  "cas-maintenance": {
+    story:
+      "This run asks the next practical question after recovery: can the repository still be trusted, repaired, and maintained over time? It turns the fleet story from a one-off rollback into an operational model.",
+    manager:
+      "Read this as long-term operability. The value is that maintenance is built into the storage model rather than bolted on around a database file.",
+    engineer:
+      "Use the outputs to confirm that packing, integrity checks, cleanup, and one-shot maintenance all work against the same repository state produced by the incident story.",
+    operator:
+      "Focus on whether fsck sees a healthy graph, whether pack finds reachable objects, and whether GC or vacuum report anything unexpectedly unreachable or deleted.",
+    summaryEvidence:
+      "The summary evidence is the fastest way to judge whether the repository is healthy enough to keep operating after the earlier incident path.",
+  },
+  "cas-sync": {
+    story:
+      "This run widens the story from one site to many. After state changes at the edge, the repository can be packaged, verified, cloned, fetched, and pushed toward HQ without inventing a separate replication narrative.",
+    manager:
+      "Read this as portability and controlled movement. The system can move state between installations with verification instead of relying on manual file copying or external choreography.",
+    engineer:
+      "Look for successful bundle creation and apply, plus ref and pack preservation across clone or push/fetch steps.",
+    operator:
+      "This is the site-to-site workflow view. The important question is whether the destination side ends up with the expected refs and verified state.",
+    summaryEvidence:
+      "The summary block should tell you whether state movement worked and whether the receiving side looks like the source side in the ways that matter.",
+  },
+  "sydraql-query": {
+    story:
+      "This run makes the engine explain itself while querying the same seeded fleet data. It is useful for people who are less interested in compiler internals than in whether the query path is observable and trustworthy.",
+    manager:
+      "Read this as runtime transparency. The engine is not just returning rows; it is exposing how it executed the work and giving the team a language for discussing quality and rollout confidence.",
+    engineer:
+      "Use trace ids, execution mode, scanned rows, and operator timings to understand what the engine actually did to answer the query.",
+    operator:
+      "Treat this as a baseline for performance and debuggability. If query behavior changes later, these are the fields you compare first.",
+    summaryEvidence:
+      "The summary evidence is the compact readout of what query ran, how it ran, and whether the telemetry fields needed for debugging came back intact.",
+  },
+  "sydraql-compiler": {
+    story:
+      "This run is the compiler rollout story in operational form. Instead of asking reviewers to trust compiler progress abstractly, it shows how compiled, shadow, and legacy paths behave on relatable fleet data.",
+    manager:
+      "Read this as controlled change management. The system can expose when the new path runs, when it falls back, and why, which makes rapid compiler work easier to review responsibly.",
+    engineer:
+      "Execution mode and fallback fields are the first things to read. They tell you whether the compiler handled the query directly or whether an older path had to take over.",
+    operator:
+      "This is rollout telemetry. Use it to judge whether new query paths are becoming more predictable or more fragile over time.",
+    summaryEvidence:
+      "The summary evidence compresses mode and fallback signals so non-specialists can tell whether the compiler run looks healthy before reading raw details.",
+  },
+  "engine-lifecycle": {
+    story:
+      "This run reframes SydraDB as a service lifecycle story, not just a persistence story. The same seeded fleet data is used to check restart behavior, recovery anchors, and post-restart query continuity.",
+    manager:
+      "Read this as continuity of service. The outcome should show that restart and checkpoint workflows preserve the state the team expects users to see.",
+    engineer:
+      "The useful comparison is before-versus-after: whether the engine restarts cleanly and whether the recovery anchor becomes visible as part of the repository story.",
+    operator:
+      "Read the control actions and the following verification together. A restart step matters only if the data view after restart still matches the intended state.",
+    summaryEvidence:
+      "The summary block is the quick answer to whether lifecycle operations preserved the expected live state.",
+  },
+};
+
+const STEP_KIND_GUIDES: Record<ScenarioStepResult["kind"], StepReadingGuide> = {
+  cas_command: {
+    meaning:
+      "This step is reading or mutating the storage repository through a native CAS command. It is evidence about the repository itself, not just application output.",
+    lookFor:
+      "Start with the top-level counts, entries, refs, or status fields. Those are the fastest signals for whether the repository structure looks healthy.",
+    managerLens:
+      "For managers and non-specialists, the value here is that SydraDB can explain storage state in reviewable steps instead of hiding it behind a single opaque file.",
+    operatorLens:
+      "For ops or SRE readers, this is where missing refs, unexpected zero counts, integrity errors, or unreachable-object signals would show up first.",
+  },
+  shell_command: {
+    meaning:
+      "This step issues a control action through the shell path. It matters because it changes state, not because the command text itself is inherently interesting.",
+    lookFor:
+      "Read the next verification step together with this one. The shell command is the action; the following query or CAS output is usually the proof.",
+    managerLens:
+      "This shows whether the action needed during an incident or operational task is simple enough to explain and safe enough to verify.",
+    operatorLens:
+      "Treat this like a runbook action: focus less on the command string and more on whether the system state after it matches the intended outcome.",
+  },
+  sydraql_query: {
+    meaning:
+      "This step runs a real sydraQL query and returns both the answer and execution telemetry. It is where correctness and engine behavior meet.",
+    lookFor:
+      "Read rows and execution metadata together. Trace ids, execution mode, scanned rows, and timings explain how the answer was produced.",
+    managerLens:
+      "This is evidence that the team can talk about query quality and engine behavior without waiting for separate observability projects.",
+    operatorLens:
+      "Use it as a debugging baseline. If the same query later becomes slower or falls back unexpectedly, these fields show what healthy looked like.",
+  },
+  query_range: {
+    meaning:
+      "This step asks what the live data view looks like right now. It is usually the most directly relatable output because it resembles what an application or dashboard would actually consume.",
+    lookFor:
+      "Pay attention to the returned rows and especially the final expected value. This often proves whether rollback or restart changed the active state correctly.",
+    managerLens:
+      "This is the business-facing verification step because it shows whether the operational action changed the live outcome in the way the team intended.",
+    operatorLens:
+      "Use this as the final correctness check after a control action. If the rows are wrong here, the earlier storage steps did not land the way you need.",
+  },
+  metrics_snapshot: {
+    meaning:
+      "This step samples internal counters from the engine. It helps translate system behavior into measurable quantities rather than anecdotes.",
+    lookFor:
+      "Read metrics as trend signals: queue depth, flushes, or fallback counters should move in ways that match the actions already taken in the run.",
+    managerLens:
+      "The main takeaway is that the storage engine exposes measurable operational signals instead of requiring the team to infer behavior indirectly.",
+    operatorLens:
+      "Unexpected jumps, missing movement, or obviously inconsistent counters usually point to the real place to investigate next.",
+  },
+  server_control: {
+    meaning:
+      "This step changes the engine process state by starting, stopping, or restarting it. The action matters because it tests service continuity.",
+    lookFor:
+      "The real meaning appears in the next verification step: did the engine come back with the same expected state and query behavior?",
+    managerLens:
+      "This is evidence about continuity and recoverability, not just about data format correctness.",
+    operatorLens:
+      "Read it like a restart drill. A clean control action only counts if the subsequent validation still looks healthy.",
+  },
+};
+
+const STEP_GUIDE_OVERRIDES: Record<string, Record<string, Partial<StepReadingGuide>>> = {
+  "cas-history": {
+    refs: {
+      meaning:
+        "This confirms the repository has a live named head before anyone is asked to trust the rollback story.",
+      lookFor:
+        "If heads/main is present, there is a concrete active pointer the rest of the incident narrative can anchor to.",
+    },
+    log: {
+      meaning:
+        "This is the storage-side timeline of the incident. It shows whether the bad change is visible as history rather than disappearing into overwritten state.",
+      lookFor:
+        "More than one entry means the baseline and the changed state are both visible and reviewable.",
+    },
+    diff: {
+      meaning:
+        "This isolates the difference between the safe checkpoint and the current head so reviewers can see what changed before recovery.",
+    },
+    rollback: {
+      meaning:
+        "This is the control action that moves the active head back to the known-good checkpoint.",
+      lookFor:
+        "Read the next range query as the proof. The command matters because it should change what the live system sees.",
+    },
+    "verify-rollback": {
+      meaning:
+        "This is the most application-facing validation step in the scenario. It checks whether the bad incident points are truly gone from the live head.",
+      lookFor:
+        "If the last returned value matches the baseline instead of the incident, the recovery succeeded in the view downstream systems would actually read.",
+    },
+    reflog: {
+      meaning:
+        "The reflog keeps the recovery action itself auditable. It shows that rollback is not just possible, but reviewable after the fact.",
+    },
+  },
+  "cas-maintenance": {
+    pack: {
+      meaning:
+        "Packing turns loose reachable objects into a more maintainable storage shape without changing the meaning of the repository.",
+    },
+    fsck: {
+      meaning:
+        "fsck is the direct integrity readout. It answers whether the graph still makes sense after the earlier incident and recovery path.",
+    },
+    gc: {
+      meaning:
+        "GC estimates what data is still truly reachable and what could eventually be cleaned up.",
+    },
+    vacuum: {
+      meaning:
+        "Vacuum is the combined maintenance path. It gives non-specialists a single command to associate with “make the repository healthy again.”",
+    },
+  },
+  "sydraql-compiler": {
+    compiled: {
+      lookFor:
+        "The first field to scan is execution_mode. If it says compiled, the new compiler path handled the query directly.",
+    },
+    shadow: {
+      lookFor:
+        "Shadow output is about rollout safety. For managers it says “we can compare paths”; for engineers it says “we can see fallback behavior clearly.”",
+    },
+    legacy: {
+      meaning:
+        "This is the older reference path the newer compiler behavior is being measured against.",
+    },
+  },
+};
+
 function readInitialTheme(): ThemeMode {
   if (typeof window === "undefined") return "dark";
   try {
@@ -107,8 +329,29 @@ function formatTimestamp(value: string): string {
   return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
-function StepCard({ step, index }: { step: ScenarioStepResult; index: number }) {
+function getStepGuide(scenarioId: string | undefined, step: ScenarioStepResult): StepReadingGuide {
+  const base = STEP_KIND_GUIDES[step.kind];
+  const override = scenarioId ? STEP_GUIDE_OVERRIDES[scenarioId]?.[step.id] : undefined;
+
+  return {
+    meaning: override?.meaning ?? base.meaning,
+    lookFor: override?.lookFor ?? base.lookFor,
+    managerLens: override?.managerLens ?? base.managerLens,
+    operatorLens: override?.operatorLens ?? base.operatorLens,
+  };
+}
+
+function StepCard({
+  scenarioId,
+  step,
+  index,
+}: {
+  scenarioId?: string;
+  step: ScenarioStepResult;
+  index: number;
+}) {
   const [open, setOpen] = useState(step.status === "failed");
+  const guide = getStepGuide(scenarioId, step);
 
   return (
     <div className="step">
@@ -125,6 +368,26 @@ function StepCard({ step, index }: { step: ScenarioStepResult; index: number }) 
       {open && (
         <div className="step__body">
           <p className="step__summary">{step.summary}</p>
+          <div className="reading-guide reading-guide--step">
+            <div className="reading-guide__grid">
+              <div>
+                <div className="reading-guide__label">What this step means</div>
+                <p className="reading-guide__text">{guide.meaning}</p>
+              </div>
+              <div>
+                <div className="reading-guide__label">What to look for</div>
+                <p className="reading-guide__text">{guide.lookFor}</p>
+              </div>
+              <div>
+                <div className="reading-guide__label">Manager reading</div>
+                <p className="reading-guide__text">{guide.managerLens}</p>
+              </div>
+              <div>
+                <div className="reading-guide__label">Ops / SRE reading</div>
+                <p className="reading-guide__text">{guide.operatorLens}</p>
+              </div>
+            </div>
+          </div>
           {step.command && <pre className="step__command">{step.command}</pre>}
           {step.assertions.length > 0 && (
             <div className="assertions">
@@ -209,6 +472,7 @@ export function ShowcaseDashboard({
   const selectedRun = runResult && selected && runResult.scenarioId === selected.manifest.id ? runResult : null;
   const enabledCaps = Object.values(state?.capabilities ?? {}).filter(Boolean).length;
   const visibleLaunchCards = LAUNCH_CARDS.filter((card) => !dismissedLaunchCardIds.includes(card.id));
+  const readingGuide = selected ? SCENARIO_READING_GUIDES[selected.manifest.id] : undefined;
 
   return (
     <div>
@@ -356,6 +620,51 @@ export function ShowcaseDashboard({
                   <div className="content">
                     {selectedRun ? (
                       <>
+                        <div className="reading-guide">
+                          <div className="reading-guide__header">
+                            <div className="reading-guide__title">How to read this run</div>
+                            <div className="reading-guide__subtitle">
+                              A guided read for managers, mid-level engineers, and ops reviewers who want the story before the raw output.
+                            </div>
+                          </div>
+                          <div className="reading-guide__story">
+                            <div className="reading-guide__label">Scenario context</div>
+                            <p className="reading-guide__text">
+                              {readingGuide?.story ??
+                                "This run is one slice of the SydraDB story shown against real seeded data. Start with the summary evidence, then use each step as proof for the claim the scenario is making."}
+                            </p>
+                          </div>
+                          <div className="reading-guide__grid">
+                            <div>
+                              <div className="reading-guide__label">If you are a manager</div>
+                              <p className="reading-guide__text">
+                                {readingGuide?.manager ??
+                                  "Focus on whether the run makes the outcome understandable, measurable, and reversible without requiring specialist storage knowledge."}
+                              </p>
+                            </div>
+                            <div>
+                              <div className="reading-guide__label">If you are an engineer</div>
+                              <p className="reading-guide__text">
+                                {readingGuide?.engineer ??
+                                  "Read the outputs as implementation proof: what ran, what state it observed, and what the assertions validated."}
+                              </p>
+                            </div>
+                            <div>
+                              <div className="reading-guide__label">If you run ops / SRE / DevOps</div>
+                              <p className="reading-guide__text">
+                                {readingGuide?.operator ??
+                                  "Look for healthy state transitions, explicit verification, and signals that the operational path is predictable under failure or recovery conditions."}
+                              </p>
+                            </div>
+                            <div>
+                              <div className="reading-guide__label">How to read the summary evidence</div>
+                              <p className="reading-guide__text">
+                                {readingGuide?.summaryEvidence ??
+                                  "Treat the summary block as the short readout. It should tell you whether the scenario succeeded before you open the raw step payloads."}
+                              </p>
+                            </div>
+                          </div>
+                        </div>
                         {selectedRun.summaryEvidence && (
                           <div className="summary-block">
                             <div className="summary-block__header">Summary Evidence</div>
@@ -366,7 +675,7 @@ export function ShowcaseDashboard({
                         )}
                         <div className="step-list">
                           {selectedRun.steps.map((step, i) => (
-                            <StepCard key={step.id} step={step} index={i} />
+                            <StepCard key={step.id} scenarioId={selected.manifest.id} step={step} index={i} />
                           ))}
                         </div>
                       </>
