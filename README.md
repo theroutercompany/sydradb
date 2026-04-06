@@ -64,6 +64,9 @@ The current trading-facing alpha is definition-driven and keeps the existing sin
 - Inspect derived-runtime health with `GET /api/v1/rollups` and `GET /api/v1/signals`
 - Inspect signal history with `GET /api/v1/signals/history?name=<signal-id>&start_ts_ns=<...>&end_ts_ns=<...>`
 - Subscribe to signal SSE output with `GET /api/v1/signals/subscribe?name=<signal-id>`
+- Replay signal and analysis results across CAS revisions with:
+  - `POST /api/v1/replay/signals`
+  - `POST /api/v1/replay/analysis`
 - Run revision-aware analysis with:
   - `POST /api/v1/analysis/markout`
   - `POST /api/v1/analysis/slippage`
@@ -75,7 +78,11 @@ Current contract notes:
 - Market APIs require `ts_ns` / `*_ts_ns` fields and treat them as nanosecond epoch time end-to-end.
 - Market ingest is schema-validated and fans out each row into sibling exact-series metrics such as `market.trade.price` and `market.bar.close`.
 - Derived outputs carry provenance labels including `data_revision`, `definition_id`, and `definition_version`.
-- `GET /api/v1/analysis/catalog` is intentionally conservative. Today it advertises only analysis behavior that is fully implemented and stable.
+- `GET /api/v1/analysis/catalog` now advertises the grouped analysis modes that are actually implemented: `group_by = none | venue | symbol`.
+- Grouped analysis follows the current wildcard rules:
+  - `group_by = none`: require both `symbol` and `venue`
+  - `group_by = venue`: require `symbol`, allow `venue` wildcard
+  - `group_by = symbol`: require `venue`, allow `symbol` wildcard
 - Native multi-column storage is not implemented yet; that remains a later internal foundation project.
 
 ## Nix

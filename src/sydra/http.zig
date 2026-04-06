@@ -163,8 +163,17 @@ fn handleRequest(handle: *alloc_mod.AllocatorHandle, alloc: std.mem.Allocator, e
     if (std.mem.eql(u8, path, "/api/v1/cas/log") and method == .GET) {
         return try handleCasLog(alloc, eng, req, query);
     }
+    if (std.mem.eql(u8, path, "/api/v1/cas/resolve") and method == .GET) {
+        return try handleCasResolve(alloc, eng, req, query);
+    }
     if (std.mem.eql(u8, path, "/api/v1/cas/diff") and method == .GET) {
         return try handleCasDiff(alloc, eng, req, query);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/replay/signals") and method == .POST) {
+        return try handleReplaySignals(alloc, eng, req);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/replay/analysis") and method == .POST) {
+        return try handleReplayAnalysis(alloc, eng, req);
     }
     if (std.mem.eql(u8, path, "/api/v1/analysis/markout") and method == .POST) {
         return try handleAnalysisMarkout(alloc, eng, req);
@@ -972,8 +981,10 @@ test "buildStatusPayload emits extended runtime counters" {
 }
 
 test "supportedAnalysisGroupBy stays truthful" {
-    try std.testing.expectEqual(@as(usize, 1), supportedAnalysisGroupBy().len);
+    try std.testing.expectEqual(@as(usize, 3), supportedAnalysisGroupBy().len);
     try std.testing.expectEqualStrings("none", supportedAnalysisGroupBy()[0]);
+    try std.testing.expectEqualStrings("venue", supportedAnalysisGroupBy()[1]);
+    try std.testing.expectEqualStrings("symbol", supportedAnalysisGroupBy()[2]);
 }
 
 test "queryMarketRows reconstructs rows from fanout series" {
@@ -1065,6 +1076,163 @@ test "querySignalHistoryRows strips provenance labels" {
     try std.testing.expectEqualStrings("{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}", rows[0].labels_json);
     try std.testing.expectEqualStrings("ema", rows[0].definition_id);
     try std.testing.expectEqual(@as(u32, 1), rows[0].definition_version);
+}
+
+test "writeMarkoutAnalysisResult groups by venue" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/http-markout-group-venue", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const cfg = config.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var eng = try Engine.init(talloc, cfg);
+    defer eng.deinit();
+
+    const xnas_labels = try canonicalLabelsForMarket(talloc, "AAPL", "XNAS", null, null);
+    defer talloc.free(xnas_labels);
+    _ = try eng.ingestExactMetric("market.trade.price", xnas_labels, 100, 10.0, null);
+    _ = try eng.ingestExactMetric("market.trade.size", xnas_labels, 100, 1.0, null);
+    _ = try eng.ingestExactMetric("market.trade.price", xnas_labels, 110, 11.0, null);
+    _ = try eng.ingestExactMetric("market.trade.size", xnas_labels, 110, 1.0, null);
+
+    const bats_labels = try canonicalLabelsForMarket(talloc, "AAPL", "BATS", null, null);
+    defer talloc.free(bats_labels);
+    _ = try eng.ingestExactMetric("market.trade.price", bats_labels, 100, 20.0, null);
+    _ = try eng.ingestExactMetric("market.trade.size", bats_labels, 100, 1.0, null);
+    _ = try eng.ingestExactMetric("market.trade.price", bats_labels, 110, 22.0, null);
+    _ = try eng.ingestExactMetric("market.trade.size", bats_labels, 110, 1.0, null);
+
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        talloc,
+        \\{"symbol":"AAPL","start_ts_ns":100,"end_ts_ns":110,"group_by":"venue","horizons_ns":[10]}
+    , .{});
+    defer parsed.deinit();
+
+    var buffer = std.array_list.Managed(u8).init(talloc);
+    defer buffer.deinit();
+    var writer = buffer.writer();
+    var tmp_buf: [1024]u8 = undefined;
+    var adapter = writer.adaptToNewApi(&tmp_buf);
+    var iface = &adapter.new_interface;
+    var jw = std.json.Stringify{ .writer = iface };
+    try writeMarkoutAnalysisResult(&jw, talloc, eng, parsed.value.object, null);
+    try iface.flush();
+    if (adapter.err) |err| return err;
+
+    var result = try std.json.parseFromSlice(std.json.Value, talloc, buffer.items, .{});
+    defer result.deinit();
+    const root = result.value.object;
+    try std.testing.expectEqualStrings("venue", root.get("group_by").?.string);
+    const groups = root.get("groups").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), groups.len);
+    var saw_xnas = false;
+    var saw_bats = false;
+    for (groups) |group| {
+        const key = group.object.get("key").?.object;
+        const horizons = group.object.get("horizons").?.array.items;
+        try std.testing.expectEqual(@as(usize, 1), horizons.len);
+        const metric = horizons[0].object;
+        try std.testing.expectEqual(@as(i64, 1), metric.get("sample_count").?.integer);
+        if (std.mem.eql(u8, key.get("venue").?.string, "XNAS")) {
+            saw_xnas = true;
+            try std.testing.expectApproxEqAbs(@as(f64, 1.0), metric.get("value").?.float, 1e-9);
+        } else if (std.mem.eql(u8, key.get("venue").?.string, "BATS")) {
+            saw_bats = true;
+            try std.testing.expectApproxEqAbs(@as(f64, 2.0), metric.get("value").?.float, 1e-9);
+        }
+    }
+    try std.testing.expect(saw_xnas);
+    try std.testing.expect(saw_bats);
+}
+
+test "writeSlippageAnalysisResult groups by symbol" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/http-slippage-group-symbol", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const cfg = config.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var eng = try Engine.init(talloc, cfg);
+    defer eng.deinit();
+
+    const aapl_labels = try canonicalLabelsForMarket(talloc, "AAPL", "XNAS", null, null);
+    defer talloc.free(aapl_labels);
+    _ = try eng.ingestExactMetric("market.trade.price", aapl_labels, 100, 10.0, null);
+    _ = try eng.ingestExactMetric("market.trade.size", aapl_labels, 100, 1.0, null);
+    _ = try eng.ingestExactMetric("market.quote.bid", aapl_labels, 100, 9.0, null);
+    _ = try eng.ingestExactMetric("market.quote.ask", aapl_labels, 100, 11.0, null);
+
+    const tsla_labels = try canonicalLabelsForMarket(talloc, "TSLA", "XNAS", null, null);
+    defer talloc.free(tsla_labels);
+    _ = try eng.ingestExactMetric("market.trade.price", tsla_labels, 100, 20.0, null);
+    _ = try eng.ingestExactMetric("market.trade.size", tsla_labels, 100, 1.0, null);
+    _ = try eng.ingestExactMetric("market.quote.bid", tsla_labels, 100, 19.0, null);
+    _ = try eng.ingestExactMetric("market.quote.ask", tsla_labels, 100, 21.0, null);
+
+    var parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        talloc,
+        \\{"venue":"XNAS","start_ts_ns":100,"end_ts_ns":100,"group_by":"symbol"}
+    , .{});
+    defer parsed.deinit();
+
+    var buffer = std.array_list.Managed(u8).init(talloc);
+    defer buffer.deinit();
+    var writer = buffer.writer();
+    var tmp_buf: [1024]u8 = undefined;
+    var adapter = writer.adaptToNewApi(&tmp_buf);
+    var iface = &adapter.new_interface;
+    var jw = std.json.Stringify{ .writer = iface };
+    try writeSlippageAnalysisResult(&jw, talloc, eng, parsed.value.object, null);
+    try iface.flush();
+    if (adapter.err) |err| return err;
+
+    var result = try std.json.parseFromSlice(std.json.Value, talloc, buffer.items, .{});
+    defer result.deinit();
+    const root = result.value.object;
+    try std.testing.expectEqualStrings("symbol", root.get("group_by").?.string);
+    const groups = root.get("groups").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), groups.len);
+    for (groups) |group| {
+        const key = group.object.get("key").?.object;
+        const sample_count = group.object.get("sample_count").?.integer;
+        try std.testing.expectEqual(@as(i64, 1), sample_count);
+        try std.testing.expectApproxEqAbs(@as(f64, 0.0), group.object.get("signed_avg").?.float, 1e-9);
+        try std.testing.expect(key.get("symbol") != null);
+    }
 }
 
 fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
@@ -2560,7 +2728,7 @@ fn handleAnalysisCatalog(req: *std.http.Server.Request) !void {
 }
 
 fn supportedAnalysisGroupBy() []const []const u8 {
-    return &[_][]const u8{"none"};
+    return &[_][]const u8{ "none", "venue", "symbol" };
 }
 
 fn handleCasRefs(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
@@ -2628,6 +2796,38 @@ fn handleCasLog(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Re
     try response.end();
 }
 
+fn handleCasResolve(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request, query: []const u8) !void {
+    var cas = eng.cas orelse return respondJsonError(alloc, req, .not_found, "cas_disabled", "cas disabled");
+    const spec = queryParam(query, "spec") orelse return respondJsonError(alloc, req, .bad_request, "missing_spec", "missing spec");
+    const commit_id = cas.resolveCommitSpec(spec) catch |err| switch (err) {
+        error.RefNotFound => return respondJsonError(alloc, req, .not_found, "spec_not_found", "spec not found"),
+        else => return respondJsonError(alloc, req, .bad_request, "invalid_spec", @errorName(err)),
+    };
+    const entries = try cas.loadLog(spec, 1);
+    defer {
+        for (entries) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+    if (entries.len == 0) return respondJsonError(alloc, req, .not_found, "commit_not_found", "commit not found");
+
+    var send_buffer: [512]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try jw.beginObject();
+    try jw.objectField("commit_id");
+    const hex = commit_id.toHex();
+    try jw.write(hex[0..]);
+    try jw.objectField("created_at_ms");
+    try jw.write(entries[0].created_at_ms);
+    try jw.objectField("reason");
+    try jw.write(entries[0].reason);
+    try jw.endObject();
+    try response.end();
+}
+
 fn handleCasDiff(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request, query: []const u8) !void {
     var cas = eng.cas orelse return respondJsonError(alloc, req, .not_found, "cas_disabled", "cas disabled");
     const lhs = queryParam(query, "lhs") orelse return respondJsonError(alloc, req, .bad_request, "missing_lhs", "missing lhs");
@@ -2661,6 +2861,144 @@ fn handleCasDiff(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     try response.end();
 }
 
+fn handleReplaySignals(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    var cas = eng.cas orelse return respondJsonError(alloc, req, .not_found, "cas_disabled", "cas disabled");
+    var parsed = readJsonBody(alloc, req, 64 * 1024) catch |err| switch (err) {
+        error.LengthRequired => return respondJsonError(alloc, req, .length_required, "length_required", "length required"),
+        error.PayloadTooLarge => return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large"),
+        else => return respondJsonError(alloc, req, .bad_request, "invalid_json", "invalid json"),
+    };
+    defer parsed.deinit(alloc);
+    const obj = parsed.parsed.value.object;
+    const signal_name = jsonRequiredString(obj, "signal_name") orelse return respondJsonError(alloc, req, .bad_request, "missing_signal_name", "missing signal_name");
+    const from_revision = jsonRequiredString(obj, "from_revision") orelse return respondJsonError(alloc, req, .bad_request, "missing_from_revision", "missing from_revision");
+    const to_revision = jsonRequiredString(obj, "to_revision") orelse return respondJsonError(alloc, req, .bad_request, "missing_to_revision", "missing to_revision");
+    const step = if (obj.get("step")) |value| if (value == .string) value.string else "commit" else "commit";
+    if (!std.mem.eql(u8, step, "commit")) return respondJsonError(alloc, req, .bad_request, "unsupported_step", "unsupported step");
+    const start_ts_ns = if (obj.get("start_ts_ns")) |value| if (value == .integer) value.integer else return respondJsonError(alloc, req, .bad_request, "invalid_start_ts_ns", "invalid start_ts_ns") else std.math.minInt(i64);
+    const end_ts_ns = if (obj.get("end_ts_ns")) |value| if (value == .integer) value.integer else return respondJsonError(alloc, req, .bad_request, "invalid_end_ts_ns", "invalid end_ts_ns") else std.math.maxInt(i64);
+
+    var signal = try eng.latestSignal(signal_name) orelse return respondJsonError(alloc, req, .not_found, "signal_not_found", "signal not found");
+    defer signal.deinit(alloc);
+    const revisions = collectReplayEntries(alloc, &cas, from_revision, to_revision, 4096) catch |err| switch (err) {
+        error.InvalidReplayRange => return respondJsonError(alloc, req, .bad_request, "invalid_replay_range", "invalid replay range"),
+        error.RefNotFound => return respondJsonError(alloc, req, .not_found, "revision_not_found", "revision not found"),
+        else => return respondJsonError(alloc, req, .internal_server_error, "replay_prepare_failed", @errorName(err)),
+    };
+    defer {
+        for (revisions) |*entry| entry.deinit(alloc);
+        alloc.free(revisions);
+    }
+    var send_buffer: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try jw.beginObject();
+    try jw.objectField("signal_name");
+    try jw.write(signal_name);
+    try jw.objectField("step");
+    try jw.write("commit");
+    try jw.objectField("revisions");
+    try jw.beginArray();
+    for (revisions) |entry| {
+        const commit_hex = entry.commit_id.toHex();
+        const rows = try querySignalHistoryRows(alloc, eng, signal.id, signal.version, start_ts_ns, end_ts_ns, commit_hex[0..]);
+        defer freeSignalHistoryRows(alloc, rows);
+        try jw.beginObject();
+        try jw.objectField("commit_id");
+        try jw.write(commit_hex[0..]);
+        try jw.objectField("created_at_ms");
+        try jw.write(entry.created_at_ms);
+        try jw.objectField("reason");
+        try jw.write(entry.reason);
+        try jw.objectField("rows");
+        try jw.beginArray();
+        for (rows) |row| try writeSignalHistoryRow(&jw, row);
+        try jw.endArray();
+        try jw.objectField("row_count");
+        try jw.write(rows.len);
+        try jw.endObject();
+    }
+    try jw.endArray();
+    try jw.endObject();
+    try response.end();
+}
+
+fn handleReplayAnalysis(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    var cas = eng.cas orelse return respondJsonError(alloc, req, .not_found, "cas_disabled", "cas disabled");
+    var parsed = readJsonBody(alloc, req, 64 * 1024) catch |err| switch (err) {
+        error.LengthRequired => return respondJsonError(alloc, req, .length_required, "length_required", "length required"),
+        error.PayloadTooLarge => return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large"),
+        else => return respondJsonError(alloc, req, .bad_request, "invalid_json", "invalid json"),
+    };
+    defer parsed.deinit(alloc);
+    const obj = parsed.parsed.value.object;
+    const analysis_name = jsonRequiredString(obj, "analysis") orelse return respondJsonError(alloc, req, .bad_request, "missing_analysis", "missing analysis");
+    const params_value = obj.get("params") orelse return respondJsonError(alloc, req, .bad_request, "missing_params", "missing params");
+    if (params_value != .object) return respondJsonError(alloc, req, .bad_request, "invalid_params", "invalid params");
+    const from_revision = jsonRequiredString(obj, "from_revision") orelse return respondJsonError(alloc, req, .bad_request, "missing_from_revision", "missing from_revision");
+    const to_revision = jsonRequiredString(obj, "to_revision") orelse return respondJsonError(alloc, req, .bad_request, "missing_to_revision", "missing to_revision");
+    const step = if (obj.get("step")) |value| if (value == .string) value.string else "commit" else "commit";
+    if (!std.mem.eql(u8, step, "commit")) return respondJsonError(alloc, req, .bad_request, "unsupported_step", "unsupported step");
+    const revisions = collectReplayEntries(alloc, &cas, from_revision, to_revision, 4096) catch |err| switch (err) {
+        error.InvalidReplayRange => return respondJsonError(alloc, req, .bad_request, "invalid_replay_range", "invalid replay range"),
+        error.RefNotFound => return respondJsonError(alloc, req, .not_found, "revision_not_found", "revision not found"),
+        else => return respondJsonError(alloc, req, .internal_server_error, "replay_prepare_failed", @errorName(err)),
+    };
+    defer {
+        for (revisions) |*entry| entry.deinit(alloc);
+        alloc.free(revisions);
+    }
+    if (revisions.len != 0) {
+        const first_hex = revisions[0].commit_id.toHex();
+        var scratch = std.array_list.Managed(u8).init(alloc);
+        defer scratch.deinit();
+        var scratch_writer = scratch.writer();
+        var scratch_buf: [512]u8 = undefined;
+        var adapter = scratch_writer.adaptToNewApi(&scratch_buf);
+        var iface = &adapter.new_interface;
+        var scratch_jw = std.json.Stringify{ .writer = iface };
+        writeReplayAnalysisResult(&scratch_jw, alloc, eng, analysis_name, params_value.object, first_hex[0..]) catch |err| switch (err) {
+            error.UnsupportedReplayAnalysis => return respondJsonError(alloc, req, .bad_request, "unsupported_analysis", "unsupported analysis"),
+            else => return respondAnalysisComputationError(alloc, req, err),
+        };
+        try iface.flush();
+        if (adapter.err) |err| return err;
+    }
+
+    var send_buffer: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try jw.beginObject();
+    try jw.objectField("analysis");
+    try jw.write(analysis_name);
+    try jw.objectField("step");
+    try jw.write("commit");
+    try jw.objectField("revisions");
+    try jw.beginArray();
+    for (revisions) |entry| {
+        const commit_hex = entry.commit_id.toHex();
+        try jw.beginObject();
+        try jw.objectField("commit_id");
+        try jw.write(commit_hex[0..]);
+        try jw.objectField("created_at_ms");
+        try jw.write(entry.created_at_ms);
+        try jw.objectField("reason");
+        try jw.write(entry.reason);
+        try jw.objectField("result");
+        try writeReplayAnalysisResult(&jw, alloc, eng, analysis_name, params_value.object, commit_hex[0..]);
+        try jw.endObject();
+    }
+    try jw.endArray();
+    try jw.endObject();
+    try response.end();
+}
+
 fn handleSignalSubscribe(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request, query: []const u8) !void {
     const name = queryParam(query, "name") orelse return respondJsonError(alloc, req, .bad_request, "missing_name", "missing name");
     var signal = try eng.latestSignal(name) orelse return respondJsonError(alloc, req, .not_found, "signal_not_found", "signal not found");
@@ -2671,6 +3009,12 @@ fn handleSignalSubscribe(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.
         std.fmt.parseInt(u64, value, 10) catch 0
     else
         0;
+    if (after_sequence != 0) {
+        _ = eng.listSignalEvents(signal.id, signal.version, after_sequence, null, null, 1) catch |err| switch (err) {
+            error.EventReplayExpired => return respondJsonError(alloc, req, .conflict, "event_replay_expired", "event replay expired"),
+            else => return respondJsonError(alloc, req, .internal_server_error, "signal_event_lookup_failed", @errorName(err)),
+        };
+    }
 
     var send_buffer: [1024]u8 = undefined;
     var response = try req.respondStreaming(&send_buffer, .{
@@ -2687,6 +3031,11 @@ fn handleSignalSubscribe(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.
     var last_epoch = eng.currentSignalEventEpoch();
     while (true) {
         const events = eng.listSignalEvents(signal.id, signal.version, last_seen_sequence, null, null, 512) catch |err| switch (err) {
+            error.EventReplayExpired => {
+                try response.writer.writeAll("event: error\n");
+                try response.writer.writeAll("data: {\"code\":\"event_replay_expired\"}\n\n");
+                break;
+            },
             else => {
                 std.log.warn("signal subscribe event lookup failed: {s}", .{@errorName(err)});
                 break;
@@ -2728,6 +3077,26 @@ fn eventIdSequence(event_id: []const u8) u64 {
     return std.fmt.parseInt(u64, sequence_text, 10) catch 0;
 }
 
+fn respondAnalysisComputationError(
+    alloc: std.mem.Allocator,
+    req: *std.http.Server.Request,
+    err: anyerror,
+) !void {
+    switch (err) {
+        error.MissingSymbol => return respondJsonError(alloc, req, .bad_request, "missing_symbol", "missing symbol"),
+        error.MissingVenue => return respondJsonError(alloc, req, .bad_request, "missing_venue", "missing venue"),
+        error.MissingStartTsNs => return respondJsonError(alloc, req, .bad_request, "missing_start_ts_ns", "missing start_ts_ns"),
+        error.MissingEndTsNs => return respondJsonError(alloc, req, .bad_request, "missing_end_ts_ns", "missing end_ts_ns"),
+        error.MissingHorizon => return respondJsonError(alloc, req, .bad_request, "missing_horizon_ns", "missing horizon_ns"),
+        error.InvalidGroupBy => return respondJsonError(alloc, req, .bad_request, "invalid_group_by", "invalid group_by"),
+        error.UnsupportedGroupBy => return respondJsonError(alloc, req, .bad_request, "unsupported_group_by", "unsupported group_by"),
+        error.SignalNotFound => return respondJsonError(alloc, req, .not_found, "signal_not_found", "signal not found"),
+        error.BarPolicyNotFound => return respondJsonError(alloc, req, .not_found, "bar_policy_not_found", "bar policy not found"),
+        error.InvalidCharacter => return respondJsonError(alloc, req, .bad_request, "invalid_analysis_request", "invalid analysis request"),
+        else => return respondJsonError(alloc, req, .internal_server_error, "analysis_failed", @errorName(err)),
+    }
+}
+
 fn handleAnalysisMarkout(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
     var parsed = readJsonBody(alloc, req, 64 * 1024) catch |err| switch (err) {
         error.LengthRequired => return respondJsonError(alloc, req, .length_required, "length_required", "length required"),
@@ -2735,176 +3104,19 @@ fn handleAnalysisMarkout(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.
         else => return respondJsonError(alloc, req, .bad_request, "invalid_json", "invalid json"),
     };
     defer parsed.deinit(alloc);
-    const obj = parsed.parsed.value.object;
-    const symbol = jsonRequiredString(obj, "symbol") orelse return respondJsonError(alloc, req, .bad_request, "missing_symbol", "missing symbol");
-    const venue = jsonRequiredString(obj, "venue") orelse return respondJsonError(alloc, req, .bad_request, "missing_venue", "missing venue");
-    const start_ts = jsonRequiredInt(obj, "start_ts_ns") orelse jsonRequiredInt(obj, "start") orelse return respondJsonError(alloc, req, .bad_request, "missing_start_ts_ns", "missing start_ts_ns");
-    const end_ts = jsonRequiredInt(obj, "end_ts_ns") orelse jsonRequiredInt(obj, "end") orelse return respondJsonError(alloc, req, .bad_request, "missing_end_ts_ns", "missing end_ts_ns");
-    const single_horizon_ns = if (obj.get("horizon_ns")) |value| if (value == .integer) value.integer else return respondJsonError(alloc, req, .bad_request, "invalid_horizon_ns", "invalid horizon_ns") else null;
-    const horizons_ns = if (obj.get("horizons_ns")) |value|
-        try jsonIntArray(alloc, value)
-    else if (single_horizon_ns) |value|
-        try alloc.dupe(i64, &.{value})
-    else
-        return respondJsonError(alloc, req, .bad_request, "missing_horizon_ns", "missing horizon_ns");
-    defer alloc.free(horizons_ns);
-    const revision = if (obj.get("revision")) |value| if (value == .string) value.string else null else null;
-    const signal_name = if (obj.get("signal_name")) |value| if (value == .string) value.string else null else null;
-    const bar_policy_id = if (obj.get("bar_policy_id")) |value| if (value == .string) value.string else null else null;
-    const group_by = if (obj.get("group_by")) |value|
-        if (value == .string and (std.mem.eql(u8, value.string, "none") or std.mem.eql(u8, value.string, "venue") or std.mem.eql(u8, value.string, "symbol")))
-            value.string
-        else
-            return respondJsonError(alloc, req, .bad_request, "invalid_group_by", "invalid group_by")
-    else
-        "none";
-    if (!std.mem.eql(u8, group_by, "none")) {
-        return respondJsonError(alloc, req, .bad_request, "unsupported_group_by", "unsupported group_by");
-    }
-    var max_horizon: i64 = 0;
-    for (horizons_ns) |horizon| {
-        if (horizon > max_horizon) max_horizon = horizon;
-    }
-    var filter = std.json.Value{ .object = std.json.ObjectMap.init(alloc) };
-    defer filter.object.deinit();
-    try filter.object.put("symbol", .{ .string = symbol });
-    try filter.object.put("venue", .{ .string = venue });
-    const price_columns = [_][]const u8{"price"};
-    const price_rows = try queryMarketRows(alloc, eng, "market.trade", filter, start_ts, end_ts + max_horizon, price_columns[0..], revision);
-    defer freeMarketQueryRows(alloc, price_rows);
-    var signal_version: ?u32 = null;
-    const signal_rows = if (signal_name) |signal_id| blk: {
-        var signal = try eng.latestSignal(signal_id) orelse return respondJsonError(alloc, req, .not_found, "signal_not_found", "signal not found");
-        defer signal.deinit(alloc);
-        signal_version = signal.version;
-        break :blk try querySignalHistoryRows(alloc, eng, signal_id, signal.version, start_ts, end_ts, revision);
-    } else try alloc.alloc(SignalHistoryRow, 0);
-    defer if (signal_name != null) freeSignalHistoryRows(alloc, signal_rows) else alloc.free(signal_rows);
 
-    var send_buffer: [1024]u8 = undefined;
-    var response = try req.respondStreaming(&send_buffer, .{
-        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
-    });
-    errdefer response.end() catch {};
-    var jw = std.json.Stringify{ .writer = &response.writer };
-    try jw.beginObject();
-    try jw.objectField("analysis");
-    try jw.write("markout");
-    try jw.objectField("data_revision");
-    const revision_label = try resolvedRevisionLabel(alloc, eng, revision);
-    defer alloc.free(revision_label);
-    try jw.write(revision_label);
-    try jw.objectField("group_by");
-    try jw.write(group_by);
-    try jw.objectField("definition_refs");
-    try jw.beginArray();
-    if (signal_name) |value| {
-        try jw.beginObject();
-        try jw.objectField("kind");
-        try jw.write("signal");
-        try jw.objectField("id");
-        try jw.write(value);
-        try jw.objectField("version");
-        try jw.write(signal_version.?);
-        try jw.endObject();
-    }
-    if (bar_policy_id) |value| {
-        var policy = eng.latestBarPolicy(value) orelse return respondJsonError(alloc, req, .not_found, "bar_policy_not_found", "bar policy not found");
-        defer policy.deinit(alloc);
-        try jw.beginObject();
-        try jw.objectField("kind");
-        try jw.write("bar_policy");
-        try jw.objectField("id");
-        try jw.write(value);
-        try jw.objectField("version");
-        try jw.write(policy.version);
-        try jw.endObject();
-    }
-    try jw.endArray();
-    if (bar_policy_id) |value| {
-        try jw.objectField("bar_policy_id");
-        try jw.write(value);
-    }
-    try jw.objectField("groups");
-    try jw.beginArray();
-    try jw.beginObject();
-    try jw.objectField("key");
-    try jw.beginObject();
-    try jw.objectField("symbol");
-    try jw.write(symbol);
-    try jw.objectField("venue");
-    try jw.write(venue);
-    try jw.endObject();
-    try jw.objectField("horizons");
-    try jw.beginArray();
-    for (horizons_ns) |horizon_ns| {
-        var count: usize = 0;
-        var total: f64 = 0;
-        var dropped: usize = 0;
-        var future_idx: usize = 0;
-        if (signal_name) |_| {
-            for (signal_rows) |row| {
-                if (row.ts_ns < start_ts or row.ts_ns > end_ts) continue;
-                while (future_idx < price_rows.len and price_rows[future_idx].ts_ns < row.ts_ns + horizon_ns) : (future_idx += 1) {}
-                if (future_idx >= price_rows.len) {
-                    dropped += 1;
-                    continue;
-                }
-                const entry_idx = findMarketRowIndexAtOrAfter(price_rows, row.ts_ns) orelse {
-                    dropped += 1;
-                    continue;
-                };
-                const future_price = try marketQueryRowColumnValue(alloc, price_rows[future_idx], "price") orelse {
-                    dropped += 1;
-                    continue;
-                };
-                const entry_price = try marketQueryRowColumnValue(alloc, price_rows[entry_idx], "price") orelse {
-                    dropped += 1;
-                    continue;
-                };
-                total += future_price - entry_price;
-                count += 1;
-            }
-        } else {
-            for (price_rows) |row| {
-                if (row.ts_ns < start_ts or row.ts_ns > end_ts) continue;
-                while (future_idx < price_rows.len and price_rows[future_idx].ts_ns < row.ts_ns + horizon_ns) : (future_idx += 1) {}
-                if (future_idx >= price_rows.len) {
-                    dropped += 1;
-                    continue;
-                }
-                const future_price = try marketQueryRowColumnValue(alloc, price_rows[future_idx], "price") orelse {
-                    dropped += 1;
-                    continue;
-                };
-                const entry_price = try marketQueryRowColumnValue(alloc, row, "price") orelse {
-                    dropped += 1;
-                    continue;
-                };
-                total += future_price - entry_price;
-                count += 1;
-            }
-        }
-        try jw.beginObject();
-        try jw.objectField("horizon_ns");
-        try jw.write(horizon_ns);
-        try jw.objectField("sample_count");
-        try jw.write(count);
-        try jw.objectField("dropped_samples");
-        try jw.write(dropped);
-        try jw.objectField("dropped_reasons");
-        try jw.beginArray();
-        if (dropped != 0) try jw.write("missing_future_price");
-        try jw.endArray();
-        try jw.objectField("value");
-        if (count != 0) try jw.write(total / @as(f64, @floatFromInt(count))) else try jw.write(null);
-        try jw.endObject();
-    }
-    try jw.endArray();
-    try jw.endObject();
-    try jw.endArray();
-    try jw.endObject();
-    try response.end();
+    var buffer = std.array_list.Managed(u8).init(alloc);
+    defer buffer.deinit();
+    var writer = buffer.writer();
+    var tmp: [1024]u8 = undefined;
+    var adapter = writer.adaptToNewApi(&tmp);
+    var iface = &adapter.new_interface;
+    var jw = std.json.Stringify{ .writer = iface };
+    writeMarkoutAnalysisResult(&jw, alloc, eng, parsed.parsed.value.object, null) catch |err| return respondAnalysisComputationError(alloc, req, err);
+    try iface.flush();
+    if (adapter.err) |err| return err;
+    const headers = [_]std.http.Header{.{ .name = "Content-Type", .value = "application/json" }};
+    try req.respond(buffer.items, .{ .extra_headers = &headers });
 }
 
 fn handleAnalysisSlippage(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
@@ -2914,123 +3126,18 @@ fn handleAnalysisSlippage(alloc: std.mem.Allocator, eng: *Engine, req: *std.http
         else => return respondJsonError(alloc, req, .bad_request, "invalid_json", "invalid json"),
     };
     defer parsed.deinit(alloc);
-    const obj = parsed.parsed.value.object;
-    const symbol = jsonRequiredString(obj, "symbol") orelse return respondJsonError(alloc, req, .bad_request, "missing_symbol", "missing symbol");
-    const venue = jsonRequiredString(obj, "venue") orelse return respondJsonError(alloc, req, .bad_request, "missing_venue", "missing venue");
-    const start_ts = jsonRequiredInt(obj, "start_ts_ns") orelse jsonRequiredInt(obj, "start") orelse return respondJsonError(alloc, req, .bad_request, "missing_start_ts_ns", "missing start_ts_ns");
-    const end_ts = jsonRequiredInt(obj, "end_ts_ns") orelse jsonRequiredInt(obj, "end") orelse return respondJsonError(alloc, req, .bad_request, "missing_end_ts_ns", "missing end_ts_ns");
-    const revision = if (obj.get("revision")) |value| if (value == .string) value.string else null else null;
-    const execution_side = if (obj.get("execution_side")) |value| if (value == .string) value.string else "auto" else "auto";
-    const entry_price_source = if (obj.get("entry_price_source")) |value| if (value == .string) value.string else "trade" else "trade";
-    const benchmark_source = if (obj.get("benchmark_source")) |value| if (value == .string) value.string else "mid" else "mid";
-    const group_by = if (obj.get("group_by")) |value|
-        if (value == .string and (std.mem.eql(u8, value.string, "none") or std.mem.eql(u8, value.string, "venue") or std.mem.eql(u8, value.string, "symbol")))
-            value.string
-        else
-            return respondJsonError(alloc, req, .bad_request, "invalid_group_by", "invalid group_by")
-    else
-        "none";
-    if (!std.mem.eql(u8, group_by, "none")) {
-        return respondJsonError(alloc, req, .bad_request, "unsupported_group_by", "unsupported group_by");
-    }
-    var filter = std.json.Value{ .object = std.json.ObjectMap.init(alloc) };
-    defer filter.object.deinit();
-    try filter.object.put("symbol", .{ .string = symbol });
-    try filter.object.put("venue", .{ .string = venue });
-    const trade_columns = [_][]const u8{"price"};
-    const quote_columns = [_][]const u8{ "bid", "ask" };
-    const trade_rows = try queryMarketRows(alloc, eng, "market.trade", filter, start_ts, end_ts, trade_columns[0..], revision);
-    defer freeMarketQueryRows(alloc, trade_rows);
-    const quote_rows = try queryMarketRows(alloc, eng, "market.quote", filter, start_ts, end_ts, quote_columns[0..], revision);
-    defer freeMarketQueryRows(alloc, quote_rows);
-
-    var quote_idx: usize = 0;
-    var signed_total: f64 = 0;
-    var abs_total: f64 = 0;
-    var spread_capture_total: f64 = 0;
-    var count: usize = 0;
-    var dropped_samples: usize = 0;
-    for (trade_rows) |trade| {
-        while (quote_idx + 1 < quote_rows.len and quote_rows[quote_idx + 1].ts_ns <= trade.ts_ns) : (quote_idx += 1) {}
-        if (quote_rows.len == 0) {
-            dropped_samples += 1;
-            break;
-        }
-        const bid = try marketQueryRowColumnValue(alloc, quote_rows[quote_idx], "bid") orelse {
-            dropped_samples += 1;
-            continue;
-        };
-        const ask = try marketQueryRowColumnValue(alloc, quote_rows[quote_idx], "ask") orelse {
-            dropped_samples += 1;
-            continue;
-        };
-        const trade_price = try marketQueryRowColumnValue(alloc, trade, "price") orelse {
-            dropped_samples += 1;
-            continue;
-        };
-        const mid = (bid + ask) / 2.0;
-        const entry_price = if (std.mem.eql(u8, entry_price_source, "trade")) trade_price else mid;
-        const benchmark_price = if (std.mem.eql(u8, benchmark_source, "mid")) mid else trade_price;
-        var slip = entry_price - benchmark_price;
-        if (std.mem.eql(u8, execution_side, "sell")) slip = -slip;
-        signed_total += slip;
-        abs_total += @abs(slip);
-        spread_capture_total += -slip;
-        count += 1;
-    }
-
-    var send_buffer: [512]u8 = undefined;
-    var response = try req.respondStreaming(&send_buffer, .{
-        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
-    });
-    errdefer response.end() catch {};
-    var jw = std.json.Stringify{ .writer = &response.writer };
-    try jw.beginObject();
-    try jw.objectField("analysis");
-    try jw.write("slippage");
-    try jw.objectField("data_revision");
-    const revision_label = try resolvedRevisionLabel(alloc, eng, revision);
-    defer alloc.free(revision_label);
-    try jw.write(revision_label);
-    try jw.objectField("group_by");
-    try jw.write(group_by);
-    try jw.objectField("definition_refs");
-    try jw.beginArray();
-    try jw.endArray();
-    try jw.objectField("groups");
-    try jw.beginArray();
-    try jw.beginObject();
-    try jw.objectField("key");
-    try jw.beginObject();
-    try jw.objectField("symbol");
-    try jw.write(symbol);
-    try jw.objectField("venue");
-    try jw.write(venue);
-    try jw.endObject();
-    try jw.objectField("sample_count");
-    try jw.write(count);
-    try jw.objectField("dropped_samples");
-    try jw.write(dropped_samples);
-    try jw.objectField("dropped_reasons");
-    try jw.beginArray();
-    if (dropped_samples != 0) try jw.write("missing_quote_benchmark");
-    try jw.endArray();
-    try jw.objectField("execution_side");
-    try jw.write(execution_side);
-    try jw.objectField("entry_price_source");
-    try jw.write(entry_price_source);
-    try jw.objectField("benchmark_source");
-    try jw.write(benchmark_source);
-    try jw.objectField("signed_avg");
-    if (count != 0) try jw.write(signed_total / @as(f64, @floatFromInt(count))) else try jw.write(null);
-    try jw.objectField("abs_avg");
-    if (count != 0) try jw.write(abs_total / @as(f64, @floatFromInt(count))) else try jw.write(null);
-    try jw.objectField("spread_capture_avg");
-    if (count != 0) try jw.write(spread_capture_total / @as(f64, @floatFromInt(count))) else try jw.write(null);
-    try jw.endObject();
-    try jw.endArray();
-    try jw.endObject();
-    try response.end();
+    var buffer = std.array_list.Managed(u8).init(alloc);
+    defer buffer.deinit();
+    var writer = buffer.writer();
+    var tmp: [1024]u8 = undefined;
+    var adapter = writer.adaptToNewApi(&tmp);
+    var iface = &adapter.new_interface;
+    var jw = std.json.Stringify{ .writer = iface };
+    writeSlippageAnalysisResult(&jw, alloc, eng, parsed.parsed.value.object, null) catch |err| return respondAnalysisComputationError(alloc, req, err);
+    try iface.flush();
+    if (adapter.err) |err| return err;
+    const headers = [_]std.http.Header{.{ .name = "Content-Type", .value = "application/json" }};
+    try req.respond(buffer.items, .{ .extra_headers = &headers });
 }
 
 fn handleAnalysisQuoteQuality(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
@@ -3040,104 +3147,18 @@ fn handleAnalysisQuoteQuality(alloc: std.mem.Allocator, eng: *Engine, req: *std.
         else => return respondJsonError(alloc, req, .bad_request, "invalid_json", "invalid json"),
     };
     defer parsed.deinit(alloc);
-    const obj = parsed.parsed.value.object;
-    const symbol = jsonRequiredString(obj, "symbol") orelse return respondJsonError(alloc, req, .bad_request, "missing_symbol", "missing symbol");
-    const venue = jsonRequiredString(obj, "venue") orelse return respondJsonError(alloc, req, .bad_request, "missing_venue", "missing venue");
-    const start_ts = jsonRequiredInt(obj, "start_ts_ns") orelse jsonRequiredInt(obj, "start") orelse return respondJsonError(alloc, req, .bad_request, "missing_start_ts_ns", "missing start_ts_ns");
-    const end_ts = jsonRequiredInt(obj, "end_ts_ns") orelse jsonRequiredInt(obj, "end") orelse return respondJsonError(alloc, req, .bad_request, "missing_end_ts_ns", "missing end_ts_ns");
-    const stale_after_ns = if (obj.get("stale_after_ns")) |value| if (value == .integer) value.integer else 5 * std.time.ns_per_s else 5 * std.time.ns_per_s;
-    const revision = if (obj.get("revision")) |value| if (value == .string) value.string else null else null;
-    const group_by = if (obj.get("group_by")) |value|
-        if (value == .string and (std.mem.eql(u8, value.string, "none") or std.mem.eql(u8, value.string, "venue") or std.mem.eql(u8, value.string, "symbol")))
-            value.string
-        else
-            return respondJsonError(alloc, req, .bad_request, "invalid_group_by", "invalid group_by")
-    else
-        "none";
-    if (!std.mem.eql(u8, group_by, "none")) {
-        return respondJsonError(alloc, req, .bad_request, "unsupported_group_by", "unsupported group_by");
-    }
-    var filter = std.json.Value{ .object = std.json.ObjectMap.init(alloc) };
-    defer filter.object.deinit();
-    try filter.object.put("symbol", .{ .string = symbol });
-    try filter.object.put("venue", .{ .string = venue });
-    const quote_columns = [_][]const u8{ "bid", "ask" };
-    const quote_rows = try queryMarketRows(alloc, eng, "market.quote", filter, start_ts, end_ts, quote_columns[0..], revision);
-    defer freeMarketQueryRows(alloc, quote_rows);
-    var avg_spread_total: f64 = 0;
-    var stale_count: usize = 0;
-    var crossed_count: usize = 0;
-    var locked_count: usize = 0;
-    var dropped_samples: usize = 0;
-    for (quote_rows, 0..) |row, idx| {
-        const bid = try marketQueryRowColumnValue(alloc, row, "bid") orelse {
-            dropped_samples += 1;
-            continue;
-        };
-        const ask = try marketQueryRowColumnValue(alloc, row, "ask") orelse {
-            dropped_samples += 1;
-            continue;
-        };
-        const spread = ask - bid;
-        avg_spread_total += spread;
-        if (spread < 0) crossed_count += 1;
-        if (spread == 0) locked_count += 1;
-        if (idx > 0) {
-            const prev_bid = try marketQueryRowColumnValue(alloc, quote_rows[idx - 1], "bid") orelse continue;
-            const prev_ask = try marketQueryRowColumnValue(alloc, quote_rows[idx - 1], "ask") orelse continue;
-            if (bid == prev_bid and ask == prev_ask and (row.ts_ns - quote_rows[idx - 1].ts_ns) > stale_after_ns) {
-                stale_count += 1;
-            }
-        }
-    }
-    var send_buffer: [768]u8 = undefined;
-    var response = try req.respondStreaming(&send_buffer, .{
-        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
-    });
-    errdefer response.end() catch {};
-    var jw = std.json.Stringify{ .writer = &response.writer };
-    try jw.beginObject();
-    try jw.objectField("analysis");
-    try jw.write("quote-quality");
-    try jw.objectField("data_revision");
-    const revision_label = try resolvedRevisionLabel(alloc, eng, revision);
-    defer alloc.free(revision_label);
-    try jw.write(revision_label);
-    try jw.objectField("group_by");
-    try jw.write(group_by);
-    try jw.objectField("definition_refs");
-    try jw.beginArray();
-    try jw.endArray();
-    try jw.objectField("groups");
-    try jw.beginArray();
-    try jw.beginObject();
-    try jw.objectField("key");
-    try jw.beginObject();
-    try jw.objectField("symbol");
-    try jw.write(symbol);
-    try jw.objectField("venue");
-    try jw.write(venue);
-    try jw.endObject();
-    try jw.objectField("sample_count");
-    try jw.write(quote_rows.len);
-    try jw.objectField("dropped_samples");
-    try jw.write(dropped_samples);
-    try jw.objectField("dropped_reasons");
-    try jw.beginArray();
-    if (dropped_samples != 0) try jw.write("unpaired_quote_samples");
-    try jw.endArray();
-    try jw.objectField("avg_spread");
-    if (quote_rows.len != 0) try jw.write(avg_spread_total / @as(f64, @floatFromInt(quote_rows.len))) else try jw.write(null);
-    try jw.objectField("stale_count");
-    try jw.write(stale_count);
-    try jw.objectField("crossed_count");
-    try jw.write(crossed_count);
-    try jw.objectField("locked_count");
-    try jw.write(locked_count);
-    try jw.endObject();
-    try jw.endArray();
-    try jw.endObject();
-    try response.end();
+    var buffer = std.array_list.Managed(u8).init(alloc);
+    defer buffer.deinit();
+    var writer = buffer.writer();
+    var tmp: [1024]u8 = undefined;
+    var adapter = writer.adaptToNewApi(&tmp);
+    var iface = &adapter.new_interface;
+    var jw = std.json.Stringify{ .writer = iface };
+    writeQuoteQualityAnalysisResult(&jw, alloc, eng, parsed.parsed.value.object, null) catch |err| return respondAnalysisComputationError(alloc, req, err);
+    try iface.flush();
+    if (adapter.err) |err| return err;
+    const headers = [_]std.http.Header{.{ .name = "Content-Type", .value = "application/json" }};
+    try req.respond(buffer.items, .{ .extra_headers = &headers });
 }
 
 fn jsonStringArrayConst(alloc: std.mem.Allocator, value: std.json.Value) ![][]const u8 {
@@ -3267,6 +3288,124 @@ const SignalHistoryRow = struct {
         alloc.free(self.labels_json);
         alloc.free(self.data_revision);
         alloc.free(self.definition_id);
+        self.* = undefined;
+    }
+};
+
+const AnalysisGroupBy = enum {
+    none,
+    venue,
+    symbol,
+};
+
+const AnalysisGroupKey = struct {
+    symbol: ?[]u8 = null,
+    venue: ?[]u8 = null,
+
+    fn clone(self: AnalysisGroupKey, alloc: std.mem.Allocator) !AnalysisGroupKey {
+        return .{
+            .symbol = if (self.symbol) |value| try alloc.dupe(u8, value) else null,
+            .venue = if (self.venue) |value| try alloc.dupe(u8, value) else null,
+        };
+    }
+
+    fn deinit(self: *AnalysisGroupKey, alloc: std.mem.Allocator) void {
+        if (self.symbol) |value| alloc.free(value);
+        if (self.venue) |value| alloc.free(value);
+        self.* = undefined;
+    }
+
+    fn eql(lhs: AnalysisGroupKey, rhs: AnalysisGroupKey) bool {
+        const symbol_equal = if (lhs.symbol) |value|
+            rhs.symbol != null and std.mem.eql(u8, value, rhs.symbol.?)
+        else
+            rhs.symbol == null;
+        if (!symbol_equal) return false;
+        return if (lhs.venue) |value|
+            rhs.venue != null and std.mem.eql(u8, value, rhs.venue.?)
+        else
+            rhs.venue == null;
+    }
+};
+
+const AnalysisRowGroup = struct {
+    key: AnalysisGroupKey,
+    row_indices: std.array_list.Managed(usize),
+
+    fn deinit(self: *AnalysisRowGroup, alloc: std.mem.Allocator) void {
+        self.key.deinit(alloc);
+        self.row_indices.deinit();
+        self.* = undefined;
+    }
+};
+
+const MarkoutAccumulator = struct {
+    key: AnalysisGroupKey,
+    sample_counts: []usize,
+    dropped_samples: []usize,
+    totals: []f64,
+
+    fn init(alloc: std.mem.Allocator, key: AnalysisGroupKey, horizon_count: usize) !MarkoutAccumulator {
+        const sample_counts = try alloc.alloc(usize, horizon_count);
+        errdefer alloc.free(sample_counts);
+        const dropped_samples = try alloc.alloc(usize, horizon_count);
+        errdefer alloc.free(dropped_samples);
+        const totals = try alloc.alloc(f64, horizon_count);
+        errdefer alloc.free(totals);
+        @memset(sample_counts, 0);
+        @memset(dropped_samples, 0);
+        @memset(totals, 0);
+        return .{
+            .key = try key.clone(alloc),
+            .sample_counts = sample_counts,
+            .dropped_samples = dropped_samples,
+            .totals = totals,
+        };
+    }
+
+    fn deinit(self: *MarkoutAccumulator, alloc: std.mem.Allocator) void {
+        self.key.deinit(alloc);
+        alloc.free(self.sample_counts);
+        alloc.free(self.dropped_samples);
+        alloc.free(self.totals);
+        self.* = undefined;
+    }
+};
+
+const SlippageAccumulator = struct {
+    key: AnalysisGroupKey,
+    sample_count: usize = 0,
+    dropped_samples: usize = 0,
+    signed_total: f64 = 0,
+    abs_total: f64 = 0,
+    spread_capture_total: f64 = 0,
+
+    fn init(alloc: std.mem.Allocator, key: AnalysisGroupKey) !SlippageAccumulator {
+        return .{ .key = try key.clone(alloc) };
+    }
+
+    fn deinit(self: *SlippageAccumulator, alloc: std.mem.Allocator) void {
+        self.key.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+const QuoteQualityAccumulator = struct {
+    key: AnalysisGroupKey,
+    sample_count: usize = 0,
+    valid_spread_count: usize = 0,
+    dropped_samples: usize = 0,
+    avg_spread_total: f64 = 0,
+    stale_count: usize = 0,
+    crossed_count: usize = 0,
+    locked_count: usize = 0,
+
+    fn init(alloc: std.mem.Allocator, key: AnalysisGroupKey) !QuoteQualityAccumulator {
+        return .{ .key = try key.clone(alloc) };
+    }
+
+    fn deinit(self: *QuoteQualityAccumulator, alloc: std.mem.Allocator) void {
+        self.key.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -3706,11 +3845,698 @@ fn labelValueFromJson(alloc: std.mem.Allocator, labels_json: []const u8, key: []
     return null;
 }
 
+fn parseAnalysisGroupBy(obj: std.json.ObjectMap) !AnalysisGroupBy {
+    const value = obj.get("group_by") orelse return .none;
+    if (value != .string) return error.InvalidGroupBy;
+    if (std.mem.eql(u8, value.string, "none")) return .none;
+    if (std.mem.eql(u8, value.string, "venue")) return .venue;
+    if (std.mem.eql(u8, value.string, "symbol")) return .symbol;
+    return error.InvalidGroupBy;
+}
+
+fn analysisGroupByText(group_by: AnalysisGroupBy) []const u8 {
+    return switch (group_by) {
+        .none => "none",
+        .venue => "venue",
+        .symbol => "symbol",
+    };
+}
+
+fn validateAnalysisScope(group_by: AnalysisGroupBy, symbol: ?[]const u8, venue: ?[]const u8) !void {
+    switch (group_by) {
+        .none => {
+            if (symbol == null) return error.MissingSymbol;
+            if (venue == null) return error.MissingVenue;
+        },
+        .venue => {
+            if (symbol == null) return error.MissingSymbol;
+        },
+        .symbol => {
+            if (venue == null) return error.MissingVenue;
+        },
+    }
+}
+
+fn buildAnalysisFilter(alloc: std.mem.Allocator, symbol: ?[]const u8, venue: ?[]const u8) !std.json.Value {
+    var filter = std.json.Value{ .object = std.json.ObjectMap.init(alloc) };
+    errdefer filter.object.deinit();
+    if (symbol) |value| try filter.object.put("symbol", .{ .string = value });
+    if (venue) |value| try filter.object.put("venue", .{ .string = value });
+    return filter;
+}
+
+fn analysisGroupKeyFromLabels(alloc: std.mem.Allocator, labels_json: []const u8, group_by: AnalysisGroupBy) !?AnalysisGroupKey {
+    const symbol = try labelValueFromJson(alloc, labels_json, "symbol");
+    errdefer if (symbol) |value| alloc.free(value);
+    const venue = try labelValueFromJson(alloc, labels_json, "venue");
+    errdefer if (venue) |value| alloc.free(value);
+    return switch (group_by) {
+        .none => if (symbol != null and venue != null)
+            .{ .symbol = symbol, .venue = venue }
+        else blk: {
+            if (symbol) |value| alloc.free(value);
+            if (venue) |value| alloc.free(value);
+            break :blk null;
+        },
+        .venue => if (venue != null)
+            .{ .venue = venue }
+        else blk: {
+            if (symbol) |value| alloc.free(value);
+            if (venue) |value| alloc.free(value);
+            break :blk null;
+        },
+        .symbol => if (symbol != null)
+            .{ .symbol = symbol }
+        else blk: {
+            if (symbol) |value| alloc.free(value);
+            if (venue) |value| alloc.free(value);
+            break :blk null;
+        },
+    };
+}
+
+fn freeAnalysisRowGroups(alloc: std.mem.Allocator, groups: []AnalysisRowGroup) void {
+    for (groups) |*group| group.deinit(alloc);
+    alloc.free(groups);
+}
+
+fn freeMarkoutAccumulators(alloc: std.mem.Allocator, groups: []MarkoutAccumulator) void {
+    for (groups) |*group| group.deinit(alloc);
+    alloc.free(groups);
+}
+
+fn freeSlippageAccumulators(alloc: std.mem.Allocator, groups: []SlippageAccumulator) void {
+    for (groups) |*group| group.deinit(alloc);
+    alloc.free(groups);
+}
+
+fn freeQuoteQualityAccumulators(alloc: std.mem.Allocator, groups: []QuoteQualityAccumulator) void {
+    for (groups) |*group| group.deinit(alloc);
+    alloc.free(groups);
+}
+
+fn ensureAnalysisRowGroup(
+    alloc: std.mem.Allocator,
+    groups: *std.array_list.Managed(AnalysisRowGroup),
+    key: AnalysisGroupKey,
+) !void {
+    for (groups.items) |entry| {
+        if (entry.key.eql(key)) {
+            return;
+        }
+    }
+    try groups.append(.{
+        .key = try key.clone(alloc),
+        .row_indices = std.array_list.Managed(usize).init(alloc),
+    });
+}
+
+fn buildMarketRowGroups(alloc: std.mem.Allocator, rows: []const MarketQueryRow, group_by: AnalysisGroupBy) ![]AnalysisRowGroup {
+    var groups = std.array_list.Managed(AnalysisRowGroup).init(alloc);
+    errdefer {
+        for (groups.items) |*group| group.deinit(alloc);
+        groups.deinit();
+    }
+    for (rows, 0..) |row, idx| {
+        var key = (try analysisGroupKeyFromLabels(alloc, row.labels_json, group_by)) orelse continue;
+        defer key.deinit(alloc);
+        try ensureAnalysisRowGroup(alloc, &groups, key);
+        for (groups.items) |*group| {
+            if (group.key.eql(key)) {
+                try group.row_indices.append(idx);
+                break;
+            }
+        }
+    }
+    return try groups.toOwnedSlice();
+}
+
+fn buildSignalRowGroups(alloc: std.mem.Allocator, rows: []const SignalHistoryRow, group_by: AnalysisGroupBy) ![]AnalysisRowGroup {
+    var groups = std.array_list.Managed(AnalysisRowGroup).init(alloc);
+    errdefer {
+        for (groups.items) |*group| group.deinit(alloc);
+        groups.deinit();
+    }
+    for (rows, 0..) |row, idx| {
+        var key = (try analysisGroupKeyFromLabels(alloc, row.labels_json, group_by)) orelse continue;
+        defer key.deinit(alloc);
+        try ensureAnalysisRowGroup(alloc, &groups, key);
+        for (groups.items) |*group| {
+            if (group.key.eql(key)) {
+                try group.row_indices.append(idx);
+                break;
+            }
+        }
+    }
+    return try groups.toOwnedSlice();
+}
+
+fn findAnalysisRowGroup(groups: []const AnalysisRowGroup, key: AnalysisGroupKey) ?usize {
+    for (groups, 0..) |group, idx| {
+        if (group.key.eql(key)) return idx;
+    }
+    return null;
+}
+
+fn findGroupedMarketRowPositionAtOrAfter(rows: []const MarketQueryRow, group: AnalysisRowGroup, ts_ns: i64) ?usize {
+    for (group.row_indices.items, 0..) |row_idx, pos| {
+        if (rows[row_idx].ts_ns >= ts_ns) return pos;
+    }
+    return null;
+}
+
+fn writeAnalysisGroupKey(jw: *std.json.Stringify, key: AnalysisGroupKey) !void {
+    try jw.beginObject();
+    if (key.symbol) |value| {
+        try jw.objectField("symbol");
+        try jw.write(value);
+    }
+    if (key.venue) |value| {
+        try jw.objectField("venue");
+        try jw.write(value);
+    }
+    try jw.endObject();
+}
+
+fn ensureMarkoutAccumulator(
+    alloc: std.mem.Allocator,
+    groups: *std.array_list.Managed(MarkoutAccumulator),
+    key: AnalysisGroupKey,
+    horizon_count: usize,
+) !usize {
+    for (groups.items, 0..) |entry, idx| {
+        if (entry.key.eql(key)) return idx;
+    }
+    try groups.append(try MarkoutAccumulator.init(alloc, key, horizon_count));
+    return groups.items.len - 1;
+}
+
+fn ensureSlippageAccumulator(
+    alloc: std.mem.Allocator,
+    groups: *std.array_list.Managed(SlippageAccumulator),
+    key: AnalysisGroupKey,
+) !usize {
+    for (groups.items, 0..) |entry, idx| {
+        if (entry.key.eql(key)) return idx;
+    }
+    try groups.append(try SlippageAccumulator.init(alloc, key));
+    return groups.items.len - 1;
+}
+
+fn ensureQuoteQualityAccumulator(
+    alloc: std.mem.Allocator,
+    groups: *std.array_list.Managed(QuoteQualityAccumulator),
+    key: AnalysisGroupKey,
+) !usize {
+    for (groups.items, 0..) |entry, idx| {
+        if (entry.key.eql(key)) return idx;
+    }
+    try groups.append(try QuoteQualityAccumulator.init(alloc, key));
+    return groups.items.len - 1;
+}
+
 fn findMarketRowIndexAtOrAfter(rows: []const MarketQueryRow, ts_ns: i64) ?usize {
     for (rows, 0..) |row, idx| {
         if (row.ts_ns >= ts_ns) return idx;
     }
     return null;
+}
+
+fn collectReplayEntries(alloc: std.mem.Allocator, cas: *cas_mod.CasManager, from_spec: []const u8, to_spec: []const u8, max_entries: usize) ![]cas_mod.LogEntry {
+    const from_id = try cas.resolveCommitSpec(from_spec);
+    const raw = try cas.loadLog(to_spec, max_entries);
+    errdefer {
+        for (raw) |*entry| entry.deinit(alloc);
+        alloc.free(raw);
+    }
+
+    var found_from = false;
+    var selected = std.array_list.Managed(cas_mod.LogEntry).init(alloc);
+    errdefer {
+        for (selected.items) |*entry| entry.deinit(alloc);
+        selected.deinit();
+    }
+    for (raw) |entry| {
+        try selected.append(.{
+            .commit_id = entry.commit_id,
+            .created_at_ms = entry.created_at_ms,
+            .reason = try alloc.dupe(u8, entry.reason),
+            .parent_count = entry.parent_count,
+        });
+        if (entry.commit_id.eql(from_id)) {
+            found_from = true;
+            break;
+        }
+    }
+    for (raw) |*entry| entry.deinit(alloc);
+    alloc.free(raw);
+    if (!found_from) return error.InvalidReplayRange;
+
+    std.mem.reverse(cas_mod.LogEntry, selected.items);
+    return try selected.toOwnedSlice();
+}
+
+fn writeReplayAnalysisResult(
+    jw: *std.json.Stringify,
+    alloc: std.mem.Allocator,
+    eng: *Engine,
+    analysis_name: []const u8,
+    params: std.json.ObjectMap,
+    revision: []const u8,
+) !void {
+    if (std.mem.eql(u8, analysis_name, "markout")) {
+        return try writeMarkoutAnalysisResult(jw, alloc, eng, params, revision);
+    }
+    if (std.mem.eql(u8, analysis_name, "slippage")) {
+        return try writeSlippageAnalysisResult(jw, alloc, eng, params, revision);
+    }
+    if (std.mem.eql(u8, analysis_name, "quote_quality") or std.mem.eql(u8, analysis_name, "quote-quality")) {
+        return try writeQuoteQualityAnalysisResult(jw, alloc, eng, params, revision);
+    }
+    return error.UnsupportedReplayAnalysis;
+}
+
+fn writeMarkoutAnalysisResult(
+    jw: *std.json.Stringify,
+    alloc: std.mem.Allocator,
+    eng: *Engine,
+    obj: std.json.ObjectMap,
+    revision_override: ?[]const u8,
+) !void {
+    const symbol = if (obj.get("symbol")) |value| if (value == .string) value.string else return error.InvalidCharacter else null;
+    const venue = if (obj.get("venue")) |value| if (value == .string) value.string else return error.InvalidCharacter else null;
+    const start_ts = jsonRequiredInt(obj, "start_ts_ns") orelse jsonRequiredInt(obj, "start") orelse return error.MissingStartTsNs;
+    const end_ts = jsonRequiredInt(obj, "end_ts_ns") orelse jsonRequiredInt(obj, "end") orelse return error.MissingEndTsNs;
+    const group_by = try parseAnalysisGroupBy(obj);
+    try validateAnalysisScope(group_by, symbol, venue);
+    const single_horizon_ns = if (obj.get("horizon_ns")) |value| if (value == .integer) value.integer else return error.InvalidCharacter else null;
+    const horizons_ns = if (obj.get("horizons_ns")) |value|
+        try jsonIntArray(alloc, value)
+    else if (single_horizon_ns) |value|
+        try alloc.dupe(i64, &.{value})
+    else
+        return error.MissingHorizon;
+    defer alloc.free(horizons_ns);
+    const signal_name = if (obj.get("signal_name")) |value| if (value == .string) value.string else null else null;
+    const bar_policy_id = if (obj.get("bar_policy_id")) |value| if (value == .string) value.string else null else null;
+    const revision = revision_override orelse (if (obj.get("revision")) |value| if (value == .string) value.string else null else null);
+
+    var filter = try buildAnalysisFilter(alloc, symbol, venue);
+    defer filter.object.deinit();
+
+    var max_horizon: i64 = 0;
+    for (horizons_ns) |horizon| {
+        if (horizon > max_horizon) max_horizon = horizon;
+    }
+    const price_columns = [_][]const u8{"price"};
+    const price_rows = try queryMarketRows(alloc, eng, "market.trade", filter, start_ts, end_ts + max_horizon, price_columns[0..], revision);
+    defer freeMarketQueryRows(alloc, price_rows);
+
+    var signal_version: ?u32 = null;
+    const signal_rows = if (signal_name) |signal_id| blk: {
+        var signal = try eng.latestSignal(signal_id) orelse return error.SignalNotFound;
+        defer signal.deinit(alloc);
+        signal_version = signal.version;
+        break :blk try querySignalHistoryRows(alloc, eng, signal_id, signal.version, start_ts, end_ts, revision);
+    } else try alloc.alloc(SignalHistoryRow, 0);
+    defer if (signal_name != null) freeSignalHistoryRows(alloc, signal_rows) else alloc.free(signal_rows);
+
+    const price_groups = try buildMarketRowGroups(alloc, price_rows, group_by);
+    defer freeAnalysisRowGroups(alloc, price_groups);
+    const signal_groups = if (signal_name != null)
+        try buildSignalRowGroups(alloc, signal_rows, group_by)
+    else
+        try alloc.alloc(AnalysisRowGroup, 0);
+    defer if (signal_name != null) freeAnalysisRowGroups(alloc, signal_groups) else alloc.free(signal_groups);
+
+    var groups = std.array_list.Managed(MarkoutAccumulator).init(alloc);
+    defer {
+        for (groups.items) |*group| group.deinit(alloc);
+        groups.deinit();
+    }
+
+    if (signal_name != null) {
+        for (signal_groups) |signal_group| {
+            _ = try ensureMarkoutAccumulator(alloc, &groups, signal_group.key, horizons_ns.len);
+        }
+    } else {
+        for (price_groups) |price_group| {
+            _ = try ensureMarkoutAccumulator(alloc, &groups, price_group.key, horizons_ns.len);
+        }
+    }
+    for (groups.items) |*accum| {
+        const price_group_idx = findAnalysisRowGroup(price_groups, accum.key);
+        const signal_group_idx = if (signal_name != null) findAnalysisRowGroup(signal_groups, accum.key) else null;
+        if (signal_name != null and signal_group_idx == null) continue;
+        for (horizons_ns, 0..) |horizon_ns, horizon_idx| {
+            if (signal_name != null) {
+                const signal_group = signal_groups[signal_group_idx.?];
+                if (price_group_idx == null) {
+                    accum.dropped_samples[horizon_idx] += signal_group.row_indices.items.len;
+                    continue;
+                }
+                const price_group = price_groups[price_group_idx.?];
+                var future_pos: usize = 0;
+                for (signal_group.row_indices.items) |signal_row_idx| {
+                    const signal_row = signal_rows[signal_row_idx];
+                    while (future_pos < price_group.row_indices.items.len and price_rows[price_group.row_indices.items[future_pos]].ts_ns < signal_row.ts_ns + horizon_ns) : (future_pos += 1) {}
+                    if (future_pos >= price_group.row_indices.items.len) {
+                        accum.dropped_samples[horizon_idx] += 1;
+                        continue;
+                    }
+                    const entry_pos = findGroupedMarketRowPositionAtOrAfter(price_rows, price_group, signal_row.ts_ns) orelse {
+                        accum.dropped_samples[horizon_idx] += 1;
+                        continue;
+                    };
+                    const future_price = try marketQueryRowColumnValue(alloc, price_rows[price_group.row_indices.items[future_pos]], "price") orelse {
+                        accum.dropped_samples[horizon_idx] += 1;
+                        continue;
+                    };
+                    const entry_price = try marketQueryRowColumnValue(alloc, price_rows[price_group.row_indices.items[entry_pos]], "price") orelse {
+                        accum.dropped_samples[horizon_idx] += 1;
+                        continue;
+                    };
+                    accum.totals[horizon_idx] += future_price - entry_price;
+                    accum.sample_counts[horizon_idx] += 1;
+                }
+            } else {
+                if (price_group_idx == null) continue;
+                const price_group = price_groups[price_group_idx.?];
+                var future_pos: usize = 0;
+                for (price_group.row_indices.items, 0..) |price_row_idx, pos| {
+                    const row = price_rows[price_row_idx];
+                    while (future_pos < price_group.row_indices.items.len and price_rows[price_group.row_indices.items[future_pos]].ts_ns < row.ts_ns + horizon_ns) : (future_pos += 1) {}
+                    if (future_pos >= price_group.row_indices.items.len) {
+                        accum.dropped_samples[horizon_idx] += price_group.row_indices.items.len - pos;
+                        break;
+                    }
+                    const future_price = try marketQueryRowColumnValue(alloc, price_rows[price_group.row_indices.items[future_pos]], "price") orelse {
+                        accum.dropped_samples[horizon_idx] += 1;
+                        continue;
+                    };
+                    const entry_price = try marketQueryRowColumnValue(alloc, row, "price") orelse {
+                        accum.dropped_samples[horizon_idx] += 1;
+                        continue;
+                    };
+                    accum.totals[horizon_idx] += future_price - entry_price;
+                    accum.sample_counts[horizon_idx] += 1;
+                }
+            }
+        }
+    }
+
+    try jw.beginObject();
+    try jw.objectField("analysis");
+    try jw.write("markout");
+    try jw.objectField("data_revision");
+    const resolved_revision = try resolvedRevisionLabel(alloc, eng, revision);
+    defer alloc.free(resolved_revision);
+    try jw.write(resolved_revision);
+    try jw.objectField("group_by");
+    try jw.write(analysisGroupByText(group_by));
+    try jw.objectField("definition_refs");
+    try jw.beginArray();
+    if (signal_name) |value| {
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write("signal");
+        try jw.objectField("id");
+        try jw.write(value);
+        try jw.objectField("version");
+        try jw.write(signal_version.?);
+        try jw.endObject();
+    }
+    if (bar_policy_id) |value| {
+        var policy = eng.latestBarPolicy(value) orelse return error.BarPolicyNotFound;
+        defer policy.deinit(alloc);
+        try jw.beginObject();
+        try jw.objectField("kind");
+        try jw.write("bar_policy");
+        try jw.objectField("id");
+        try jw.write(value);
+        try jw.objectField("version");
+        try jw.write(policy.version);
+        try jw.endObject();
+    }
+    try jw.endArray();
+    if (bar_policy_id) |value| {
+        try jw.objectField("bar_policy_id");
+        try jw.write(value);
+    }
+    try jw.objectField("groups");
+    try jw.beginArray();
+    for (groups.items) |accum| {
+        try jw.beginObject();
+        try jw.objectField("key");
+        try writeAnalysisGroupKey(jw, accum.key);
+        try jw.objectField("horizons");
+        try jw.beginArray();
+        for (horizons_ns, 0..) |horizon_ns, horizon_idx| {
+            try jw.beginObject();
+            try jw.objectField("horizon_ns");
+            try jw.write(horizon_ns);
+            try jw.objectField("sample_count");
+            try jw.write(accum.sample_counts[horizon_idx]);
+            try jw.objectField("dropped_samples");
+            try jw.write(accum.dropped_samples[horizon_idx]);
+            try jw.objectField("dropped_reasons");
+            try jw.beginArray();
+            if (accum.dropped_samples[horizon_idx] != 0) try jw.write("missing_future_price");
+            try jw.endArray();
+            try jw.objectField("value");
+            if (accum.sample_counts[horizon_idx] != 0)
+                try jw.write(accum.totals[horizon_idx] / @as(f64, @floatFromInt(accum.sample_counts[horizon_idx])))
+            else
+                try jw.write(null);
+            try jw.endObject();
+        }
+        try jw.endArray();
+        try jw.endObject();
+    }
+    try jw.endArray();
+    try jw.endObject();
+}
+
+fn writeSlippageAnalysisResult(
+    jw: *std.json.Stringify,
+    alloc: std.mem.Allocator,
+    eng: *Engine,
+    obj: std.json.ObjectMap,
+    revision_override: ?[]const u8,
+) !void {
+    const symbol = if (obj.get("symbol")) |value| if (value == .string) value.string else return error.InvalidCharacter else null;
+    const venue = if (obj.get("venue")) |value| if (value == .string) value.string else return error.InvalidCharacter else null;
+    const start_ts = jsonRequiredInt(obj, "start_ts_ns") orelse jsonRequiredInt(obj, "start") orelse return error.MissingStartTsNs;
+    const end_ts = jsonRequiredInt(obj, "end_ts_ns") orelse jsonRequiredInt(obj, "end") orelse return error.MissingEndTsNs;
+    const group_by = try parseAnalysisGroupBy(obj);
+    try validateAnalysisScope(group_by, symbol, venue);
+    const execution_side = if (obj.get("execution_side")) |value| if (value == .string) value.string else "auto" else "auto";
+    const entry_price_source = if (obj.get("entry_price_source")) |value| if (value == .string) value.string else "trade" else "trade";
+    const benchmark_source = if (obj.get("benchmark_source")) |value| if (value == .string) value.string else "mid" else "mid";
+    const revision = revision_override orelse (if (obj.get("revision")) |value| if (value == .string) value.string else null else null);
+
+    var filter = try buildAnalysisFilter(alloc, symbol, venue);
+    defer filter.object.deinit();
+    const trade_columns = [_][]const u8{"price"};
+    const quote_columns = [_][]const u8{ "bid", "ask" };
+    const trade_rows = try queryMarketRows(alloc, eng, "market.trade", filter, start_ts, end_ts, trade_columns[0..], revision);
+    defer freeMarketQueryRows(alloc, trade_rows);
+    const quote_rows = try queryMarketRows(alloc, eng, "market.quote", filter, start_ts, end_ts, quote_columns[0..], revision);
+    defer freeMarketQueryRows(alloc, quote_rows);
+
+    const trade_groups = try buildMarketRowGroups(alloc, trade_rows, group_by);
+    defer freeAnalysisRowGroups(alloc, trade_groups);
+    const quote_groups = try buildMarketRowGroups(alloc, quote_rows, group_by);
+    defer freeAnalysisRowGroups(alloc, quote_groups);
+
+    var groups = std.array_list.Managed(SlippageAccumulator).init(alloc);
+    defer {
+        for (groups.items) |*group| group.deinit(alloc);
+        groups.deinit();
+    }
+    for (trade_groups) |trade_group| {
+        const group_idx = try ensureSlippageAccumulator(alloc, &groups, trade_group.key);
+        const quote_group_idx = findAnalysisRowGroup(quote_groups, trade_group.key);
+        if (quote_group_idx == null) {
+            groups.items[group_idx].dropped_samples += trade_group.row_indices.items.len;
+            continue;
+        }
+        const quote_group = quote_groups[quote_group_idx.?];
+        if (quote_group.row_indices.items.len == 0) {
+            groups.items[group_idx].dropped_samples += trade_group.row_indices.items.len;
+            continue;
+        }
+        var quote_pos: usize = 0;
+        for (trade_group.row_indices.items) |trade_row_idx| {
+            const trade = trade_rows[trade_row_idx];
+            while (quote_pos + 1 < quote_group.row_indices.items.len and quote_rows[quote_group.row_indices.items[quote_pos + 1]].ts_ns <= trade.ts_ns) : (quote_pos += 1) {}
+            const quote = quote_rows[quote_group.row_indices.items[quote_pos]];
+            const bid = try marketQueryRowColumnValue(alloc, quote, "bid") orelse {
+                groups.items[group_idx].dropped_samples += 1;
+                continue;
+            };
+            const ask = try marketQueryRowColumnValue(alloc, quote, "ask") orelse {
+                groups.items[group_idx].dropped_samples += 1;
+                continue;
+            };
+            const trade_price = try marketQueryRowColumnValue(alloc, trade, "price") orelse {
+                groups.items[group_idx].dropped_samples += 1;
+                continue;
+            };
+            const mid = (bid + ask) / 2.0;
+            const entry_price = if (std.mem.eql(u8, entry_price_source, "trade")) trade_price else mid;
+            const benchmark_price = if (std.mem.eql(u8, benchmark_source, "mid")) mid else trade_price;
+            var slip = entry_price - benchmark_price;
+            if (std.mem.eql(u8, execution_side, "sell")) slip = -slip;
+            groups.items[group_idx].signed_total += slip;
+            groups.items[group_idx].abs_total += @abs(slip);
+            groups.items[group_idx].spread_capture_total += -slip;
+            groups.items[group_idx].sample_count += 1;
+        }
+    }
+
+    try jw.beginObject();
+    try jw.objectField("analysis");
+    try jw.write("slippage");
+    try jw.objectField("data_revision");
+    const resolved_revision = try resolvedRevisionLabel(alloc, eng, revision);
+    defer alloc.free(resolved_revision);
+    try jw.write(resolved_revision);
+    try jw.objectField("group_by");
+    try jw.write(analysisGroupByText(group_by));
+    try jw.objectField("definition_refs");
+    try jw.beginArray();
+    try jw.endArray();
+    try jw.objectField("groups");
+    try jw.beginArray();
+    for (groups.items) |group| {
+        try jw.beginObject();
+        try jw.objectField("key");
+        try writeAnalysisGroupKey(jw, group.key);
+        try jw.objectField("sample_count");
+        try jw.write(group.sample_count);
+        try jw.objectField("dropped_samples");
+        try jw.write(group.dropped_samples);
+        try jw.objectField("dropped_reasons");
+        try jw.beginArray();
+        if (group.dropped_samples != 0) try jw.write("missing_quote_benchmark");
+        try jw.endArray();
+        try jw.objectField("execution_side");
+        try jw.write(execution_side);
+        try jw.objectField("entry_price_source");
+        try jw.write(entry_price_source);
+        try jw.objectField("benchmark_source");
+        try jw.write(benchmark_source);
+        try jw.objectField("signed_avg");
+        if (group.sample_count != 0) try jw.write(group.signed_total / @as(f64, @floatFromInt(group.sample_count))) else try jw.write(null);
+        try jw.objectField("abs_avg");
+        if (group.sample_count != 0) try jw.write(group.abs_total / @as(f64, @floatFromInt(group.sample_count))) else try jw.write(null);
+        try jw.objectField("spread_capture_avg");
+        if (group.sample_count != 0) try jw.write(group.spread_capture_total / @as(f64, @floatFromInt(group.sample_count))) else try jw.write(null);
+        try jw.endObject();
+    }
+    try jw.endArray();
+    try jw.endObject();
+}
+
+fn writeQuoteQualityAnalysisResult(
+    jw: *std.json.Stringify,
+    alloc: std.mem.Allocator,
+    eng: *Engine,
+    obj: std.json.ObjectMap,
+    revision_override: ?[]const u8,
+) !void {
+    const symbol = if (obj.get("symbol")) |value| if (value == .string) value.string else return error.InvalidCharacter else null;
+    const venue = if (obj.get("venue")) |value| if (value == .string) value.string else return error.InvalidCharacter else null;
+    const start_ts = jsonRequiredInt(obj, "start_ts_ns") orelse jsonRequiredInt(obj, "start") orelse return error.MissingStartTsNs;
+    const end_ts = jsonRequiredInt(obj, "end_ts_ns") orelse jsonRequiredInt(obj, "end") orelse return error.MissingEndTsNs;
+    const group_by = try parseAnalysisGroupBy(obj);
+    try validateAnalysisScope(group_by, symbol, venue);
+    const stale_after_ns = if (obj.get("stale_after_ns")) |value| if (value == .integer) value.integer else 5 * std.time.ns_per_s else 5 * std.time.ns_per_s;
+    const revision = revision_override orelse (if (obj.get("revision")) |value| if (value == .string) value.string else null else null);
+
+    var filter = try buildAnalysisFilter(alloc, symbol, venue);
+    defer filter.object.deinit();
+    const quote_columns = [_][]const u8{ "bid", "ask" };
+    const quote_rows = try queryMarketRows(alloc, eng, "market.quote", filter, start_ts, end_ts, quote_columns[0..], revision);
+    defer freeMarketQueryRows(alloc, quote_rows);
+
+    const quote_groups = try buildMarketRowGroups(alloc, quote_rows, group_by);
+    defer freeAnalysisRowGroups(alloc, quote_groups);
+
+    var groups = std.array_list.Managed(QuoteQualityAccumulator).init(alloc);
+    defer {
+        for (groups.items) |*group| group.deinit(alloc);
+        groups.deinit();
+    }
+    for (quote_groups) |quote_group| {
+        const group_idx = try ensureQuoteQualityAccumulator(alloc, &groups, quote_group.key);
+        groups.items[group_idx].sample_count = quote_group.row_indices.items.len;
+        for (quote_group.row_indices.items, 0..) |quote_row_idx, pos| {
+            const row = quote_rows[quote_row_idx];
+            const bid = try marketQueryRowColumnValue(alloc, row, "bid") orelse {
+                groups.items[group_idx].dropped_samples += 1;
+                continue;
+            };
+            const ask = try marketQueryRowColumnValue(alloc, row, "ask") orelse {
+                groups.items[group_idx].dropped_samples += 1;
+                continue;
+            };
+            const spread = ask - bid;
+            groups.items[group_idx].avg_spread_total += spread;
+            groups.items[group_idx].valid_spread_count += 1;
+            if (spread < 0) groups.items[group_idx].crossed_count += 1;
+            if (spread == 0) groups.items[group_idx].locked_count += 1;
+            if (pos > 0) {
+                const prev_row = quote_rows[quote_group.row_indices.items[pos - 1]];
+                const prev_bid = try marketQueryRowColumnValue(alloc, prev_row, "bid") orelse continue;
+                const prev_ask = try marketQueryRowColumnValue(alloc, prev_row, "ask") orelse continue;
+                if (bid == prev_bid and ask == prev_ask and (row.ts_ns - prev_row.ts_ns) > stale_after_ns) groups.items[group_idx].stale_count += 1;
+            }
+        }
+    }
+
+    try jw.beginObject();
+    try jw.objectField("analysis");
+    try jw.write("quote-quality");
+    try jw.objectField("data_revision");
+    const resolved_revision = try resolvedRevisionLabel(alloc, eng, revision);
+    defer alloc.free(resolved_revision);
+    try jw.write(resolved_revision);
+    try jw.objectField("group_by");
+    try jw.write(analysisGroupByText(group_by));
+    try jw.objectField("definition_refs");
+    try jw.beginArray();
+    try jw.endArray();
+    try jw.objectField("groups");
+    try jw.beginArray();
+    for (groups.items) |group| {
+        try jw.beginObject();
+        try jw.objectField("key");
+        try writeAnalysisGroupKey(jw, group.key);
+        try jw.objectField("sample_count");
+        try jw.write(group.sample_count);
+        try jw.objectField("dropped_samples");
+        try jw.write(group.dropped_samples);
+        try jw.objectField("dropped_reasons");
+        try jw.beginArray();
+        if (group.dropped_samples != 0) try jw.write("unpaired_quote_samples");
+        try jw.endArray();
+        try jw.objectField("avg_spread");
+        if (group.valid_spread_count != 0)
+            try jw.write(group.avg_spread_total / @as(f64, @floatFromInt(group.valid_spread_count)))
+        else
+            try jw.write(null);
+        try jw.objectField("stale_count");
+        try jw.write(group.stale_count);
+        try jw.objectField("crossed_count");
+        try jw.write(group.crossed_count);
+        try jw.objectField("locked_count");
+        try jw.write(group.locked_count);
+        try jw.endObject();
+    }
+    try jw.endArray();
+    try jw.endObject();
 }
 
 fn canonicalLabelsForMarket(
