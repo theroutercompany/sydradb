@@ -21,6 +21,7 @@ pub const CodegenResult = struct {
 
 pub fn buildProgram(allocator: std.mem.Allocator, compiled: compiler.CompiledSelect) CodegenError!CodegenResult {
     if (compiled.typed_query.is_aggregate_query) {
+        if (compiled.typed_query.select.fill != null) return error.UnsupportedPreparedQuery;
         return try buildAggregateProgram(allocator, compiled);
     }
 

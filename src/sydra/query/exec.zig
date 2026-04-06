@@ -1007,7 +1007,7 @@ test "executeWithMode compiled supports visible selector tag projections" {
     try std.testing.expect((try cursor.next()) == null);
 }
 
-test "executeWithMode compiled falls back to legacy for fill clauses and records metrics" {
+test "executeWithMode compiled keeps fill clauses on the native physical path" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -1049,12 +1049,12 @@ test "executeWithMode compiled falls back to legacy for fill clauses and records
     defer cursor.deinit();
 
     try std.testing.expectEqualStrings("compiled", cursor.stats.execution_mode);
-    try std.testing.expect(cursor.stats.legacy_fallback);
-    try std.testing.expectEqualStrings(@tagName(compiler_diagnostics.FallbackReason.unsupported_fill), cursor.stats.fallback_reason);
+    try std.testing.expect(!cursor.stats.legacy_fallback);
+    try std.testing.expectEqualStrings("", cursor.stats.fallback_reason);
     try std.testing.expectEqual(@as(u64, 1), engine.metrics.query_compile_attempts_total.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 0), engine.metrics.query_compile_success_total.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 1), engine.metrics.query_compile_fallback_total.load(.monotonic));
-    try std.testing.expectEqual(@as(u64, 1), engine.metrics.query_compile_unsupported_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), engine.metrics.query_compile_success_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), engine.metrics.query_compile_fallback_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), engine.metrics.query_compile_unsupported_total.load(.monotonic));
 
     const first = (try cursor.next()) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(i64, 60), first.values[0].integer);
@@ -1379,7 +1379,7 @@ test "execution snapshots stay stable for supported and fallback query classes" 
     const fallback_snapshot = try collectCursorContractSnapshot(talloc, &fallback_cursor);
     defer talloc.free(fallback_snapshot);
     try std.testing.expectEqualStrings(
-        \\mode=compiled|legacy_fallback=true|fallback_reason=unsupported_fill
+        \\mode=compiled|legacy_fallback=false|fallback_reason=
         \\bucket|avg_value
         \\60|3.5
         \\0|1.75

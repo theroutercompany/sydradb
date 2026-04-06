@@ -264,7 +264,7 @@ For sydraQL specifically, `code` now distinguishes:
 
 - `parse_failed` – lexer/parser failures such as unexpected tokens or malformed literals
 - `validation_failed` – syntactically valid queries that fail semantic validation
-- `unsupported_query_shape` – shapes that the current compiled/runtime contract does not support
+- compiler/runtime contract reasons such as `unsupported_statement`, `unsupported_grouping`, `unsupported_projection`, `unsupported_ordering`, `unsupported_predicate`, `unsupported_expression`, `unsupported_function`, `series_not_found`, `ambiguous_selector`, and `shadow_mismatch`
 - `shadow_mismatch` – shadow-mode verification failures
 - `query_too_large` – query text exceeds the current `65536` byte execution ceiling
 - `execution_error` – other runtime failures that do not fit the categories above
@@ -272,7 +272,6 @@ For sydraQL specifically, `code` now distinguishes:
 `stats.fallback_reason` uses a stable taxonomy for the current alpha subset:
 
 - `unsupported_statement`
-- `unsupported_fill`
 - `unsupported_tag_filter`
 - `unsupported_grouping`
 - `unsupported_aggregate`

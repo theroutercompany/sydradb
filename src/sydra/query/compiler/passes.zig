@@ -14,7 +14,6 @@ pub fn buildTypedSelect(
 ) errors.CompileError!ir.TypedQuery {
     if (statement.* != .select) return error.UnsupportedStatement;
     const select = statement.select;
-    if (select.fill != null) return error.UnsupportedFill;
 
     const deferred_features = &[_]ir.DeferredFeature{};
     const allow_tag_identifiers = bound_selector != null;
