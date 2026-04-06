@@ -584,18 +584,16 @@ pub const Engine = struct {
     }
 
     pub fn snapshotTo(self: *Engine, dst_path: []const u8) !void {
-        try waitForQueueEmpty(self, 5_000);
-        self.stop_flag = true;
-        self.queue.close();
-        if (self.writer_thread) |t| {
-            t.join();
-            self.writer_thread = null;
-        }
+        try pauseWriterForMaintenance(self);
+        errdefer resumeWriterAfterMaintenance(self) catch |err| {
+            std.log.err("failed to resume writer after snapshotTo: {s}", .{@errorName(err)});
+        };
         const flushed = try flushMemtable(self);
         if (flushed) try self.syncCasSnapshot("snapshot-flush");
         try self.wal.file.sync();
         if (!flushed or self.cas == null) try self.ensureSnapshotBundleHead();
         try @import("snapshot.zig").snapshot(self.alloc, self.config.data_dir, dst_path, self.config.fsync);
+        try resumeWriterAfterMaintenance(self);
     }
 
     pub fn ingest(self: *Engine, item: IngestItem) !void {
@@ -1258,6 +1256,11 @@ pub const Engine = struct {
     }
 
     pub fn compactNow(self: *Engine) !bool {
+        try pauseWriterForMaintenance(self);
+        errdefer resumeWriterAfterMaintenance(self) catch |err| {
+            std.log.err("failed to resume writer after compaction: {s}", .{@errorName(err)});
+        };
+        _ = try flushMemtable(self);
         if (self.cas) |*cas| {
             try self.metadata.refreshCasIndexIfStale(cas);
         }
@@ -1269,6 +1272,7 @@ pub const Engine = struct {
             try self.createMaintenanceCheckpoint("compaction");
             try self.syncCasSnapshot("compaction");
         }
+        try resumeWriterAfterMaintenance(self);
         return changed;
     }
 
@@ -2748,6 +2752,10 @@ test "engine snapshotTo captures a restorable CAS bundle" {
         engine.noteTags(sid, "{\"host\":\"snapshot\"}");
 
         try engine.snapshotTo(snapshot_path);
+        try std.testing.expect(engine.writer_thread != null);
+        try std.testing.expectEqual(false, engine.metrics.maintenance_pause_active.load(.monotonic));
+        try engine.ingest(.{ .series_id = sid, .ts = 1_010, .value = 12.0, .tags_json = "{}" });
+        try engine.waitForQueryablePoints(talloc, sid, 3, 1_000);
     }
 
     {
@@ -3027,14 +3035,19 @@ test "engine primary mode compacts from CAS-backed segment descriptors without s
         defer engine.deinit();
 
         try std.testing.expect(try engine.compactNow());
+        try std.testing.expect(engine.writer_thread != null);
+        try std.testing.expectEqual(false, engine.metrics.maintenance_pause_active.load(.monotonic));
+        try engine.ingest(.{ .series_id = sid, .ts = 2_000, .value = 3.0, .tags_json = "{}" });
+        try engine.waitForQueryablePoints(talloc, sid, 3, 1_000);
         try std.testing.expectEqual(@as(usize, 1), engine.metadata.manifest.entries.items.len);
 
         var results = std.array_list.Managed(types.Point).init(talloc);
         defer results.deinit();
         try engine.queryRange(sid, 0, 10_000, &results);
-        try std.testing.expectEqual(@as(usize, 2), results.items.len);
+        try std.testing.expectEqual(@as(usize, 3), results.items.len);
         try std.testing.expectEqual(@as(i64, 1_000), results.items[0].ts);
         try std.testing.expectApproxEqAbs(@as(f64, 2.0), results.items[1].value, 1e-9);
+        try std.testing.expectApproxEqAbs(@as(f64, 3.0), results.items[2].value, 1e-9);
     }
 }
 
