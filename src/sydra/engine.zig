@@ -603,7 +603,7 @@ pub const Engine = struct {
         var last_flush = std.time.milliTimestamp();
         var last_sync = last_flush;
         var last_pop_ns = std.time.nanoTimestamp();
-        while (!self.stop_flag) {
+        while (true) {
             if (self.queue.pop()) |it| {
                 defer self.alloc.free(it.tags_json);
                 const now_ns = std.time.nanoTimestamp();
@@ -638,7 +638,10 @@ pub const Engine = struct {
                     std.log.warn("failed to append to memtable: {s}", .{@errorName(err)});
                     continue;
                 }
-            } else sleepMs(10);
+            } else {
+                if (self.stop_flag) break;
+                sleepMs(10);
+            }
 
             const now = std.time.milliTimestamp();
             const mem_usage = self.mem.bytes.load(.monotonic);
@@ -2474,6 +2477,50 @@ test "engine quarantines failed ingest payloads with selector metadata" {
     try std.testing.expectEqualStrings("{\"host\":\"a\",\"rack\":\"r1\"}", obj.get("tags_json").?.string);
     try std.testing.expectEqualStrings("wal_append", obj.get("stage").?.string);
     try std.testing.expectEqualStrings("SyntheticFailure", obj.get("error").?.string);
+}
+
+test "engine writer loop drains queued ingests during shutdown" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/shutdown-drain", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 60_000,
+        .memtable_max_bytes = 1024 * 1024,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const sid = types.hash64("shutdown.drain.series");
+    try pauseWriterForMaintenance(engine);
+    engine.queue.reopen();
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.0, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 20, .value = 2.0, .tags_json = "{}" });
+    engine.stop_flag = true;
+    engine.queue.close();
+
+    engine.writerLoop();
+
+    var results = std.array_list.Managed(types.Point).init(talloc);
+    defer results.deinit();
+    try engine.queryRange(sid, 0, 10_000, &results);
+    try std.testing.expectEqual(@as(usize, 2), results.items.len);
+    try std.testing.expectEqual(@as(i64, 10), results.items[0].ts);
+    try std.testing.expectEqual(@as(i64, 20), results.items[1].ts);
 }
 
 test "engine snapshotTo captures a restorable CAS bundle" {
