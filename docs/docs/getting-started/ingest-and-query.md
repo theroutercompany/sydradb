@@ -11,6 +11,13 @@ tags:
 
 [`POST /api/v1/ingest`](../reference/http-api.md#post-apiv1ingest) accepts NDJSON (newline-delimited JSON). Each line is an object with:
 
+- Preferred telemetry envelope:
+  - `metric` (string, required)
+  - `ts` (integer, required)
+  - `value` (number, optional)
+  - `fields` (object, optional): numeric-only sibling metrics
+  - `labels` (object, optional)
+  - `kind`, `unit`, `description` (optional metric metadata)
 - `series` (string, required)
 - `ts` (integer, required)
 - `value` (number, optional)
@@ -20,7 +27,7 @@ tags:
 Example:
 
 ```sh
-curl -XPOST localhost:8080/api/v1/ingest --data-binary $'{"series":"weather.room1","ts":1694300000,"value":24.2,"tags":{"site":"home","sensor":"a"}}\\n'
+curl -XPOST localhost:8080/api/v1/ingest --data-binary $'{"metric":"requests_total","ts":1694300000,"value":42,"labels":{"service":"api","host":"edge-1"},"kind":"counter","unit":"requests"}\\n'
 ```
 
 Response:
@@ -36,7 +43,7 @@ Response:
 [`POST /api/v1/query/range`](../reference/http-api.md#post-apiv1queryrange) takes JSON:
 
 ```json
-{"series":"weather.room1","start":1694290000,"end":1694310000}
+{"metric":"requests_total","labels":{"service":"api","host":"edge-1"},"start":1694290000,"end":1694310000}
 ```
 
 You can also pass `series_id` (integer) instead of `series`.
@@ -52,6 +59,8 @@ The response is a JSON array of points:
 [`GET /api/v1/query/range`](../reference/http-api.md#get-apiv1queryrange) supports:
 
 - `series_id=<u64>` (preferred) or `series=<string>`
+- `metric=<string>`
+- `labels=<string>` (canonical JSON object)
 - `tags=<string>` (defaults to `{}`) — passed into the series hash as-is
 - `start=<i64>` (required)
 - `end=<i64>` (required)
@@ -62,7 +71,15 @@ Example:
 curl 'http://localhost:8080/api/v1/query/range?series=weather.room1&start=1694290000&end=1694310000'
 ```
 
-## Find series by tags (HTTP)
+## Discover metrics and series (HTTP)
+
+`POST /api/v1/metrics/find` returns metric descriptors such as `metric`, `kind`, `series_count`, `label_keys`, and time bounds.
+
+`POST /api/v1/series/find` returns exact series descriptors for one metric family, including canonical `labels`.
+
+`POST /api/v1/labels/values` returns known values for one label key, optionally scoped to a metric family.
+
+## Find series by tags (legacy HTTP)
 
 [`POST /api/v1/query/find`](../reference/http-api.md#post-apiv1queryfind) accepts JSON:
 

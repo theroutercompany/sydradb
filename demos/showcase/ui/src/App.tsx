@@ -1,6 +1,6 @@
 import { startTransition, useDeferredValue, useEffect, useState } from "react";
 
-import type { DemoStateResponse, ScenarioRunResult, ScenarioStepResult } from "../../shared/contracts.js";
+import type { DemoStateResponse, EvidencePanel, ScenarioRunResult, ScenarioStepResult } from "../../shared/contracts.js";
 import { fetchState, resetSession, runScenario } from "./api.js";
 
 type ThemeMode = "dark" | "light";
@@ -47,43 +47,43 @@ const LAUNCH_CARDS: LaunchCardDefinition[] = [
   {
     id: "edge-story",
     order: "01",
-    eyebrow: "Incident setup",
-    title: "Edge fleet story",
-    body: "This demo starts with three local SydraDB storage instances: edge-east, edge-west, and HQ. Edge-east receives a bad rollout and becomes the problem site; the rest of the fleet gives you the control group.",
+    eyebrow: "What goes in",
+    title: "Local telemetry at the edge",
+    body: "Think of SydraDB here as the local time-series store behind each gateway or service. In the demo, edge-east, edge-west, and HQ each run their own SydraDB storage instance and ingest tagged power telemetry.",
     bullets: [
-      "Baseline telemetry is seeded into both edge sites before the incident lands.",
-      "Only edge-east picks up the bad state, so CAS history has something concrete to investigate and reverse.",
-      "Start with history and recovery to diff the checkpoint, inspect the reflog, and move heads/main back to the safe commit.",
+      "Applications, collectors, or gateway processes write tagged numeric points into SydraDB over `/api/v1/ingest` or the CLI ingest path.",
+      "Queries come back through range APIs or sydraQL, so the database is useful before anyone touches CAS internals.",
+      "Edge-east later takes on bad state, which gives the demo a realistic storage problem to inspect and recover from.",
     ],
-    ctaLabel: "start here",
+    ctaLabel: "see incident",
     scenarioId: "cas-history",
   },
   {
     id: "maintenance-lane",
     order: "02",
-    eyebrow: "Operational proof",
-    title: "Ops and exchange lane",
-    body: "Once the rollback story makes sense, the next question is whether the storage remains inspectable, repairable, and movable under operational pressure.",
+    eyebrow: "What ops gets",
+    title: "Recoverable and inspectable storage",
+    body: "Once the data has landed, SydraDB gives operators and mid-level engineers a storage model they can inspect, repair, roll back, and move without treating the database like a black box.",
     bullets: [
-      "Pack, fsck, GC, and vacuum show the storage stays healthy after the incident and rollback path.",
-      "Bundle, clone, fetch, and push show that the same state can move toward HQ without inventing a separate replication demo.",
-      "This is the part of the story where SydraDB stops looking like a database file and starts looking like an operational data model.",
+      "History and recovery show what changed and how the active storage head can move back to a safe checkpoint.",
+      "Pack, fsck, GC, vacuum, bundle, clone, fetch, and push show that the same storage stays healthy and movable after the incident.",
+      "This is the point where SydraDB stops looking like just another embedded database file and starts looking like an operational storage model.",
     ],
-    ctaLabel: "continue",
+    ctaLabel: "see ops lane",
     scenarioId: "cas-maintenance",
   },
   {
     id: "compiler-lane",
     order: "03",
-    eyebrow: "Query visibility",
-    title: "Compiler evidence lane",
-    body: "The same fleet fixtures also power the sydraQL and compiler scenarios, so query execution evidence stays attached to the operational story instead of drifting into a synthetic benchmark.",
+    eyebrow: "What developers see",
+    title: "Queries with visible execution paths",
+    body: "The same fleet data also drives sydraQL and compiler scenarios, so developers can see not just query answers but how the engine executed them.",
     bullets: [
-      "Use the compiler scenarios to inspect compiled, shadow, and legacy behavior on real seeded edge data.",
-      "Trace ids, execution mode, and fallback fields make the engine's decision path visible while compiler work is still moving quickly.",
-      "This is where the showcase answers not just what SydraDB stores, but how it reasons about the fleet data in flight.",
+      "Trace ids, execution mode, and fallback fields make the query path explainable to engineers and SREs.",
+      "Compiled mode and shadow verification let the team roll out query work without going blind, while fallback fields show when legacy execution had to take over.",
+      "This is where the demo answers not just what SydraDB stores, but how it behaves while serving that data.",
     ],
-    ctaLabel: "inspect",
+    ctaLabel: "see query lane",
     scenarioId: "sydraql-compiler",
   },
 ];
@@ -139,7 +139,7 @@ const SCENARIO_READING_GUIDES: Record<string, ScenarioReadingGuide> = {
   },
   "sydraql-compiler": {
     story:
-      "This run is the compiler rollout story in operational form. Instead of asking reviewers to trust compiler progress abstractly, it shows how compiled, shadow, and legacy paths behave on relatable fleet data.",
+      "This run is the compiler rollout story in operational form. Instead of asking reviewers to trust compiler progress abstractly, it shows how compiled and shadow paths behave on relatable fleet data, plus when they still fall back to legacy execution.",
     manager:
       "Read this as controlled change management. The system can expose when the new path runs, when it falls back, and why, which makes rapid compiler work easier to review responsibly.",
     engineer:
@@ -288,10 +288,6 @@ const STEP_GUIDE_OVERRIDES: Record<string, Record<string, Partial<StepReadingGui
       lookFor:
         "Shadow output is about rollout safety. For managers it says “we can compare paths”; for engineers it says “we can see fallback behavior clearly.”",
     },
-    legacy: {
-      meaning:
-        "This is the older reference path the newer compiler behavior is being measured against.",
-    },
   },
 };
 
@@ -322,7 +318,7 @@ const SCENARIO_MODEL_GUIDES: Record<string, ScenarioModelGuide> = {
   },
   "sydraql-compiler": {
     focus:
-      "This scenario proves that the compiler rollout is observable. Compiled, shadow, and legacy paths can all be reasoned about against the same seeded fleet state.",
+      "This scenario proves that the compiler rollout is observable. Compiled and shadow paths can be reasoned about against the same seeded fleet state, and legacy fallback remains visible when the newer path does not apply.",
     operatorQuestion:
       "If a new query path is being rolled out, can I tell whether the system used it, fell back, or disagreed with an older path?",
   },
@@ -363,6 +359,7 @@ function persistLaunchCardsHidden(): void {
 }
 
 function formatValue(value: unknown): string {
+  if (value === undefined) return "Not available";
   if (typeof value === "string") return value;
   return JSON.stringify(value, null, 2);
 }
@@ -385,17 +382,53 @@ function getStepGuide(scenarioId: string | undefined, step: ScenarioStepResult):
   };
 }
 
+function readValueByPath(target: unknown, path?: string): unknown {
+  if (!path || path === "") {
+    return target;
+  }
+
+  return path.split(".").reduce<unknown>((current, key) => {
+    if (current == null) {
+      return undefined;
+    }
+    if (Array.isArray(current)) {
+      const index = Number(key);
+      return Number.isInteger(index) ? current[index] : undefined;
+    }
+    if (typeof current === "object") {
+      return (current as Record<string, unknown>)[key];
+    }
+    return undefined;
+  }, target);
+}
+
+function getPanelValue(step: ScenarioStepResult, panel: EvidencePanel): unknown {
+  if (panel.kind === "command") {
+    return step.command ?? step.textOutput ?? step.output;
+  }
+
+  return readValueByPath(step.output, panel.sourcePath);
+}
+
 function StepCard({
   scenarioId,
   step,
   index,
+  panels,
 }: {
   scenarioId?: string;
   step: ScenarioStepResult;
   index: number;
+  panels: EvidencePanel[];
 }) {
   const [open, setOpen] = useState(step.status === "failed");
   const guide = getStepGuide(scenarioId, step);
+  const renderedPanels = panels
+    .map((panel) => ({
+      panel,
+      value: getPanelValue(step, panel),
+    }))
+    .filter(({ value }) => value !== undefined);
 
   return (
     <div className="step">
@@ -446,11 +479,22 @@ function StepCard({
               ))}
             </div>
           )}
-          {step.output != null && (
-            <div className="step__output">
-              <div className="step__output-label">Output</div>
-              <pre className="step__output-pre">{formatValue(step.output)}</pre>
+          {renderedPanels.length > 0 ? (
+            <div className="evidence-panels">
+              {renderedPanels.map(({ panel, value }) => (
+                <div key={panel.id} className="step__output">
+                  <div className="step__output-label">{panel.title}</div>
+                  <pre className="step__output-pre">{formatValue(value)}</pre>
+                </div>
+              ))}
             </div>
+          ) : (
+            step.output != null && (
+              <div className="step__output">
+                <div className="step__output-label">Output</div>
+                <pre className="step__output-pre">{formatValue(step.output)}</pre>
+              </div>
+            )
           )}
           {step.textOutput && (
             <div className="step__output">
@@ -628,8 +672,8 @@ export function ShowcaseDashboard({
                   <p className="main__description">{selected.manifest.summary}</p>
                 </div>
                 <div className="main__clarifier">
-                  Git-like terms here refer to SydraDB&apos;s internal storage model. `heads/main`, commits, reflogs,
-                  and checkpoints are storage-state concepts, not the application&apos;s source-code Git branch.
+                  SydraDB is a single-node time-series database for tagged telemetry. The Git-like terms in this demo
+                  describe SydraDB&apos;s internal storage model, not the application&apos;s source-code Git branch.
                 </div>
               </div>
 
@@ -733,7 +777,13 @@ export function ShowcaseDashboard({
                         )}
                         <div className="step-list">
                           {selectedRun.steps.map((step, i) => (
-                            <StepCard key={step.id} scenarioId={selected.manifest.id} step={step} index={i} />
+                            <StepCard
+                              key={step.id}
+                              scenarioId={selected.manifest.id}
+                              step={step}
+                              index={i}
+                              panels={selected.manifest.steps.find((manifestStep) => manifestStep.id === step.id)?.evidencePanels ?? []}
+                            />
                           ))}
                         </div>
                       </>
@@ -792,35 +842,62 @@ export function ShowcaseDashboard({
               {activeTab === "model" && (
                 <div className="content">
                   <div className="model-grid">
-                    <div className="model-section">
-                      <h3 className="context-section__title">Where SydraDB sits</h3>
+                    <div className="model-section model-section--wide">
+                      <h3 className="context-section__title">What SydraDB is for</h3>
                       <ul>
-                        <li>SydraDB is the local time-series database and storage engine running on each site.</li>
-                        <li>In this demo, `edge-east`, `edge-west`, and `hq` are separate SydraDB storage instances.</li>
-                        <li>The fictional application is not talking to Git here. It is talking to SydraDB over HTTP and CLI surfaces.</li>
+                        <li>SydraDB is for applications and systems that need to ingest tagged telemetry locally and query it quickly.</li>
+                        <li>The current strongest story is local numeric time-series data from services, collectors, gateways, and edge software.</li>
+                        <li>The differentiator is not just that it stores the data, but that the storage stays inspectable, recoverable, and syncable after the data lands.</li>
                       </ul>
                     </div>
 
                     <div className="model-section">
-                      <h3 className="context-section__title">How data gets into storage</h3>
+                      <h3 className="context-section__title">What SydraDB stores today</h3>
+                      <ul>
+                        <li>Tagged numeric time-series points: `series`, `ts`, `value`, and optional tags.</li>
+                        <li>Engine state such as WAL, segments, manifests, tag snapshots, and series catalog metadata.</li>
+                        <li>In CAS mode, internal storage history that enables rollback, diff, checkpoint, bundle, and maintenance workflows.</li>
+                      </ul>
+                    </div>
+
+                    <div className="model-section">
+                      <h3 className="context-section__title">Who uses it</h3>
+                      <ul>
+                        <li>Application engineers who need a local telemetry store behind a service, device, or gateway.</li>
+                        <li>Platform and edge teams who need durable local storage plus later movement or recovery.</li>
+                        <li>SRE, DevOps, and ops teams who need to understand what changed inside storage after a rollout or incident.</li>
+                      </ul>
+                    </div>
+
+                    <div className="model-section">
+                      <h3 className="context-section__title">How applications fill it</h3>
                       <ul>
                         <li>Producers emit telemetry points, which the demo seeds as NDJSON and POSTs to `POST /api/v1/ingest`.</li>
                         <li>The engine appends WAL data, updates in-memory state, and flushes segments as part of the normal time-series write path.</li>
-                        <li>Queries then read back through `POST /api/v1/query/range` or `POST /api/v1/sydraql` depending on the scenario.</li>
+                        <li>This means SydraDB is called first as the local write target for telemetry, not first as a maintenance tool.</li>
                       </ul>
                     </div>
 
                     <div className="model-section">
-                      <h3 className="context-section__title">What `cas_mode = dual_write` means</h3>
+                      <h3 className="context-section__title">How applications and operators read it</h3>
+                      <ul>
+                        <li>Applications and dashboards read back through `POST /api/v1/query/range` or `POST /api/v1/sydraql`.</li>
+                        <li>Operators and engineers inspect or maintain storage through `sydradb cas ...` commands and post-action verification queries.</li>
+                        <li>The demo is trying to show both sides: how the store gets filled and what the storage model buys you afterwards.</li>
+                      </ul>
+                    </div>
+
+                    <div className="model-section">
+                      <h3 className="context-section__title">What `cas_mode = dual_write` adds</h3>
                       <ul>
                         <li>SydraDB keeps writing the regular engine state, but it also writes an immutable CAS commit chain alongside it.</li>
                         <li>The active storage snapshot is pointed to by `heads/main` inside SydraDB&apos;s own ref namespace.</li>
-                        <li>That is why rollback, diff, reflog, pack, gc, bundle, and checkpoint operations can act on the storage model directly.</li>
+                        <li>That is what makes rollback, diff, reflog, pack, gc, bundle, and checkpoint operations meaningful at the storage level.</li>
                       </ul>
                     </div>
 
                     <div className="model-section">
-                      <h3 className="context-section__title">How reads use that model</h3>
+                      <h3 className="context-section__title">How reads use that storage model</h3>
                       <ul>
                         <li>`metadata_read_mode = legacy` reads the older compatibility path only.</li>
                         <li>`metadata_read_mode = shadow` serves legacy answers while cross-checking them against CAS.</li>
@@ -829,11 +906,20 @@ export function ShowcaseDashboard({
                     </div>
 
                     <div className="model-section">
-                      <h3 className="context-section__title">What ops and reliability teams touch</h3>
+                      <h3 className="context-section__title">Why not just SQLite here?</h3>
                       <ul>
-                        <li>Application or collector paths fill the store through ingest APIs.</li>
-                        <li>Operators and engineers inspect or repair the store through `sydradb cas ...` commands and engine/query verification steps.</li>
-                        <li>The showcase is meant to make both sides visible: how the store is filled and how the storage model behaves afterwards.</li>
+                        <li>SQLite can store measurements, but it does not give you built-in storage history, rollback, bundle, or reflog-aware maintenance semantics.</li>
+                        <li>SydraDB is useful when local telemetry storage and local storage operations both matter.</li>
+                        <li>The point of the demo is to show the full path: data in, queries out, and operational storage workflows in between.</li>
+                      </ul>
+                    </div>
+
+                    <div className="model-section">
+                      <h3 className="context-section__title">Where SydraDB sits in this demo</h3>
+                      <ul>
+                        <li>Each site in the story runs a local SydraDB instance: edge-east, edge-west, and HQ.</li>
+                        <li>The fictional application is not talking to Git here. It is talking to SydraDB over HTTP ingest, range APIs, sydraQL, and CLI maintenance commands.</li>
+                        <li>The incident story exists to make the product workflow concrete for someone evaluating whether SydraDB fits their own telemetry system.</li>
                       </ul>
                     </div>
 
