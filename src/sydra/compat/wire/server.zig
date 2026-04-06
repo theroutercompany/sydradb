@@ -1330,6 +1330,58 @@ test "sql core prepared path handles simple insert queries" {
     try waitForQueryablePoints(alloc, engine, sid, 1, 1_000);
 }
 
+test "sql core prepared path handles simple delete queries" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/pgwire-sql-core-delete", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .compiled,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    const sid = @import("../../types.zig").seriesIdFrom("writes.simple_delete", "{}");
+    try engine.registerSeries("writes.simple_delete", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.0, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 20, .value = 2.0, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 30, .value = 3.0, .tags_json = "{}" });
+
+    var allocating_writer: std.Io.Writer.Allocating = .init(alloc);
+    defer allocating_writer.deinit();
+
+    const handled = try handleSqlCorePreparedQuery(
+        alloc,
+        anyWriter(&allocating_writer.writer),
+        engine,
+        "DELETE FROM writes.simple_delete WHERE time >= 20",
+    );
+    try std.testing.expect(handled == .handled);
+    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "DELETE 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "execution_mode=sql_core_vm") != null);
+
+    var points = std.array_list.Managed(@import("../../types.zig").Point).init(alloc);
+    defer points.deinit();
+    try engine.queryRange(sid, std.math.minInt(i64), std.math.maxInt(i64), &points);
+    try std.testing.expectEqual(@as(usize, 1), points.items.len);
+    try std.testing.expectEqual(@as(i64, 10), points.items[0].ts);
+}
+
 test "extended protocol executes direct SQL prepared statements" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
