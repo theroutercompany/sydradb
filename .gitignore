@@ -34,3 +34,4 @@ docs/build/
 docs/coverage/
 docs/.vite/
 docs/**/*.tsbuildinfo
+.gstack/
