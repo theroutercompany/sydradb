@@ -356,6 +356,17 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         }
         return;
     }
+    if (std.mem.eql(u8, sub, "head")) {
+        if (args.len >= 4) {
+            const target = std.mem.sliceTo(args[3], 0);
+            if (try cas.refs.readHead(target) == null) return error.RefNotFound;
+            try cas.writeHeadSymRef(target);
+        }
+        const head = try cas.readHeadSymRef() orelse try alloc.dupe(u8, cas_mod.main_ref);
+        defer alloc.free(head);
+        std.debug.print("cas head {s}\n", .{head});
+        return;
+    }
     if (std.mem.eql(u8, sub, "log")) {
         const spec = if (args.len >= 4) std.mem.sliceTo(args[3], 0) else cas_mod.main_ref;
         const entries = try cas.loadLog(spec, 64);

@@ -46,7 +46,9 @@ Under `data_dir`, the engine uses:
 - `reftable/` – append-only reftable stack for migrated/new repository refs and reflogs
   - `tables.list` – ordered active reftable stack
   - `state` – monotonic next-update counter for update-indexed table naming
+  - `info/summary` – rebuildable table summary index for key-range and reflog-range pruning
   - `<min_update>-<max_update>.table` – update-indexed reftable files, including tombstones when refs are deleted
+- `symrefs/` – symbolic ref targets such as local `HEAD` and mirrored remote HEAD targets
 - `lost-found/` – optional fsck output for dangling commit/blob/tree ids
 
 ## WAL format (v0)
@@ -181,6 +183,7 @@ Operational notes:
 - `objects/info/commit-graph` version 2 stores fixed-width Bloom filters for logical metadata paths such as `metadata/segments`, `metadata/tags`, `metadata/series_catalog`, and `wal/*`.
 - Active packs now carry adjacent `.manifest` files with per-type object counts and pack checksums; `cas fsck` validates those manifests before trusting mixed-pack reachability.
 - Reftable writes now use update-indexed table names, a persisted `reftable/state` counter, and block-indexed v3 tables with separate ref and reflog block indexes plus a footer checksum. Readers remain compatible with older flat v1/v2 tables and rewrite them into the current format during compaction or upgrade.
+- Runtime reftable lookups now use `reftable/info/summary` plus block-level cursor reads so `readRef`, `listRefs`, and ref-scoped reflog reads no longer decode entire v3 tables by default.
 - `cas fsck --repair` only rebuilds derivable metadata: active-pack reverse indexes and manifests, `objects/info/*` side indexes, and `reftable/state` plus `reftable/tables.list`. It never rewrites commit, tree, or blob payloads.
 - `cas fsck --connectivity-only` limits validation to refs, reflogs, reachable objects, commit-graph consistency, and dangling detection.
 - `cas fsck --lost-found` writes dangling commit/blob/tree ids into `lost-found/`.

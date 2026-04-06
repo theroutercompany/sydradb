@@ -107,6 +107,7 @@ Apache-2.0
 ./zig-out/bin/sydradb cas bundle apply <bundle_dir>
 ./zig-out/bin/sydradb cas verify
 ./zig-out/bin/sydradb cas refs
+./zig-out/bin/sydradb cas head [ref]
 ./zig-out/bin/sydradb cas log [heads/main]
 ./zig-out/bin/sydradb cas branch <name> [spec]
 ./zig-out/bin/sydradb cas tag <name> [spec]
@@ -156,8 +157,10 @@ Config notes:
 - WAL recovery order is sourced from the CAS commit graph when CAS is enabled, with any uncaptured live WAL files appended as tail replay.
 - `snapshot`/`restore` now operate on CAS bundles. A restored bundle only materializes `objects/` and `refs/`; use `metadata_read_mode = "primary"` for mirrorless startup, or run `cas checkout` / `cas export-legacy` if you need compatibility files regenerated.
 - `objects/info/pack-inventory` records the active pack set with stable BLAKE3 digests and object counts, and bundle manifests now use format v4 so they can describe the exact exported pack subset plus prerequisite refs.
+- `reftable/info/summary` is a rebuildable side index over active tables. It records ref key ranges, reflog ranges, update spans, and tombstone presence so runtime lookups can skip irrelevant tables before decoding blocks.
 - `cas clone` now supports an explicit `--borrow` mode. The default path remains owned and pack-preserving; `--borrow` initializes the destination refs immediately and keeps object lookup backed by the source repository through alternates.
 - `cas fetch-local` still tracks source refs under `remotes/<repository-id>/...` and borrows source object storage by default. `--materialize` imports the reachable borrowed objects into the destination and clears alternates afterward.
+- Reftable-backed repositories now persist symbolic heads under `symrefs/`. `cas head` reads or updates the local `HEAD` target, and `cas fetch-local` mirrors a source `HEAD` target into `symrefs/remotes/<repository-id>/HEAD` when the source publishes one.
 - `cas push-local` now defaults to owned transfer: it fast-forwards the destination `heads/main`, materializes the pushed reachable objects locally, and leaves the destination independent of the source. Use `--borrow` only when you explicitly want alternates-backed storage.
 - Sealed segment and WAL payloads are chunked into CAS extent trees; `cas checkout` / `cas export-legacy` materialize mirror files by walking those trees rather than depending on legacy blobs.
 - Segment descriptors now carry a canonical native `segment_root` tree for sealed segment data. Each root stores a `meta` blob plus per-block `stats`, `ts`, and `values` objects so later read paths can skip blocks without materializing a full `.seg` file.
