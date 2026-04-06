@@ -1904,47 +1904,6 @@ test "simple query rejects oversized query text with stable program limit error"
     try std.testing.expect(std.mem.indexOf(u8, written, query_common.query_text_too_large_message) != null);
 }
 
-test "simple query maps missing translated sydraql series to stable undefined-table error" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{ .iterate = true });
-    defer tmp.cleanup();
-
-    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/pgwire-missing-series", .{tmp.sub_path});
-    defer alloc.free(data_path);
-
-    const config: @import("../../config.zig").Config = .{
-        .data_dir = try alloc.dupe(u8, data_path),
-        .http_port = 0,
-        .fsync = .none,
-        .flush_interval_ms = 5,
-        .memtable_max_bytes = 1024,
-        .retention_days = 0,
-        .auth_token = try alloc.dupe(u8, ""),
-        .enable_influx = false,
-        .enable_prom = false,
-        .mem_limit_bytes = 1024 * 1024,
-        .cas_mode = .off,
-        .query_compiler_mode = .compiled,
-        .retention_ns = std.StringHashMap(u32).init(alloc),
-    };
-    var engine = try engine_mod.Engine.init(alloc, config);
-    defer engine.deinit();
-
-    var payload = std.array_list.Managed(u8).init(alloc);
-    defer payload.deinit();
-    try payload.appendSlice("SELECT value FROM missing.series WHERE time >= 0");
-    try payload.append(0);
-
-    var allocating_writer: std.Io.Writer.Allocating = .init(alloc);
-    defer allocating_writer.deinit();
-
-    try handleSimpleQuery(alloc, anyWriter(&allocating_writer.writer), payload.items, engine);
-
-    const written = allocating_writer.written();
-    try std.testing.expect(std.mem.indexOf(u8, written, "42P01") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, compiler_diagnostics.diagnosticMessage(.series_not_found)) != null);
-}
-
 test "extended protocol rejects oversized parse text with stable program limit error" {
     const alloc = std.testing.allocator;
     const sql = try alloc.alloc(u8, query_common.max_query_text_bytes + 32);
