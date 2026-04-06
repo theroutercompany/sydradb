@@ -123,11 +123,11 @@ compiled_response="$(post_until_contains \
 
 fallback_response="$(post_until_contains \
   "http://127.0.0.1:$PORT/api/v1/sydraql" \
-  "select abs(-1)" \
+  "select time_bucket(60, time) as bucket, avg(value) as avg_value from weather.room1 where time >= 0 group by time_bucket(60, time) fill(linear) order by bucket desc" \
   "$workdir/server.log" \
   '"rows"' \
   '"legacy_fallback":true' \
-  '"fallback_reason":"unsupported_function"')"
+  '"fallback_reason":"unsupported_fill"')"
 
 failure_headers="$(mktemp)"
 failure_body="$(mktemp)"

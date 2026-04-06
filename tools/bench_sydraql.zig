@@ -219,7 +219,7 @@ pub fn main() !void {
         .{ .name = "raw_scan_limit", .query = "select time, value from weather.room1 where time >= 0 order by time limit 10" },
         .{ .name = "grouped_aggregate", .query = "select avg(value) from weather.room1 where time >= 0 group by time_bucket(60, time)" },
         .{ .name = "selector_tag_read", .query = "select tag.host as host, avg(value) as avg_value from tagged.room1 where tag.host = 'web' group by tag.host" },
-        .{ .name = "unsupported_fallback", .query = "select abs(-1)" },
+        .{ .name = "unsupported_fallback", .query = "select time_bucket(60, time) as bucket, avg(value) as avg_value from weather.room1 where time >= 0 group by time_bucket(60, time) fill(linear) order by bucket desc" },
     };
     const cardinalities = [_]usize{ 2, 100, 10_000 };
 

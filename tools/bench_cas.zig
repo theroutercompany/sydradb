@@ -4,6 +4,7 @@ const cas_mod = sydra.cas;
 const cfg = sydra.config;
 const engine_mod = sydra.engine;
 const manifest_mod = sydra.manifest;
+const metric_catalog_mod = sydra.metric_catalog;
 const series_catalog_mod = sydra.series_catalog;
 const tags_mod = sydra.tags;
 const types = sydra.types;
@@ -95,7 +96,9 @@ fn bootstrapHead(alloc: std.mem.Allocator, cas: *cas_mod.CasManager, data_dir: s
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(alloc, data_dir, .none);
     defer series_catalog.deinit();
-    _ = try cas.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(alloc, data_dir, .none);
+    defer metric_catalog.deinit();
+    _ = try cas.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
 }
 
 fn runFreshPrimaryScenario(alloc: std.mem.Allocator) !void {

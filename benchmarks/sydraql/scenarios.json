@@ -23,7 +23,7 @@
     },
     {
       "name": "unsupported_fallback",
-      "query": "select abs(-1)"
+      "query": "select time_bucket(60, time) as bucket, avg(value) as avg_value from weather.room1 where time >= 0 group by time_bucket(60, time) fill(linear) order by bucket desc"
     }
   ],
   "metrics": [

@@ -204,6 +204,8 @@ pub fn build(b: *std.Build) void {
     const bench_run = b.addRunArtifact(bench_exe);
     if (b.args) |args| bench_run.addArgs(args);
     b.step("bench-alloc", "Run allocator ingest benchmark").dependOn(&bench_run.step);
+    const bench_smoke = b.step("bench-smoke", "Run allocator, sydraQL, and CAS benchmark smoke scenarios");
+    bench_smoke.dependOn(&bench_run.step);
 
     const bench_sydraql_exe = if (is015) blk5: {
         const root_mod = b.createModule(.{ .root_source_file = b.path("tools/bench_sydraql.zig"), .target = target, .optimize = optimize });
@@ -240,6 +242,7 @@ pub fn build(b: *std.Build) void {
     const bench_sydraql_run = b.addRunArtifact(bench_sydraql_exe);
     if (b.args) |args| bench_sydraql_run.addArgs(args);
     b.step("bench-sydraql", "Run compiled SydraQL benchmark scenarios").dependOn(&bench_sydraql_run.step);
+    bench_smoke.dependOn(&bench_sydraql_run.step);
 
     const bench_cas_exe = if (is015) blk6: {
         const root_mod = b.createModule(.{ .root_source_file = b.path("tools/bench_cas.zig"), .target = target, .optimize = optimize });
@@ -276,4 +279,5 @@ pub fn build(b: *std.Build) void {
     const bench_cas_run = b.addRunArtifact(bench_cas_exe);
     if (b.args) |args| bench_cas_run.addArgs(args);
     b.step("bench-cas", "Run CAS bundle maintenance and local transfer benchmarks").dependOn(&bench_cas_run.step);
+    bench_smoke.dependOn(&bench_cas_run.step);
 }
