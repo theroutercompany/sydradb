@@ -437,6 +437,7 @@ fn handleSimpleQuery(
     switch (try handleSqlCorePreparedQuery(alloc, writer, engine, trimmed)) {
         .handled => return,
         .fallback => |reason| {
+            defer alloc.free(reason);
             const notice = try std.fmt.allocPrint(alloc, "sql_prepare_fallback=translator reason={s}", .{reason});
             defer alloc.free(notice);
             try protocol.writeNoticeResponse(writer, notice);
@@ -867,8 +868,9 @@ fn handleSqlCorePreparedQuery(
     var stmt = prepared_query.prepareSqlCore(alloc, engine, sql, .{}) catch |err| switch (err) {
         error.OutOfMemory => return err,
         error.NotImplemented => {
-            log.debug("sql_core prepared path falling back for {s}: {s}", .{ sql, @errorName(err) });
-            return .{ .fallback = @errorName(err) };
+            const reason = try classifySqlPrepareFallback(alloc, sql);
+            log.debug("sql_core prepared path falling back for {s}: {s}", .{ sql, reason });
+            return .{ .fallback = reason };
         },
         else => {
             try protocol.writeErrorResponse(writer, "ERROR", "42601", @errorName(err));
@@ -928,6 +930,20 @@ fn handleSqlCorePreparedQuery(
     try protocol.writeCommandComplete(writer, tag);
     try protocol.writeReadyForQuery(writer, 'I');
     return .handled;
+}
+
+fn classifySqlPrepareFallback(alloc: std.mem.Allocator, sql: []const u8) ![]const u8 {
+    var skeleton = try frontend.sql_core.parseSqlCoreSkeleton(alloc, sql);
+    defer skeleton.deinit();
+
+    if (skeleton.stmt == null) {
+        if (skeleton.diagnostics.len != 0) {
+            const code = @tagName(skeleton.diagnostics[0].code);
+            return try std.fmt.allocPrint(alloc, "frontend_{s}", .{code});
+        }
+        return try alloc.dupe(u8, "frontend_uncovered");
+    }
+    return try alloc.dupe(u8, "compiler_not_implemented");
 }
 
 fn handleSydraqlQuery(
@@ -1598,7 +1614,7 @@ test "simple query writes explicit translator fallback notice for uncovered SQL"
     try handleSimpleQuery(alloc, anyWriter(&allocating_writer.writer), payload.items, engine);
 
     const written = allocating_writer.written();
-    try std.testing.expect(std.mem.indexOf(u8, written, "sql_prepare_fallback=translator reason=NotImplemented") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "sql_prepare_fallback=translator reason=compiler_not_implemented") != null);
 }
 
 test "extended protocol suspends and resumes portals" {

@@ -42,6 +42,8 @@ pub const BindingContext = struct {
     named_parameters: []const NamedParameterBinding = &.{},
     parameter_descriptions: []const ParameterDescription = &.{},
     translation_fallback: bool = false,
+    generated_frontend_used: bool = false,
+    fallback_reason: ?[]const u8 = null,
 
     pub fn parameterCount(self: @This()) usize {
         return self.parameters.len;
@@ -235,6 +237,8 @@ pub const PreparedStmt = struct {
                 .parameters = normalized.parameters,
                 .named_parameters = normalized.named_parameters,
                 .translation_fallback = self.binding.translation_fallback,
+                .generated_frontend_used = self.binding.generated_frontend_used,
+                .fallback_reason = self.binding.fallback_reason,
             },
             self.flags,
             normalized,
@@ -269,6 +273,14 @@ pub const PreparedStmt = struct {
             .kind = self.binding.statement_kind,
             .produces_rows = statementKindProducesRows(self.binding.statement_kind),
         };
+    }
+
+    pub fn coverageUsed(self: *const PreparedStmt) bool {
+        return self.binding.generated_frontend_used;
+    }
+
+    pub fn fallbackReason(self: *const PreparedStmt) ?[]const u8 {
+        return self.binding.fallback_reason;
     }
 
     pub fn producesRows(self: *const PreparedStmt) bool {
@@ -451,6 +463,7 @@ pub fn prepareSydraQL(
             .diagnostics = shadow.diagnostics,
             .parameters = normalized.parameters,
             .named_parameters = normalized.named_parameters,
+            .generated_frontend_used = shadow.generated_stmt != null,
         },
         flags,
         normalized,
@@ -481,6 +494,7 @@ pub fn prepareSqlCore(
                 .diagnostics = skeleton.diagnostics,
                 .parameters = normalized.parameters,
                 .named_parameters = normalized.named_parameters,
+                .generated_frontend_used = skeleton.used_generated_runtime,
             },
             flags,
             normalized,
@@ -1981,6 +1995,39 @@ test "prepared statement executes parameterized deletes through the VM" {
     try engine.queryRange(sid, std.math.minInt(i64), std.math.maxInt(i64), &points);
     try std.testing.expectEqual(@as(usize, 1), points.items.len);
     try std.testing.expectEqual(@as(i64, 10), points.items[0].ts);
+}
+
+test "prepared statement surfaces frontend coverage metadata" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-coverage", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .legacy,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    var stmt = try prepareSqlCore(alloc, engine, "SELECT 1", .{});
+    defer stmt.finalize();
+
+    try std.testing.expect(stmt.coverageUsed());
+    try std.testing.expect(stmt.fallbackReason() == null);
 }
 
 test "binding context tracks named parameter slots" {
