@@ -2179,6 +2179,76 @@ test "engine replays wal on startup" {
     try engine.verifyCasState();
 }
 
+test "engine replays WAL registrations and points consistently across metadata modes" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/wal-mode-recovery", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const raw_tags = "{\"rack\":\"r1\",\"host\":\"a\"}";
+    const canonical_tags = "{\"host\":\"a\",\"rack\":\"r1\"}";
+    const sid = types.seriesIdFrom("wal.mode.series", raw_tags);
+
+    try std.fs.cwd().makePath(data_path);
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var wal = try wal_mod.WAL.open(talloc, data_dir, .none);
+    _ = try wal.appendSeriesRegistration(sid, "wal.mode.series", canonical_tags);
+    _ = try wal.append(sid, 1_000, 42.0);
+    _ = try wal.append(sid, 1_050, 43.5);
+    wal.close();
+
+    const modes = [_]cfg.MetadataReadMode{ .legacy, .shadow, .primary };
+    for (modes) |mode| {
+        const config = cfg.Config{
+            .data_dir = try talloc.dupe(u8, data_path),
+            .http_port = 0,
+            .fsync = .none,
+            .flush_interval_ms = 100,
+            .memtable_max_bytes = 1024,
+            .retention_days = 0,
+            .auth_token = try talloc.dupe(u8, ""),
+            .enable_influx = false,
+            .enable_prom = false,
+            .mem_limit_bytes = 1024 * 1024,
+            .cas_mode = .dual_write,
+            .metadata_read_mode = mode,
+            .retention_ns = std.StringHashMap(u32).init(talloc),
+        };
+
+        var engine = try Engine.init(talloc, config);
+        defer engine.deinit();
+
+        var results = std.array_list.Managed(types.Point).init(talloc);
+        defer results.deinit();
+        try engine.queryRange(sid, 0, 10_000, &results);
+        try std.testing.expectEqual(@as(usize, 2), results.items.len);
+        try std.testing.expectEqual(@as(i64, 1_000), results.items[0].ts);
+        try std.testing.expectApproxEqAbs(@as(f64, 42.0), results.items[0].value, 1e-9);
+        try std.testing.expectEqual(@as(i64, 1_050), results.items[1].ts);
+        try std.testing.expectApproxEqAbs(@as(f64, 43.5), results.items[1].value, 1e-9);
+
+        try std.testing.expectEqual(sid, switch (engine.resolveUniqueSeriesName("wal.mode.series")) {
+            .resolved => |resolved| resolved,
+            else => return error.TestUnexpectedResult,
+        });
+        try std.testing.expectEqual(sid, switch (try engine.resolveExactSeries("wal.mode.series", raw_tags)) {
+            .resolved => |resolved| resolved,
+            else => return error.TestUnexpectedResult,
+        });
+
+        const by_id = try engine.resolveSelector(.{ .by_id = sid });
+        try std.testing.expectEqual(series_catalog_mod.ResolutionStatus.resolved, by_id.status);
+        try std.testing.expectEqualStrings("wal.mode.series", by_id.series.?);
+        try std.testing.expectEqualStrings(canonical_tags, by_id.canonical_tags.?);
+        try std.testing.expectEqual(@as(u64, 0), engine.metrics.cas_shadow_mismatch_total.load(.monotonic));
+        try engine.verifyCasState();
+    }
+}
+
 test "engine replays only the uncaptured current wal tail after CAS snapshot recovery" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
