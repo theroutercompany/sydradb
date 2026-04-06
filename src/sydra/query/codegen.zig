@@ -502,13 +502,13 @@ fn rewriteOrderingExpr(
     expr: *const ast.Expr,
     projections: []const compiler.TypedProjection,
 ) !*const ast.Expr {
-    if (expr.* == .identifier) return expr;
+    if (expr.* == .identifier) return identifierExpr(allocator, expr.identifier.value);
 
     for (projections) |projection| {
         if (!expression.expressionsEqual(expr, projection.expr.expr)) continue;
         return identifierExpr(allocator, projection.name);
     }
-    return expr;
+    return error.UnsupportedPreparedQuery;
 }
 
 fn identifierExpr(allocator: std.mem.Allocator, name: []const u8) !*const ast.Expr {
