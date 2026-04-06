@@ -389,8 +389,17 @@ fn emitSchemaLoads(
         const register: i64 = @intCast(start_register + idx);
         switch (column.expr.*) {
             .identifier => |ident| {
-                const code = columnCode(ident.value) orelse return error.UnsupportedProjection;
-                try instructions.append(.{ .opcode = .column, .p1 = 0, .p2 = code, .p3 = register });
+                if (columnCode(ident.value)) |code| {
+                    try instructions.append(.{ .opcode = .column, .p1 = 0, .p2 = code, .p3 = register });
+                } else {
+                    const expr_id: u16 = @intCast(exprs.items.len);
+                    try exprs.append(column.expr);
+                    try instructions.append(.{
+                        .opcode = .function,
+                        .p1 = register,
+                        .p4 = .{ .expr = expr_id },
+                    });
+                }
             },
             .literal => {
                 const const_id: u16 = @intCast(constants.items.len);

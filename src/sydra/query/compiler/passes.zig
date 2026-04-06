@@ -575,7 +575,7 @@ fn trailingSegment(slice: []const u8) []const u8 {
 
 fn hasTagPrefix(slice: []const u8) bool {
     const dot = std.mem.indexOfScalar(u8, slice, '.') orelse return false;
-    return std.ascii.eqlIgnoreCase(slice[0..dot], "tag");
+    return std.ascii.eqlIgnoreCase(slice[0..dot], "tag") or std.ascii.eqlIgnoreCase(slice[0..dot], "label");
 }
 
 test "extractTimeRange merges bounded predicates" {

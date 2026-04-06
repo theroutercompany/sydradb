@@ -6,6 +6,7 @@ const plan = @import("plan.zig");
 const ast = @import("ast.zig");
 const types = @import("../types.zig");
 const engine_mod = @import("../engine.zig");
+const metric_catalog_mod = @import("../storage/metric_catalog.zig");
 const expression = @import("expression.zig");
 const value_mod = @import("value.zig");
 
@@ -20,11 +21,16 @@ const QueryRangeError = @typeInfo(@typeInfo(@TypeOf(engine_mod.Engine.queryRange
 pub const ExecuteError = std.mem.Allocator.Error || expression.EvalError || QueryRangeError || error{
     UnsupportedPlan,
     UnsupportedAggregate,
+    UnsupportedFill,
+    AmbiguousMetricFamilyQuery,
 };
 
 pub const Row = struct {
     schema: []const plan.ColumnInfo,
     values: []Value,
+    tags: []const expression.TagField = &.{},
+    series_id: ?types.SeriesId = null,
+    ts: ?i64 = null,
 };
 
 pub const Operator = struct {
@@ -81,12 +87,18 @@ pub const Operator = struct {
         rows_out: u64,
     };
 
+    pub const SelectorStats = struct {
+        mode: []const u8,
+        selected_series_count: u64,
+    };
+
     const Scan = struct {
         engine: *engine_mod.Engine,
-        series_id: ?types.SeriesId,
-        points: std.array_list.Managed(types.Point),
-        index: usize,
+        series: []ScanSeries,
+        series_index: usize,
         buffer: []Value,
+        selector_mode: []const u8,
+        selected_series_count: u64,
     };
 
     const OneRow = struct {
@@ -111,6 +123,8 @@ pub const Operator = struct {
         groups: ManagedArrayList(GroupState),
         key_buffer: ManagedArrayList(Value),
         output_buffer: []Value,
+        fill: ?ast.FillClause,
+        metric_kind: metric_catalog_mod.MetricKind,
         initialized: bool,
         index: usize,
     };
@@ -118,6 +132,7 @@ pub const Operator = struct {
     const Sort = struct {
         rows: ManagedArrayList(OwnedRow),
         index: usize,
+        selector_stats: ?SelectorStats = null,
     };
 
     const Limit = struct {
@@ -126,12 +141,13 @@ pub const Operator = struct {
         remaining: usize,
     };
 
-    const AggregateKind = enum { avg, sum, count, min, max, first, last };
+    const AggregateKind = enum { avg, sum, count, min, max, first, last, percentile, delta, rate, irate };
 
     const AggregateExpr = struct {
         expr: *const ast.Expr,
         kind: AggregateKind,
         args: []const *const ast.Expr,
+        quantile: f64 = 0,
     };
 
     const ColumnKind = enum { group, aggregate };
@@ -146,6 +162,27 @@ pub const Operator = struct {
         count: u64,
     };
 
+    const PercentileState = struct {
+        values: ManagedArrayList(f64),
+        quantile: f64,
+    };
+
+    const SeriesDerivativeState = struct {
+        series_id: types.SeriesId,
+        first_ts: i64,
+        last_ts: i64,
+        first_value: f64,
+        last_value: f64,
+        reset_accum: f64 = 0,
+        last_step_delta: ?f64 = null,
+        last_step_dt: ?i64 = null,
+    };
+
+    const DerivativeState = struct {
+        series: ManagedArrayList(SeriesDerivativeState),
+        metric_kind: metric_catalog_mod.MetricKind,
+    };
+
     const AggregateState = union(enum) {
         avg: AvgState,
         sum: f64,
@@ -154,6 +191,11 @@ pub const Operator = struct {
         max: OptionalValue,
         first: OptionalValue,
         last: OptionalValue,
+        percentile: PercentileState,
+        delta: DerivativeState,
+        rate: DerivativeState,
+        irate: DerivativeState,
+        filled: Value,
     };
 
     const OptionalValue = struct {
@@ -169,6 +211,16 @@ pub const Operator = struct {
     const OwnedRow = struct {
         values: []Value,
         keys: []Value,
+        tags: []const expression.TagField = &.{},
+        series_id: ?types.SeriesId = null,
+        ts: ?i64 = null,
+    };
+
+    const ScanSeries = struct {
+        series_id: types.SeriesId,
+        points: std.array_list.Managed(types.Point),
+        tags: []expression.TagField,
+        index: usize = 0,
     };
 
     pub fn collectStats(self: *Operator, list: *ManagedArrayList(Operator.StatsSnapshot)) !void {
@@ -189,6 +241,23 @@ pub const Operator = struct {
             .test_source,
             => {},
         }
+    }
+
+    pub fn selectorStats(self: *Operator) ?SelectorStats {
+        return switch (self.payload) {
+            .scan => |payload| .{
+                .mode = payload.selector_mode,
+                .selected_series_count = payload.selected_series_count,
+            },
+            .filter => |payload| payload.child.selectorStats(),
+            .project => |payload| payload.child.selectorStats(),
+            .aggregate => |payload| payload.child.selectorStats(),
+            .limit => |payload| payload.child.selectorStats(),
+            .sort => |payload| payload.selector_stats,
+            .one_row,
+            .test_source,
+            => null,
+        };
     }
 };
 
@@ -240,12 +309,13 @@ fn createScanOperator(allocator: std.mem.Allocator, engine: *engine_mod.Engine, 
 
     var payload = Operator.Scan{
         .engine = engine,
-        .series_id = null,
-        .points = std.array_list.Managed(types.Point).init(allocator),
-        .index = 0,
+        .series = try allocator.alloc(Operator.ScanSeries, 0),
+        .series_index = 0,
         .buffer = try allocator.alloc(Value, schema.len),
+        .selector_mode = "exact",
+        .selected_series_count = 0,
     };
-    errdefer payload.points.deinit();
+    errdefer allocator.free(payload.series);
     errdefer allocator.free(payload.buffer);
 
     for (payload.buffer) |*slot| slot.* = Value.null;
@@ -253,53 +323,176 @@ fn createScanOperator(allocator: std.mem.Allocator, engine: *engine_mod.Engine, 
     const selector = node.selector.?;
     switch (selector) {
         .ast => |ast_selector| switch (ast_selector.series) {
-            .by_id => |id| payload.series_id = @as(types.SeriesId, @intCast(id.value)),
+            .by_id => |id| try appendScanSeries(allocator, &payload, engine, @as(types.SeriesId, @intCast(id.value)), null, node.time_bounds),
             .name => |ident| {
                 const resolution = engine.resolveSelector(.{ .name = ident.value }) catch return error.UnsupportedPlan;
                 switch (resolution.status) {
-                    .resolved, .exact_match => payload.series_id = resolution.series_id,
-                    .not_found, .ambiguous => return error.UnsupportedPlan,
+                    .resolved, .exact_match => try appendScanSeries(allocator, &payload, engine, resolution.series_id.?, resolution.canonical_tags, node.time_bounds),
+                    .ambiguous => {
+                        payload.selector_mode = "metric_family";
+                        try appendMetricFamilySeries(allocator, &payload, engine, ident.value, node.label_constraints, node.time_bounds);
+                    },
+                    .not_found => {},
                 }
             },
         },
-        .bound => |bound_selector| payload.series_id = bound_selector.series_id,
+        .bound => |bound_selector| try appendScanSeries(allocator, &payload, engine, bound_selector.series_id, bound_selector.canonical_tags, node.time_bounds),
     }
 
-    if (payload.series_id) |sid| {
-        const bounds = node.time_bounds;
-        const start_ts = bounds.min orelse std.math.minInt(i64);
-        const end_ts = bounds.max orelse std.math.maxInt(i64);
-        try payload.engine.queryRange(sid, start_ts, end_ts, &payload.points);
+    payload.selected_series_count = @intCast(payload.series.len);
+    if (node.require_exact_series and payload.selected_series_count > 1) {
+        return error.AmbiguousMetricFamilyQuery;
     }
 
     return try createOperator(allocator, schema, "scan", scanNext, scanDestroy, .{ .scan = payload });
 }
 
 fn scanNext(op: *Operator) ExecuteError!?Row {
-    var payload = &op.payload.scan;
-    if (payload.index >= payload.points.items.len) return null;
-    const point = payload.points.items[payload.index];
-    payload.index += 1;
-
-    for (op.schema, 0..) |column, idx| {
-        if (column.expr.* != .identifier) return error.UnsupportedPlan;
-        const name = column.expr.identifier.value;
-        if (namesEqual(name, "time")) {
-            payload.buffer[idx] = Value{ .integer = point.ts };
-        } else if (namesEqual(name, "value")) {
-            payload.buffer[idx] = Value{ .float = point.value };
-        } else {
-            return error.UnsupportedPlan;
+    const payload = &op.payload.scan;
+    while (payload.series_index < payload.series.len) {
+        var current = &payload.series[payload.series_index];
+        if (current.index >= current.points.items.len) {
+            payload.series_index += 1;
+            continue;
         }
-    }
+        const point = current.points.items[current.index];
+        current.index += 1;
 
-    return Row{ .schema = op.schema, .values = payload.buffer };
+        for (op.schema, 0..) |column, idx| {
+            if (column.expr.* != .identifier) return error.UnsupportedPlan;
+            const name = column.expr.identifier.value;
+            if (namesEqual(name, "time")) {
+                payload.buffer[idx] = Value{ .integer = point.ts };
+            } else if (namesEqual(name, "value")) {
+                payload.buffer[idx] = Value{ .float = point.value };
+            } else if (hasTagLikePrefix(name)) {
+                payload.buffer[idx] = findTagValue(current.tags, tagKey(name));
+            } else {
+                return error.UnsupportedPlan;
+            }
+        }
+
+        return Row{
+            .schema = op.schema,
+            .values = payload.buffer,
+            .tags = current.tags,
+            .series_id = current.series_id,
+            .ts = point.ts,
+        };
+    }
+    return null;
 }
 
 fn scanDestroy(op: *Operator) void {
-    var payload = &op.payload.scan;
-    payload.points.deinit();
+    const payload = &op.payload.scan;
+    for (payload.series) |scan_series| {
+        scan_series.points.deinit();
+        for (scan_series.tags) |tag| {
+            op.allocator.free(tag.key);
+            op.allocator.free(tag.value);
+        }
+        op.allocator.free(scan_series.tags);
+    }
+    op.allocator.free(payload.series);
     op.allocator.free(payload.buffer);
+}
+
+fn appendScanSeries(
+    allocator: std.mem.Allocator,
+    payload: *Operator.Scan,
+    engine: *engine_mod.Engine,
+    series_id: types.SeriesId,
+    canonical_tags: ?[]const u8,
+    bounds: physical.TimeBounds,
+) ExecuteError!void {
+    var points = std.array_list.Managed(types.Point).init(allocator);
+    errdefer points.deinit();
+    const start_ts = bounds.min orelse std.math.minInt(i64);
+    const end_ts = bounds.max orelse std.math.maxInt(i64);
+    try engine.queryRange(series_id, start_ts, end_ts, &points);
+
+    const tags_json = canonical_tags orelse blk: {
+        const resolution = engine.resolveSelector(.{ .by_id = series_id }) catch break :blk null;
+        break :blk resolution.canonical_tags;
+    };
+    const tag_fields = try parseTagFields(allocator, tags_json orelse "{}");
+    errdefer freeTagFields(allocator, tag_fields);
+
+    const next = try allocator.realloc(payload.series, payload.series.len + 1);
+    payload.series = next;
+    payload.series[payload.series.len - 1] = .{
+        .series_id = series_id,
+        .points = points,
+        .tags = tag_fields,
+    };
+}
+
+fn appendMetricFamilySeries(
+    allocator: std.mem.Allocator,
+    payload: *Operator.Scan,
+    engine: *engine_mod.Engine,
+    metric: []const u8,
+    constraints: []const physical.LabelConstraint,
+    bounds: physical.TimeBounds,
+) ExecuteError!void {
+    const descriptors = try engine.seriesDescriptorsForMetric(allocator, metric, null, true, null);
+    defer allocator.free(descriptors);
+    for (descriptors) |descriptor| {
+        if (!descriptorSatisfiesConstraints(descriptor.labels_json, constraints)) continue;
+        try appendScanSeries(allocator, payload, engine, descriptor.series_id, descriptor.labels_json, bounds);
+    }
+}
+
+fn parseTagFields(allocator: std.mem.Allocator, tags_json: []const u8) ExecuteError![]expression.TagField {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, tags_json, .{}) catch return allocator.alloc(expression.TagField, 0);
+    defer parsed.deinit();
+    if (parsed.value != .object) return try allocator.alloc(expression.TagField, 0);
+
+    var fields = std.array_list.Managed(expression.TagField).init(allocator);
+    errdefer {
+        for (fields.items) |field| {
+            allocator.free(field.key);
+            allocator.free(field.value);
+        }
+        fields.deinit();
+    }
+    var it = parsed.value.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .string) continue;
+        try fields.append(.{
+            .key = try allocator.dupe(u8, entry.key_ptr.*),
+            .value = try allocator.dupe(u8, entry.value_ptr.string),
+        });
+    }
+    return try fields.toOwnedSlice();
+}
+
+fn descriptorSatisfiesConstraints(labels_json: []const u8, constraints: []const physical.LabelConstraint) bool {
+    if (constraints.len == 0) return true;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var parsed = std.json.parseFromSlice(std.json.Value, arena.allocator(), labels_json, .{}) catch return false;
+    if (parsed.value != .object) return false;
+    for (constraints) |constraint| {
+        const actual = parsed.value.object.get(constraint.key) orelse return false;
+        if (actual != .string or !std.mem.eql(u8, actual.string, constraint.value)) return false;
+    }
+    return true;
+}
+
+fn freeTagFields(allocator: std.mem.Allocator, fields: []expression.TagField) void {
+    for (fields) |field| {
+        allocator.free(field.key);
+        allocator.free(field.value);
+    }
+    allocator.free(fields);
+}
+
+fn findTagValue(fields: []const expression.TagField, key: []const u8) Value {
+    for (fields) |field| {
+        if (namesEqual(field.key, key)) return .{ .string = field.value };
+    }
+    return Value.null;
 }
 
 fn createOneRowOperator(allocator: std.mem.Allocator, schema: []const plan.ColumnInfo) ExecuteError!*Operator {
@@ -311,7 +504,7 @@ fn oneRowNext(op: *Operator) ExecuteError!?Row {
     var payload = &op.payload.one_row;
     if (payload.emitted) return null;
     payload.emitted = true;
-    return Row{ .schema = op.schema, .values = empty_values[0..] };
+    return Row{ .schema = op.schema, .values = empty_values[0..], .tags = &.{}, .series_id = null, .ts = null };
 }
 
 fn oneRowDestroy(op: *Operator) void {
@@ -326,10 +519,10 @@ fn createFilterOperator(allocator: std.mem.Allocator, child: *Operator, predicat
 fn filterNext(op: *Operator) ExecuteError!?Row {
     var payload = &op.payload.filter;
     while (try payload.child.next()) |row| {
-        var ctx = expression.RowContext{ .schema = row.schema, .values = row.values };
+        var ctx = expression.RowContext{ .schema = row.schema, .values = row.values, .tags = row.tags };
         const resolver = expression.rowResolver(&ctx);
         if (try expression.evaluateBoolean(payload.predicate, &resolver)) {
-            return Row{ .schema = op.schema, .values = row.values };
+            return Row{ .schema = op.schema, .values = row.values, .tags = row.tags, .series_id = row.series_id, .ts = row.ts };
         }
     }
     return null;
@@ -362,13 +555,13 @@ fn projectNext(op: *Operator) ExecuteError!?Row {
     if (maybe_child == null) return null;
     const child_row = maybe_child.?;
 
-    var ctx = expression.RowContext{ .schema = child_row.schema, .values = child_row.values };
+    var ctx = expression.RowContext{ .schema = child_row.schema, .values = child_row.values, .tags = child_row.tags };
     const resolver = expression.rowResolver(&ctx);
     for (op.schema, 0..) |column, idx| {
         payload.buffer[idx] = try expression.evaluate(column.expr, &resolver);
     }
 
-    return Row{ .schema = op.schema, .values = payload.buffer };
+    return Row{ .schema = op.schema, .values = payload.buffer, .tags = child_row.tags, .series_id = child_row.series_id, .ts = child_row.ts };
 }
 
 fn projectDestroy(op: *Operator) void {
@@ -390,6 +583,8 @@ fn createAggregateOperator(allocator: std.mem.Allocator, child: *Operator, node:
         .groups = ManagedArrayList(Operator.GroupState).init(allocator),
         .key_buffer = ManagedArrayList(Value).init(allocator),
         .output_buffer = try allocator.alloc(Value, schema.len),
+        .fill = node.fill,
+        .metric_kind = inferMetricKind(child),
         .initialized = false,
         .index = 0,
     };
@@ -419,7 +614,12 @@ fn analyseAggregates(allocator: std.mem.Allocator, columns: []const plan.ColumnI
         if (aggregateKindFor(call.callee.value)) |kind| {
             if (map.get(expr) != null) continue;
             const idx = exprs.items.len;
-            try exprs.append(.{ .expr = expr, .kind = kind, .args = call.args });
+            try exprs.append(.{
+                .expr = expr,
+                .kind = kind,
+                .args = call.args,
+                .quantile = try aggregateQuantile(call),
+            });
             try map.put(expr, idx);
         }
     }
@@ -477,6 +677,7 @@ fn aggregateDestroy(op: *Operator) void {
     var payload = &op.payload.aggregate;
     payload.child.destroy();
     for (payload.groups.items) |group| {
+        for (group.aggregates) |state| deinitAggregateState(op.allocator, state);
         op.allocator.free(group.keys);
         op.allocator.free(group.aggregates);
     }
@@ -489,7 +690,7 @@ fn aggregateDestroy(op: *Operator) void {
 
 fn materializeGroups(allocator: std.mem.Allocator, payload: *Operator.Aggregate, child: *Operator) ExecuteError!void {
     while (try child.next()) |row| {
-        var ctx = expression.RowContext{ .schema = row.schema, .values = row.values };
+        var ctx = expression.RowContext{ .schema = row.schema, .values = row.values, .tags = row.tags };
         const resolver = expression.rowResolver(&ctx);
 
         try payload.key_buffer.ensureTotalCapacity(payload.group_exprs.len);
@@ -500,8 +701,9 @@ fn materializeGroups(allocator: std.mem.Allocator, payload: *Operator.Aggregate,
 
         const key_slice = payload.key_buffer.items;
         const group_state = try findOrCreateGroup(allocator, payload, key_slice);
-        try updateAggregateStates(payload, &resolver, group_state);
+        try updateAggregateStates(payload, &resolver, group_state, row.series_id, row.ts);
     }
+    if (payload.fill != null) try applyFill(allocator, payload);
 }
 
 fn findOrCreateGroup(allocator: std.mem.Allocator, payload: *Operator.Aggregate, key_values: []const Value) ExecuteError!*Operator.GroupState {
@@ -514,20 +716,26 @@ fn findOrCreateGroup(allocator: std.mem.Allocator, payload: *Operator.Aggregate,
     const key_copy = try Value.copySlice(allocator, key_values);
     const states = try allocator.alloc(Operator.AggregateState, payload.aggregates.len);
     for (payload.aggregates, 0..) |agg, idx| {
-        states[idx] = initState(agg.kind);
+        states[idx] = initState(allocator, agg);
     }
 
     try payload.groups.append(.{ .keys = key_copy, .aggregates = states });
     return &payload.groups.items[payload.groups.items.len - 1];
 }
 
-fn updateAggregateStates(payload: *Operator.Aggregate, resolver: *const expression.Resolver, group: *Operator.GroupState) ExecuteError!void {
+fn updateAggregateStates(
+    payload: *Operator.Aggregate,
+    resolver: *const expression.Resolver,
+    group: *Operator.GroupState,
+    series_id: ?types.SeriesId,
+    ts: ?i64,
+) ExecuteError!void {
     for (payload.aggregates, 0..) |agg, idx| {
         var maybe_value: ?Value = null;
         if (agg.args.len != 0) {
             maybe_value = try expression.evaluate(agg.args[0], resolver);
         }
-        try updateState(&group.aggregates[idx], agg.kind, maybe_value);
+        try updateState(&group.aggregates[idx], agg, maybe_value, payload.metric_kind, series_id, ts);
     }
 }
 
@@ -549,6 +757,7 @@ fn createSortOperator(
         rows.deinit();
     }
 
+    const child_selector_stats = child.selectorStats();
     defer child.destroy();
 
     const capacity = if (limit_hint) |hint| hint.offset + hint.take else 0;
@@ -595,7 +804,7 @@ fn createSortOperator(
         }
     }
 
-    return try createOperator(allocator, schema, "sort", sortNext, sortDestroy, .{ .sort = .{ .rows = rows, .index = 0 } });
+    return try createOperator(allocator, schema, "sort", sortNext, sortDestroy, .{ .sort = .{ .rows = rows, .index = 0, .selector_stats = child_selector_stats } });
 }
 
 fn createLimitOperator(
@@ -627,7 +836,7 @@ fn sortNext(op: *Operator) ExecuteError!?Row {
     if (payload.index >= payload.rows.items.len) return null;
     const row = payload.rows.items[payload.index];
     payload.index += 1;
-    return Row{ .schema = op.schema, .values = row.values };
+    return Row{ .schema = op.schema, .values = row.values, .tags = row.tags, .series_id = row.series_id, .ts = row.ts };
 }
 
 fn sortDestroy(op: *Operator) void {
@@ -663,8 +872,8 @@ fn makeOwnedRow(
 ) ExecuteError!Operator.OwnedRow {
     const copy = try Value.copySlice(allocator, row.values);
     errdefer allocator.free(copy);
-    const keys = try computeOrderingKeys(allocator, schema, ordering, copy);
-    return Operator.OwnedRow{ .values = copy, .keys = keys };
+    const keys = try computeOrderingKeys(allocator, schema, ordering, copy, row.tags);
+    return Operator.OwnedRow{ .values = copy, .keys = keys, .tags = row.tags, .series_id = row.series_id, .ts = row.ts };
 }
 
 fn freeOwnedRow(allocator: std.mem.Allocator, owned: Operator.OwnedRow) void {
@@ -677,10 +886,11 @@ fn computeOrderingKeys(
     schema: []const plan.ColumnInfo,
     ordering: []const ast.OrderExpr,
     values: []Value,
+    tags: []const expression.TagField,
 ) ExecuteError![]Value {
     const keys = try allocator.alloc(Value, ordering.len);
     errdefer allocator.free(keys);
-    var ctx = expression.RowContext{ .schema = schema, .values = values };
+    var ctx = expression.RowContext{ .schema = schema, .values = values, .tags = tags };
     const resolver = expression.rowResolver(&ctx);
     for (ordering, 0..) |order_expr, idx| {
         keys[idx] = try expression.evaluate(order_expr.expr, &resolver);
@@ -780,11 +990,23 @@ fn aggregateKindFor(name: []const u8) ?Operator.AggregateKind {
     if (std.ascii.eqlIgnoreCase(name, "max")) return .max;
     if (std.ascii.eqlIgnoreCase(name, "first")) return .first;
     if (std.ascii.eqlIgnoreCase(name, "last")) return .last;
+    if (std.ascii.eqlIgnoreCase(name, "percentile")) return .percentile;
+    if (std.ascii.eqlIgnoreCase(name, "delta")) return .delta;
+    if (std.ascii.eqlIgnoreCase(name, "rate")) return .rate;
+    if (std.ascii.eqlIgnoreCase(name, "irate")) return .irate;
     return null;
 }
 
-fn initState(kind: Operator.AggregateKind) Operator.AggregateState {
-    return switch (kind) {
+fn aggregateQuantile(call: ast.Call) ExecuteError!f64 {
+    if (!std.ascii.eqlIgnoreCase(call.callee.value, "percentile")) return 0;
+    if (call.args.len < 2) return error.UnsupportedAggregate;
+    const quantile = try (try expression.evaluateConstant(call.args[1])).asFloat();
+    if (quantile < 0 or quantile > 1) return error.UnsupportedAggregate;
+    return quantile;
+}
+
+fn initState(allocator: std.mem.Allocator, aggregate: Operator.AggregateExpr) Operator.AggregateState {
+    return switch (aggregate.kind) {
         .avg => .{ .avg = .{ .total = 0, .count = 0 } },
         .sum => .{ .sum = 0 },
         .count => .{ .count = 0 },
@@ -792,11 +1014,32 @@ fn initState(kind: Operator.AggregateKind) Operator.AggregateState {
         .max => .{ .max = .{} },
         .first => .{ .first = .{} },
         .last => .{ .last = .{} },
+        .percentile => .{ .percentile = .{ .values = ManagedArrayList(f64).init(allocator), .quantile = aggregate.quantile } },
+        .delta => .{ .delta = .{ .series = ManagedArrayList(Operator.SeriesDerivativeState).init(allocator), .metric_kind = .gauge } },
+        .rate => .{ .rate = .{ .series = ManagedArrayList(Operator.SeriesDerivativeState).init(allocator), .metric_kind = .gauge } },
+        .irate => .{ .irate = .{ .series = ManagedArrayList(Operator.SeriesDerivativeState).init(allocator), .metric_kind = .gauge } },
     };
 }
 
-fn updateState(state: *Operator.AggregateState, kind: Operator.AggregateKind, maybe_value: ?Value) ExecuteError!void {
-    switch (kind) {
+fn deinitAggregateState(allocator: std.mem.Allocator, state: Operator.AggregateState) void {
+    switch (state) {
+        .percentile => |payload| payload.values.deinit(),
+        .delta => |payload| payload.series.deinit(),
+        .rate => |payload| payload.series.deinit(),
+        .irate => |payload| payload.series.deinit(),
+        else => _ = allocator,
+    }
+}
+
+fn updateState(
+    state: *Operator.AggregateState,
+    aggregate: Operator.AggregateExpr,
+    maybe_value: ?Value,
+    metric_kind: metric_catalog_mod.MetricKind,
+    series_id: ?types.SeriesId,
+    ts: ?i64,
+) ExecuteError!void {
+    switch (aggregate.kind) {
         .avg => {
             if (maybe_value) |value| {
                 const num = try value.asFloat();
@@ -892,11 +1135,42 @@ fn updateState(state: *Operator.AggregateState, kind: Operator.AggregateKind, ma
                 }
             }
         },
+        .percentile => {
+            if (maybe_value) |value| {
+                if (!value.isNull()) {
+                    switch (state.*) {
+                        .percentile => |*percentile_state| try percentile_state.values.append(try value.asFloat()),
+                        else => unreachable,
+                    }
+                }
+            }
+        },
+        .delta, .rate, .irate => {
+            if (maybe_value == null or series_id == null or ts == null) return;
+            const numeric = try maybe_value.?.asFloat();
+            switch (state.*) {
+                .delta => |*payload| {
+                    payload.metric_kind = metric_kind;
+                    try updateDerivativeSeries(&payload.series, series_id.?, ts.?, numeric, metric_kind);
+                },
+                .rate => |*payload| {
+                    payload.metric_kind = metric_kind;
+                    try updateDerivativeSeries(&payload.series, series_id.?, ts.?, numeric, metric_kind);
+                },
+                .irate => |*payload| {
+                    payload.metric_kind = metric_kind;
+                    try updateDerivativeSeries(&payload.series, series_id.?, ts.?, numeric, metric_kind);
+                },
+                else => unreachable,
+            }
+        },
     }
 }
 
 fn finalizeState(state: Operator.AggregateState, kind: Operator.AggregateKind) Value {
-    return switch (kind) {
+    return switch (state) {
+        .filled => |value| value,
+        else => switch (kind) {
         .avg => switch (state) {
             .avg => |avg_state| if (avg_state.count == 0) Value.null else Value{ .float = avg_state.total / @as(f64, @floatFromInt(avg_state.count)) },
             else => unreachable,
@@ -925,7 +1199,256 @@ fn finalizeState(state: Operator.AggregateState, kind: Operator.AggregateKind) V
             .last => |last_state| if (last_state.seen) last_state.value else Value.null,
             else => unreachable,
         },
+        .percentile => switch (state) {
+            .percentile => |percentile_state| percentileValue(percentile_state.values.items, percentile_state.quantile),
+            else => unreachable,
+        },
+        .delta => switch (state) {
+            .delta => |payload| derivativeAggregateValue(payload.series.items, .delta, payload.metric_kind),
+            else => unreachable,
+        },
+        .rate => switch (state) {
+            .rate => |payload| derivativeAggregateValue(payload.series.items, .rate, payload.metric_kind),
+            else => unreachable,
+        },
+        .irate => switch (state) {
+            .irate => |payload| derivativeAggregateValue(payload.series.items, .irate, payload.metric_kind),
+            else => unreachable,
+        },
+    } };
+}
+
+fn updateDerivativeSeries(
+    states: *ManagedArrayList(Operator.SeriesDerivativeState),
+    series_id: types.SeriesId,
+    ts: i64,
+    value: f64,
+    metric_kind: metric_catalog_mod.MetricKind,
+) !void {
+    for (states.items) |*state| {
+        if (state.series_id != series_id) continue;
+        const previous_value = state.last_value;
+        const previous_ts = state.last_ts;
+        if (metric_kind == .counter and value < previous_value) {
+            state.reset_accum += value;
+            state.last_step_delta = value;
+        } else {
+            state.last_step_delta = value - previous_value;
+        }
+        state.last_step_dt = ts - previous_ts;
+        state.last_ts = ts;
+        state.last_value = value;
+        return;
+    }
+    try states.append(.{
+        .series_id = series_id,
+        .first_ts = ts,
+        .last_ts = ts,
+        .first_value = value,
+        .last_value = value,
+    });
+}
+
+const DerivativeKind = enum { delta, rate, irate };
+
+fn derivativeAggregateValue(
+    states: []const Operator.SeriesDerivativeState,
+    kind: DerivativeKind,
+    metric_kind: metric_catalog_mod.MetricKind,
+) Value {
+    var saw = false;
+    var total: f64 = 0;
+    for (states) |state| {
+        switch (kind) {
+            .delta => {
+                total += derivativeDelta(state, metric_kind);
+                saw = true;
+            },
+            .rate => {
+                const duration = state.last_ts - state.first_ts;
+                if (duration <= 0) continue;
+                total += derivativeDelta(state, metric_kind) / @as(f64, @floatFromInt(duration));
+                saw = true;
+            },
+            .irate => {
+                if (state.last_step_delta == null or state.last_step_dt == null or state.last_step_dt.? <= 0) continue;
+                total += state.last_step_delta.? / @as(f64, @floatFromInt(state.last_step_dt.?));
+                saw = true;
+            },
+        }
+    }
+    return if (saw) Value{ .float = total } else Value.null;
+}
+
+fn derivativeDelta(state: Operator.SeriesDerivativeState, metric_kind: metric_catalog_mod.MetricKind) f64 {
+    return if (metric_kind == .counter)
+        (state.last_value - state.first_value) + state.reset_accum
+    else
+        state.last_value - state.first_value;
+}
+
+fn percentileValue(values: []const f64, quantile: f64) Value {
+    if (values.len == 0) return Value.null;
+    const copy = std.heap.page_allocator.alloc(f64, values.len) catch return Value.null;
+    defer std.heap.page_allocator.free(copy);
+    @memcpy(copy, values);
+    std.sort.block(f64, copy, {}, struct {
+        fn lessThan(_: void, lhs: f64, rhs: f64) bool {
+            return lhs < rhs;
+        }
+    }.lessThan);
+    const index_float = quantile * @as(f64, @floatFromInt(copy.len - 1));
+    const lower: usize = @intFromFloat(@floor(index_float));
+    const upper: usize = @intFromFloat(@ceil(index_float));
+    if (lower == upper) return .{ .float = copy[lower] };
+    const weight = index_float - @as(f64, @floatFromInt(lower));
+    return .{ .float = copy[lower] + (copy[upper] - copy[lower]) * weight };
+}
+
+fn inferMetricKind(child: *Operator) metric_catalog_mod.MetricKind {
+    return switch (child.payload) {
+        .scan => |payload| if (payload.series.len != 0) child.payload.scan.engine.metricKindOrDefault(scanMetricName(child.payload.scan.engine, payload.series[0].series_id) orelse "") else .gauge,
+        .filter => |payload| inferMetricKind(payload.child),
+        .project => |payload| inferMetricKind(payload.child),
+        .limit => |payload| inferMetricKind(payload.child),
+        .sort,
+        .aggregate,
+        .one_row,
+        .test_source,
+        => .gauge,
     };
+}
+
+fn scanMetricName(engine: *engine_mod.Engine, series_id: types.SeriesId) ?[]const u8 {
+    const resolution = engine.resolveSelector(.{ .by_id = series_id }) catch return null;
+    return resolution.series;
+}
+
+fn applyFill(allocator: std.mem.Allocator, payload: *Operator.Aggregate) ExecuteError!void {
+    const fill = payload.fill orelse return;
+    const bucket_idx = timeBucketGroupIndex(payload.group_exprs) orelse return error.UnsupportedFill;
+    const bucket_step = timeBucketStep(payload.group_exprs[bucket_idx].expr) orelse return error.UnsupportedFill;
+
+    std.sort.pdq(Operator.GroupState, payload.groups.items, FillSortContext{ .bucket_idx = bucket_idx }, FillSortContext.lessThan);
+
+    var filled = ManagedArrayList(Operator.GroupState).init(allocator);
+    errdefer {
+        for (filled.items) |group| {
+            for (group.aggregates) |state| deinitAggregateState(allocator, state);
+            allocator.free(group.keys);
+            allocator.free(group.aggregates);
+        }
+        filled.deinit();
+    }
+
+    var idx: usize = 0;
+    while (idx < payload.groups.items.len) {
+        try filled.append(payload.groups.items[idx]);
+        var previous = payload.groups.items[idx];
+        idx += 1;
+        while (idx < payload.groups.items.len and sameFillPartition(previous.keys, payload.groups.items[idx].keys, bucket_idx)) : (idx += 1) {
+            const next_group = payload.groups.items[idx];
+            const current_bucket = try previous.keys[bucket_idx].asInt();
+            const next_bucket = try next_group.keys[bucket_idx].asInt();
+            var missing_bucket = current_bucket + bucket_step;
+            while (missing_bucket < next_bucket) : (missing_bucket += bucket_step) {
+                const fill_value = switch (fill.strategy) {
+                    .previous => try filledValuesFromGroup(allocator, payload, previous),
+                    .constant => |expr| blk: {
+                        const value = try expression.evaluateConstant(expr);
+                        break :blk try filledValuesConstant(allocator, payload, value);
+                    },
+                    else => return error.UnsupportedFill,
+                };
+                const filled_group = try makeFilledGroup(allocator, payload, previous, bucket_idx, missing_bucket, fill_value);
+                try filled.append(filled_group);
+            }
+            try filled.append(next_group);
+            previous = next_group;
+        }
+    }
+
+    payload.groups.deinit();
+    payload.groups = filled;
+}
+
+const FillSortContext = struct {
+    bucket_idx: usize,
+
+    fn lessThan(ctx: FillSortContext, lhs: Operator.GroupState, rhs: Operator.GroupState) bool {
+        if (comparePartitionKeys(lhs.keys, rhs.keys, ctx.bucket_idx) == .lt) return true;
+        if (comparePartitionKeys(lhs.keys, rhs.keys, ctx.bucket_idx) == .gt) return false;
+        return valueToInt(lhs.keys[ctx.bucket_idx]) < valueToInt(rhs.keys[ctx.bucket_idx]);
+    }
+};
+
+fn timeBucketGroupIndex(groupings: []const ast.GroupExpr) ?usize {
+    for (groupings, 0..) |grouping, idx| {
+        if (grouping.expr.* == .call and std.ascii.eqlIgnoreCase(grouping.expr.call.callee.value, "time_bucket")) return idx;
+    }
+    return null;
+}
+
+fn timeBucketStep(expr: *const ast.Expr) ?i64 {
+    if (expr.* != .call or !std.ascii.eqlIgnoreCase(expr.call.callee.value, "time_bucket")) return null;
+    if (expr.call.args.len == 0) return null;
+    const value = expression.evaluateConstant(expr.call.args[0]) catch return null;
+    return @intFromFloat(valueToFloat(value));
+}
+
+fn sameFillPartition(lhs: []const Value, rhs: []const Value, bucket_idx: usize) bool {
+    return comparePartitionKeys(lhs, rhs, bucket_idx) == .eq;
+}
+
+fn comparePartitionKeys(lhs: []const Value, rhs: []const Value, bucket_idx: usize) std.math.Order {
+    var idx: usize = 0;
+    while (idx < lhs.len and idx < rhs.len) : (idx += 1) {
+        if (idx == bucket_idx) continue;
+        const order = compareValuesForSort(lhs[idx], rhs[idx]);
+        if (order != .eq) return order;
+    }
+    return .eq;
+}
+
+fn valueToInt(value: Value) i64 {
+    return switch (value) {
+        .integer => |integer| integer,
+        .float => |float| @intFromFloat(float),
+        else => 0,
+    };
+}
+
+fn filledValuesFromGroup(allocator: std.mem.Allocator, payload: *const Operator.Aggregate, group: Operator.GroupState) ![]Value {
+    const values = try allocator.alloc(Value, payload.aggregates.len);
+    for (payload.aggregates, 0..) |aggregate, idx| {
+        values[idx] = finalizeState(group.aggregates[idx], aggregate.kind);
+    }
+    return values;
+}
+
+fn filledValuesConstant(allocator: std.mem.Allocator, payload: *const Operator.Aggregate, value: Value) ![]Value {
+    const values = try allocator.alloc(Value, payload.aggregates.len);
+    for (values) |*slot| slot.* = value;
+    return values;
+}
+
+fn makeFilledGroup(
+    allocator: std.mem.Allocator,
+    payload: *const Operator.Aggregate,
+    source: Operator.GroupState,
+    bucket_idx: usize,
+    bucket_value: i64,
+    filled_values: []Value,
+) !Operator.GroupState {
+    defer allocator.free(filled_values);
+    const keys = try Value.copySlice(allocator, source.keys);
+    keys[bucket_idx] = .{ .integer = bucket_value };
+    const states = try allocator.alloc(Operator.AggregateState, payload.aggregates.len);
+    for (payload.aggregates, 0..) |aggregate, idx| {
+        states[idx] = .{ .filled = filled_values[idx] };
+        _ = aggregate;
+    }
+    return .{ .keys = keys, .aggregates = states };
 }
 
 fn findGroupIndex(groupings: []const ast.GroupExpr, expr: *const ast.Expr) ?usize {
@@ -957,6 +1480,17 @@ fn namesEqual(a: []const u8, b: []const u8) bool {
     return std.ascii.eqlIgnoreCase(a, b);
 }
 
+fn hasTagLikePrefix(name: []const u8) bool {
+    const dot = std.mem.indexOfScalar(u8, name, '.') orelse return false;
+    const prefix = name[0..dot];
+    return std.ascii.eqlIgnoreCase(prefix, "tag") or std.ascii.eqlIgnoreCase(prefix, "label");
+}
+
+fn tagKey(name: []const u8) []const u8 {
+    const dot = std.mem.indexOfScalar(u8, name, '.') orelse return name;
+    return name[dot + 1 ..];
+}
+
 pub fn createTestSourceOperator(allocator: std.mem.Allocator, schema: []const plan.ColumnInfo, rows: []([]Value)) ExecuteError!*Operator {
     const payload = Operator.TestSource{ .schema = schema, .rows = rows, .index = 0 };
     return try createOperator(allocator, schema, "test_source", testSourceNext, testSourceDestroy, .{ .test_source = payload });
@@ -967,7 +1501,7 @@ fn testSourceNext(op: *Operator) ExecuteError!?Row {
     if (payload.index >= payload.rows.len) return null;
     const values = payload.rows[payload.index];
     payload.index += 1;
-    return Row{ .schema = payload.schema, .values = values };
+    return Row{ .schema = payload.schema, .values = values, .tags = &.{}, .series_id = null, .ts = null };
 }
 
 fn testSourceDestroy(op: *Operator) void {

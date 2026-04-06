@@ -337,7 +337,7 @@ fn trailingSegment(name: []const u8) []const u8 {
 
 fn hasTagPrefix(name: []const u8) bool {
     const dot = std.mem.indexOfScalar(u8, name, '.') orelse return false;
-    return std.ascii.eqlIgnoreCase(name[0..dot], "tag");
+    return std.ascii.eqlIgnoreCase(name[0..dot], "tag") or std.ascii.eqlIgnoreCase(name[0..dot], "label");
 }
 
 fn tagKey(name: []const u8) []const u8 {

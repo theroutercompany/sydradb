@@ -26,6 +26,8 @@ pub const ExecutionStats = struct {
     execution_mode: []const u8 = "legacy",
     legacy_fallback: bool = false,
     fallback_reason: []const u8 = "",
+    selector_mode: []const u8 = "",
+    selected_series_count: u64 = 0,
 };
 
 pub const OperatorStats = operator.Operator.StatsSnapshot;
@@ -55,6 +57,10 @@ pub const ExecutionCursor = struct {
         errdefer list.deinit();
         try self.operator.collectStats(&list);
         return try list.toOwnedSlice();
+    }
+
+    pub fn selectorStats(self: *ExecutionCursor) ?operator.Operator.SelectorStats {
+        return self.operator.selectorStats();
     }
 };
 
