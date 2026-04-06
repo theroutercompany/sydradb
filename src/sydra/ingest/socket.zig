@@ -228,6 +228,10 @@ pub const Client = struct {
         self.cache.clearRetainingCapacity();
     }
 
+    pub fn ensureDeclaredBatch(self: *Client, inputs: []const ClientDeclareInput) ![]ClientDeclaration {
+        return try self.declareCachedBatch(inputs);
+    }
+
     pub fn declareCachedBatch(self: *Client, inputs: []const ClientDeclareInput) ![]ClientDeclaration {
         var results = try self.alloc.alloc(ClientDeclaration, inputs.len);
         errdefer self.alloc.free(results);
@@ -502,7 +506,7 @@ pub fn appendParsedLines(
         }
     }
 
-    const declared = try client.declareCachedBatch(declarations);
+    const declared = try client.ensureDeclaredBatch(declarations);
     defer alloc.free(declared);
 
     const frame_cap = client.maxAppendPointsPerFrame(@max(@as(usize, 1), max_points_per_frame));
@@ -580,6 +584,32 @@ const BorrowedDeclareEntry = struct {
     name: []const u8,
     tags_json: []const u8,
     descriptor: ?metric_catalog_mod.DescriptorInput,
+};
+
+const DeclareAckOutcome = struct {
+    client_decl_id: u32,
+    status: DeclareStatus,
+    code: ErrorCode,
+    series_id: types.SeriesId,
+};
+
+const PendingServerDeclare = struct {
+    response_index: usize,
+    entry: BorrowedDeclareEntry,
+    canonical_tags: []u8,
+    signature: []u8,
+    stored_signature: bool = false,
+
+    fn deinit(self: *PendingServerDeclare, alloc: std.mem.Allocator) void {
+        alloc.free(self.canonical_tags);
+        if (!self.stored_signature) alloc.free(self.signature);
+        self.* = undefined;
+    }
+};
+
+const PendingServerDeclareAlias = struct {
+    response_index: usize,
+    pending_index: usize,
 };
 
 const PeerCredentials = struct {
@@ -730,51 +760,147 @@ fn handleDeclareBatch(eng: *Engine, session: *SessionState, payload: []const u8,
     const start_ns = std.time.nanoTimestamp();
     var offset: usize = 0;
     const count = try takeInt(u32, payload, &offset);
-    var response = std.array_list.Managed(u8).init(eng.alloc);
-    defer response.deinit();
-    try appendInt(&response, u32, count);
+    const ack_outcomes = try eng.alloc.alloc(DeclareAckOutcome, count);
+    defer eng.alloc.free(ack_outcomes);
+
+    var pending = std.array_list.Managed(PendingServerDeclare).init(eng.alloc);
+    defer {
+        for (pending.items) |*item| item.deinit(eng.alloc);
+        pending.deinit();
+    }
+    var pending_aliases = std.array_list.Managed(PendingServerDeclareAlias).init(eng.alloc);
+    defer pending_aliases.deinit();
+    var pending_decl_ids = std.AutoHashMap(u32, usize).init(eng.alloc);
+    defer pending_decl_ids.deinit();
 
     var idx: usize = 0;
     while (idx < count) : (idx += 1) {
         const entry = try parseDeclareEntry(payload, &offset);
         const canonical_tags = service.canonicalizeTagsJson(eng.alloc, entry.tags_json) catch {
             _ = eng.metrics.local_ingest_rejected_total.fetchAdd(1, .monotonic);
-            try appendDeclareAckEntry(&response, entry.client_decl_id, .rejected, .invalid_decl, 0);
+            ack_outcomes[idx] = .{
+                .client_decl_id = entry.client_decl_id,
+                .status = .rejected,
+                .code = .invalid_decl,
+                .series_id = 0,
+            };
             continue;
         };
-        defer eng.alloc.free(canonical_tags);
+        errdefer eng.alloc.free(canonical_tags);
 
         const signature = try buildDeclarationSignature(eng.alloc, entry.decl_kind, entry.name, canonical_tags, entry.descriptor);
-        var stored_signature = false;
-        defer if (!stored_signature) eng.alloc.free(signature);
+        errdefer eng.alloc.free(signature);
 
         if (session.declarations.get(entry.client_decl_id)) |existing| {
-            if (std.mem.eql(u8, existing.signature, signature)) {
-                try appendDeclareAckEntry(&response, entry.client_decl_id, .ok, .protocol_error, existing.series_id);
-            } else {
+            ack_outcomes[idx] = .{
+                .client_decl_id = entry.client_decl_id,
+                .status = if (std.mem.eql(u8, existing.signature, signature)) .ok else .rejected,
+                .code = if (std.mem.eql(u8, existing.signature, signature)) .protocol_error else .decl_id_conflict,
+                .series_id = if (std.mem.eql(u8, existing.signature, signature)) existing.series_id else 0,
+            };
+            if (!std.mem.eql(u8, existing.signature, signature)) {
                 _ = eng.metrics.local_ingest_rejected_total.fetchAdd(1, .monotonic);
-                try appendDeclareAckEntry(&response, entry.client_decl_id, .rejected, .decl_id_conflict, 0);
             }
+            eng.alloc.free(canonical_tags);
+            eng.alloc.free(signature);
             continue;
         }
 
-        const series_id = eng.declareExactSeriesCanonical(entry.name, canonical_tags, entry.descriptor) catch |err| switch (err) {
-            error.MetricDescriptorConflict => blk: {
+        if (pending_decl_ids.get(entry.client_decl_id)) |pending_index| {
+            const existing = pending.items[pending_index];
+            if (std.mem.eql(u8, existing.signature, signature)) {
+                try pending_aliases.append(.{
+                    .response_index = idx,
+                    .pending_index = pending_index,
+                });
+            } else {
                 _ = eng.metrics.local_ingest_rejected_total.fetchAdd(1, .monotonic);
-                try appendDeclareAckEntry(&response, entry.client_decl_id, .rejected, .metric_descriptor_conflict, 0);
-                break :blk null;
-            },
-            else => return err,
-        };
-        if (series_id == null) continue;
+                ack_outcomes[idx] = .{
+                    .client_decl_id = entry.client_decl_id,
+                    .status = .rejected,
+                    .code = .decl_id_conflict,
+                    .series_id = 0,
+                };
+            }
+            eng.alloc.free(canonical_tags);
+            eng.alloc.free(signature);
+            continue;
+        }
 
-        try session.declarations.put(entry.client_decl_id, .{
+        try pending.append(.{
+            .response_index = idx,
+            .entry = entry,
+            .canonical_tags = canonical_tags,
             .signature = signature,
-            .series_id = series_id.?,
         });
-        stored_signature = true;
-        _ = eng.metrics.local_ingest_declare_total.fetchAdd(1, .monotonic);
-        try appendDeclareAckEntry(&response, entry.client_decl_id, .ok, .protocol_error, series_id.?);
+        try pending_decl_ids.put(entry.client_decl_id, pending.items.len - 1);
+    }
+
+    if (pending.items.len != 0) {
+        const declare_inputs = try eng.alloc.alloc(Engine.ExactSeriesCanonicalDeclarationInput, pending.items.len);
+        defer eng.alloc.free(declare_inputs);
+        const declare_results = try eng.alloc.alloc(Engine.ExactSeriesBatchDeclarationResult, pending.items.len);
+        defer eng.alloc.free(declare_results);
+
+        for (pending.items, 0..) |item, pending_idx| {
+            declare_inputs[pending_idx] = .{
+                .name = item.entry.name,
+                .canonical_tags = item.canonical_tags,
+                .descriptor = item.entry.descriptor,
+            };
+        }
+        try eng.declareExactSeriesCanonicalBatch(declare_inputs, declare_results);
+
+        for (pending.items, 0..) |*item, pending_idx| {
+            const result = declare_results[pending_idx];
+            const outcome = switch (result.status) {
+                .ok => blk: {
+                    const series_id = result.series_id.?;
+                    try session.declarations.put(item.entry.client_decl_id, .{
+                        .signature = item.signature,
+                        .series_id = series_id,
+                    });
+                    item.stored_signature = true;
+                    _ = eng.metrics.local_ingest_declare_total.fetchAdd(1, .monotonic);
+                    break :blk DeclareAckOutcome{
+                        .client_decl_id = item.entry.client_decl_id,
+                        .status = .ok,
+                        .code = .protocol_error,
+                        .series_id = series_id,
+                    };
+                },
+                .metric_descriptor_conflict => blk: {
+                    _ = eng.metrics.local_ingest_rejected_total.fetchAdd(1, .monotonic);
+                    break :blk DeclareAckOutcome{
+                        .client_decl_id = item.entry.client_decl_id,
+                        .status = .rejected,
+                        .code = .metric_descriptor_conflict,
+                        .series_id = 0,
+                    };
+                },
+                .series_conflict => blk: {
+                    _ = eng.metrics.local_ingest_rejected_total.fetchAdd(1, .monotonic);
+                    break :blk DeclareAckOutcome{
+                        .client_decl_id = item.entry.client_decl_id,
+                        .status = .rejected,
+                        .code = .invalid_decl,
+                        .series_id = 0,
+                    };
+                },
+            };
+            ack_outcomes[item.response_index] = outcome;
+            for (pending_aliases.items) |alias| {
+                if (alias.pending_index != pending_idx) continue;
+                ack_outcomes[alias.response_index] = outcome;
+            }
+        }
+    }
+
+    var response = std.array_list.Managed(u8).init(eng.alloc);
+    defer response.deinit();
+    try appendInt(&response, u32, count);
+    for (ack_outcomes) |ack| {
+        try appendDeclareAckEntry(&response, ack.client_decl_id, ack.status, ack.code, ack.series_id);
     }
 
     const elapsed_ns = std.time.nanoTimestamp() - start_ns;

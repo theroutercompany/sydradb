@@ -147,12 +147,29 @@ pub fn applyParsedIngestLine(eng: *Engine, parsed: ParsedIngestLine) !types.Seri
     const canonical_tags = try canonicalizeTagsJson(eng.alloc, parsed.tags_json);
     defer eng.alloc.free(canonical_tags);
 
+    var declarations = try eng.alloc.alloc(Engine.ExactSeriesCanonicalDeclarationInput, parsed.writes.len);
+    defer eng.alloc.free(declarations);
+    const declaration_results = try eng.alloc.alloc(Engine.ExactSeriesBatchDeclarationResult, parsed.writes.len);
+    defer eng.alloc.free(declaration_results);
     var points = try eng.alloc.alloc(Engine.ResolvedIngestPoint, parsed.writes.len);
     defer eng.alloc.free(points);
 
+    for (parsed.writes, 0..) |write, idx| {
+        declarations[idx] = .{
+            .name = write.series,
+            .canonical_tags = canonical_tags,
+            .descriptor = descriptorInput(&write),
+        };
+    }
+    try eng.declareExactSeriesCanonicalBatch(declarations, declaration_results);
+
     var first_sid: ?types.SeriesId = null;
     for (parsed.writes, 0..) |write, idx| {
-        const sid = try eng.declareExactSeriesCanonical(write.series, canonical_tags, descriptorInput(&write));
+        const sid = switch (declaration_results[idx].status) {
+            .ok => declaration_results[idx].series_id.?,
+            .metric_descriptor_conflict => return error.MetricDescriptorConflict,
+            .series_conflict => return error.SeriesIdConflict,
+        };
         points[idx] = .{
             .series_id = sid,
             .ts = parsed.ts,

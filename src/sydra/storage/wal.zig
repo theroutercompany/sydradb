@@ -390,6 +390,59 @@ pub const WAL = struct {
         return try appendPayload(self, payload.items);
     }
 
+    pub fn appendSeriesRegistrationBatch(self: *WAL, registrations: anytype) !u64 {
+        const regs_type = @TypeOf(registrations);
+        const regs_info = @typeInfo(regs_type);
+        comptime {
+            if (regs_info != .pointer or regs_info.pointer.size != .slice) {
+                @compileError("appendSeriesRegistrationBatch expects a slice of registration-like structs");
+            }
+            const Reg = regs_info.pointer.child;
+            if (!@hasField(Reg, "series_id") or !@hasField(Reg, "series") or !@hasField(Reg, "canonical_tags")) {
+                @compileError("appendSeriesRegistrationBatch registrations must expose series_id, series, and canonical_tags");
+            }
+        }
+
+        if (registrations.len == 0) return 0;
+
+        var total_bytes: usize = 0;
+        for (registrations) |registration| {
+            const payload_len = 1 + 8 + 4 + 4 + registration.series.len + registration.canonical_tags.len;
+            total_bytes += 4 + payload_len + 4;
+        }
+
+        const encoded = try self.alloc.alloc(u8, total_bytes);
+        defer self.alloc.free(encoded);
+
+        var offset: usize = 0;
+        for (registrations) |registration| {
+            const payload_len: u32 = @intCast(1 + 8 + 4 + 4 + registration.series.len + registration.canonical_tags.len);
+            writeIntBytes(u32, encoded, &offset, payload_len);
+
+            const payload = encoded[offset .. offset + payload_len];
+            payload[0] = 2;
+            writeIntSlice(u64, payload[1..9], registration.series_id);
+            writeIntSlice(u32, payload[9..13], @intCast(registration.series.len));
+            writeIntSlice(u32, payload[13..17], @intCast(registration.canonical_tags.len));
+            @memcpy(payload[17 .. 17 + registration.series.len], registration.series);
+            @memcpy(payload[17 + registration.series.len .. 17 + registration.series.len + registration.canonical_tags.len], registration.canonical_tags);
+            offset += payload_len;
+
+            var crc = std.hash.Crc32.init();
+            crc.update(payload);
+            writeIntBytes(u32, encoded, &offset, crc.final());
+        }
+
+        try self.file.writeAll(encoded);
+        self.bytes_written += total_bytes;
+        switch (self.fsync) {
+            .always => try self.file.sync(),
+            .interval => {},
+            .none => {},
+        }
+        return total_bytes;
+    }
+
     pub fn rotateIfNeeded(self: *WAL) !void {
         if (self.bytes_written < 64 * 1024 * 1024) return; // 64 MiB
         self.file.close();

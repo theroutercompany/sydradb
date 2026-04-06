@@ -63,6 +63,13 @@ pub const RegisterResult = enum {
     updated,
 };
 
+pub const BatchRegisterResult = enum {
+    unchanged,
+    inserted,
+    updated,
+    conflict,
+};
+
 pub const MetricCatalog = struct {
     alloc: std.mem.Allocator,
     fsync: cfg.FsyncPolicy,
@@ -149,6 +156,50 @@ pub const MetricCatalog = struct {
         try self.index.put(self.entries.items[self.entries.items.len - 1].metric, self.entries.items.len - 1);
         if (self.root != null) try self.rewriteLocked();
         return .inserted;
+    }
+
+    pub fn registerBatch(self: *MetricCatalog, inputs: []const DescriptorInput, out: []BatchRegisterResult) !void {
+        std.debug.assert(inputs.len == out.len);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var changed = false;
+        for (inputs, 0..) |input, idx| {
+            if (self.index.get(input.metric)) |entry_idx| {
+                const result = mergeDescriptor(self.alloc, &self.entries.items[entry_idx], input) catch |err| switch (err) {
+                    error.MetricDescriptorConflict => {
+                        out[idx] = .conflict;
+                        continue;
+                    },
+                    else => return err,
+                };
+                out[idx] = switch (result) {
+                    .unchanged => .unchanged,
+                    .inserted => unreachable,
+                    .updated => .updated,
+                };
+                changed = changed or result != .unchanged;
+                continue;
+            }
+
+            var descriptor = Descriptor{
+                .metric = try self.alloc.dupe(u8, input.metric),
+                .kind = input.kind,
+                .unit = try dupeOptional(self.alloc, normalizeOptional(input.unit)),
+                .description = try dupeOptional(self.alloc, normalizeOptional(input.description)),
+                .source_metric = try dupeOptional(self.alloc, normalizeOptional(input.source_metric)),
+                .source_field = try dupeOptional(self.alloc, normalizeOptional(input.source_field)),
+            };
+            errdefer descriptor.deinit(self.alloc);
+
+            try self.entries.append(self.alloc, descriptor);
+            try self.index.put(self.entries.items[self.entries.items.len - 1].metric, self.entries.items.len - 1);
+            out[idx] = .inserted;
+            changed = true;
+        }
+
+        if (changed and self.root != null) try self.rewriteLocked();
     }
 
     pub fn checkpointTo(self: *MetricCatalog) !void {

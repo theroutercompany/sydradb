@@ -442,6 +442,23 @@ pub const Engine = struct {
         descriptor: ?metric_catalog_mod.DescriptorInput = null,
     };
 
+    pub const ExactSeriesCanonicalDeclarationInput = struct {
+        name: []const u8,
+        canonical_tags: []const u8,
+        descriptor: ?metric_catalog_mod.DescriptorInput = null,
+    };
+
+    pub const ExactSeriesDeclarationStatus = enum {
+        ok,
+        metric_descriptor_conflict,
+        series_conflict,
+    };
+
+    pub const ExactSeriesBatchDeclarationResult = struct {
+        status: ExactSeriesDeclarationStatus = .ok,
+        series_id: ?types.SeriesId = null,
+    };
+
     pub const ExactSeriesDeclarationResult = struct {
         series_id: types.SeriesId,
         canonical_tags: []u8,
@@ -2663,6 +2680,53 @@ pub const Engine = struct {
         if (dirty) self.tag_index_dirty.store(true, .monotonic);
     }
 
+    fn noteTagsBatch(
+        self: *Engine,
+        inputs: []const ExactSeriesCanonicalDeclarationInput,
+        results: []const ExactSeriesBatchDeclarationResult,
+    ) !void {
+        var groups = std.StringHashMap(std.array_list.Managed(types.SeriesId)).init(self.alloc);
+        defer {
+            var it = groups.iterator();
+            while (it.next()) |entry| entry.value_ptr.deinit();
+            groups.deinit();
+        }
+
+        for (inputs, results) |input, result| {
+            if (result.status != .ok) continue;
+            const series_id = result.series_id orelse continue;
+            const gop = try groups.getOrPut(input.canonical_tags);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = std.array_list.Managed(types.SeriesId).init(self.alloc);
+            }
+            try gop.value_ptr.append(series_id);
+        }
+
+        var dirty = false;
+        var group_it = groups.iterator();
+        while (group_it.next()) |entry| {
+            var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, entry.key_ptr.*, .{}) catch continue;
+            defer parsed.deinit();
+            if (parsed.value != .object) continue;
+
+            var json_it = parsed.value.object.iterator();
+            while (json_it.next()) |tag_entry| {
+                if (tag_entry.value_ptr.* != .string) continue;
+                const key = std.fmt.allocPrint(self.alloc, "{s}={s}", .{ tag_entry.key_ptr.*, tag_entry.value_ptr.string }) catch continue;
+                defer self.alloc.free(key);
+                for (entry.value_ptr.items) |series_id| {
+                    const inserted = self.metadata.tags.add(key, series_id) catch |err| {
+                        std.log.warn("tag index add failed: {s}", .{@errorName(err)});
+                        continue;
+                    };
+                    dirty = dirty or inserted;
+                }
+            }
+        }
+
+        if (dirty) self.tag_index_dirty.store(true, .monotonic);
+    }
+
     fn appendMemtablePoint(self: *Engine, sid: types.SeriesId, ts: i64, value: f64) !void {
         const gop = try self.mem.series.getOrPut(sid);
         if (!gop.found_existing) {
@@ -2960,21 +3024,115 @@ pub const Engine = struct {
         _ = try self.wal.appendSeriesRegistration(series_id, series_name, canonical_tags);
     }
 
+    pub fn declareExactSeriesCanonicalBatch(
+        self: *Engine,
+        inputs: []const ExactSeriesCanonicalDeclarationInput,
+        results: []ExactSeriesBatchDeclarationResult,
+    ) !void {
+        std.debug.assert(inputs.len == results.len);
+        if (inputs.len == 0) return;
+
+        self.exact_series_declare_mu.lock();
+        defer self.exact_series_declare_mu.unlock();
+
+        for (results) |*result| {
+            result.* = .{};
+        }
+
+        var descriptor_inputs = std.array_list.Managed(metric_catalog_mod.DescriptorInput).init(self.alloc);
+        defer descriptor_inputs.deinit();
+        var descriptor_result_indices = std.array_list.Managed(usize).init(self.alloc);
+        defer descriptor_result_indices.deinit();
+
+        for (inputs, 0..) |input, idx| {
+            if (input.descriptor) |descriptor| {
+                try descriptor_inputs.append(descriptor);
+                try descriptor_result_indices.append(idx);
+            }
+        }
+
+        if (descriptor_inputs.items.len != 0) {
+            const descriptor_results = try self.alloc.alloc(metric_catalog_mod.BatchRegisterResult, descriptor_inputs.items.len);
+            defer self.alloc.free(descriptor_results);
+
+            try self.metadata.metric_catalog.registerBatch(descriptor_inputs.items, descriptor_results);
+            for (descriptor_results, 0..) |descriptor_result, compact_idx| {
+                const result_idx = descriptor_result_indices.items[compact_idx];
+                if (descriptor_result == .conflict) {
+                    results[result_idx] = .{
+                        .status = .metric_descriptor_conflict,
+                        .series_id = null,
+                    };
+                }
+            }
+        }
+
+        var series_inputs = std.array_list.Managed(series_catalog_mod.CanonicalRegisterInput).init(self.alloc);
+        defer series_inputs.deinit();
+        var series_result_indices = std.array_list.Managed(usize).init(self.alloc);
+        defer series_result_indices.deinit();
+
+        for (inputs, 0..) |input, idx| {
+            if (results[idx].status != .ok) continue;
+            const series_id = types.seriesIdFrom(input.name, input.canonical_tags);
+            try series_inputs.append(.{
+                .series = input.name,
+                .canonical_tags = input.canonical_tags,
+                .series_id = series_id,
+            });
+            try series_result_indices.append(idx);
+        }
+
+        if (series_inputs.items.len != 0) {
+            const series_results = try self.alloc.alloc(series_catalog_mod.RegisterBatchResult, series_inputs.items.len);
+            defer self.alloc.free(series_results);
+
+            var wal_registrations = std.array_list.Managed(series_catalog_mod.PendingWalRegistration).init(self.alloc);
+            defer wal_registrations.deinit();
+
+            try self.metadata.series_catalog.registerCanonicalBatch(series_inputs.items, series_results, &wal_registrations);
+            if (wal_registrations.items.len != 0) {
+                _ = try self.wal.appendSeriesRegistrationBatch(wal_registrations.items);
+            }
+
+            for (series_results, 0..) |series_result, compact_idx| {
+                const result_idx = series_result_indices.items[compact_idx];
+                const series_id = series_inputs.items[compact_idx].series_id;
+                results[result_idx] = switch (series_result) {
+                    .inserted, .unchanged => .{
+                        .status = .ok,
+                        .series_id = series_id,
+                    },
+                    .conflict => .{
+                        .status = .series_conflict,
+                        .series_id = null,
+                    },
+                };
+            }
+        }
+
+        try self.noteTagsBatch(inputs, results);
+    }
+
     pub fn declareExactSeriesCanonical(
         self: *Engine,
         name: []const u8,
         canonical_tags: []const u8,
         descriptor: ?metric_catalog_mod.DescriptorInput,
     ) !types.SeriesId {
-        self.exact_series_declare_mu.lock();
-        defer self.exact_series_declare_mu.unlock();
-        if (descriptor) |descriptor_input| {
-            _ = try self.registerMetricDescriptor(descriptor_input);
-        }
-        const series_id = types.seriesIdFrom(name, canonical_tags);
-        try self.registerSeries(name, canonical_tags, series_id);
-        self.noteTags(series_id, canonical_tags);
-        return series_id;
+        var result: [1]ExactSeriesBatchDeclarationResult = undefined;
+        try self.declareExactSeriesCanonicalBatch(&.{
+            .{
+                .name = name,
+                .canonical_tags = canonical_tags,
+                .descriptor = descriptor,
+            },
+        }, result[0..]);
+        return switch (result[0].status) {
+            .ok => result[0].series_id.?,
+            .metric_descriptor_conflict => error.MetricDescriptorConflict,
+            .series_conflict => error.SeriesIdConflict,
+        };
     }
 
     fn collectSegmentHighwater(highwater: *std.AutoHashMap(types.SeriesId, i64), entries: anytype) !void {
@@ -3879,6 +4037,62 @@ test "engine exact-series declaration is idempotent and indexes tags once" {
     const descriptor = engine.metricDescriptor("svc.req").?;
     try std.testing.expectEqual(metric_catalog_mod.MetricKind.counter, descriptor.kind.?);
     try std.testing.expectEqualStrings("requests", descriptor.unit.?);
+}
+
+test "engine batch exact-series declaration preserves per-entry conflicts and successes" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/declare-batch", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var engine = try Engine.init(talloc, try testConfig(talloc, data_path));
+    defer engine.deinit();
+
+    const conflicting_sid = types.seriesIdFrom("svc.conflict", "{}");
+    try engine.registerSeriesInternal("svc.other", "{}", conflicting_sid, true);
+
+    const inputs = [_]Engine.ExactSeriesCanonicalDeclarationInput{
+        .{
+            .name = "svc.batch",
+            .canonical_tags = "{\"host\":\"a\"}",
+            .descriptor = .{ .metric = "svc.batch", .kind = .counter },
+        },
+        .{
+            .name = "svc.batch",
+            .canonical_tags = "{\"host\":\"b\"}",
+            .descriptor = .{ .metric = "svc.batch", .kind = .counter },
+        },
+        .{
+            .name = "svc.batch",
+            .canonical_tags = "{\"host\":\"c\"}",
+            .descriptor = .{ .metric = "svc.batch", .kind = .gauge },
+        },
+        .{
+            .name = "svc.conflict",
+            .canonical_tags = "{}",
+            .descriptor = null,
+        },
+    };
+    var results: [inputs.len]Engine.ExactSeriesBatchDeclarationResult = undefined;
+    try engine.declareExactSeriesCanonicalBatch(&inputs, results[0..]);
+
+    try std.testing.expectEqual(Engine.ExactSeriesDeclarationStatus.ok, results[0].status);
+    try std.testing.expectEqual(Engine.ExactSeriesDeclarationStatus.ok, results[1].status);
+    try std.testing.expectEqual(Engine.ExactSeriesDeclarationStatus.metric_descriptor_conflict, results[2].status);
+    try std.testing.expectEqual(Engine.ExactSeriesDeclarationStatus.series_conflict, results[3].status);
+    try std.testing.expectEqual(types.seriesIdFrom("svc.batch", "{\"host\":\"a\"}"), results[0].series_id.?);
+    try std.testing.expectEqual(types.seriesIdFrom("svc.batch", "{\"host\":\"b\"}"), results[1].series_id.?);
+
+    const host_a = engine.metadata.tags.get("host=a");
+    const host_b = engine.metadata.tags.get("host=b");
+    const host_c = engine.metadata.tags.get("host=c");
+    try std.testing.expectEqual(@as(usize, 1), host_a.len);
+    try std.testing.expectEqual(@as(usize, 1), host_b.len);
+    try std.testing.expectEqual(@as(usize, 0), host_c.len);
+    try std.testing.expectEqual(results[0].series_id.?, host_a[0]);
+    try std.testing.expectEqual(results[1].series_id.?, host_b[0]);
 }
 
 test "engine appendResolvedBatch rejects atomically when memory limit is exceeded" {

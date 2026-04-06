@@ -50,6 +50,24 @@ pub const RebuildEntry = struct {
     series_id: types.SeriesId,
 };
 
+pub const CanonicalRegisterInput = struct {
+    series: []const u8,
+    canonical_tags: []const u8,
+    series_id: types.SeriesId,
+};
+
+pub const RegisterBatchResult = enum {
+    unchanged,
+    inserted,
+    conflict,
+};
+
+pub const PendingWalRegistration = struct {
+    series_id: types.SeriesId,
+    series: []const u8,
+    canonical_tags: []const u8,
+};
+
 pub const SeriesCatalog = struct {
     alloc: std.mem.Allocator,
     fsync: cfg.FsyncPolicy,
@@ -143,6 +161,63 @@ pub const SeriesCatalog = struct {
 
         try self.appendLine(owned_series, canonical_tags, series_id);
         return true;
+    }
+
+    pub fn registerCanonicalBatch(
+        self: *SeriesCatalog,
+        inputs: []const CanonicalRegisterInput,
+        out: []RegisterBatchResult,
+        wal_registrations: *std.array_list.Managed(PendingWalRegistration),
+    ) !void {
+        std.debug.assert(inputs.len == out.len);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var inserted_indices = std.array_list.Managed(usize).init(self.alloc);
+        defer inserted_indices.deinit();
+
+        for (inputs, 0..) |input, idx| {
+            const owned_series = try self.alloc.dupe(u8, input.series);
+            errdefer self.alloc.free(owned_series);
+
+            const owned_tags = try self.alloc.dupe(u8, input.canonical_tags);
+            errdefer self.alloc.free(owned_tags);
+
+            const selector_key = try buildSelectorKey(self.alloc, owned_series, owned_tags);
+            errdefer self.alloc.free(selector_key);
+
+            const inserted = self.insertOwned(owned_series, owned_tags, selector_key, input.series_id) catch |err| switch (err) {
+                error.SeriesIdConflict => {
+                    self.alloc.free(owned_series);
+                    self.alloc.free(owned_tags);
+                    self.alloc.free(selector_key);
+                    out[idx] = .conflict;
+                    continue;
+                },
+                else => return err,
+            };
+            if (!inserted) {
+                out[idx] = .unchanged;
+                continue;
+            }
+
+            out[idx] = .inserted;
+            try inserted_indices.append(self.entries.items.len - 1);
+        }
+
+        if (inserted_indices.items.len != 0) {
+            try self.appendLinesLocked(inserted_indices.items);
+            try wal_registrations.ensureUnusedCapacity(inserted_indices.items.len);
+            for (inserted_indices.items) |entry_idx| {
+                const entry = self.entries.items[entry_idx];
+                wal_registrations.appendAssumeCapacity(.{
+                    .series_id = entry.series_id,
+                    .series = entry.series,
+                    .canonical_tags = entry.canonical_tags,
+                });
+            }
+        }
     }
 
     pub fn resolveUniqueName(self: *SeriesCatalog, series: []const u8) Match {
@@ -323,6 +398,41 @@ pub const SeriesCatalog = struct {
         if (adapter.err) |write_err| return write_err;
 
         try buffer.append('\n');
+        try self.file.?.writeAll(buffer.items);
+        switch (self.fsync) {
+            .always => try self.file.?.sync(),
+            .interval, .none => {},
+        }
+    }
+
+    fn appendLinesLocked(self: *SeriesCatalog, entry_indices: []const usize) !void {
+        if (self.file == null or entry_indices.len == 0) return;
+
+        var buffer = std.array_list.Managed(u8).init(self.alloc);
+        defer buffer.deinit();
+
+        var writer = buffer.writer();
+        var tmp: [256]u8 = undefined;
+        var adapter = writer.adaptToNewApi(&tmp);
+        const iface = &adapter.new_interface;
+
+        for (entry_indices) |entry_idx| {
+            const entry = self.entries.items[entry_idx];
+            var jw = std.json.Stringify{ .writer = iface };
+            try jw.beginObject();
+            try jw.objectField("series");
+            try jw.write(entry.series);
+            try jw.objectField("tags_json");
+            try jw.write(entry.canonical_tags);
+            try jw.objectField("series_id");
+            try jw.write(entry.series_id);
+            try jw.endObject();
+            try iface.writeByte('\n');
+        }
+
+        try iface.flush();
+        if (adapter.err) |write_err| return write_err;
+
         try self.file.?.writeAll(buffer.items);
         switch (self.fsync) {
             .always => try self.file.?.sync(),
