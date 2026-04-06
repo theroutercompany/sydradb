@@ -79,6 +79,43 @@ curl 'http://localhost:8080/api/v1/query/range?series=weather.room1&start=169429
 
 `POST /api/v1/labels/values` returns known values for one label key, optionally scoped to a metric family.
 
+`POST /api/v1/metrics/health` returns per-metric operator health such as missing metadata, inactive series counts, and last-seen timestamps.
+
+## Compare windows (HTTP)
+
+Use `POST /api/v1/query/compare` to compare one exact series across two time windows:
+
+```json
+{
+  "metric":"requests_total",
+  "labels":{"service":"api","host":"edge-1"},
+  "start":1694300000,
+  "end":1694303600,
+  "baseline_start":1694296400,
+  "baseline_end":1694300000,
+  "aggregate":"delta"
+}
+```
+
+For counters, `delta` is reset-aware, which makes this endpoint useful for before/after deploy checks.
+
+## Write and query annotations (HTTP)
+
+Use `POST /api/v1/annotations/write` to persist deploy markers, incident notes, or maintenance windows:
+
+```json
+{
+  "kind":"deploy",
+  "title":"api rollout",
+  "metric":"requests_total",
+  "labels":{"service":"api"},
+  "start":1694300100,
+  "message":"rolled out build 2026.04.06"
+}
+```
+
+Use `POST /api/v1/annotations/query` to fetch those markers for a time range and metric scope.
+
 ## Find series by tags (legacy HTTP)
 
 [`POST /api/v1/query/find`](../reference/http-api.md#post-apiv1queryfind) accepts JSON:

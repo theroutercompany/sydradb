@@ -4,6 +4,7 @@ const types = @import("types.zig");
 const config = @import("config.zig");
 const compat = @import("compat.zig");
 const cas_mod = @import("storage/cas.zig");
+const annotations_mod = @import("storage/annotations.zig");
 const metric_catalog_mod = @import("storage/metric_catalog.zig");
 const query_exec = @import("query/exec.zig");
 const compiler_diagnostics = @import("query/compiler/diagnostics.zig");
@@ -123,6 +124,18 @@ fn handleRequest(handle: *alloc_mod.AllocatorHandle, alloc: std.mem.Allocator, e
     }
     if (std.mem.eql(u8, path, "/api/v1/labels/values") and method == .POST) {
         return try handleLabelValues(alloc, eng, req);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/metrics/health") and method == .POST) {
+        return try handleMetricsHealth(alloc, eng, req);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/query/compare") and method == .POST) {
+        return try handleQueryCompare(alloc, eng, req);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/annotations/write") and method == .POST) {
+        return try handleAnnotationWrite(alloc, eng, req);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/annotations/query") and method == .POST) {
+        return try handleAnnotationQuery(alloc, eng, req);
     }
     if (std.mem.eql(u8, path, "/api/v1/sydraql") and method == .POST) {
         return try handleSydraql(alloc, eng, req);
@@ -1964,6 +1977,428 @@ fn handleLabelValues(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Serv
     try response.end();
 }
 
+fn handleMetricsHealth(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    var parsed = readJsonBody(alloc, req, 64 * 1024) catch |err| switch (err) {
+        error.LengthRequired => return respondJsonError(alloc, req, .length_required, "length_required", "length required"),
+        error.PayloadTooLarge => return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large"),
+        else => return respondJsonError(alloc, req, .bad_request, "invalid_json", "invalid json"),
+    };
+    defer parsed.deinit(alloc);
+    const obj = parsed.parsed.value.object;
+
+    const prefix = if (obj.get("prefix")) |value|
+        if (value == .string) value.string else return respondJsonError(alloc, req, .bad_request, "invalid_prefix", "invalid prefix")
+    else
+        "";
+    const labels_value = obj.get("labels");
+    if (labels_value) |labels| {
+        if (labels != .object) return respondJsonError(alloc, req, .bad_request, "invalid_labels", "invalid labels");
+    }
+    const inactive_before_ts = if (obj.get("inactive_before_ts")) |value|
+        if (value == .integer) value.integer else return respondJsonError(alloc, req, .bad_request, "invalid_inactive_before_ts", "invalid inactive_before_ts")
+    else
+        null;
+    const limit = if (obj.get("limit")) |value|
+        if (value == .integer and value.integer >= 0) @as(usize, @intCast(value.integer)) else return respondJsonError(alloc, req, .bad_request, "invalid_limit", "invalid limit")
+    else
+        null;
+
+    var unique = std.StringHashMap(void).init(alloc);
+    defer {
+        var it = unique.iterator();
+        while (it.next()) |entry| alloc.free(entry.key_ptr.*);
+        unique.deinit();
+    }
+    var metrics = std.array_list.Managed([]const u8).init(alloc);
+    defer {
+        for (metrics.items) |metric| alloc.free(metric);
+        metrics.deinit();
+    }
+
+    collect_metrics: {
+        eng.metadata.series_catalog.mutex.lock();
+        defer eng.metadata.series_catalog.mutex.unlock();
+        for (eng.metadata.series_catalog.entries.items) |entry| {
+            if (prefix.len != 0 and !std.mem.startsWith(u8, entry.series, prefix)) continue;
+            if (unique.contains(entry.series)) continue;
+            if (labels_value) |labels| {
+                const descriptor_matches = descriptorMatchesLabels(entry.canonical_tags, labels, true) catch false;
+                if (!descriptor_matches) continue;
+            }
+            const owned_metric = try alloc.dupe(u8, entry.series);
+            errdefer alloc.free(owned_metric);
+            try unique.put(owned_metric, {});
+            try metrics.append(owned_metric);
+            if (limit) |bounded| {
+                if (metrics.items.len >= bounded) break :collect_metrics;
+            }
+        }
+    }
+
+    std.sort.block([]const u8, metrics.items, {}, struct {
+        fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+            return std.mem.lessThan(u8, lhs, rhs);
+        }
+    }.lessThan);
+
+    var send_buffer: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{
+            .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        },
+    });
+    errdefer response.end() catch {};
+
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try jw.beginArray();
+    for (metrics.items) |metric| {
+        const series = try eng.seriesDescriptorsForMetric(alloc, metric, labels_value, true, null);
+        defer alloc.free(series);
+        const descriptor = eng.metricDescriptor(metric);
+        const label_keys = try collectLabelKeysForSeries(alloc, series);
+        defer freeOwnedStrings(alloc, label_keys);
+        const bounds = combineSeriesBounds(series);
+
+        var inactive_series_count: usize = 0;
+        if (inactive_before_ts) |cutoff| {
+            for (series) |descriptor_item| {
+                if (descriptor_item.last_ts == null or descriptor_item.last_ts.? < cutoff) inactive_series_count += 1;
+            }
+        }
+
+        try jw.beginObject();
+        try jw.objectField("metric");
+        try jw.write(metric);
+        try jw.objectField("kind");
+        try jw.write(if (descriptor) |desc|
+            if (desc.kind) |kind| kind.text() else metric_catalog_mod.MetricKind.gauge.text()
+        else
+            metric_catalog_mod.MetricKind.gauge.text());
+        try jw.objectField("series_count");
+        try jw.write(series.len);
+        try jw.objectField("inactive_series_count");
+        try jw.write(inactive_series_count);
+        try jw.objectField("inactive");
+        try jw.write(if (inactive_before_ts) |cutoff|
+            bounds.last_ts == null or bounds.last_ts.? < cutoff
+        else
+            false);
+        try jw.objectField("label_keys");
+        try jw.beginArray();
+        for (label_keys) |key| try jw.write(key);
+        try jw.endArray();
+        try jw.objectField("missing_metadata");
+        try jw.beginArray();
+        if (descriptor == null or descriptor.?.kind == null) try jw.write("kind");
+        if (descriptor == null or descriptor.?.unit == null) try jw.write("unit");
+        if (descriptor == null or descriptor.?.description == null) try jw.write("description");
+        try jw.endArray();
+        try jw.objectField("first_ts");
+        if (bounds.first_ts) |first_ts| try jw.write(first_ts) else try jw.write(null);
+        try jw.objectField("last_ts");
+        if (bounds.last_ts) |last_ts| try jw.write(last_ts) else try jw.write(null);
+        try jw.endObject();
+    }
+    try jw.endArray();
+    try response.end();
+}
+
+fn handleQueryCompare(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    var parsed = readJsonBody(alloc, req, 64 * 1024) catch |err| switch (err) {
+        error.LengthRequired => return respondJsonError(alloc, req, .length_required, "length_required", "length required"),
+        error.PayloadTooLarge => return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large"),
+        else => return respondJsonError(alloc, req, .bad_request, "invalid_json", "invalid json"),
+    };
+    defer parsed.deinit(alloc);
+    const obj = parsed.parsed.value.object;
+
+    const aggregate_value = obj.get("aggregate") orelse {
+        return respondJsonError(alloc, req, .bad_request, "missing_aggregate", "missing aggregate");
+    };
+    if (aggregate_value != .string) {
+        return respondJsonError(alloc, req, .bad_request, "invalid_aggregate", "invalid aggregate");
+    }
+    const aggregate = aggregate_value.string;
+    const start_value = obj.get("start") orelse return respondJsonError(alloc, req, .bad_request, "missing_start", "missing start");
+    const end_value = obj.get("end") orelse return respondJsonError(alloc, req, .bad_request, "missing_end", "missing end");
+    const baseline_start_value = obj.get("baseline_start") orelse return respondJsonError(alloc, req, .bad_request, "missing_baseline_start", "missing baseline_start");
+    const baseline_end_value = obj.get("baseline_end") orelse return respondJsonError(alloc, req, .bad_request, "missing_baseline_end", "missing baseline_end");
+    if (start_value != .integer or end_value != .integer or baseline_start_value != .integer or baseline_end_value != .integer) {
+        return respondJsonError(alloc, req, .bad_request, "invalid_time_range", "invalid time range");
+    }
+
+    const labels_value = obj.get("labels");
+    if (labels_value) |labels| {
+        if (labels != .object) return respondJsonError(alloc, req, .bad_request, "invalid_labels", "invalid labels");
+    }
+    const tags_value = obj.get("tags");
+    if (tags_value) |tags| {
+        if (tags != .object) return respondJsonError(alloc, req, .bad_request, "invalid_tags", "invalid tags");
+    }
+
+    const start_ts: i64 = @intCast(start_value.integer);
+    const end_ts: i64 = @intCast(end_value.integer);
+    const baseline_start_ts: i64 = @intCast(baseline_start_value.integer);
+    const baseline_end_ts: i64 = @intCast(baseline_end_value.integer);
+    if (end_ts < start_ts or baseline_end_ts < baseline_start_ts) {
+        return respondJsonError(alloc, req, .bad_request, "invalid_time_range", "invalid time range");
+    }
+
+    const sid = if (obj.get("series_id")) |value|
+        if (value == .integer and value.integer >= 0)
+            @as(types.SeriesId, @intCast(value.integer))
+        else
+            return respondJsonError(alloc, req, .bad_request, "invalid_series_id", "invalid series_id")
+    else if (obj.get("metric")) |metric_value|
+        if (metric_value == .string) blk: {
+            const labels_json = try extractTagsJson(alloc, labels_value);
+            defer if (labels_json.owned) |owned| alloc.free(owned);
+            break :blk if (labels_value != null)
+                try resolveExactSeriesId(eng, metric_value.string, labels_json.value)
+            else
+                try resolveUniqueSeriesId(eng, metric_value.string);
+        } else return respondJsonError(alloc, req, .bad_request, "invalid_metric", "invalid metric")
+    else if (obj.get("series")) |series_value|
+        if (series_value == .string) blk: {
+            const tags_json = try extractTagsJson(alloc, tags_value);
+            defer if (tags_json.owned) |owned| alloc.free(owned);
+            break :blk if (tags_value != null)
+                try resolveExactSeriesId(eng, series_value.string, tags_json.value)
+            else
+                try resolveUniqueSeriesId(eng, series_value.string);
+        } else return respondJsonError(alloc, req, .bad_request, "invalid_series", "invalid series")
+    else
+        null;
+
+    const resolved_sid = sid orelse {
+        return respondJsonError(alloc, req, .not_found, "series_not_resolved", "series not found or ambiguous");
+    };
+    if (resolved_sid == null_series_id) {
+        return respondJsonError(alloc, req, .not_found, "series_not_found", "series not found");
+    }
+
+    const resolution = try eng.resolveSelector(.{ .by_id = resolved_sid });
+    const metric_name: ?[]const u8 = if (resolution.series) |metric|
+        metric
+    else if (obj.get("metric")) |metric_value|
+        if (metric_value == .string) metric_value.string else null
+    else if (obj.get("series")) |series_value|
+        if (series_value == .string) series_value.string else null
+    else
+        null;
+    const metric_kind = if (metric_name) |metric| eng.metricKindOrDefault(metric) else metric_catalog_mod.MetricKind.gauge;
+
+    var current_points = std.array_list.Managed(types.Point).init(alloc);
+    defer current_points.deinit();
+    try eng.queryRange(resolved_sid, start_ts, end_ts, &current_points);
+
+    var baseline_points = std.array_list.Managed(types.Point).init(alloc);
+    defer baseline_points.deinit();
+    try eng.queryRange(resolved_sid, baseline_start_ts, baseline_end_ts, &baseline_points);
+
+    const current_value = aggregatePointsForCompare(current_points.items, aggregate, metric_kind) catch {
+        return respondJsonError(alloc, req, .bad_request, "invalid_aggregate", "invalid aggregate");
+    };
+    const baseline_value = aggregatePointsForCompare(baseline_points.items, aggregate, metric_kind) catch {
+        return respondJsonError(alloc, req, .bad_request, "invalid_aggregate", "invalid aggregate");
+    };
+
+    var send_buffer: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{
+            .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        },
+    });
+    errdefer response.end() catch {};
+
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try jw.beginObject();
+    try jw.objectField("series_id");
+    try jw.write(resolved_sid);
+    if (metric_name) |metric| {
+        try jw.objectField("metric");
+        try jw.write(metric);
+    }
+    if (resolution.canonical_tags) |labels_json| {
+        try jw.objectField("labels");
+        try writeCanonicalJsonObject(&jw, labels_json);
+    }
+    try jw.objectField("aggregate");
+    try jw.write(aggregate);
+    try jw.objectField("metric_kind");
+    try jw.write(metric_kind.text());
+
+    try jw.objectField("current");
+    try jw.beginObject();
+    try jw.objectField("start");
+    try jw.write(start_ts);
+    try jw.objectField("end");
+    try jw.write(end_ts);
+    try jw.objectField("samples");
+    try jw.write(current_points.items.len);
+    try jw.objectField("value");
+    if (current_value) |value| try jw.write(value) else try jw.write(null);
+    try jw.endObject();
+
+    try jw.objectField("baseline");
+    try jw.beginObject();
+    try jw.objectField("start");
+    try jw.write(baseline_start_ts);
+    try jw.objectField("end");
+    try jw.write(baseline_end_ts);
+    try jw.objectField("samples");
+    try jw.write(baseline_points.items.len);
+    try jw.objectField("value");
+    if (baseline_value) |value| try jw.write(value) else try jw.write(null);
+    try jw.endObject();
+
+    try jw.objectField("change_abs");
+    if (current_value != null and baseline_value != null) {
+        try jw.write(current_value.? - baseline_value.?);
+    } else {
+        try jw.write(null);
+    }
+    try jw.objectField("change_pct");
+    if (percentChange(current_value, baseline_value)) |value| try jw.write(value) else try jw.write(null);
+    try jw.endObject();
+    try response.end();
+}
+
+fn handleAnnotationWrite(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    var parsed = readJsonBody(alloc, req, 64 * 1024) catch |err| switch (err) {
+        error.LengthRequired => return respondJsonError(alloc, req, .length_required, "length_required", "length required"),
+        error.PayloadTooLarge => return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large"),
+        else => return respondJsonError(alloc, req, .bad_request, "invalid_json", "invalid json"),
+    };
+    defer parsed.deinit(alloc);
+    const obj = parsed.parsed.value.object;
+
+    const kind_value = obj.get("kind") orelse return respondJsonError(alloc, req, .bad_request, "missing_kind", "missing kind");
+    const title_value = obj.get("title") orelse return respondJsonError(alloc, req, .bad_request, "missing_title", "missing title");
+    const start_value = obj.get("start") orelse return respondJsonError(alloc, req, .bad_request, "missing_start", "missing start");
+    if (kind_value != .string or title_value != .string or start_value != .integer) {
+        return respondJsonError(alloc, req, .bad_request, "invalid_annotation", "invalid annotation");
+    }
+    if (obj.get("labels")) |labels| {
+        if (labels != .object) return respondJsonError(alloc, req, .bad_request, "invalid_labels", "invalid labels");
+    }
+
+    const start_ts: i64 = @intCast(start_value.integer);
+    const end_ts: i64 = if (obj.get("end")) |value|
+        if (value == .integer) @intCast(value.integer) else return respondJsonError(alloc, req, .bad_request, "invalid_end", "invalid end")
+    else
+        start_ts;
+    if (end_ts < start_ts) return respondJsonError(alloc, req, .bad_request, "invalid_time_range", "invalid time range");
+
+    const labels_json = try extractTagsJson(alloc, obj.get("labels"));
+    defer if (labels_json.owned) |owned| alloc.free(owned);
+
+    var entry = annotations_mod.append(alloc, eng.data_dir, .{
+        .kind = kind_value.string,
+        .title = title_value.string,
+        .message = if (obj.get("message")) |message|
+            if (message == .string) message.string else return respondJsonError(alloc, req, .bad_request, "invalid_message", "invalid message")
+        else
+            null,
+        .metric = if (obj.get("metric")) |metric|
+            if (metric == .string) metric.string else return respondJsonError(alloc, req, .bad_request, "invalid_metric", "invalid metric")
+        else
+            null,
+        .start_ts = start_ts,
+        .end_ts = end_ts,
+        .labels_json = labels_json.value,
+    }) catch |err| switch (err) {
+        else => return respondJsonError(alloc, req, .internal_server_error, "annotation_write_failed", @errorName(err)),
+    };
+    defer entry.deinit(alloc);
+
+    var send_buffer: [512]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{
+            .status = .created,
+            .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try writeAnnotationEntry(&jw, entry);
+    try response.end();
+}
+
+fn handleAnnotationQuery(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    var parsed = readJsonBody(alloc, req, 64 * 1024) catch |err| switch (err) {
+        error.LengthRequired => return respondJsonError(alloc, req, .length_required, "length_required", "length required"),
+        error.PayloadTooLarge => return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large"),
+        else => return respondJsonError(alloc, req, .bad_request, "invalid_json", "invalid json"),
+    };
+    defer parsed.deinit(alloc);
+    const obj = parsed.parsed.value.object;
+
+    const labels_value = obj.get("labels");
+    if (labels_value) |labels| {
+        if (labels != .object) return respondJsonError(alloc, req, .bad_request, "invalid_labels", "invalid labels");
+    }
+    var op_and = true;
+    if (obj.get("op")) |value| {
+        if (value == .string and std.ascii.eqlIgnoreCase(value.string, "or")) op_and = false;
+    }
+    const limit = if (obj.get("limit")) |value|
+        if (value == .integer and value.integer >= 0) @as(usize, @intCast(value.integer)) else return respondJsonError(alloc, req, .bad_request, "invalid_limit", "invalid limit")
+    else
+        null;
+
+    const entries = annotations_mod.query(alloc, eng.data_dir, .{
+        .start_ts = if (obj.get("start")) |value|
+            if (value == .integer) value.integer else return respondJsonError(alloc, req, .bad_request, "invalid_start", "invalid start")
+        else
+            null,
+        .end_ts = if (obj.get("end")) |value|
+            if (value == .integer) value.integer else return respondJsonError(alloc, req, .bad_request, "invalid_end", "invalid end")
+        else
+            null,
+        .kind = if (obj.get("kind")) |value|
+            if (value == .string) value.string else return respondJsonError(alloc, req, .bad_request, "invalid_kind", "invalid kind")
+        else
+            null,
+        .metric = if (obj.get("metric")) |value|
+            if (value == .string) value.string else return respondJsonError(alloc, req, .bad_request, "invalid_metric", "invalid metric")
+        else
+            null,
+        .limit = null,
+    }) catch |err| switch (err) {
+        else => return respondJsonError(alloc, req, .internal_server_error, "annotation_query_failed", @errorName(err)),
+    };
+    defer {
+        for (entries) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+
+    var send_buffer: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{
+            .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        },
+    });
+    errdefer response.end() catch {};
+
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try jw.beginArray();
+    var emitted: usize = 0;
+    for (entries) |entry| {
+        if (labels_value) |labels| {
+            const matches = descriptorMatchesLabels(entry.labels_json, labels, op_and) catch false;
+            if (!matches) continue;
+        }
+        try writeAnnotationEntry(&jw, entry);
+        emitted += 1;
+        if (limit) |bounded| {
+            if (emitted >= bounded) break;
+        }
+    }
+    try jw.endArray();
+    try response.end();
+}
+
 const OwnedJsonBody = struct {
     body: []u8,
     parsed: std.json.Parsed(std.json.Value),
@@ -2073,4 +2508,91 @@ fn extractLabelValue(labels_json: []const u8, key: []const u8) !?[]const u8 {
     const value = parsed.value.object.get(key) orelse return null;
     if (value != .string) return null;
     return value.string;
+}
+
+fn writeAnnotationEntry(jw: *std.json.Stringify, entry: annotations_mod.Entry) !void {
+    try jw.beginObject();
+    try jw.objectField("id");
+    try jw.write(entry.id);
+    try jw.objectField("kind");
+    try jw.write(entry.kind);
+    try jw.objectField("title");
+    try jw.write(entry.title);
+    if (entry.message) |message| {
+        try jw.objectField("message");
+        try jw.write(message);
+    }
+    if (entry.metric) |metric| {
+        try jw.objectField("metric");
+        try jw.write(metric);
+    }
+    try jw.objectField("start");
+    try jw.write(entry.start_ts);
+    try jw.objectField("end");
+    try jw.write(entry.end_ts);
+    try jw.objectField("labels");
+    try writeCanonicalJsonObject(jw, entry.labels_json);
+    try jw.endObject();
+}
+
+fn aggregatePointsForCompare(
+    points: []const types.Point,
+    aggregate: []const u8,
+    metric_kind: metric_catalog_mod.MetricKind,
+) !?f64 {
+    if (points.len == 0) return null;
+
+    if (std.ascii.eqlIgnoreCase(aggregate, "last")) return points[points.len - 1].value;
+    if (std.ascii.eqlIgnoreCase(aggregate, "count")) return @as(f64, @floatFromInt(points.len));
+    if (std.ascii.eqlIgnoreCase(aggregate, "sum")) {
+        var total: f64 = 0;
+        for (points) |point| total += point.value;
+        return total;
+    }
+    if (std.ascii.eqlIgnoreCase(aggregate, "avg")) {
+        var total: f64 = 0;
+        for (points) |point| total += point.value;
+        return total / @as(f64, @floatFromInt(points.len));
+    }
+    if (std.ascii.eqlIgnoreCase(aggregate, "min")) {
+        var minimum = points[0].value;
+        for (points[1..]) |point| {
+            if (point.value < minimum) minimum = point.value;
+        }
+        return minimum;
+    }
+    if (std.ascii.eqlIgnoreCase(aggregate, "max")) {
+        var maximum = points[0].value;
+        for (points[1..]) |point| {
+            if (point.value > maximum) maximum = point.value;
+        }
+        return maximum;
+    }
+    if (std.ascii.eqlIgnoreCase(aggregate, "delta")) {
+        return switch (metric_kind) {
+            .counter => resetAwareDelta(points),
+            .gauge => points[points.len - 1].value - points[0].value,
+        };
+    }
+    return error.UnsupportedCompareAggregate;
+}
+
+fn resetAwareDelta(points: []const types.Point) f64 {
+    if (points.len == 0) return 0;
+    var total: f64 = 0;
+    var prev = points[0].value;
+    for (points[1..]) |point| {
+        if (point.value >= prev) {
+            total += point.value - prev;
+        } else {
+            total += point.value;
+        }
+        prev = point.value;
+    }
+    return total;
+}
+
+fn percentChange(current: ?f64, baseline: ?f64) ?f64 {
+    if (current == null or baseline == null or baseline.? == 0) return null;
+    return ((current.? - baseline.?) / baseline.?) * 100.0;
 }

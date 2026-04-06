@@ -236,6 +236,89 @@ Response JSON:
 {"values":["api","worker"]}
 ```
 
+## `POST /api/v1/metrics/health`
+
+Request JSON:
+
+- `prefix` (string, optional)
+- `labels` (object, optional)
+- `inactive_before_ts` (integer, optional)
+- `limit` (integer, optional)
+
+Response JSON: array of per-metric health summaries with:
+
+- `metric`
+- `kind`
+- `series_count`
+- `inactive_series_count`
+- `inactive`
+- `label_keys`
+- `missing_metadata`
+- `first_ts`
+- `last_ts`
+
+## `POST /api/v1/query/compare`
+
+Request JSON:
+
+- `start` (integer, required)
+- `end` (integer, required)
+- `baseline_start` (integer, required)
+- `baseline_end` (integer, required)
+- `aggregate` (string, required): `last`, `avg`, `sum`, `min`, `max`, `count`, or `delta`
+- `series_id` (integer) **or** `metric` (string) **or** `series` (string)
+- `labels` (object, optional; preferred exact selector for `metric`)
+- `tags` (object, optional; legacy exact selector for `series`)
+
+Response JSON:
+
+- `series_id`
+- `metric` (when known)
+- `labels` (when known)
+- `aggregate`
+- `metric_kind`
+- `current`: `{start,end,samples,value}`
+- `baseline`: `{start,end,samples,value}`
+- `change_abs`
+- `change_pct`
+
+## `POST /api/v1/annotations/write`
+
+Request JSON:
+
+- `kind` (string, required)
+- `title` (string, required)
+- `message` (string, optional)
+- `metric` (string, optional)
+- `labels` (object, optional)
+- `start` (integer, required)
+- `end` (integer, optional; defaults to `start`)
+
+Response JSON: the stored annotation record.
+
+## `POST /api/v1/annotations/query`
+
+Request JSON:
+
+- `start` (integer, optional)
+- `end` (integer, optional)
+- `kind` (string, optional)
+- `metric` (string, optional)
+- `labels` (object, optional)
+- `op` (string, optional): `"and"` (default) or `"or"`
+- `limit` (integer, optional)
+
+Response JSON: array of annotation records with:
+
+- `id`
+- `kind`
+- `title`
+- `message` (optional)
+- `metric` (optional)
+- `start`
+- `end`
+- `labels`
+
 ## `POST /api/v1/sydraql`
 
 Request body is **plain text** sydraQL.

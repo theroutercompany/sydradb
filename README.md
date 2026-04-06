@@ -133,7 +133,7 @@ Apache-2.0
 ## CLI
 
 ```bash
-./zig-out/bin/sydradb             # serve (HTTP): /api/v1/ingest, /api/v1/query/range, /api/v1/metrics/find, /api/v1/series/find, /api/v1/labels/values, /api/v1/sydraql, /metrics
+./zig-out/bin/sydradb             # serve (HTTP): /api/v1/ingest, /api/v1/query/range, /api/v1/query/compare, /api/v1/metrics/find, /api/v1/metrics/health, /api/v1/series/find, /api/v1/labels/values, /api/v1/annotations/write, /api/v1/annotations/query, /api/v1/sydraql, /metrics
 ./zig-out/bin/sydradb pgwire      # PostgreSQL wire protocol preview (simple query + preview prepared flow)
 ./zig-out/bin/sydradb ingest      # read NDJSON from stdin, flush, and exit only after points are queryable
 ./zig-out/bin/sydradb query <series_id> <start_ts> <end_ts>
@@ -200,6 +200,9 @@ Config notes:
 - Telemetry `fields` fan out into sibling metrics named `<metric>.<field>` without changing on-disk point storage.
 - `/api/v1/query/range` accepts `metric` + `labels` as the preferred exact selector surface; `series_id` and legacy `series` + `tags` remain supported.
 - Discovery endpoints `/api/v1/metrics/find`, `/api/v1/series/find`, and `/api/v1/labels/values` expose the catalog and label metadata needed for telemetry-style workflows.
+- `/api/v1/metrics/health` highlights inactive metric families, missing metadata, label keys, and per-metric series counts so operators can spot weak instrumentation quickly.
+- `/api/v1/query/compare` compares one exact series across two time windows with operator-friendly aggregates such as `last`, `avg`, `sum`, `count`, and reset-aware `delta`.
+- `/api/v1/annotations/write` and `/api/v1/annotations/query` let clients persist deploy markers, maintenance windows, and incident notes alongside time-series investigations.
 - `sydradb ingest` now uses the same line parser and series-id derivation as HTTP ingest, including telemetry envelopes, `tags`/`labels`, and legacy fallback-to-first-numeric `fields` behavior.
 - `cas_mode = "dual_write"` writes immutable metadata commits and `refs/heads/main` alongside the legacy storage path.
 - `metadata_read_mode = "shadow"` serves from legacy metadata and cross-checks answers against the CAS snapshot.
