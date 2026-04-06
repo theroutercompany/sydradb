@@ -6,6 +6,7 @@ const compat = @import("compat.zig");
 const cas_mod = @import("storage/cas.zig");
 const metric_catalog_mod = @import("storage/metric_catalog.zig");
 const query_exec = @import("query/exec.zig");
+const compiler_diagnostics = @import("query/compiler/diagnostics.zig");
 const query_common = @import("query/common.zig");
 const plan = @import("query/plan.zig");
 const query_executor = @import("query/executor.zig");
@@ -325,6 +326,31 @@ const ExecutionErrorContract = struct {
 };
 
 fn executionErrorContract(err: query_exec.ExecuteError) ExecutionErrorContract {
+    if (compiler_diagnostics.fromCompileError(err)) |reason| {
+        return switch (reason) {
+            .series_not_found => .{
+                .status = .not_found,
+                .code = compiler_diagnostics.reasonName(reason),
+                .message = compiler_diagnostics.diagnosticMessage(reason),
+            },
+            .ambiguous_selector => .{
+                .status = .conflict,
+                .code = compiler_diagnostics.reasonName(reason),
+                .message = compiler_diagnostics.diagnosticMessage(reason),
+            },
+            .shadow_mismatch => .{
+                .status = .service_unavailable,
+                .code = compiler_diagnostics.reasonName(reason),
+                .message = compiler_diagnostics.diagnosticMessage(reason),
+            },
+            else => .{
+                .status = .bad_request,
+                .code = compiler_diagnostics.reasonName(reason),
+                .message = compiler_diagnostics.diagnosticMessage(reason),
+            },
+        };
+    }
+
     return switch (err) {
         error.OutOfMemory => .{
             .status = .internal_server_error,
@@ -350,25 +376,7 @@ fn executionErrorContract(err: query_exec.ExecuteError) ExecutionErrorContract {
             .code = "validation_failed",
             .message = "validation failed",
         },
-        error.UnsupportedPlan,
-        error.UnsupportedExpression,
-        error.UnsupportedAggregate,
-        error.UnsupportedStatement,
-        error.UnsupportedFill,
-        error.UnsupportedTagFilter,
-        error.UnsupportedGrouping,
-        error.UnsupportedProjection,
-        error.UnsupportedOrdering,
-        error.UnsupportedPredicate,
-        error.UnsupportedFunction,
-        => .{
-            .status = .bad_request,
-            .code = "unsupported_query_shape",
-            .message = @errorName(err),
-        },
-        error.ShadowMismatch,
-        error.CasShadowMismatch,
-        => .{
+        error.CasShadowMismatch => .{
             .status = .service_unavailable,
             .code = "shadow_mismatch",
             .message = @errorName(err),
@@ -764,7 +772,20 @@ test "executionErrorContract distinguishes parse validation and unsupported fail
 
     const unsupported_contract = executionErrorContract(error.UnsupportedFunction);
     try std.testing.expectEqual(std.http.Status.bad_request, unsupported_contract.status);
-    try std.testing.expectEqualStrings("unsupported_query_shape", unsupported_contract.code);
+    try std.testing.expectEqualStrings("unsupported_function", unsupported_contract.code);
+    try std.testing.expectEqualStrings(compiler_diagnostics.diagnosticMessage(.unsupported_function), unsupported_contract.message);
+
+    const missing_series_contract = executionErrorContract(error.SeriesNotFound);
+    try std.testing.expectEqual(std.http.Status.not_found, missing_series_contract.status);
+    try std.testing.expectEqualStrings("series_not_found", missing_series_contract.code);
+
+    const ambiguous_contract = executionErrorContract(error.AmbiguousSelector);
+    try std.testing.expectEqual(std.http.Status.conflict, ambiguous_contract.status);
+    try std.testing.expectEqualStrings("ambiguous_selector", ambiguous_contract.code);
+
+    const shadow_contract = executionErrorContract(error.ShadowMismatch);
+    try std.testing.expectEqual(std.http.Status.service_unavailable, shadow_contract.status);
+    try std.testing.expectEqualStrings("shadow_mismatch", shadow_contract.code);
 }
 
 test "sydraql query text limit uses stable error payload" {
