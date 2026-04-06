@@ -14,6 +14,7 @@ Current entrypoints:
 - `zig build bench-ingest-transport -- --scenario warm_declared_10k`
 - `zig build bench-ingest-transport -- --scenario cold_declare_10k`
 - `zig build bench-ingest-transport -- --scenario steady_state_100k`
+- `zig build bench-preview-gates`
 
 The scenario files under `benchmarks/*/scenarios.json` are the checked-in contract for what we intend to measure and publish.
 

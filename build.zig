@@ -113,6 +113,12 @@ pub fn build(b: *std.Build) void {
     http_large_ingest_smoke.step.dependOn(b.getInstallStep());
     demo_smoke.dependOn(&http_large_ingest_smoke.step);
 
+    const http_concurrent_fanout_smoke = b.addSystemCommand(&.{ "bash", "-lc", "SYDRADB_BIN=\"$1\" bash demos/demo-http-concurrent-fanout.sh", "demo-http-concurrent-fanout" });
+    http_concurrent_fanout_smoke.addArtifactArg(exe);
+    http_concurrent_fanout_smoke.setCwd(repo_root);
+    http_concurrent_fanout_smoke.step.dependOn(b.getInstallStep());
+    demo_smoke.dependOn(&http_concurrent_fanout_smoke.step);
+
     const unit_tests = if (is015) blk2: {
         const root_mod = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize });
         root_mod.addImport("build_options", build_options_module);
@@ -340,4 +346,22 @@ pub fn build(b: *std.Build) void {
     bench_transport_smoke_run.step.dependOn(b.getInstallStep());
     bench_transport_smoke_run.addArgs(&.{ "--scenario", "one_hot_one_writer" });
     bench_smoke.dependOn(&bench_transport_smoke_run.step);
+
+    const preview_gate_exe = if (is015) blk8: {
+        const root_mod = b.createModule(.{ .root_source_file = b.path("tools/check_local_ingest_preview.zig"), .target = target, .optimize = optimize });
+        break :blk8 b.addExecutable(.{ .name = "check_local_ingest_preview", .root_module = root_mod });
+    } else blk8: {
+        break :blk8 b.addExecutable(.{ .name = "check_local_ingest_preview", .root_source_file = b.path("tools/check_local_ingest_preview.zig"), .target = target, .optimize = optimize });
+    };
+    preview_gate_exe.linkLibC();
+
+    const preview_gate_run = b.addRunArtifact(preview_gate_exe);
+    if (b.args) |args| preview_gate_run.addArgs(args);
+    b.step("check-local-ingest-preview", "Evaluate preview gates from bench-ingest-transport output").dependOn(&preview_gate_run.step);
+
+    const preview_gate_combo = b.addSystemCommand(&.{ "bash", "-lc", "tmpfile=$(mktemp \"${TMPDIR:-/tmp}/sydra-preview-gates.XXXXXX\") && trap 'rm -f \"$tmpfile\"' EXIT && \"$1\" 2>&1 | tee \"$tmpfile\" && \"$2\" --input \"$tmpfile\"", "bench-preview-gates" });
+    preview_gate_combo.addArtifactArg(bench_transport_exe);
+    preview_gate_combo.addArtifactArg(preview_gate_exe);
+    preview_gate_combo.step.dependOn(b.getInstallStep());
+    b.step("bench-preview-gates", "Run ingest transport benchmarks and evaluate preview gates").dependOn(&preview_gate_combo.step);
 }

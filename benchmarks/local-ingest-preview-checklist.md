@@ -7,6 +7,7 @@ Use this checklist before calling the exact-series local ingest socket preview-r
 - `nix develop -c zig build test -Doptimize=ReleaseSafe`
 - `zig build demo-smoke`
 - `zig build bench-smoke`
+- `zig build bench-preview-gates`
 - `zig build bench-ingest-transport -- --scenario one_hot_one_writer`
 - `zig build bench-ingest-transport -- --scenario fanout_four_writers`
 - `zig build bench-ingest-transport -- --scenario warm_declared_10k`
@@ -42,6 +43,7 @@ Required:
 - live HTTP `Expect: 100-continue` uploads still pass
 - socket handshake/version/declaration/unknown-decl/timeout tests still pass
 - socket-only and combined HTTP+socket demos still pass
+- concurrent live HTTP fanout smoke still passes
 - market-row ingest is still documented as HTTP-only
 
 ## Source Of Truth
