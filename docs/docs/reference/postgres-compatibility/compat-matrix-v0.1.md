@@ -29,6 +29,29 @@ This document tracks SydraDB’s PostgreSQL-compatibility surface at a feature-m
 - `zig build test` – executes translator fixtures (see `tests/translator/cases.jsonl`) and catalog bootstrap assertions (`src/sydra/catalog.zig:test "bootstrap seeds global defaults"`).
 - `/debug/compat/stats` – exposes translation/fallback/cache counters sourced from `src/sydra/compat/stats.zig`; reset between suites.
 - `/debug/compat/catalog` – renders the live namespace/class/type snapshot for validating catalog seeds while the shim evolves.
+- `zig build compat-wire-test` – exercises the preview `pgwire` contract for simple query plus the narrow direct prepared/extended subset.
+
+---
+
+## Preview contract (April 5, 2026)
+
+The current PostgreSQL compatibility layer is a narrow alpha bridge, not a broad PostgreSQL replacement.
+
+Supported today:
+
+- startup/auth flow plus simple query execution
+- a preview extended-query path for a narrow direct SQL-core subset
+- direct prepared/extended `SELECT`, `INSERT`, and `DELETE` flows with text parameters
+- `Parse`, `Bind`, `Describe`, `Execute`, and `Close` on the supported subset
+- explicit preview notices for `execution_mode`, `legacy_fallback`, and `fallback_reason`
+
+Current hard limits / fail-fast behavior:
+
+- clients should use `sslmode=disable`
+- query text is capped at `65536` bytes
+- unsupported direct prepare/bind shapes fail with stable `0A000`
+- binary bind parameters and binary result formats are rejected
+- `COPY`, broad catalog emulation, and wider ORM compatibility remain out of scope for this alpha
 
 ---
 
@@ -37,8 +60,8 @@ This document tracks SydraDB’s PostgreSQL-compatibility surface at a feature-m
 ### A1. Connectivity & Protocol
 | Area | Current | Target | Notes |
 |---|---|---|---|
-| Wire protocol v3 (Simple query only) | **Partial** | **Shim** | Startup/auth flow plus simple query path exist today; extended protocol and portals remain later work. |
-| SSL/TLS & sslmode | **Plan** | **Shim** | `disable/prefer/require/verify-ca/verify-full`. |
+| Wire protocol v3 (simple query + preview extended flow) | **Partial** | **Shim** | Startup/auth flow, simple query, and a narrow direct prepared/extended subset exist today; broader SQL compatibility still remains later work. |
+| SSL/TLS & sslmode | **Partial** | **Shim** | Current preview expects `sslmode=disable`; TLS modes such as `prefer/require/verify-ca/verify-full` remain planned. |
 | Auth: SCRAM‑SHA‑256 | **Plan** | **Shim** | MD5 fallback optional; prefer SCRAM only. |
 | COPY (text, binary) | **Plan** | **Shim** | Map to sydra bulk loader; stream backpressure. |
 | ParameterStatus / GUCs | **Partial** | **Shim** | Basic parameter status flow exists; broader GUC surface remains later work. |
