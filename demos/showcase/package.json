@@ -12,7 +12,7 @@
     "build:runner": "tsc -p runner/tsconfig.json",
     "build:ui": "vite build --config ui/vite.config.ts",
     "test": "vitest run",
-    "preview": "node dist/runner/server.js"
+    "preview": "node dist/runner/runner/server.js"
   },
   "dependencies": {
     "express": "^4.21.2",

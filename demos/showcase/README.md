@@ -43,6 +43,64 @@ Tests:
 npm test
 ```
 
+Built preview:
+
+```bash
+npm run build
+npm run preview
+```
+
+## How It Runs
+
+- The UI is a React/Vite frontend.
+- The runner is a local Express JSON API that serves `/api/demo/*`.
+- The runner creates temporary workspaces under your OS temp directory.
+- Each workspace gets its own generated `sydradb.toml`, local `data/` directory, and HTTP port.
+- The runner then starts real `sydradb` child processes against those workspaces, seeds them with fixture data, and executes scenario steps through HTTP or CLI calls.
+
+In local development, `npm run dev` runs:
+
+- `npm run dev:runner` on `127.0.0.1:4177`
+- `npm run dev:ui` on `127.0.0.1:4173`
+
+The Vite dev server proxies `/api/demo/*` to the runner.
+
+In built/preview mode, the runner serves the compiled frontend itself, so the UI and API come from the same process.
+
+## Docker
+
+The showcase can run as a single container that includes:
+
+- the built `sydradb` binary
+- the built showcase runner
+- the built static UI
+- scenario manifests and fixtures
+
+Build from the repo root:
+
+```bash
+docker build -f demos/showcase/Dockerfile -t sydradb-showcase .
+```
+
+Run it:
+
+```bash
+docker run --rm -p 4177:4177 sydradb-showcase
+```
+
+Then open:
+
+```text
+http://127.0.0.1:4177/
+```
+
+Container notes:
+
+- The container runs the Express runner, which also serves the built UI.
+- The runner binds to `0.0.0.0` inside the container through `SHOWCASE_HOST=0.0.0.0`.
+- The runner uses `SYDRADB_BIN=/app/bin/sydradb`.
+- Scenario temp workspaces are still ephemeral and live inside the container filesystem.
+
 ## Expectations
 
 - Build `./zig-out/bin/sydradb` from the repo root before running scenario tests.
