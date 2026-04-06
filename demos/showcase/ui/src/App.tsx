@@ -4,7 +4,7 @@ import type { DemoStateResponse, ScenarioRunResult, ScenarioStepResult } from ".
 import { fetchState, resetSession, runScenario } from "./api.js";
 
 type ThemeMode = "dark" | "light";
-type TabId = "evidence" | "context";
+type TabId = "evidence" | "context" | "model";
 type LaunchCardId = "edge-story" | "maintenance-lane" | "compiler-lane";
 
 const THEME_STORAGE_KEY = "sydra-showcase-theme";
@@ -36,6 +36,11 @@ interface StepReadingGuide {
   lookFor: string;
   managerLens: string;
   operatorLens: string;
+}
+
+interface ScenarioModelGuide {
+  focus: string;
+  operatorQuestion: string;
 }
 
 const LAUNCH_CARDS: LaunchCardDefinition[] = [
@@ -290,6 +295,45 @@ const STEP_GUIDE_OVERRIDES: Record<string, Record<string, Partial<StepReadingGui
   },
 };
 
+const SCENARIO_MODEL_GUIDES: Record<string, ScenarioModelGuide> = {
+  "cas-history": {
+    focus:
+      "This scenario proves that an incident on edge-east is stored as repository history inside SydraDB itself, which is why diff, rollback, and reflog operations are meaningful in the first place.",
+    operatorQuestion:
+      "If a site goes bad, can I inspect the storage timeline, identify the safe checkpoint, and move the active head back without rebuilding the whole system by hand?",
+  },
+  "cas-maintenance": {
+    focus:
+      "This scenario proves that once the repository has lived through writes and recovery, it can still be packed, validated, cleaned up, and repaired as part of normal operations.",
+    operatorQuestion:
+      "After a recovery, does the storage remain healthy and maintainable, or do we need a second toolchain to make it trustworthy again?",
+  },
+  "cas-sync": {
+    focus:
+      "This scenario proves that the same storage state can move between edge and HQ as repository state, not just as copied files or ad hoc export/import scripts.",
+    operatorQuestion:
+      "Can I move or clone the storage state between sites while preserving refs, packs, and verifiable history?",
+  },
+  "sydraql-query": {
+    focus:
+      "This scenario proves that the engine can explain how it answered a query against real fleet data, which helps operators and mid-level engineers debug without jumping straight into internals.",
+    operatorQuestion:
+      "When a query looks odd or slow, do I get enough execution evidence to understand what path the engine took?",
+  },
+  "sydraql-compiler": {
+    focus:
+      "This scenario proves that the compiler rollout is observable. Compiled, shadow, and legacy paths can all be reasoned about against the same seeded fleet state.",
+    operatorQuestion:
+      "If a new query path is being rolled out, can I tell whether the system used it, fell back, or disagreed with an older path?",
+  },
+  "engine-lifecycle": {
+    focus:
+      "This scenario proves that the service lifecycle and the storage lifecycle line up: restart, recovery anchors, and query continuity all stay part of one operational model.",
+    operatorQuestion:
+      "When the service restarts or maintenance runs, does the live view stay consistent with the repository state I expect?",
+  },
+};
+
 function readInitialTheme(): ThemeMode {
   if (typeof window === "undefined") return "dark";
   try {
@@ -473,6 +517,7 @@ export function ShowcaseDashboard({
   const enabledCaps = Object.values(state?.capabilities ?? {}).filter(Boolean).length;
   const visibleLaunchCards = LAUNCH_CARDS.filter((card) => !dismissedLaunchCardIds.includes(card.id));
   const readingGuide = selected ? SCENARIO_READING_GUIDES[selected.manifest.id] : undefined;
+  const modelGuide = selected ? SCENARIO_MODEL_GUIDES[selected.manifest.id] : undefined;
 
   return (
     <div>
@@ -580,6 +625,10 @@ export function ShowcaseDashboard({
               <div className="main__header">
                 <h1 className="main__title">{selected.manifest.title}</h1>
                 <p className="main__description">{selected.manifest.summary}</p>
+                <div className="main__clarifier">
+                  Git-like terms here refer to SydraDB&apos;s internal CAS storage repository. `heads/main`, commits,
+                  reflogs, and checkpoints are storage-state concepts, not the application&apos;s source-code Git branch.
+                </div>
               </div>
 
               <div className="tabs">
@@ -596,6 +645,13 @@ export function ShowcaseDashboard({
                   onClick={() => setActiveTab("context")}
                 >
                   Context
+                </button>
+                <button
+                  type="button"
+                  className={`tab ${activeTab === "model" ? "tab--active" : ""}`}
+                  onClick={() => setActiveTab("model")}
+                >
+                  How it works
                 </button>
               </div>
 
@@ -727,6 +783,69 @@ export function ShowcaseDashboard({
                         )),
                       )}
                     </ul>
+                  </div>
+                </div>
+              )}
+
+              {activeTab === "model" && (
+                <div className="content">
+                  <div className="model-grid">
+                    <div className="model-section">
+                      <h3 className="context-section__title">Where SydraDB sits</h3>
+                      <ul>
+                        <li>SydraDB is the local time-series database and storage engine running on each site.</li>
+                        <li>In this demo, `edge-east`, `edge-west`, and `hq` are separate SydraDB repositories.</li>
+                        <li>The fictional application is not talking to Git here. It is talking to SydraDB over HTTP and CLI surfaces.</li>
+                      </ul>
+                    </div>
+
+                    <div className="model-section">
+                      <h3 className="context-section__title">How data gets into storage</h3>
+                      <ul>
+                        <li>Producers emit telemetry points, which the demo seeds as NDJSON and POSTs to `POST /api/v1/ingest`.</li>
+                        <li>The engine appends WAL data, updates in-memory state, and flushes segments as part of the normal time-series write path.</li>
+                        <li>Queries then read back through `POST /api/v1/query/range` or `POST /api/v1/sydraql` depending on the scenario.</li>
+                      </ul>
+                    </div>
+
+                    <div className="model-section">
+                      <h3 className="context-section__title">What `cas_mode = dual_write` means</h3>
+                      <ul>
+                        <li>SydraDB keeps writing the regular engine state, but it also writes an immutable CAS commit chain alongside it.</li>
+                        <li>The active storage snapshot is pointed to by `heads/main` inside SydraDB&apos;s own ref namespace.</li>
+                        <li>That is why rollback, diff, reflog, pack, gc, bundle, and checkpoint operations can act on the storage model directly.</li>
+                      </ul>
+                    </div>
+
+                    <div className="model-section">
+                      <h3 className="context-section__title">How reads use that model</h3>
+                      <ul>
+                        <li>`metadata_read_mode = legacy` reads the older compatibility path only.</li>
+                        <li>`metadata_read_mode = shadow` serves legacy answers while cross-checking them against CAS.</li>
+                        <li>`metadata_read_mode = primary` serves metadata from CAS directly, which is the mode the showcase is trying to make legible.</li>
+                      </ul>
+                    </div>
+
+                    <div className="model-section">
+                      <h3 className="context-section__title">What ops and reliability teams touch</h3>
+                      <ul>
+                        <li>Application or collector paths fill the store through ingest APIs.</li>
+                        <li>Operators and engineers inspect or repair the store through `sydradb cas ...` commands and engine/query verification steps.</li>
+                        <li>The showcase is meant to make both sides visible: how the store is filled and how the storage model behaves afterwards.</li>
+                      </ul>
+                    </div>
+
+                    <div className="model-section">
+                      <h3 className="context-section__title">Why this scenario exists</h3>
+                      <p className="model-section__body">{modelGuide?.focus ?? "This scenario exists to show one concrete way the time-series engine and the CAS storage model interact."}</p>
+                      <div className="model-note">
+                        <div className="model-note__label">Operational question</div>
+                        <p className="model-note__body">
+                          {modelGuide?.operatorQuestion ??
+                            "What would an operator or engineer need to verify here in order to trust the storage workflow?"}
+                        </p>
+                      </div>
+                    </div>
                   </div>
                 </div>
               )}
