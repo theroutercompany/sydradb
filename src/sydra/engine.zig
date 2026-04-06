@@ -3,6 +3,8 @@ const cfg = @import("config.zig");
 const types = @import("types.zig");
 const AtomicU64 = @import("atomic_util.zig").AtomicU64;
 const manifest_mod = @import("storage/manifest.zig");
+const market_catalog_mod = @import("storage/market_catalog.zig");
+const market_runtime_mod = @import("storage/market_runtime.zig");
 const metric_catalog_mod = @import("storage/metric_catalog.zig");
 const object_store = @import("storage/object_store.zig");
 const series_catalog_mod = @import("storage/series_catalog.zig");
@@ -36,9 +38,14 @@ pub const Engine = struct {
     flush_timer_ms: u32,
     metrics: Metrics,
     writer_thread: ?std.Thread = null,
+    derived_thread: ?std.Thread = null,
     stop_flag: bool = false,
     queue: *Queue,
     cas: ?cas_mod.CasManager = null,
+    market_runtime: market_runtime_mod.State,
+    derived_mu: std.Thread.Mutex = .{},
+    derived_cv: std.Thread.Condition = .{},
+    derived_pending: bool = false,
 
     pub const SelectorLookup = union(enum) {
         by_id: types.SeriesId,
@@ -57,12 +64,52 @@ pub const Engine = struct {
         last_ts: ?i64 = null,
     };
 
+    const MetricSeriesGroup = struct {
+        labels_json: []u8,
+        series_ids: []types.SeriesId,
+
+        fn deinit(self: *MetricSeriesGroup, alloc: std.mem.Allocator) void {
+            alloc.free(self.labels_json);
+            alloc.free(self.series_ids);
+        }
+    };
+
+    const TradeSample = struct {
+        ts: i64,
+        price: f64,
+        size: f64,
+    };
+
+    const QuoteSample = struct {
+        ts: i64,
+        bid: f64,
+        ask: f64,
+        bid_size: f64,
+        ask_size: f64,
+    };
+
+    const BarSample = struct {
+        ts: i64,
+        open: f64,
+        high: f64,
+        low: f64,
+        close: f64,
+        volume: f64,
+        vwap: f64,
+    };
+
+    const LabelAddition = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
     pub const MetadataState = struct {
         alloc: std.mem.Allocator,
         manifest: manifest_mod.Manifest,
         tags: tags_mod.TagIndex,
         series_catalog: series_catalog_mod.SeriesCatalog,
         metric_catalog: metric_catalog_mod.MetricCatalog,
+        market_catalog: market_catalog_mod.Catalog,
         cas_index: ?cas_mod.SnapshotIndex = null,
         cas_index_mu: std.Thread.Mutex = .{},
 
@@ -71,6 +118,7 @@ pub const Engine = struct {
             self.tags.deinit();
             self.series_catalog.deinit();
             self.metric_catalog.deinit();
+            self.market_catalog.deinit();
             self.cas_index_mu.lock();
             defer self.cas_index_mu.unlock();
             if (self.cas_index) |*index| {
@@ -205,12 +253,15 @@ pub const Engine = struct {
             errdefer series_catalog.deinit();
             var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(alloc, data_dir, fsync);
             errdefer metric_catalog.deinit();
+            var market_catalog = try market_catalog_mod.Catalog.loadOrInit(alloc, data_dir, fsync);
+            errdefer market_catalog.deinit();
             return .{
                 .alloc = alloc,
                 .manifest = manifest,
                 .tags = tags,
                 .series_catalog = series_catalog,
                 .metric_catalog = metric_catalog,
+                .market_catalog = market_catalog,
                 .cas_index = null,
             };
         }
@@ -221,7 +272,6 @@ pub const Engine = struct {
             fsync: cfg.FsyncPolicy,
             cas_manager: *cas_mod.CasManager,
         ) !MetadataState {
-            _ = data_dir;
             var index = try cas_manager.loadHeadIndex();
             errdefer index.deinit();
             var manifest = try manifestFromSnapshot(alloc, index.snapshot.segment_descriptors);
@@ -232,12 +282,18 @@ pub const Engine = struct {
             errdefer series_catalog.deinit();
             var metric_catalog = try metricCatalogFromSnapshot(alloc, fsync, index.snapshot.metric_catalog_snapshot);
             errdefer metric_catalog.deinit();
+            var market_catalog = if (index.snapshot.market_catalog_snapshot) |snapshot|
+                try market_catalog_mod.Catalog.initFromSnapshot(alloc, data_dir, fsync, snapshot)
+            else
+                try market_catalog_mod.Catalog.loadOrInit(alloc, data_dir, fsync);
+            errdefer market_catalog.deinit();
             return .{
                 .alloc = alloc,
                 .manifest = manifest,
                 .tags = tags,
                 .series_catalog = series_catalog,
                 .metric_catalog = metric_catalog,
+                .market_catalog = market_catalog,
                 .cas_index = index,
             };
         }
@@ -365,6 +421,31 @@ pub const Engine = struct {
                 .value = item.value,
                 .tags_json = owned_tags,
             });
+            self.cv.signal();
+        }
+        pub fn pushBatch(self: *Queue, items: []const IngestItem) !void {
+            if (items.len == 0) return;
+            self.mu.lock();
+            defer self.mu.unlock();
+            if (self.closed) return error.Closed;
+
+            const start_len = self.buf.items.len;
+            errdefer {
+                while (self.buf.items.len > start_len) {
+                    const removed = self.buf.pop().?;
+                    self.alloc.free(removed.tags_json);
+                }
+            }
+            for (items) |item| {
+                const owned_tags = try self.alloc.dupe(u8, item.tags_json);
+                errdefer self.alloc.free(owned_tags);
+                try self.buf.append(.{
+                    .series_id = item.series_id,
+                    .ts = item.ts,
+                    .value = item.value,
+                    .tags_json = owned_tags,
+                });
+            }
             self.cv.signal();
         }
         pub fn pop(self: *Queue) ?IngestItem {
@@ -544,6 +625,7 @@ pub const Engine = struct {
             .metrics = Metrics.init(),
             .queue = undefined,
             .cas = cas_manager,
+            .market_runtime = undefined,
         };
         metadata_transferred = true;
         cas_manager_transferred = true;
@@ -559,25 +641,42 @@ pub const Engine = struct {
             engine.queue.deinit();
             engine.alloc.destroy(engine.queue);
         }
+        engine.market_runtime = try market_runtime_mod.State.loadOrInit(alloc, engine.data_dir, engine.config.fsync);
+        errdefer engine.market_runtime.deinit();
         if (engine.cas) |*cas| {
-            _ = try cas.bootstrapIfMissing(engine.data_dir, &engine.metadata.manifest, &engine.metadata.tags, &engine.metadata.series_catalog, &engine.metadata.metric_catalog);
+            _ = try cas.bootstrapIfMissingWithMarket(
+                engine.data_dir,
+                &engine.metadata.manifest,
+                &engine.metadata.tags,
+                &engine.metadata.series_catalog,
+                &engine.metadata.metric_catalog,
+                &engine.metadata.market_catalog,
+            );
             try engine.metadata.refreshCasIndex(cas);
         }
         try engine.recover();
         engine.writer_thread = try std.Thread.spawn(.{}, writerLoop, .{engine});
+        engine.derived_thread = try std.Thread.spawn(.{}, derivedLoop, .{engine});
+        engine.scheduleDerivedRefresh();
         return engine;
     }
 
     pub fn deinit(self: *Engine) void {
         self.stop_flag = true;
         self.queue.close();
+        self.derived_mu.lock();
+        self.derived_pending = true;
+        self.derived_mu.unlock();
+        self.derived_cv.broadcast();
         if (self.writer_thread) |t| t.join();
+        if (self.derived_thread) |t| t.join();
         self.mem.deinit();
         self.metadata.deinit();
         self.wal.close();
         self.data_dir.close();
         self.queue.deinit();
         self.alloc.destroy(self.queue);
+        self.market_runtime.deinit();
         if (self.cas) |*cas| cas.deinit();
         self.config.deinit(self.alloc);
         self.alloc.destroy(self);
@@ -607,6 +706,31 @@ pub const Engine = struct {
             }
         }
         try self.queue.push(item);
+        const len_now = self.queue.len();
+        const len_now_u64: u64 = @intCast(len_now);
+        _ = self.metrics.queue_len_sum.fetchAdd(len_now_u64, .monotonic);
+        _ = self.metrics.queue_len_samples.fetchAdd(1, .monotonic);
+        var current_max = self.metrics.queue_max_len.load(.monotonic);
+        while (len_now > current_max) {
+            if (self.metrics.queue_max_len.cmpxchgWeak(current_max, len_now, .monotonic, .monotonic)) |prev|
+                current_max = prev
+            else
+                break;
+        }
+    }
+
+    pub fn ingestBatch(self: *Engine, items: []const IngestItem) !void {
+        if (items.len == 0) return;
+        if (self.config.mem_limit_bytes != 0) {
+            const queued_bytes = self.queue.len() * @sizeOf(IngestItem);
+            const resident_bytes = self.mem.bytes.load(.monotonic) + queued_bytes + items.len * @sizeOf(IngestItem);
+            if (resident_bytes >= self.config.mem_limit_bytes) {
+                _ = self.metrics.ingest_rejected_total.fetchAdd(1, .monotonic);
+                _ = self.metrics.ingest_rejected_mem_limit_total.fetchAdd(1, .monotonic);
+                return error.MemoryLimitExceeded;
+            }
+        }
+        try self.queue.pushBatch(items);
         const len_now = self.queue.len();
         const len_now_u64: u64 = @intCast(len_now);
         _ = self.metrics.queue_len_sum.fetchAdd(len_now_u64, .monotonic);
@@ -692,6 +816,7 @@ pub const Engine = struct {
                     self.syncCasSnapshot(reason) catch |err| {
                         std.log.warn("cas sync failed: {s}", .{@errorName(err)});
                     };
+                    self.scheduleDerivedRefresh();
                 }
             }
             // fsync policy: interval
@@ -714,6 +839,703 @@ pub const Engine = struct {
         }
     }
 
+    fn scheduleDerivedRefresh(self: *Engine) void {
+        self.derived_mu.lock();
+        self.derived_pending = true;
+        self.derived_mu.unlock();
+        self.derived_cv.signal();
+    }
+
+    fn derivedLoop(self: *Engine) void {
+        while (true) {
+            self.derived_mu.lock();
+            while (!self.derived_pending and !self.stop_flag) {
+                self.derived_cv.wait(&self.derived_mu);
+            }
+            const should_stop = self.stop_flag;
+            self.derived_pending = false;
+            self.derived_mu.unlock();
+            if (should_stop) break;
+            self.processDerivedDefinitions() catch |err| {
+                std.log.warn("derived worker failed: {s}", .{@errorName(err)});
+            };
+        }
+    }
+
+    fn processDerivedDefinitions(self: *Engine) !void {
+        const rollups = try self.metadata.market_catalog.listRollups();
+        defer {
+            for (rollups) |*entry| entry.deinit(self.alloc);
+            self.alloc.free(rollups);
+        }
+        for (rollups) |rollup| {
+            if (self.market_runtime.isPaused("rollup", rollup.id, rollup.version)) continue;
+            const now_ts = std.time.nanoTimestamp();
+            try self.market_runtime.reportStart("rollup", rollup.id, rollup.version, @intCast(now_ts));
+            const report = self.processRollupDefinition(rollup) catch |err| blk: {
+                std.log.warn("rollup processing failed for {s}: {s}", .{ rollup.id, @errorName(err) });
+                break :blk market_runtime_mod.ProcessingReport{ .success = false, .error_message = @errorName(err) };
+            };
+            try self.market_runtime.reportResult("rollup", rollup.id, rollup.version, @intCast(std.time.nanoTimestamp()), report);
+        }
+
+        const signals = try self.metadata.market_catalog.listSignals();
+        defer {
+            for (signals) |*entry| entry.deinit(self.alloc);
+            self.alloc.free(signals);
+        }
+        for (signals) |signal| {
+            if (self.market_runtime.isPaused("signal", signal.id, signal.version)) continue;
+            const now_ts = std.time.nanoTimestamp();
+            try self.market_runtime.reportStart("signal", signal.id, signal.version, @intCast(now_ts));
+            const report = self.processSignalDefinition(signal) catch |err| blk: {
+                std.log.warn("signal processing failed for {s}: {s}", .{ signal.id, @errorName(err) });
+                break :blk market_runtime_mod.ProcessingReport{ .success = false, .error_message = @errorName(err) };
+            };
+            try self.market_runtime.reportResult("signal", signal.id, signal.version, @intCast(std.time.nanoTimestamp()), report);
+        }
+    }
+
+    fn processRollupDefinition(self: *Engine, rollup: market_catalog_mod.RollupDefinition) !market_runtime_mod.ProcessingReport {
+        return switch (rollup.transform_kind) {
+            .trade_to_bar => try self.processTradeToBar(rollup),
+            .quote_to_spread_mid => try self.processQuoteToSpreadMid(rollup),
+            .bar_to_bar => try self.processBarToBar(rollup),
+        };
+    }
+
+    fn makeEventId(alloc: std.mem.Allocator, metric: []const u8, labels_json: []const u8, ts: i64) ![]u8 {
+        return try std.fmt.allocPrint(alloc, "{s}|{s}|{d}", .{ metric, labels_json, ts });
+    }
+
+    fn reportWithEvent(
+        self: *Engine,
+        rows_processed: u64,
+        emissions_total: u64,
+        metric: []const u8,
+        labels_json: []const u8,
+        ts: ?i64,
+    ) !market_runtime_mod.ProcessingReport {
+        if (ts) |value| {
+            const event_id = try makeEventId(self.alloc, metric, labels_json, value);
+            defer self.alloc.free(event_id);
+            return .{
+                .rows_processed = rows_processed,
+                .emissions_total = emissions_total,
+                .last_event_id = event_id,
+            };
+        }
+        return .{ .rows_processed = rows_processed, .emissions_total = emissions_total };
+    }
+
+    fn processTradeToBar(self: *Engine, rollup: market_catalog_mod.RollupDefinition) !market_runtime_mod.ProcessingReport {
+        var policy = self.latestBarPolicy(rollup.policy_id) orelse return .{};
+        defer policy.deinit(self.alloc);
+        const groups = try self.collectMetricSeriesGroups(rollup.source_metric, &.{ "price", "size" });
+        defer self.freeMetricSeriesGroups(groups);
+        if (groups.len == 0) return .{};
+
+        const revision = try self.currentDataRevisionLabel();
+        defer self.alloc.free(revision);
+        const interval_text = try std.fmt.allocPrint(self.alloc, "{d}", .{policy.interval_ns});
+        defer self.alloc.free(interval_text);
+        const version_text = try std.fmt.allocPrint(self.alloc, "{d}", .{rollup.version});
+        defer self.alloc.free(version_text);
+
+        var rows_processed: u64 = 0;
+        var emissions_total: u64 = 0;
+        var last_emitted_ts: ?i64 = null;
+        var last_emitted_labels: ?[]const u8 = null;
+        for (groups) |group| {
+            const checkpoint = self.market_runtime.getHighwater("rollup", rollup.id, rollup.version, group.labels_json) orelse std.math.minInt(i64);
+            const start_ts = if (checkpoint == std.math.minInt(i64)) checkpoint else checkpoint + 1;
+            const price_points = try self.querySeriesPoints(group.series_ids[0], start_ts, std.math.maxInt(i64));
+            defer self.alloc.free(price_points);
+            const size_points = try self.querySeriesPoints(group.series_ids[1], start_ts, std.math.maxInt(i64));
+            defer self.alloc.free(size_points);
+            const trades = try alignTradeSamples(self.alloc, price_points, size_points);
+            defer self.alloc.free(trades);
+            if (trades.len < 2) continue;
+            rows_processed += @intCast(trades.len);
+
+            const latest_bucket = bucketStart(trades[trades.len - 1].ts, policy.interval_ns);
+            if (latest_bucket == std.math.minInt(i64)) continue;
+            var bucket_open: ?f64 = null;
+            var bucket_high: f64 = 0;
+            var bucket_low: f64 = 0;
+            var bucket_close: f64 = 0;
+            var bucket_volume: f64 = 0;
+            var bucket_notional: f64 = 0;
+            var current_bucket: i64 = bucketStart(trades[0].ts, policy.interval_ns);
+
+            const output_labels = try mergeLabelsJson(self.alloc, group.labels_json, &.{
+                .{ .key = "interval", .value = interval_text },
+                .{ .key = "bar_policy_id", .value = policy.id },
+                .{ .key = "data_revision", .value = revision },
+                .{ .key = "definition_id", .value = rollup.id },
+                .{ .key = "definition_version", .value = version_text },
+            });
+            defer self.alloc.free(output_labels);
+
+            var emitted_highwater: ?i64 = null;
+            for (trades) |trade| {
+                const trade_bucket = bucketStart(trade.ts, policy.interval_ns);
+                if (trade_bucket != current_bucket) {
+                    if (current_bucket < latest_bucket and bucket_open != null) {
+                        try self.emitBarMetrics(rollup.target_metric, output_labels, current_bucket, bucket_open.?, bucket_high, bucket_low, bucket_close, bucket_volume, if (bucket_volume != 0) bucket_notional / bucket_volume else bucket_close, rollup.source_metric);
+                        emissions_total += 6;
+                        last_emitted_ts = current_bucket;
+                        last_emitted_labels = group.labels_json;
+                        emitted_highwater = current_bucket + policy.interval_ns - 1;
+                    }
+                    current_bucket = trade_bucket;
+                    bucket_open = null;
+                    bucket_high = 0;
+                    bucket_low = 0;
+                    bucket_close = 0;
+                    bucket_volume = 0;
+                    bucket_notional = 0;
+                }
+                if (bucket_open == null) {
+                    bucket_open = trade.price;
+                    bucket_high = trade.price;
+                    bucket_low = trade.price;
+                } else {
+                    if (trade.price > bucket_high) bucket_high = trade.price;
+                    if (trade.price < bucket_low) bucket_low = trade.price;
+                }
+                bucket_close = trade.price;
+                bucket_volume += trade.size;
+                bucket_notional += trade.price * trade.size;
+            }
+
+            if (emitted_highwater) |highwater| {
+                try self.market_runtime.upsertHighwater("rollup", rollup.id, rollup.version, group.labels_json, highwater);
+            }
+        }
+        return try self.reportWithEvent(rows_processed, emissions_total, rollup.target_metric, last_emitted_labels orelse "{}", last_emitted_ts);
+    }
+
+    fn processQuoteToSpreadMid(self: *Engine, rollup: market_catalog_mod.RollupDefinition) !market_runtime_mod.ProcessingReport {
+        const groups = try self.collectMetricSeriesGroups(rollup.source_metric, &.{ "bid", "ask", "bid_size", "ask_size" });
+        defer self.freeMetricSeriesGroups(groups);
+        if (groups.len == 0) return .{};
+
+        const revision = try self.currentDataRevisionLabel();
+        defer self.alloc.free(revision);
+        const version_text = try std.fmt.allocPrint(self.alloc, "{d}", .{rollup.version});
+        defer self.alloc.free(version_text);
+
+        var rows_processed: u64 = 0;
+        var emissions_total: u64 = 0;
+        var last_emitted_ts: ?i64 = null;
+        var last_emitted_labels: ?[]const u8 = null;
+        for (groups) |group| {
+            const checkpoint = self.market_runtime.getHighwater("rollup", rollup.id, rollup.version, group.labels_json) orelse std.math.minInt(i64);
+            const start_ts = if (checkpoint == std.math.minInt(i64)) checkpoint else checkpoint + 1;
+            const bid_points = try self.querySeriesPoints(group.series_ids[0], start_ts, std.math.maxInt(i64));
+            defer self.alloc.free(bid_points);
+            const ask_points = try self.querySeriesPoints(group.series_ids[1], start_ts, std.math.maxInt(i64));
+            defer self.alloc.free(ask_points);
+            const bid_size_points = try self.querySeriesPoints(group.series_ids[2], start_ts, std.math.maxInt(i64));
+            defer self.alloc.free(bid_size_points);
+            const ask_size_points = try self.querySeriesPoints(group.series_ids[3], start_ts, std.math.maxInt(i64));
+            defer self.alloc.free(ask_size_points);
+            const quotes = try alignQuoteSamples(self.alloc, bid_points, ask_points, bid_size_points, ask_size_points);
+            defer self.alloc.free(quotes);
+            if (quotes.len == 0) continue;
+            rows_processed += @intCast(quotes.len);
+
+            const output_labels = try mergeLabelsJson(self.alloc, group.labels_json, &.{
+                .{ .key = "data_revision", .value = revision },
+                .{ .key = "definition_id", .value = rollup.id },
+                .{ .key = "definition_version", .value = version_text },
+            });
+            defer self.alloc.free(output_labels);
+
+            for (quotes) |quote| {
+                const spread_metric = try std.fmt.allocPrint(self.alloc, "{s}.spread", .{rollup.target_metric});
+                try self.emitDerivedMetric(spread_metric, output_labels, quote.ts, quote.ask - quote.bid, rollup.source_metric, "spread");
+                self.alloc.free(spread_metric);
+                const mid_metric = try std.fmt.allocPrint(self.alloc, "{s}.mid", .{rollup.target_metric});
+                try self.emitDerivedMetric(mid_metric, output_labels, quote.ts, (quote.ask + quote.bid) / 2.0, rollup.source_metric, "mid");
+                self.alloc.free(mid_metric);
+                emissions_total += 2;
+                last_emitted_ts = quote.ts;
+                last_emitted_labels = group.labels_json;
+            }
+            try self.market_runtime.upsertHighwater("rollup", rollup.id, rollup.version, group.labels_json, quotes[quotes.len - 1].ts);
+        }
+        return try self.reportWithEvent(rows_processed, emissions_total, rollup.target_metric, last_emitted_labels orelse "{}", last_emitted_ts);
+    }
+
+    fn processBarToBar(self: *Engine, rollup: market_catalog_mod.RollupDefinition) !market_runtime_mod.ProcessingReport {
+        var policy = self.latestBarPolicy(rollup.policy_id) orelse return .{};
+        defer policy.deinit(self.alloc);
+        const groups = try self.collectMetricSeriesGroups(rollup.source_metric, &.{ "open", "high", "low", "close", "volume", "vwap" });
+        defer self.freeMetricSeriesGroups(groups);
+        if (groups.len == 0) return .{};
+
+        const revision = try self.currentDataRevisionLabel();
+        defer self.alloc.free(revision);
+        const interval_text = try std.fmt.allocPrint(self.alloc, "{d}", .{policy.interval_ns});
+        defer self.alloc.free(interval_text);
+        const version_text = try std.fmt.allocPrint(self.alloc, "{d}", .{rollup.version});
+        defer self.alloc.free(version_text);
+
+        var rows_processed: u64 = 0;
+        var emissions_total: u64 = 0;
+        var last_emitted_ts: ?i64 = null;
+        var last_emitted_labels: ?[]const u8 = null;
+        for (groups) |group| {
+            const checkpoint = self.market_runtime.getHighwater("rollup", rollup.id, rollup.version, group.labels_json) orelse std.math.minInt(i64);
+            const start_ts = if (checkpoint == std.math.minInt(i64)) checkpoint else checkpoint + 1;
+            const bars = try self.queryBarSamples(group.series_ids, start_ts);
+            defer self.alloc.free(bars);
+            if (bars.len < 2) continue;
+            rows_processed += @intCast(bars.len);
+            const latest_bucket = bucketStart(bars[bars.len - 1].ts, policy.interval_ns);
+
+            const output_labels = try mergeLabelsJson(self.alloc, group.labels_json, &.{
+                .{ .key = "interval", .value = interval_text },
+                .{ .key = "bar_policy_id", .value = policy.id },
+                .{ .key = "data_revision", .value = revision },
+                .{ .key = "definition_id", .value = rollup.id },
+                .{ .key = "definition_version", .value = version_text },
+            });
+            defer self.alloc.free(output_labels);
+
+            var current_bucket = bucketStart(bars[0].ts, policy.interval_ns);
+            var bucket_open: ?f64 = null;
+            var bucket_high: f64 = 0;
+            var bucket_low: f64 = 0;
+            var bucket_close: f64 = 0;
+            var bucket_volume: f64 = 0;
+            var bucket_notional: f64 = 0;
+            var emitted_highwater: ?i64 = null;
+            for (bars) |bar| {
+                const next_bucket = bucketStart(bar.ts, policy.interval_ns);
+                if (next_bucket != current_bucket) {
+                    if (current_bucket < latest_bucket and bucket_open != null) {
+                        try self.emitBarMetrics(rollup.target_metric, output_labels, current_bucket, bucket_open.?, bucket_high, bucket_low, bucket_close, bucket_volume, if (bucket_volume != 0) bucket_notional / bucket_volume else bucket_close, rollup.source_metric);
+                        emissions_total += 6;
+                        last_emitted_ts = current_bucket;
+                        last_emitted_labels = group.labels_json;
+                        emitted_highwater = current_bucket + policy.interval_ns - 1;
+                    }
+                    current_bucket = next_bucket;
+                    bucket_open = null;
+                    bucket_high = 0;
+                    bucket_low = 0;
+                    bucket_close = 0;
+                    bucket_volume = 0;
+                    bucket_notional = 0;
+                }
+                if (bucket_open == null) {
+                    bucket_open = bar.open;
+                    bucket_high = bar.high;
+                    bucket_low = bar.low;
+                } else {
+                    if (bar.high > bucket_high) bucket_high = bar.high;
+                    if (bar.low < bucket_low) bucket_low = bar.low;
+                }
+                bucket_close = bar.close;
+                bucket_volume += bar.volume;
+                bucket_notional += bar.vwap * bar.volume;
+            }
+            if (emitted_highwater) |highwater| {
+                try self.market_runtime.upsertHighwater("rollup", rollup.id, rollup.version, group.labels_json, highwater);
+            }
+        }
+        return try self.reportWithEvent(rows_processed, emissions_total, rollup.target_metric, last_emitted_labels orelse "{}", last_emitted_ts);
+    }
+
+    fn processSignalDefinition(self: *Engine, signal: market_catalog_mod.SignalDefinition) !market_runtime_mod.ProcessingReport {
+        const signal_column = try signalColumnConfig(self.alloc, signal);
+        defer self.alloc.free(signal_column.primary);
+        if (signal_column.secondary) |secondary| {
+            defer self.alloc.free(secondary);
+        }
+
+        const columns = if (signal_column.secondary != null)
+            try self.alloc.dupe([]const u8, &.{ signal_column.primary, signal_column.secondary.? })
+        else
+            try self.alloc.dupe([]const u8, &.{signal_column.primary});
+        defer self.alloc.free(columns);
+
+        const groups = try self.collectMetricSeriesGroups(signal.input_metric, columns);
+        defer self.freeMetricSeriesGroups(groups);
+        if (groups.len == 0) return .{};
+
+        const revision = try self.currentDataRevisionLabel();
+        defer self.alloc.free(revision);
+        const version_text = try std.fmt.allocPrint(self.alloc, "{d}", .{signal.version});
+        defer self.alloc.free(version_text);
+
+        var rows_processed: u64 = 0;
+        var emissions_total: u64 = 0;
+        var last_emitted_ts: ?i64 = null;
+        var last_emitted_labels: ?[]const u8 = null;
+        for (groups) |group| {
+            const checkpoint = self.market_runtime.getHighwater("signal", signal.id, signal.version, group.labels_json) orelse std.math.minInt(i64);
+            const primary_points = try self.querySeriesPoints(group.series_ids[0], std.math.minInt(i64), std.math.maxInt(i64));
+            defer self.alloc.free(primary_points);
+            rows_processed += @intCast(primary_points.len);
+            const secondary_points = if (group.series_ids.len > 1)
+                try self.querySeriesPoints(group.series_ids[1], std.math.minInt(i64), std.math.maxInt(i64))
+            else
+                try self.alloc.alloc(types.Point, 0);
+            defer self.alloc.free(secondary_points);
+
+            const output_labels = try mergeLabelsJson(self.alloc, group.labels_json, &.{
+                .{ .key = "data_revision", .value = revision },
+                .{ .key = "definition_id", .value = signal.id },
+                .{ .key = "definition_version", .value = version_text },
+            });
+            defer self.alloc.free(output_labels);
+
+            const output_metric = try std.fmt.allocPrint(self.alloc, "_signal.{s}", .{signal.id});
+            defer self.alloc.free(output_metric);
+            const signal_report = try self.emitSignalPoints(output_metric, output_labels, signal, primary_points, secondary_points, checkpoint);
+            emissions_total += signal_report.emissions_total;
+            if (signal_report.last_event_id != null) {
+                last_emitted_ts = if (primary_points.len != 0) primary_points[primary_points.len - 1].ts else last_emitted_ts;
+                last_emitted_labels = group.labels_json;
+            }
+            if (primary_points.len != 0) {
+                try self.market_runtime.upsertHighwater("signal", signal.id, signal.version, group.labels_json, primary_points[primary_points.len - 1].ts);
+            }
+        }
+        return try self.reportWithEvent(rows_processed, emissions_total, signal.id, last_emitted_labels orelse "{}", last_emitted_ts);
+    }
+
+    fn emitSignalPoints(
+        self: *Engine,
+        output_metric: []const u8,
+        output_labels: []const u8,
+        signal: market_catalog_mod.SignalDefinition,
+        primary_points: []const types.Point,
+        secondary_points: []const types.Point,
+        checkpoint: i64,
+    ) !market_runtime_mod.ProcessingReport {
+        if (primary_points.len == 0) return .{};
+        var params = try std.json.parseFromSlice(std.json.Value, self.alloc, signal.params_json, .{});
+        defer params.deinit();
+        const params_obj = if (params.value == .object) params.value.object else return .{};
+
+        const primary_values = try pointValues(self.alloc, primary_points);
+        defer self.alloc.free(primary_values);
+        const secondary_values = try pointValues(self.alloc, secondary_points);
+        defer self.alloc.free(secondary_values);
+
+        var emissions_total: u64 = 0;
+        var last_event_id: ?[]u8 = null;
+        defer if (last_event_id) |value| self.alloc.free(value);
+
+        switch (signal.expression_kind) {
+            .ema => {
+                const period = jsonParamInt(params_obj, "period", 12);
+                const alpha = 2.0 / (@as(f64, @floatFromInt(period)) + 1.0);
+                var ema_value = primary_values[0];
+                for (primary_points, primary_values, 0..) |point, value, idx| {
+                    if (idx != 0) ema_value = alpha * value + (1.0 - alpha) * ema_value;
+                    if (point.ts <= checkpoint) continue;
+                    try self.emitDerivedMetric(output_metric, output_labels, point.ts, ema_value, signal.input_metric, signal.expression_kind.text());
+                    emissions_total += 1;
+                    if (last_event_id) |event_id| self.alloc.free(event_id);
+                    last_event_id = try makeEventId(self.alloc, output_metric, output_labels, point.ts);
+                }
+            },
+            .moving_avg => {
+                const period = jsonParamInt(params_obj, "period", 20);
+                var sum: f64 = 0;
+                var start_idx: usize = 0;
+                for (primary_points, primary_values, 0..) |point, value, idx| {
+                    sum += value;
+                    if (idx >= period) {
+                        sum -= primary_values[start_idx];
+                        start_idx += 1;
+                    }
+                    if (idx + 1 < period or point.ts <= checkpoint) continue;
+                    try self.emitDerivedMetric(output_metric, output_labels, point.ts, sum / @as(f64, @floatFromInt(period)), signal.input_metric, signal.expression_kind.text());
+                    emissions_total += 1;
+                    if (last_event_id) |event_id| self.alloc.free(event_id);
+                    last_event_id = try makeEventId(self.alloc, output_metric, output_labels, point.ts);
+                }
+            },
+            .threshold_cross => {
+                const level = jsonParamFloat(params_obj, "level", 0);
+                if (primary_values.len < 2) return .{};
+                var prev = primary_values[0];
+                for (primary_points[1..], primary_values[1..]) |point, value| {
+                    const crossed = (prev <= level and value > level) or (prev >= level and value < level);
+                    prev = value;
+                    if (!crossed or point.ts <= checkpoint) continue;
+                    try self.emitDerivedMetric(output_metric, output_labels, point.ts, 1.0, signal.input_metric, signal.expression_kind.text());
+                    emissions_total += 1;
+                    if (last_event_id) |event_id| self.alloc.free(event_id);
+                    last_event_id = try makeEventId(self.alloc, output_metric, output_labels, point.ts);
+                }
+            },
+            .spread_gt => {
+                const threshold = jsonParamFloat(params_obj, "threshold", 0);
+                for (primary_points, primary_values) |point, value| {
+                    if (value <= threshold or point.ts <= checkpoint) continue;
+                    try self.emitDerivedMetric(output_metric, output_labels, point.ts, 1.0, signal.input_metric, signal.expression_kind.text());
+                    emissions_total += 1;
+                    if (last_event_id) |event_id| self.alloc.free(event_id);
+                    last_event_id = try makeEventId(self.alloc, output_metric, output_labels, point.ts);
+                }
+            },
+            .vwap_deviation => {
+                if (secondary_values.len == 0) return .{};
+                const threshold = jsonParamFloat(params_obj, "threshold", 0.01);
+                const paired = @min(primary_values.len, secondary_values.len);
+                for (0..paired) |idx| {
+                    const point = primary_points[idx];
+                    const price = primary_values[idx];
+                    const vwap = secondary_values[idx];
+                    if (point.ts <= checkpoint or vwap == 0) continue;
+                    if (@abs(price - vwap) / @abs(vwap) <= threshold) continue;
+                    try self.emitDerivedMetric(output_metric, output_labels, point.ts, 1.0, signal.input_metric, signal.expression_kind.text());
+                    emissions_total += 1;
+                    if (last_event_id) |event_id| self.alloc.free(event_id);
+                    last_event_id = try makeEventId(self.alloc, output_metric, output_labels, point.ts);
+                }
+            },
+            .crossover, .crossunder => {
+                const fast_period = jsonParamInt(params_obj, "fast_period", 12);
+                const slow_period = jsonParamInt(params_obj, "slow_period", 26);
+                if (primary_values.len < slow_period or slow_period <= fast_period) return .{};
+                var prev_fast: ?f64 = null;
+                var prev_slow: ?f64 = null;
+                for (primary_points, 0..) |point, idx| {
+                    if (idx + 1 < slow_period) continue;
+                    const fast = avgWindow(primary_values, idx + 1 - fast_period, fast_period);
+                    const slow = avgWindow(primary_values, idx + 1 - slow_period, slow_period);
+                    if (prev_fast != null and prev_slow != null and point.ts > checkpoint) {
+                        const crossed = if (signal.expression_kind == .crossover)
+                            prev_fast.? <= prev_slow.? and fast > slow
+                        else
+                            prev_fast.? >= prev_slow.? and fast < slow;
+                        if (crossed) {
+                            try self.emitDerivedMetric(output_metric, output_labels, point.ts, 1.0, signal.input_metric, signal.expression_kind.text());
+                            emissions_total += 1;
+                            if (last_event_id) |event_id| self.alloc.free(event_id);
+                            last_event_id = try makeEventId(self.alloc, output_metric, output_labels, point.ts);
+                        }
+                    }
+                    prev_fast = fast;
+                    prev_slow = slow;
+                }
+            },
+        }
+        return .{
+            .rows_processed = @intCast(primary_points.len),
+            .emissions_total = emissions_total,
+            .last_event_id = last_event_id,
+        };
+    }
+
+    fn emitBarMetrics(
+        self: *Engine,
+        family_metric: []const u8,
+        labels_json: []const u8,
+        ts: i64,
+        open: f64,
+        high: f64,
+        low: f64,
+        close: f64,
+        volume: f64,
+        vwap: f64,
+        source_metric: []const u8,
+    ) !void {
+        const open_metric = try std.fmt.allocPrint(self.alloc, "{s}.open", .{family_metric});
+        defer self.alloc.free(open_metric);
+        try self.emitDerivedMetric(open_metric, labels_json, ts, open, source_metric, "open");
+        const high_metric = try std.fmt.allocPrint(self.alloc, "{s}.high", .{family_metric});
+        defer self.alloc.free(high_metric);
+        try self.emitDerivedMetric(high_metric, labels_json, ts, high, source_metric, "high");
+        const low_metric = try std.fmt.allocPrint(self.alloc, "{s}.low", .{family_metric});
+        defer self.alloc.free(low_metric);
+        try self.emitDerivedMetric(low_metric, labels_json, ts, low, source_metric, "low");
+        const close_metric = try std.fmt.allocPrint(self.alloc, "{s}.close", .{family_metric});
+        defer self.alloc.free(close_metric);
+        try self.emitDerivedMetric(close_metric, labels_json, ts, close, source_metric, "close");
+        const volume_metric = try std.fmt.allocPrint(self.alloc, "{s}.volume", .{family_metric});
+        defer self.alloc.free(volume_metric);
+        try self.emitDerivedMetric(volume_metric, labels_json, ts, volume, source_metric, "volume");
+        const vwap_metric = try std.fmt.allocPrint(self.alloc, "{s}.vwap", .{family_metric});
+        defer self.alloc.free(vwap_metric);
+        try self.emitDerivedMetric(vwap_metric, labels_json, ts, vwap, source_metric, "vwap");
+    }
+
+    fn emitDerivedMetric(
+        self: *Engine,
+        metric: []const u8,
+        labels_json: []const u8,
+        ts: i64,
+        value: f64,
+        source_metric: []const u8,
+        source_field: []const u8,
+    ) !void {
+        _ = try self.ingestExactMetric(metric, labels_json, ts, value, .{
+            .metric = metric,
+            .kind = .gauge,
+            .source_metric = source_metric,
+            .source_field = source_field,
+        });
+    }
+
+    fn querySeriesPoints(self: *Engine, series_id: types.SeriesId, start_ts: i64, end_ts: i64) ![]types.Point {
+        var points = std.array_list.Managed(types.Point).init(self.alloc);
+        defer points.deinit();
+        try self.queryRange(series_id, start_ts, end_ts, &points);
+        return try self.alloc.dupe(types.Point, points.items);
+    }
+
+    fn queryBarSamples(self: *Engine, series_ids: []types.SeriesId, start_ts: i64) ![]BarSample {
+        var columns = try self.alloc.alloc([]types.Point, series_ids.len);
+        defer self.alloc.free(columns);
+        for (series_ids, 0..) |series_id, idx| {
+            columns[idx] = try self.querySeriesPoints(series_id, start_ts, std.math.maxInt(i64));
+        }
+        defer {
+            for (columns) |points| self.alloc.free(points);
+        }
+        return try alignBarSamples(self.alloc, columns);
+    }
+
+    fn collectMetricSeriesGroups(self: *Engine, family_metric: []const u8, columns: []const []const u8) ![]MetricSeriesGroup {
+        var groups = std.array_list.Managed(MetricSeriesGroup).init(self.alloc);
+        errdefer {
+            for (groups.items) |*group| group.deinit(self.alloc);
+            groups.deinit();
+        }
+
+        self.metadata.series_catalog.mutex.lock();
+        defer self.metadata.series_catalog.mutex.unlock();
+        for (self.metadata.series_catalog.entries.items) |entry| {
+            var column_index: ?usize = null;
+            for (columns, 0..) |column, idx| {
+                if (entry.series.len == family_metric.len + 1 + column.len and
+                    std.mem.startsWith(u8, entry.series, family_metric) and
+                    entry.series[family_metric.len] == '.' and
+                    std.mem.eql(u8, entry.series[family_metric.len + 1 ..], column))
+                {
+                    column_index = idx;
+                    break;
+                }
+            }
+            if (column_index == null) continue;
+
+            var group_index: ?usize = null;
+            for (groups.items, 0..) |group, idx| {
+                if (std.mem.eql(u8, group.labels_json, entry.canonical_tags)) {
+                    group_index = idx;
+                    break;
+                }
+            }
+            if (group_index == null) {
+                const series_slots = try self.alloc.alloc(types.SeriesId, columns.len);
+                @memset(series_slots, 0);
+                try groups.append(.{
+                    .labels_json = try self.alloc.dupe(u8, entry.canonical_tags),
+                    .series_ids = series_slots,
+                });
+                group_index = groups.items.len - 1;
+            }
+            groups.items[group_index.?].series_ids[column_index.?] = entry.series_id;
+        }
+
+        var filtered = std.array_list.Managed(MetricSeriesGroup).init(self.alloc);
+        errdefer {
+            for (filtered.items) |*group| group.deinit(self.alloc);
+            filtered.deinit();
+        }
+        for (groups.items) |group| {
+            var complete = true;
+            for (group.series_ids) |series_id| {
+                if (series_id == 0) {
+                    complete = false;
+                    break;
+                }
+            }
+            if (complete) {
+                try filtered.append(.{
+                    .labels_json = try self.alloc.dupe(u8, group.labels_json),
+                    .series_ids = try self.alloc.dupe(types.SeriesId, group.series_ids),
+                });
+            }
+        }
+        for (groups.items) |*group| group.deinit(self.alloc);
+        groups.deinit();
+        return try filtered.toOwnedSlice();
+    }
+
+    fn freeMetricSeriesGroups(self: *Engine, groups: []MetricSeriesGroup) void {
+        for (groups) |*group| group.deinit(self.alloc);
+        self.alloc.free(groups);
+    }
+
+    fn currentDataRevisionLabel(self: *Engine) ![]u8 {
+        if (self.cas) |*cas| {
+            if (try cas.refs.readHead(cas_mod.main_ref)) |head| {
+                const hex = head.toHex();
+                return try self.alloc.dupe(u8, hex[0..]);
+            }
+        }
+        return try self.alloc.dupe(u8, "legacy-live");
+    }
+
+    fn validateBarPolicyInput(self: *Engine, input: market_catalog_mod.BarPolicyInput) !void {
+        if (input.interval_ns <= 0) return error.InvalidBarPolicyInterval;
+        var source_schema = self.marketSchema(input.source_metric) orelse return error.InvalidBarPolicySource;
+        defer source_schema.deinit(self.alloc);
+        if (!std.mem.eql(u8, input.source_metric, "market.trade")) return error.InvalidBarPolicySource;
+        if (!stringInSlice(input.session_rule, &.{ "regular_hours", "all_sessions" })) return error.InvalidSessionRule;
+        if (!stringInSlice(input.no_trade_rule, &.{ "skip_empty", "carry_forward_none" })) return error.InvalidNoTradeRule;
+        if (!stringInSlice(input.halt_rule, &.{ "skip_halts", "treat_as_gap" })) return error.InvalidHaltRule;
+        if (!stringInSlice(input.correction_policy, &.{ "append_only", "ignore_corrections" })) return error.InvalidCorrectionPolicy;
+    }
+
+    fn validateRollupInput(self: *Engine, input: market_catalog_mod.RollupDefinitionInput) !void {
+        _ = self.latestBarPolicy(input.policy_id) orelse return error.InvalidRollupPolicy;
+        switch (input.transform_kind) {
+            .trade_to_bar => {
+                if (!std.mem.eql(u8, input.source_metric, "market.trade")) return error.InvalidRollupSource;
+                if (!std.mem.eql(u8, input.target_metric, "market.bar")) return error.InvalidRollupTarget;
+            },
+            .quote_to_spread_mid => {
+                if (!std.mem.eql(u8, input.source_metric, "market.quote")) return error.InvalidRollupSource;
+            },
+            .bar_to_bar => {
+                if (!std.mem.eql(u8, input.source_metric, "market.bar")) return error.InvalidRollupSource;
+                if (!std.mem.eql(u8, input.target_metric, "market.bar")) return error.InvalidRollupTarget;
+            },
+        }
+    }
+
+    fn validateSignalInput(self: *Engine, input: market_catalog_mod.SignalDefinitionInput) !void {
+        _ = self.marketSchema(input.input_metric) orelse {
+            if (!std.mem.startsWith(u8, input.input_metric, "market.bar") and
+                !std.mem.startsWith(u8, input.input_metric, "market.quote") and
+                !std.mem.startsWith(u8, input.input_metric, "market.trade"))
+                return error.InvalidSignalInputMetric;
+            return;
+        };
+        if (input.policy_id) |policy_id| {
+            _ = self.latestBarPolicy(policy_id) orelse return error.InvalidSignalPolicy;
+        }
+    }
+
+    fn stringInSlice(value: []const u8, allowed: []const []const u8) bool {
+        for (allowed) |candidate| {
+            if (std.mem.eql(u8, value, candidate)) return true;
+        }
+        return false;
+    }
+
     fn flushMemtable(self: *Engine) !bool {
         const start_ns = std.time.nanoTimestamp();
         var points_written: usize = 0;
@@ -732,9 +1554,9 @@ pub const Engine = struct {
             // Partition by hour (UTC)
             var start_idx: usize = 0;
             while (start_idx < arr_ptr.*.items.len) {
-                const hour = hourBucket(arr_ptr.*.items[start_idx].ts);
+                const hour = self.hourBucketForSeries(sid, arr_ptr.*.items[start_idx].ts);
                 var end_idx = start_idx + 1;
-                while (end_idx < arr_ptr.*.items.len and hourBucket(arr_ptr.*.items[end_idx].ts) == hour) : (end_idx += 1) {}
+                while (end_idx < arr_ptr.*.items.len and self.hourBucketForSeries(sid, arr_ptr.*.items[end_idx].ts) == hour) : (end_idx += 1) {}
                 const slice = arr_ptr.*.items[start_idx..end_idx];
                 // write segment
                 const selector_resolution = self.metadata.series_catalog.resolveBySeriesId(sid);
@@ -922,9 +1744,24 @@ pub const Engine = struct {
         _ = self.metrics.ingest_quarantined_total.fetchAdd(1, .monotonic);
     }
 
-    fn hourBucket(ts: i64) i64 {
-        const secs_per_hour: i64 = 3600;
-        return (@divTrunc(ts, secs_per_hour)) * secs_per_hour;
+    fn hourBucketForSeries(self: *Engine, sid: types.SeriesId, ts: i64) i64 {
+        const resolution = self.metadata.series_catalog.resolveBySeriesId(sid);
+        const divisor: i64 = if (resolution.series) |series|
+            if (std.mem.startsWith(u8, series, "market.") or std.mem.startsWith(u8, series, "_signal."))
+                3600 * std.time.ns_per_s
+            else
+                legacyHourBucketDivisor(ts)
+        else
+            legacyHourBucketDivisor(ts);
+        return (@divTrunc(ts, divisor)) * divisor;
+    }
+
+    fn legacyHourBucketDivisor(ts: i64) i64 {
+        const abs_ts: u64 = @intCast(if (ts < 0) -ts else ts);
+        if (abs_ts >= 1_000_000_000_000_000) return 3600 * std.time.ns_per_s;
+        if (abs_ts >= 1_000_000_000_000) return 3600 * std.time.us_per_s;
+        if (abs_ts >= 1_000_000_000) return 3600 * std.time.ms_per_s;
+        return 3600;
     }
 
     pub fn queryRange(self: *Engine, series_id: types.SeriesId, start_ts: i64, end_ts: i64, out: *std.array_list.Managed(types.Point)) !void {
@@ -956,6 +1793,152 @@ pub const Engine = struct {
 
     pub fn registerMetricDescriptor(self: *Engine, input: metric_catalog_mod.DescriptorInput) !metric_catalog_mod.RegisterResult {
         return try self.metadata.metric_catalog.register(input);
+    }
+
+    pub fn registerMarketSchema(self: *Engine, input: market_catalog_mod.MarketSchemaInput) !market_catalog_mod.MarketSchema {
+        const stored = try self.metadata.market_catalog.registerSchema(input);
+        if (self.cas != null) try self.syncCasSnapshot("market-schema");
+        return stored;
+    }
+
+    pub fn registerBarPolicy(self: *Engine, input: market_catalog_mod.BarPolicyInput) !market_catalog_mod.BarPolicy {
+        try self.validateBarPolicyInput(input);
+        const stored = try self.metadata.market_catalog.registerBarPolicy(input);
+        if (self.cas != null) try self.syncCasSnapshot("bar-policy");
+        return stored;
+    }
+
+    pub fn registerRollup(self: *Engine, input: market_catalog_mod.RollupDefinitionInput) !market_catalog_mod.RollupDefinition {
+        try self.validateRollupInput(input);
+        const stored = try self.metadata.market_catalog.registerRollup(input);
+        try self.market_runtime.setStatus("rollup", stored.id, stored.version, .active);
+        if (self.cas != null) try self.syncCasSnapshot("rollup-definition");
+        self.scheduleDerivedRefresh();
+        return stored;
+    }
+
+    pub fn registerSignal(self: *Engine, input: market_catalog_mod.SignalDefinitionInput) !market_catalog_mod.SignalDefinition {
+        try self.validateSignalInput(input);
+        const stored = try self.metadata.market_catalog.registerSignal(input);
+        try self.market_runtime.setStatus("signal", stored.id, stored.version, .active);
+        if (self.cas != null) try self.syncCasSnapshot("signal-definition");
+        self.scheduleDerivedRefresh();
+        return stored;
+    }
+
+    pub fn marketSchema(self: *Engine, metric: []const u8) ?market_catalog_mod.MarketSchema {
+        return self.metadata.market_catalog.getSchema(metric);
+    }
+
+    pub fn listMarketSchemas(self: *Engine) ![]market_catalog_mod.MarketSchema {
+        return try self.metadata.market_catalog.listSchemas();
+    }
+
+    pub fn listBarPolicies(self: *Engine) ![]market_catalog_mod.BarPolicy {
+        return try self.metadata.market_catalog.listBarPolicies();
+    }
+
+    pub fn listRollups(self: *Engine) ![]market_catalog_mod.RollupDefinition {
+        return try self.metadata.market_catalog.listRollups();
+    }
+
+    pub fn listSignals(self: *Engine) ![]market_catalog_mod.SignalDefinition {
+        return try self.metadata.market_catalog.listSignals();
+    }
+
+    pub fn latestBarPolicy(self: *Engine, id: []const u8) ?market_catalog_mod.BarPolicy {
+        return self.metadata.market_catalog.latestBarPolicyById(id);
+    }
+
+    pub fn rollupRuntime(self: *Engine, id: []const u8, version: u32) ?market_runtime_mod.DefinitionRuntime {
+        return self.market_runtime.runtimeFor("rollup", id, version);
+    }
+
+    pub fn signalRuntime(self: *Engine, id: []const u8, version: u32) ?market_runtime_mod.DefinitionRuntime {
+        return self.market_runtime.runtimeFor("signal", id, version);
+    }
+
+    pub fn pauseRollup(self: *Engine, id: []const u8) !void {
+        const rollups = try self.metadata.market_catalog.listRollups();
+        defer {
+            for (rollups) |*entry| entry.deinit(self.alloc);
+            self.alloc.free(rollups);
+        }
+        for (rollups) |rollup| {
+            if (std.mem.eql(u8, rollup.id, id)) try self.market_runtime.setStatus("rollup", rollup.id, rollup.version, .paused);
+        }
+    }
+
+    pub fn resumeRollup(self: *Engine, id: []const u8) !void {
+        const rollups = try self.metadata.market_catalog.listRollups();
+        defer {
+            for (rollups) |*entry| entry.deinit(self.alloc);
+            self.alloc.free(rollups);
+        }
+        for (rollups) |rollup| {
+            if (std.mem.eql(u8, rollup.id, id)) try self.market_runtime.setStatus("rollup", rollup.id, rollup.version, .active);
+        }
+        self.scheduleDerivedRefresh();
+    }
+
+    pub fn pauseSignal(self: *Engine, id: []const u8) !void {
+        const signals = try self.metadata.market_catalog.listSignals();
+        defer {
+            for (signals) |*entry| entry.deinit(self.alloc);
+            self.alloc.free(signals);
+        }
+        for (signals) |signal| {
+            if (std.mem.eql(u8, signal.id, id)) try self.market_runtime.setStatus("signal", signal.id, signal.version, .paused);
+        }
+    }
+
+    pub fn resumeSignal(self: *Engine, id: []const u8) !void {
+        const signals = try self.metadata.market_catalog.listSignals();
+        defer {
+            for (signals) |*entry| entry.deinit(self.alloc);
+            self.alloc.free(signals);
+        }
+        for (signals) |signal| {
+            if (std.mem.eql(u8, signal.id, id)) try self.market_runtime.setStatus("signal", signal.id, signal.version, .active);
+        }
+        self.scheduleDerivedRefresh();
+    }
+
+    pub fn deleteRollup(self: *Engine, id: []const u8) !bool {
+        const deleted = try self.metadata.market_catalog.deleteRollup(id);
+        if (!deleted) return false;
+        try self.market_runtime.deleteDefinition("rollup", id, null);
+        if (self.cas != null) try self.syncCasSnapshot("rollup-delete");
+        return true;
+    }
+
+    pub fn deleteSignal(self: *Engine, id: []const u8) !bool {
+        const deleted = try self.metadata.market_catalog.deleteSignal(id);
+        if (!deleted) return false;
+        try self.market_runtime.deleteDefinition("signal", id, null);
+        if (self.cas != null) try self.syncCasSnapshot("signal-delete");
+        return true;
+    }
+
+    pub fn ingestExactMetric(
+        self: *Engine,
+        metric: []const u8,
+        tags_json: []const u8,
+        ts: i64,
+        value: f64,
+        descriptor: ?metric_catalog_mod.DescriptorInput,
+    ) !types.SeriesId {
+        if (descriptor) |input| _ = try self.registerMetricDescriptor(input);
+        const sid = types.seriesIdFrom(metric, tags_json);
+        try self.registerSeries(metric, tags_json, sid);
+        try self.ingest(.{
+            .series_id = sid,
+            .ts = ts,
+            .value = value,
+            .tags_json = tags_json,
+        });
+        self.noteTags(sid, tags_json);
+        return sid;
     }
 
     pub fn metricDescriptor(self: *Engine, metric: []const u8) ?metric_catalog_mod.Descriptor {
@@ -1200,7 +2183,14 @@ pub const Engine = struct {
 
     pub fn verifyCasState(self: *Engine) !void {
         if (self.cas) |*cas| {
-            return try cas.verifyHeadMatchesLegacy(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog, &self.metadata.metric_catalog);
+            return try cas.verifyHeadMatchesLegacyWithMarket(
+                self.data_dir,
+                &self.metadata.manifest,
+                &self.metadata.tags,
+                &self.metadata.series_catalog,
+                &self.metadata.metric_catalog,
+                &self.metadata.market_catalog,
+            );
         }
         return error.CasDisabled;
     }
@@ -1280,7 +2270,15 @@ pub const Engine = struct {
         if (self.cas) |*cas| {
             const start_ns = std.time.nanoTimestamp();
             errdefer _ = self.metrics.cas_sync_failed_total.fetchAdd(1, .monotonic);
-            _ = try cas.syncLegacySnapshot(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog, &self.metadata.metric_catalog, reason);
+            _ = try cas.syncLegacySnapshotWithMarket(
+                self.data_dir,
+                &self.metadata.manifest,
+                &self.metadata.tags,
+                &self.metadata.series_catalog,
+                &self.metadata.metric_catalog,
+                &self.metadata.market_catalog,
+                reason,
+            );
             try self.metadata.refreshCasIndex(cas);
             const elapsed_ns_i128 = std.time.nanoTimestamp() - start_ns;
             const elapsed_ns: u64 = @intCast(elapsed_ns_i128);
@@ -1292,9 +2290,24 @@ pub const Engine = struct {
     fn ensureSnapshotBundleHead(self: *Engine) !void {
         if (self.cas) |*cas| {
             if (try cas.refs.readHead(cas_mod.main_ref) == null) {
-                _ = try cas.bootstrapIfMissing(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog, &self.metadata.metric_catalog);
+                _ = try cas.bootstrapIfMissingWithMarket(
+                    self.data_dir,
+                    &self.metadata.manifest,
+                    &self.metadata.tags,
+                    &self.metadata.series_catalog,
+                    &self.metadata.metric_catalog,
+                    &self.metadata.market_catalog,
+                );
             } else {
-                _ = try cas.syncLegacySnapshot(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog, &self.metadata.metric_catalog, "snapshot");
+                _ = try cas.syncLegacySnapshotWithMarket(
+                    self.data_dir,
+                    &self.metadata.manifest,
+                    &self.metadata.tags,
+                    &self.metadata.series_catalog,
+                    &self.metadata.metric_catalog,
+                    &self.metadata.market_catalog,
+                    "snapshot",
+                );
             }
             try self.metadata.refreshCasIndex(cas);
             return;
@@ -1303,9 +2316,24 @@ pub const Engine = struct {
         var temp = try cas_mod.CasManager.init(self.alloc, self.config.data_dir, self.config.fsync);
         defer temp.deinit();
         if (try temp.refs.readHead(cas_mod.main_ref) == null) {
-            _ = try temp.bootstrapIfMissing(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog, &self.metadata.metric_catalog);
+            _ = try temp.bootstrapIfMissingWithMarket(
+                self.data_dir,
+                &self.metadata.manifest,
+                &self.metadata.tags,
+                &self.metadata.series_catalog,
+                &self.metadata.metric_catalog,
+                &self.metadata.market_catalog,
+            );
         } else {
-            _ = try temp.syncLegacySnapshot(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog, &self.metadata.metric_catalog, "snapshot");
+            _ = try temp.syncLegacySnapshotWithMarket(
+                self.data_dir,
+                &self.metadata.manifest,
+                &self.metadata.tags,
+                &self.metadata.series_catalog,
+                &self.metadata.metric_catalog,
+                &self.metadata.market_catalog,
+                "snapshot",
+            );
         }
     }
 
@@ -2151,9 +3179,9 @@ fn rewriteSeriesPoints(self: *Engine, series_id: types.SeriesId, points: []types
 
     var start_idx: usize = 0;
     while (start_idx < points.len) {
-        const hour = Engine.hourBucket(points[start_idx].ts);
+        const hour = self.hourBucketForSeries(series_id, points[start_idx].ts);
         var end_idx = start_idx + 1;
-        while (end_idx < points.len and Engine.hourBucket(points[end_idx].ts) == hour) : (end_idx += 1) {}
+        while (end_idx < points.len and self.hourBucketForSeries(series_id, points[end_idx].ts) == hour) : (end_idx += 1) {}
         const slice = points[start_idx..end_idx];
         const seg_path = try segment_mod.writeSegmentWithMetadata(
             self.alloc,
@@ -2296,6 +3324,194 @@ test "engine deleteWhere rewrites series data and resets wal" {
     try engine.queryRange(sid, 0, 10_000, &resumed);
     try std.testing.expectEqual(@as(usize, 2), resumed.items.len);
     try std.testing.expectEqual(@as(i64, 40), resumed.items[1].ts);
+}
+
+const SignalColumnConfig = struct {
+    primary: []u8,
+    secondary: ?[]u8 = null,
+};
+
+fn signalColumnConfig(alloc: std.mem.Allocator, signal: market_catalog_mod.SignalDefinition) !SignalColumnConfig {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, signal.params_json, .{});
+    defer parsed.deinit();
+    const obj = if (parsed.value == .object) parsed.value.object else return .{ .primary = try alloc.dupe(u8, "close") };
+    return switch (signal.expression_kind) {
+        .ema, .moving_avg, .threshold_cross, .crossover, .crossunder => .{
+            .primary = try alloc.dupe(u8, jsonParamString(obj, "column", "close")),
+        },
+        .spread_gt => .{
+            .primary = try alloc.dupe(u8, jsonParamString(obj, "column", "spread")),
+        },
+        .vwap_deviation => .{
+            .primary = try alloc.dupe(u8, jsonParamString(obj, "price_column", "close")),
+            .secondary = try alloc.dupe(u8, jsonParamString(obj, "vwap_column", "vwap")),
+        },
+    };
+}
+
+fn jsonParamString(obj: std.json.ObjectMap, key: []const u8, default: []const u8) []const u8 {
+    if (obj.get(key)) |value| {
+        if (value == .string) return value.string;
+    }
+    return default;
+}
+
+fn jsonParamInt(obj: std.json.ObjectMap, key: []const u8, default: usize) usize {
+    if (obj.get(key)) |value| {
+        return switch (value) {
+            .integer => |int| @max(@as(usize, 1), @as(usize, @intCast(int))),
+            else => default,
+        };
+    }
+    return default;
+}
+
+fn jsonParamFloat(obj: std.json.ObjectMap, key: []const u8, default: f64) f64 {
+    if (obj.get(key)) |value| {
+        return switch (value) {
+            .float => value.float,
+            .integer => @floatFromInt(value.integer),
+            else => default,
+        };
+    }
+    return default;
+}
+
+fn pointValues(alloc: std.mem.Allocator, points: []const types.Point) ![]f64 {
+    const values = try alloc.alloc(f64, points.len);
+    for (points, 0..) |point, idx| values[idx] = point.value;
+    return values;
+}
+
+fn avgWindow(values: []const f64, start: usize, len: usize) f64 {
+    var sum: f64 = 0;
+    for (values[start .. start + len]) |value| sum += value;
+    return sum / @as(f64, @floatFromInt(len));
+}
+
+fn bucketStart(ts: i64, interval_ns: i64) i64 {
+    return (@divTrunc(ts, interval_ns)) * interval_ns;
+}
+
+fn alignTradeSamples(alloc: std.mem.Allocator, price_points: []const types.Point, size_points: []const types.Point) ![]Engine.TradeSample {
+    var out = std.array_list.Managed(Engine.TradeSample).init(alloc);
+    errdefer out.deinit();
+    var i: usize = 0;
+    var j: usize = 0;
+    while (i < price_points.len and j < size_points.len) {
+        const price_point = price_points[i];
+        const size_point = size_points[j];
+        if (price_point.ts == size_point.ts) {
+            try out.append(.{ .ts = price_point.ts, .price = price_point.value, .size = size_point.value });
+            i += 1;
+            j += 1;
+        } else if (price_point.ts < size_point.ts) {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    return try out.toOwnedSlice();
+}
+
+fn alignQuoteSamples(
+    alloc: std.mem.Allocator,
+    bid_points: []const types.Point,
+    ask_points: []const types.Point,
+    bid_size_points: []const types.Point,
+    ask_size_points: []const types.Point,
+) ![]Engine.QuoteSample {
+    const count = @min(@min(bid_points.len, ask_points.len), @min(bid_size_points.len, ask_size_points.len));
+    var out = std.array_list.Managed(Engine.QuoteSample).init(alloc);
+    errdefer out.deinit();
+    for (0..count) |idx| {
+        const ts = bid_points[idx].ts;
+        if (ask_points[idx].ts != ts or bid_size_points[idx].ts != ts or ask_size_points[idx].ts != ts) continue;
+        try out.append(.{
+            .ts = ts,
+            .bid = bid_points[idx].value,
+            .ask = ask_points[idx].value,
+            .bid_size = bid_size_points[idx].value,
+            .ask_size = ask_size_points[idx].value,
+        });
+    }
+    return try out.toOwnedSlice();
+}
+
+fn alignBarSamples(alloc: std.mem.Allocator, columns: []const []types.Point) ![]Engine.BarSample {
+    if (columns.len < 6) return try alloc.alloc(Engine.BarSample, 0);
+    const count = @min(@min(columns[0].len, columns[1].len), @min(columns[2].len, @min(columns[3].len, @min(columns[4].len, columns[5].len))));
+    var out = std.array_list.Managed(Engine.BarSample).init(alloc);
+    errdefer out.deinit();
+    for (0..count) |idx| {
+        const ts = columns[0][idx].ts;
+        if (columns[1][idx].ts != ts or columns[2][idx].ts != ts or columns[3][idx].ts != ts or columns[4][idx].ts != ts or columns[5][idx].ts != ts) continue;
+        try out.append(.{
+            .ts = ts,
+            .open = columns[0][idx].value,
+            .high = columns[1][idx].value,
+            .low = columns[2][idx].value,
+            .close = columns[3][idx].value,
+            .volume = columns[4][idx].value,
+            .vwap = columns[5][idx].value,
+        });
+    }
+    return try out.toOwnedSlice();
+}
+
+fn mergeLabelsJson(alloc: std.mem.Allocator, base_labels_json: []const u8, additions: []const Engine.LabelAddition) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, base_labels_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidTagsJson;
+
+    var buffer = std.array_list.Managed(u8).init(alloc);
+    defer buffer.deinit();
+    var writer = buffer.writer();
+    var tmp: [512]u8 = undefined;
+    var adapter = writer.adaptToNewApi(&tmp);
+    var iface = &adapter.new_interface;
+    var jw = std.json.Stringify{ .writer = iface };
+    try jw.beginObject();
+
+    var keys = std.array_list.Managed([]const u8).init(alloc);
+    defer keys.deinit();
+    var it = parsed.value.object.iterator();
+    while (it.next()) |entry| {
+        if (entry.value_ptr.* != .string) continue;
+        try keys.append(entry.key_ptr.*);
+    }
+    for (additions) |addition| {
+        var exists = false;
+        for (keys.items) |key| {
+            if (std.mem.eql(u8, key, addition.key)) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists) try keys.append(addition.key);
+    }
+    std.sort.block([]const u8, keys.items, {}, struct {
+        fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
+            return std.mem.lessThan(u8, lhs, rhs);
+        }
+    }.lessThan);
+
+    for (keys.items) |key| {
+        try jw.objectField(key);
+        var overridden = false;
+        for (additions) |addition| {
+            if (std.mem.eql(u8, addition.key, key)) {
+                try jw.write(addition.value);
+                overridden = true;
+                break;
+            }
+        }
+        if (!overridden) try jw.write(parsed.value.object.get(key).?.string);
+    }
+    try jw.endObject();
+    try iface.flush();
+    if (adapter.err) |err| return err;
+    return try buffer.toOwnedSlice();
 }
 
 test "engine replays wal on startup" {
@@ -3172,6 +4388,7 @@ test "engine compaction creates a maintenance checkpoint ref" {
             break;
         }
     }
+
     try std.testing.expect(saw_checkpoint);
 }
 
