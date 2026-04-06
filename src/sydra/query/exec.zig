@@ -660,21 +660,15 @@ test "execute supports explain bytecode" {
     defer cursor.deinit();
 
     try std.testing.expectEqualStrings("compiled", cursor.stats.execution_mode);
-    try std.testing.expectEqual(@as(usize, 8), cursor.columns.len);
-
-    const first = try cursor.next();
-    try std.testing.expect(first != null);
-    try std.testing.expect(executor.Value.equals(first.?.values[0], executor.Value{ .integer = 0 }));
-    try std.testing.expectEqualStrings("load_const", try first.?.values[1].asString());
-
-    const second = try cursor.next();
-    try std.testing.expect(second != null);
-    try std.testing.expectEqualStrings("result_row", try second.?.values[1].asString());
-
-    const third = try cursor.next();
-    try std.testing.expect(third != null);
-    try std.testing.expectEqualStrings("halt", try third.?.values[1].asString());
-    try std.testing.expect((try cursor.next()) == null);
+    const snapshot = try collectCursorSnapshot(talloc, &cursor);
+    defer talloc.free(snapshot);
+    try std.testing.expectEqualStrings(
+        \\addr|opcode|p1|p2|p3|p4|p5|comment
+        \\0|load_const|0|0|0|const[0]|0|_col0
+        \\1|result_row|0|1|0|schema[0]|0|
+        \\2|halt|0|0|0||0|
+        \\
+    , snapshot);
 }
 
 test "execute supports explain tables-used" {
@@ -709,14 +703,13 @@ test "execute supports explain tables-used" {
     defer cursor.deinit();
 
     try std.testing.expectEqualStrings("compiled", cursor.stats.execution_mode);
-    try std.testing.expectEqual(@as(usize, 3), cursor.columns.len);
-
-    const first = try cursor.next();
-    try std.testing.expect(first != null);
-    try std.testing.expectEqualStrings("series", try first.?.values[0].asString());
-    try std.testing.expectEqualStrings("weather.room1", try first.?.values[1].asString());
-    try std.testing.expect(executor.Value.equals(first.?.values[2], executor.Value{ .integer = 41 }));
-    try std.testing.expect((try cursor.next()) == null);
+    const snapshot = try collectCursorSnapshot(talloc, &cursor);
+    defer talloc.free(snapshot);
+    try std.testing.expectEqualStrings(
+        \\kind|name|series_id
+        \\series|weather.room1|41
+        \\
+    , snapshot);
 }
 
 test "executeWithMode compiled supports uniquely bound series names" {
@@ -1025,4 +1018,35 @@ fn waitForFlushForTest(engine: *engine_mod.Engine, min_flushes: u64, timeout_ms:
         }
     }
     return error.Timeout;
+}
+
+fn collectCursorSnapshot(alloc: std.mem.Allocator, cursor: *executor.ExecutionCursor) ![]u8 {
+    var buffer = std.array_list.Managed(u8).init(alloc);
+    errdefer buffer.deinit();
+
+    for (cursor.columns, 0..) |column, idx| {
+        if (idx != 0) try buffer.append('|');
+        try buffer.appendSlice(column.name);
+    }
+    try buffer.append('\n');
+
+    while (try cursor.next()) |row| {
+        for (row.values, 0..) |value, idx| {
+            if (idx != 0) try buffer.append('|');
+            try appendSnapshotValue(&buffer, value);
+        }
+        try buffer.append('\n');
+    }
+
+    return try buffer.toOwnedSlice();
+}
+
+fn appendSnapshotValue(buffer: *std.array_list.Managed(u8), value: executor.Value) !void {
+    switch (value) {
+        .null => try buffer.appendSlice("null"),
+        .boolean => |bool_value| try buffer.appendSlice(if (bool_value) "true" else "false"),
+        .integer => |int_value| try buffer.writer().print("{d}", .{int_value}),
+        .float => |float_value| try buffer.writer().print("{d}", .{float_value}),
+        .string => |string_value| try buffer.appendSlice(string_value),
+    }
 }
