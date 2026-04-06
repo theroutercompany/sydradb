@@ -1,7 +1,8 @@
 const std = @import("std");
 const cfg = @import("../config.zig");
 
-pub const path = "signal_events.jsonl";
+pub const legacy_path = "signal_events.jsonl";
+pub const dir_path = "signal_events";
 const recent_event_limit: usize = 4096;
 
 pub const Event = struct {
@@ -56,12 +57,26 @@ pub const Store = struct {
         };
         errdefer store.deinit();
 
-        const body = store.root.readFileAlloc(alloc, path, 16 * 1024 * 1024) catch |err| switch (err) {
+        store.root.makePath(dir_path) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+
+        const legacy_body = store.root.readFileAlloc(alloc, legacy_path, 16 * 1024 * 1024) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
-        defer if (body) |buf| alloc.free(buf);
-        if (body) |buf| try store.loadFromJsonl(buf);
+        defer if (legacy_body) |buf| alloc.free(buf);
+        if (legacy_body) |buf| {
+            try store.loadFromJsonl(buf);
+            try store.rewriteAllDefinitionFilesLocked();
+            store.root.deleteFile(legacy_path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+        } else {
+            try store.loadFromDefinitionDir();
+        }
         return store;
     }
 
@@ -104,7 +119,7 @@ pub const Store = struct {
 
         try self.appendToFileLocked(event);
         try self.events.append(try event.clone(self.alloc));
-        try self.trimLocked();
+        try self.trimDefinitionLocked(definition_id, definition_version);
         return event;
     }
 
@@ -124,6 +139,18 @@ pub const Store = struct {
         errdefer {
             for (out.items) |*event| event.deinit(self.alloc);
             out.deinit();
+        }
+
+        var oldest_sequence: ?u64 = null;
+        for (self.events.items) |event| {
+            if (!std.mem.eql(u8, event.definition_id, definition_id)) continue;
+            if (definition_version != null and event.definition_version != definition_version.?) continue;
+            if (oldest_sequence == null or event.sequence < oldest_sequence.?) oldest_sequence = event.sequence;
+        }
+        if (after_sequence) |seq| {
+            if (seq != 0 and oldest_sequence != null and seq + 1 < oldest_sequence.?) {
+                return error.EventReplayExpired;
+            }
         }
 
         for (self.events.items) |event| {
@@ -176,12 +203,14 @@ pub const Store = struct {
             errdefer event.deinit(self.alloc);
             try self.events.append(event);
             try self.recordLoadedSequenceLocked(definition_id.string, @intCast(version.integer), @intCast(sequence.integer));
-            try self.trimLocked();
+            try self.trimDefinitionLocked(definition_id.string, @intCast(version.integer));
         }
     }
 
     fn appendToFileLocked(self: *Store, event: Event) !void {
-        var file = try self.root.createFile(path, .{ .read = true, .truncate = false });
+        const rel_path = try definitionFilePath(self.alloc, event.definition_id, event.definition_version);
+        defer self.alloc.free(rel_path);
+        var file = try self.root.createFile(rel_path, .{ .read = true, .truncate = false });
         defer file.close();
         try file.seekFromEnd(0);
 
@@ -212,11 +241,91 @@ pub const Store = struct {
         if (self.fsync == .always) try file.sync();
     }
 
-    fn trimLocked(self: *Store) !void {
-        while (self.events.items.len > recent_event_limit) {
-            var removed = self.events.orderedRemove(0);
-            removed.deinit(self.alloc);
+    fn loadFromDefinitionDir(self: *Store) !void {
+        var dir = try self.root.openDir(dir_path, .{ .iterate = true });
+        defer dir.close();
+        var it = dir.iterate();
+        while (try it.next()) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".jsonl")) continue;
+            const body = try dir.readFileAlloc(self.alloc, entry.name, 16 * 1024 * 1024);
+            defer self.alloc.free(body);
+            try self.loadFromJsonl(body);
         }
+    }
+
+    fn trimDefinitionLocked(self: *Store, definition_id: []const u8, definition_version: u32) !void {
+        var count: usize = 0;
+        for (self.events.items) |event| {
+            if (std.mem.eql(u8, event.definition_id, definition_id) and event.definition_version == definition_version) count += 1;
+        }
+        var changed = false;
+        while (count > recent_event_limit) {
+            var idx: usize = 0;
+            while (idx < self.events.items.len) : (idx += 1) {
+                const event = self.events.items[idx];
+                if (!std.mem.eql(u8, event.definition_id, definition_id) or event.definition_version != definition_version) continue;
+                var removed = self.events.orderedRemove(idx);
+                removed.deinit(self.alloc);
+                count -= 1;
+                changed = true;
+                break;
+            }
+        }
+        if (changed) try self.rewriteDefinitionFileLocked(definition_id, definition_version);
+    }
+
+    fn rewriteAllDefinitionFilesLocked(self: *Store) !void {
+        var keys = std.StringHashMap(void).init(self.alloc);
+        defer {
+            var it = keys.iterator();
+            while (it.next()) |entry| self.alloc.free(entry.key_ptr.*);
+            keys.deinit();
+        }
+        for (self.events.items) |event| {
+            const key = try definitionKey(self.alloc, event.definition_id, event.definition_version);
+            errdefer self.alloc.free(key);
+            if (keys.contains(key)) {
+                self.alloc.free(key);
+                continue;
+            }
+            try keys.put(key, {});
+        }
+        var it = keys.iterator();
+        while (it.next()) |entry| {
+            const sep = std.mem.lastIndexOfScalar(u8, entry.key_ptr.*, '|') orelse continue;
+            const definition_id = entry.key_ptr.*[0..sep];
+            const version = try std.fmt.parseInt(u32, entry.key_ptr.*[sep + 1 ..], 10);
+            try self.rewriteDefinitionFileLocked(definition_id, version);
+        }
+    }
+
+    fn rewriteDefinitionFileLocked(self: *Store, definition_id: []const u8, definition_version: u32) !void {
+        const rel_path = try definitionFilePath(self.alloc, definition_id, definition_version);
+        defer self.alloc.free(rel_path);
+        const tmp_path = try std.fmt.allocPrint(self.alloc, "{s}.tmp", .{rel_path});
+        defer self.alloc.free(tmp_path);
+
+        var file = try self.root.createFile(tmp_path, .{ .truncate = true, .read = true });
+        defer file.close();
+        errdefer self.root.deleteFile(tmp_path) catch {};
+
+        var write_buf: [2048]u8 = undefined;
+        var writer_state = file.writer(&write_buf);
+        const writer = &writer_state.interface;
+        for (self.events.items) |event| {
+            if (!std.mem.eql(u8, event.definition_id, definition_id) or event.definition_version != definition_version) continue;
+            try writeEventJsonLine(writer, event);
+        }
+        try writer_state.end();
+        if (self.fsync == .always) try file.sync();
+        self.root.rename(tmp_path, rel_path) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                self.root.deleteFile(rel_path) catch {};
+                try self.root.rename(tmp_path, rel_path);
+            },
+            else => return err,
+        };
     }
 
     fn nextSequenceLocked(self: *Store, definition_id: []const u8, definition_version: u32) !u64 {
@@ -248,6 +357,46 @@ fn definitionKey(alloc: std.mem.Allocator, definition_id: []const u8, definition
     return try std.fmt.allocPrint(alloc, "{s}|{d}", .{ definition_id, definition_version });
 }
 
+fn definitionFilePath(alloc: std.mem.Allocator, definition_id: []const u8, definition_version: u32) ![]u8 {
+    const safe_id = try sanitizeDefinitionId(alloc, definition_id);
+    defer alloc.free(safe_id);
+    return try std.fmt.allocPrint(alloc, "{s}/{s}@{d}.jsonl", .{ dir_path, safe_id, definition_version });
+}
+
+fn sanitizeDefinitionId(alloc: std.mem.Allocator, definition_id: []const u8) ![]u8 {
+    var out = try alloc.alloc(u8, definition_id.len);
+    for (definition_id, 0..) |ch, idx| {
+        out[idx] = switch (ch) {
+            '/', '\\', ':', ' ', '\t' => '_',
+            else => ch,
+        };
+    }
+    return out;
+}
+
+fn writeEventJsonLine(writer: anytype, event: Event) !void {
+    var jw = std.json.Stringify{ .writer = writer };
+    try jw.beginObject();
+    try jw.objectField("definition_id");
+    try jw.write(event.definition_id);
+    try jw.objectField("definition_version");
+    try jw.write(event.definition_version);
+    try jw.objectField("sequence");
+    try jw.write(event.sequence);
+    try jw.objectField("event_id");
+    try jw.write(event.event_id);
+    try jw.objectField("data_revision");
+    try jw.write(event.data_revision);
+    try jw.objectField("labels_json");
+    try jw.write(event.labels_json);
+    try jw.objectField("ts_ns");
+    try jw.write(event.ts_ns);
+    try jw.objectField("value");
+    try jw.write(event.value);
+    try jw.endObject();
+    try writer.writeAll("\n");
+}
+
 test "signal event store appends and replays recent events" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -277,4 +426,36 @@ test "signal event store appends and replays recent events" {
         try std.testing.expectEqual(@as(i64, 20), events[0].ts_ns);
         try std.testing.expectEqual(@as(f64, 2.5), events[0].value);
     }
+}
+
+test "signal event store migrates legacy flat log" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = legacy_path,
+        .data =
+        \\{"definition_id":"ema","definition_version":1,"sequence":1,"event_id":"signal/ema/1/1","data_revision":"rev-a","labels_json":"{\"symbol\":\"AAPL\"}","ts_ns":10,"value":1.5}
+        \\{"definition_id":"ema","definition_version":1,"sequence":2,"event_id":"signal/ema/1/2","data_revision":"rev-a","labels_json":"{\"symbol\":\"AAPL\"}","ts_ns":20,"value":2.5}
+        \\
+        ,
+    });
+
+    var store = try Store.loadOrInit(alloc, tmp.dir, .none);
+    defer store.deinit();
+    const events = try store.listAfter("ema", 1, null, null, null, 16);
+    defer {
+        for (events) |*event| event.deinit(alloc);
+        alloc.free(events);
+    }
+    try std.testing.expectEqual(@as(usize, 2), events.len);
+
+    tmp.dir.access(legacy_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    const migrated_path = try definitionFilePath(alloc, "ema", 1);
+    defer alloc.free(migrated_path);
+    try tmp.dir.access(migrated_path, .{});
 }
