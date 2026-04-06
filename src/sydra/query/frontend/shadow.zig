@@ -5,6 +5,7 @@ const diagnostics = @import("diagnostics.zig");
 const grammar = @import("grammar.zig");
 const lexer = @import("../lexer.zig");
 const legacy_parser = @import("../parser.zig");
+const normalize = @import("normalize.zig");
 const parsergen = @import("parsergen.zig");
 const stmt_mod = @import("stmt.zig");
 const sydraql_core = @import("grammars/sydraql_core.zig");
@@ -447,4 +448,68 @@ test "shadow sydraql parser matches fixture cases" {
         try std.testing.expectEqual(expected_tag, std.meta.activeTag(result.statement));
         try std.testing.expectEqual(expected_mismatch, result.hasMismatch());
     }
+}
+
+test "shadow sydraql parser fuzz smoke exercises parser, shadow comparison, and normalizer" {
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5D7A42);
+    const random = prng.random();
+    const pieces = [_][]const u8{
+        "select", "time",   "value",   "from",     "metrics",     "weather.room1", "where", "time",   ">=",   "0",
+        "order",  "by",     "time",    "limit",    "5",           "insert",        "into",  "values", "(",    ")",
+        ",",      "delete", "explain", "bytecode", "tables_used", "group",         "tag",   "host",   "true", "false",
+        "null",   "'ok'",   "1",       "10",
+    };
+
+    var generated_count: usize = 0;
+
+    {
+        const fixed = try parseSydraqlShadow(alloc, "select time, value from metrics where time >= 0 order by time limit 5");
+        defer {
+            var owned = fixed;
+            owned.deinit();
+        }
+        try std.testing.expect(fixed.generated_stmt != null);
+        _ = normalize.normalizeFrontendStmt(fixed.arena_ptr.allocator(), fixed.generated_stmt.?) catch {};
+        generated_count += 1;
+    }
+
+    var i: usize = 0;
+    while (i < 128) : (i += 1) {
+        var query = std.array_list.Managed(u8).init(alloc);
+        defer query.deinit();
+
+        const part_count = random.intRangeAtMost(usize, 1, 12);
+        for (0..part_count) |idx| {
+            if (idx != 0) try query.append(' ');
+            try query.appendSlice(pieces[random.uintLessThan(usize, pieces.len)]);
+        }
+
+        const result = parseSydraqlShadow(alloc, query.items) catch |err| switch (err) {
+            error.UnexpectedToken,
+            error.UnexpectedStatement,
+            error.UnexpectedExpression,
+            error.UnterminatedParenthesis,
+            error.InvalidNumber,
+            error.InvalidDuration,
+            error.InvalidTimestamp,
+            error.InvalidLiteral,
+            error.UnterminatedString,
+            error.InvalidCharacter,
+            error.InvalidTrace,
+            => continue,
+            error.OutOfMemory => return error.OutOfMemory,
+        };
+        defer {
+            var owned = result;
+            owned.deinit();
+        }
+
+        if (result.generated_stmt) |stmt| {
+            _ = normalize.normalizeFrontendStmt(result.arena_ptr.allocator(), stmt) catch {};
+            generated_count += 1;
+        }
+    }
+
+    try std.testing.expect(generated_count > 0);
 }

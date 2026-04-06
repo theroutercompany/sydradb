@@ -3,6 +3,7 @@ const std = @import("std");
 const diagnostics = @import("diagnostics.zig");
 const grammar = @import("grammar.zig");
 const lexer = @import("../lexer.zig");
+const normalize = @import("normalize.zig");
 const parsergen = @import("parsergen.zig");
 const sql_semantics = @import("sql_semantics.zig");
 const stmt_mod = @import("stmt.zig");
@@ -393,4 +394,39 @@ test "sql core parser skeleton matches error fixture cases" {
         try std.testing.expectEqual(expected_code, result.diagnostics[0].code);
         try std.testing.expectEqual(expected_generated, result.used_generated_runtime);
     }
+}
+
+test "sql core parser fuzz smoke exercises parser and normalizer" {
+    const alloc = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x5D7A41);
+    const random = prng.random();
+    const pieces = [_][]const u8{
+        "select",      "value",     "time",     "from", "metrics", "weather.room1", "where", "time", ">=",     "0",
+        "and",         "value",     "<=",       "10",   "order",   "by",            "time",  "asc",  "limit",  "5",
+        "offset",      "1",         "insert",   "into", "values",  "(",             ")",     ",",    "delete", "explain",
+        "tables_used", "by_id(41)", "tag.host", "'ok'", "$1",
+    };
+    var normalized_count: usize = 0;
+
+    var i: usize = 0;
+    while (i < 128) : (i += 1) {
+        var query = std.array_list.Managed(u8).init(alloc);
+        defer query.deinit();
+
+        const part_count = random.intRangeAtMost(usize, 1, 12);
+        for (0..part_count) |idx| {
+            if (idx != 0) try query.append(' ');
+            try query.appendSlice(pieces[random.uintLessThan(usize, pieces.len)]);
+        }
+
+        var result = try parseSqlCoreSkeleton(alloc, query.items);
+        defer result.deinit();
+
+        if (result.stmt) |stmt| {
+            _ = normalize.normalizeFrontendStmt(result.arena_ptr.?.allocator(), stmt) catch {};
+            normalized_count += 1;
+        }
+    }
+
+    try std.testing.expect(normalized_count > 0);
 }
