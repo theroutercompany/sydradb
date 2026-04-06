@@ -917,6 +917,52 @@ test "executeWithMode compiled supports coalesce in constant and row projections
     try std.testing.expect((try row_cursor.next()) == null);
 }
 
+test "executeWithMode compiled supports ordering by hidden scan identifiers" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/compiled-hidden-order", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .compiled,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try engine_mod.Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const sid: u64 = 7666;
+    try engine.registerSeries("hidden.room1", "{\"host\":\"b\"}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.5, .tags_json = "{\"host\":\"b\"}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 20, .value = 3.0, .tags_json = "{\"host\":\"a\"}" });
+    try waitForFlushForTest(engine, 1, 1_000);
+
+    var time_cursor = try executeWithMode(talloc, engine, "select value from hidden.room1 where time >= 0 order by time desc limit 1", .compiled);
+    defer time_cursor.deinit();
+    const time_row = (try time_cursor.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), try time_row.values[0].asFloat(), 1e-9);
+    try std.testing.expect((try time_cursor.next()) == null);
+
+    var value_cursor = try executeWithMode(talloc, engine, "select time from hidden.room1 where time >= 0 order by value desc limit 1", .compiled);
+    defer value_cursor.deinit();
+    const value_row = (try value_cursor.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 20), value_row.values[0].integer);
+    try std.testing.expect((try value_cursor.next()) == null);
+}
+
 test "executeWithMode compiled falls back to legacy for fill clauses and records metrics" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });

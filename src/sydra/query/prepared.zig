@@ -1401,6 +1401,20 @@ test "prepared VM supports scalar ordering and limit offset" {
     try std.testing.expect(row_coalesce == .row);
     try std.testing.expectApproxEqAbs(@as(f64, 1.5), try row_coalesce.row[0].asFloat(), 1e-9);
     try std.testing.expect((try row_coalesce_stmt.step()) == .done);
+
+    var hidden_time_stmt = try prepareSydraQL(alloc, engine, "select value from stage3.room1 where time >= 0 order by time desc limit 1", .{});
+    defer hidden_time_stmt.finalize();
+    const hidden_time = try hidden_time_stmt.step();
+    try std.testing.expect(hidden_time == .row);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), try hidden_time.row[0].asFloat(), 1e-9);
+    try std.testing.expect((try hidden_time_stmt.step()) == .done);
+
+    var hidden_value_stmt = try prepareSydraQL(alloc, engine, "select time from stage3.room1 where time >= 0 order by value desc limit 1", .{});
+    defer hidden_value_stmt.finalize();
+    const hidden_value = try hidden_value_stmt.step();
+    try std.testing.expect(hidden_value == .row);
+    try std.testing.expectEqual(@as(i64, 20), hidden_value.row[0].integer);
+    try std.testing.expect((try hidden_value_stmt.step()) == .done);
 }
 
 test "prepared VM supports aggregate reads and grouped time buckets" {

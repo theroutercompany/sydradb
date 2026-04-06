@@ -27,7 +27,7 @@ pub fn buildTypedSelect(
     const aggregates = try buildAggregateSpecs(allocator, select.projections, allow_tag_identifiers);
     const is_aggregate_query = groupings.len != 0 or aggregates.len != 0;
     const projections = try buildTypedProjections(allocator, select.projections, groupings, aggregates, allow_tag_identifiers);
-    const ordering = try buildTypedOrderings(allocator, select.ordering, projections);
+    const ordering = try buildTypedOrderings(allocator, select.ordering, projections, allow_tag_identifiers, is_aggregate_query);
     const time_range = extractTimeRange(if (predicate) |typed| typed.expr else null);
     const properties = deriveProperties(select, groupings, aggregates, ordering);
 
@@ -177,13 +177,15 @@ pub fn buildTypedOrderings(
     allocator: std.mem.Allocator,
     ordering: []const ast.OrderExpr,
     projections: []const ir.TypedProjection,
+    allow_tag_identifiers: bool,
+    aggregate_query: bool,
 ) errors.CompileError![]const ir.TypedOrdering {
     if (ordering.len == 0) return &[_]ir.TypedOrdering{};
 
     const out = try allocator.alloc(ir.TypedOrdering, ordering.len);
     for (ordering, 0..) |order_expr, idx| {
         if (order_expr.expr.* == .identifier) {
-            try ensureOrderIdentifier(order_expr.expr.identifier, projections);
+            try ensureOrderIdentifier(order_expr.expr.identifier, projections, allow_tag_identifiers, aggregate_query);
         } else if (!matchesProjectionExpr(order_expr.expr, projections)) {
             return error.UnsupportedOrdering;
         }
@@ -427,10 +429,13 @@ fn isSupportedConstantScalarFunction(name: []const u8, arg_count: usize) bool {
 fn ensureOrderIdentifier(
     order_ident: ast.Identifier,
     projections: []const ir.TypedProjection,
+    allow_tag_identifiers: bool,
+    aggregate_query: bool,
 ) errors.CompileError!void {
     for (projections) |projection| {
         if (std.ascii.eqlIgnoreCase(projection.name, order_ident.value)) return;
     }
+    if (!aggregate_query and identifierAllowedInRawRow(order_ident.value, allow_tag_identifiers)) return;
     return error.UnsupportedOrdering;
 }
 
