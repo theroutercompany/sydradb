@@ -340,7 +340,7 @@ fn cliWorker(ctx: CliWorkerContext) void {
 }
 
 fn httpWorker(ctx: HttpWorkerContext) void {
-    const response = curlRequest(ctx.alloc, ctx.port, "/api/v1/ingest", .{
+    const response = httpRequest(ctx.alloc, ctx.port, "/api/v1/ingest", .{
         .method = "POST",
         .content_type = "application/x-ndjson",
         .body_path = ctx.body_path,
@@ -355,7 +355,7 @@ fn httpWorker(ctx: HttpWorkerContext) void {
 
 fn socketWorker(state: *SocketWorkerState) void {
     if (state.declared == null) {
-        state.declared = state.client.declareCachedBatch(state.inputs.?) catch |err| {
+        state.declared = state.client.ensureDeclaredBatch(state.inputs.?) catch |err| {
             std.debug.panic("socket declare failed: {s}", .{@errorName(err)});
         };
     }
@@ -547,7 +547,7 @@ fn runSocketBenchmark(alloc: std.mem.Allocator, scenario: Scenario, specs: []con
         };
         states[writer_idx].inputs = try buildSocketInputs(alloc, states[writer_idx].specs);
         if (scenario.warm_socket) {
-            states[writer_idx].declared = try states[writer_idx].client.declareCachedBatch(states[writer_idx].inputs.?);
+            states[writer_idx].declared = try states[writer_idx].client.ensureDeclaredBatch(states[writer_idx].inputs.?);
         }
     }
     defer for (states) |*state| state.deinit();
@@ -562,9 +562,14 @@ fn runSocketBenchmark(alloc: std.mem.Allocator, scenario: Scenario, specs: []con
     for (threads) |thread| thread.join();
     const active_ns = @as(u64, @intCast(std.time.nanoTimestamp() - start_ns));
     const barrier_start_ns = std.time.nanoTimestamp();
-    var flush_client = try ingest_socket.Client.connectWithRetry(alloc, server.socket_path.?, 40, 10);
-    defer flush_client.deinit();
-    _ = try flush_client.flushAndDrain(60_000);
+    var flush_client: ?ingest_socket.Client = null;
+    if (scenario.writers == 1) {
+        _ = try states[0].client.flushAndDrain(60_000);
+    } else {
+        flush_client = try ingest_socket.Client.connectWithRetry(alloc, server.socket_path.?, 40, 10);
+        defer if (flush_client) |*client| client.deinit();
+        _ = try flush_client.?.flushAndDrain(60_000);
+    }
     const barrier_ns = @as(u64, @intCast(std.time.nanoTimestamp() - barrier_start_ns));
     const elapsed_ns = active_ns + barrier_ns;
     const metrics = try fetchMetrics(alloc, server.http_port);
@@ -579,8 +584,10 @@ fn runSocketBenchmark(alloc: std.mem.Allocator, scenario: Scenario, specs: []con
         client_stats.append_frames_sent_total += snapshot.append_frames_sent_total;
         client_stats.append_points_sent_total += snapshot.append_points_sent_total;
     }
-    const flush_snapshot = flush_client.statsSnapshot();
-    client_stats.reconnect_total += flush_snapshot.reconnect_total;
+    if (flush_client) |client| {
+        const flush_snapshot = client.statsSnapshot();
+        client_stats.reconnect_total += flush_snapshot.reconnect_total;
+    }
 
     return .{
         .transport = if (scenario.warm_socket) "uds_binary_warm" else "uds_binary_cold",
@@ -718,7 +725,7 @@ fn waitForServerReady(port: u16) !void {
 fn waitForQueryableOverHttp(alloc: std.mem.Allocator, port: u16, timeout_ms: u64) !void {
     const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
     while (std.time.milliTimestamp() < deadline) {
-        const response = try curlRequest(alloc, port, "/status", .{});
+        const response = try httpRequest(alloc, port, "/status", .{});
         defer alloc.free(response.body);
         if (response.status_code != 200) {
             std.Thread.sleep(20 * std.time.ns_per_ms);
@@ -735,7 +742,7 @@ fn waitForQueryableOverHttp(alloc: std.mem.Allocator, port: u16, timeout_ms: u64
 }
 
 fn fetchMetrics(alloc: std.mem.Allocator, port: u16) !TransportMetrics {
-    const response = try curlRequest(alloc, port, "/metrics", .{});
+    const response = try httpRequest(alloc, port, "/metrics", .{});
     defer alloc.free(response.body);
     if (response.status_code != 200) return error.InvalidHttpStatus;
     return .{
@@ -764,86 +771,146 @@ const HttpResponse = struct {
     body: []u8,
 };
 
-const CurlRequestOptions = struct {
+const HttpResponseHead = struct {
+    status_code: u16,
+    content_length: ?usize = null,
+};
+
+const HttpRequestOptions = struct {
     method: []const u8 = "GET",
     content_type: ?[]const u8 = null,
     body_path: ?[]const u8 = null,
 };
 
-fn curlRequest(
+fn httpRequest(
     alloc: std.mem.Allocator,
     port: u16,
     path: []const u8,
-    options: CurlRequestOptions,
+    options: HttpRequestOptions,
 ) !HttpResponse {
-    const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}{s}", .{ port, path });
-    defer alloc.free(url);
+    const address = try std.net.Address.parseIp4("127.0.0.1", port);
+    var stream = try std.net.tcpConnectToAddress(address);
+    defer stream.close();
 
-    var argv = std.array_list.Managed([]const u8).init(alloc);
-    defer argv.deinit();
-    var body_arg: ?[]u8 = null;
-    defer if (body_arg) |arg| alloc.free(arg);
-    var header_arg_storage: ?[]u8 = null;
-    defer if (header_arg_storage) |arg| alloc.free(arg);
+    const body_size = if (options.body_path) |body_path| blk: {
+        const file = try std.fs.cwd().openFile(body_path, .{});
+        defer file.close();
+        const stat = try file.stat();
+        break :blk stat.size;
+    } else null;
 
-    try argv.append("curl");
-    try argv.append("-sS");
-    try argv.append("-i");
-    if (!std.mem.eql(u8, options.method, "GET")) {
-        try argv.append("-X");
-        try argv.append(options.method);
-    }
-    if (options.content_type) |value| {
-        const header_arg = try std.fmt.allocPrint(alloc, "Content-Type: {s}", .{value});
-        header_arg_storage = header_arg;
-        try argv.append("-H");
-        try argv.append(header_arg);
-    }
-    if (options.body_path) |path_value| {
-        try argv.append("-H");
-        try argv.append("Expect:");
-        try argv.append("--data-binary");
-        body_arg = try std.fmt.allocPrint(alloc, "@{s}", .{path_value});
-        try argv.append(body_arg.?);
-    }
-    try argv.append(url);
+    var write_buf: [8192]u8 = undefined;
+    var read_buf: [8192]u8 = undefined;
+    var writer_state = stream.writer(&write_buf);
+    var reader_state = stream.reader(&read_buf);
+    const writer = &writer_state.interface;
+    const reader = std.Io.Reader.adaptToOldInterface(reader_state.interface());
 
-    const result = try std.process.Child.run(.{
-        .allocator = alloc,
-        .argv = argv.items,
-        .max_output_bytes = 32 * 1024 * 1024,
+    try writer.print("{s} {s} HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nConnection: close\r\n", .{
+        options.method,
+        path,
+        port,
     });
-    errdefer alloc.free(result.stdout);
-    defer alloc.free(result.stderr);
-    switch (result.term) {
-        .Exited => |code| if (code != 0) {
-            std.debug.print("curl failed ({d}): {s}\n", .{ code, result.stderr });
-            alloc.free(result.stdout);
-            return error.CurlFailed;
-        },
-        else => return error.CurlFailed,
+    if (options.content_type) |value| {
+        try writer.print("Content-Type: {s}\r\n", .{value});
+    }
+    if (body_size) |size| {
+        try writer.print("Content-Length: {d}\r\n", .{size});
+        try writer.writeAll("Expect: 100-continue\r\n");
+    }
+    try writer.writeAll("\r\n");
+    if (options.body_path) |body_path| {
+        try writeFileBody(writer, body_path);
+    }
+    try writer.flush();
+
+    var head = try readHttpResponseHead(alloc, reader);
+    while (head.status_code == 100) {
+        head = try readHttpResponseHead(alloc, reader);
+    }
+    const body = try readHttpBodyAlloc(alloc, reader, head.content_length);
+    return .{
+        .status_code = head.status_code,
+        .body = body,
+    };
+}
+
+fn readHttpResponseHead(alloc: std.mem.Allocator, reader: anytype) !HttpResponseHead {
+    var header = std.array_list.Managed(u8).init(alloc);
+    defer header.deinit();
+
+    while (true) {
+        const byte = try reader.readByte();
+        try header.append(byte);
+        if (header.items.len >= 4 and std.mem.eql(u8, header.items[header.items.len - 4 ..], "\r\n\r\n")) break;
+        if (header.items.len > 64 * 1024) return error.InvalidHttpResponse;
     }
 
-    const header_end = std.mem.indexOf(u8, result.stdout, "\r\n\r\n") orelse {
-        alloc.free(result.stdout);
-        return error.InvalidHttpResponse;
-    };
-    const header_bytes = result.stdout[0..header_end];
-    const status_end = std.mem.indexOf(u8, header_bytes, "\r\n") orelse return error.InvalidHttpResponse;
-    const status_line = header_bytes[0..status_end];
+    const header_end = std.mem.indexOf(u8, header.items, "\r\n") orelse return error.InvalidHttpResponse;
+    const status_line = header.items[0..header_end];
     const status_prefix_len = if (std.mem.startsWith(u8, status_line, "HTTP/1.1 "))
         "HTTP/1.1 ".len
     else if (std.mem.startsWith(u8, status_line, "HTTP/1.0 "))
         "HTTP/1.0 ".len
     else
         return error.InvalidHttpResponse;
-    const status_code = try std.fmt.parseInt(u16, status_line[status_prefix_len .. status_prefix_len + 3], 10);
-    const body = try alloc.dupe(u8, result.stdout[header_end + 4 ..]);
-    alloc.free(result.stdout);
-    return .{
-        .status_code = status_code,
-        .body = body,
+    var response = HttpResponseHead{
+        .status_code = try std.fmt.parseInt(u16, status_line[status_prefix_len .. status_prefix_len + 3], 10),
     };
+
+    const header_fields = if (header.items.len > header_end + 4)
+        header.items[header_end + 2 .. header.items.len - 4]
+    else
+        header.items[0..0];
+    var lines = std.mem.splitSequence(u8, header_fields, "\r\n");
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        if (std.ascii.startsWithIgnoreCase(line, "content-length:")) {
+            const value = std.mem.trim(u8, line["content-length:".len..], " \t");
+            response.content_length = std.fmt.parseInt(usize, value, 10) catch null;
+        }
+    }
+    return response;
+}
+
+fn readHttpBodyAlloc(alloc: std.mem.Allocator, reader: anytype, content_length: ?usize) ![]u8 {
+    var body = std.array_list.Managed(u8).init(alloc);
+    errdefer body.deinit();
+
+    if (content_length) |expected_len| {
+        try body.ensureTotalCapacity(expected_len);
+        var remaining = expected_len;
+        var buf: [8192]u8 = undefined;
+        while (remaining != 0) {
+            const take = @min(buf.len, remaining);
+            const read_len = try reader.readAtLeast(buf[0..take], take);
+            try body.appendSlice(buf[0..read_len]);
+            remaining -= read_len;
+        }
+    } else {
+        var buf: [8192]u8 = undefined;
+        while (true) {
+            const read_len = reader.read(buf[0..]) catch |err| switch (err) {
+                error.EndOfStream => 0,
+                else => return err,
+            };
+            if (read_len == 0) break;
+            try body.appendSlice(buf[0..read_len]);
+        }
+    }
+    return try body.toOwnedSlice();
+}
+
+fn writeFileBody(writer: *std.Io.Writer, body_path: []const u8) !void {
+    var file = try std.fs.cwd().openFile(body_path, .{});
+    defer file.close();
+
+    var buf: [8192]u8 = undefined;
+    while (true) {
+        const read_len = try file.read(buf[0..]);
+        if (read_len == 0) break;
+        try writer.writeAll(buf[0..read_len]);
+    }
 }
 
 fn parseMetricLine(metrics_text: []const u8, metric_name: []const u8) ?[]const u8 {
