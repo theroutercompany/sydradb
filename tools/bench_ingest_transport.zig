@@ -4,7 +4,6 @@ const sydra = @import("sydra_tooling");
 const cfg = sydra.config;
 const Engine = sydra.engine.Engine;
 const types = sydra.types;
-const http_mod = sydra.http;
 const ingest_service = sydra.ingest_service;
 const ingest_socket = sydra.ingest_socket;
 
@@ -56,6 +55,14 @@ const scenarios = [_]Scenario{
         .points_per_writer = 10_000,
         .warm_socket = false,
     },
+    .{
+        .name = "steady_state_100k",
+        .description = "100k warm-declared points to measure sustained same-host append",
+        .series_count = 1,
+        .writers = 1,
+        .points_per_writer = 100_000,
+        .warm_socket = true,
+    },
 };
 
 const TransportMetrics = struct {
@@ -93,10 +100,9 @@ const CliWorkerContext = struct {
 };
 
 const HttpWorkerContext = struct {
-    eng: *Engine,
-    specs: []const SeriesSpec,
-    points: usize,
-    writer_idx: usize,
+    alloc: std.mem.Allocator,
+    port: u16,
+    body_path: []const u8,
 };
 
 const SocketWorkerState = struct {
@@ -196,6 +202,7 @@ fn parseArgs(alloc: std.mem.Allocator) !?[]const u8 {
                 \\  fanout_four_writers
                 \\  warm_declared_10k
                 \\  cold_declare_10k
+                \\  steady_state_100k
                 \\
             , .{});
             std.process.exit(0);
@@ -267,14 +274,17 @@ fn cliWorker(ctx: CliWorkerContext) void {
 }
 
 fn httpWorker(ctx: HttpWorkerContext) void {
-    const alloc = std.heap.c_allocator;
-    const body = buildNdjsonBody(alloc, ctx.specs, ctx.points, ctx.writer_idx) catch |err| {
-        std.debug.panic("http handler body build failed: {s}", .{@errorName(err)});
+    const response = curlRequest(ctx.alloc, ctx.port, "/api/v1/ingest", .{
+        .method = "POST",
+        .content_type = "application/x-ndjson",
+        .body_path = ctx.body_path,
+    }) catch |err| {
+        std.debug.panic("http ingest failed: {s}", .{@errorName(err)});
     };
-    defer alloc.free(body);
-    _ = http_mod.ingestRequestBody(alloc, ctx.eng, body) catch |err| {
-        std.debug.panic("http handler ingest failed: {s}", .{@errorName(err)});
-    };
+    defer ctx.alloc.free(response.body);
+    if (response.status_code != 200) {
+        std.debug.panic("unexpected HTTP ingest status {d}: {s}", .{ response.status_code, response.body });
+    }
 }
 
 fn socketWorker(state: *SocketWorkerState) void {
@@ -395,48 +405,54 @@ fn runCliDirectBenchmark(alloc: std.mem.Allocator, scenario: Scenario, specs: []
 }
 
 fn runHttpBenchmark(alloc: std.mem.Allocator, scenario: Scenario, specs: []const SeriesSpec) !BenchmarkResult {
-    const bench_id = std.time.milliTimestamp();
-    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/bench-transport-{d}-{s}-http-handler", .{ bench_id, scenario.name });
-    defer alloc.free(data_path);
-    defer std.fs.cwd().deleteTree(data_path) catch {};
+    var server = try startServerProcess(alloc, scenario.name, false);
+    defer server.deinit();
+    try waitForServerReady(server.http_port);
+
+    const body_paths = try alloc.alloc([]u8, scenario.writers);
+    defer {
+        for (body_paths) |path| alloc.free(path);
+        alloc.free(body_paths);
+    }
+    for (0..scenario.writers) |writer_idx| {
+        const range = partitionSeries(specs.len, scenario.writers, writer_idx);
+        const body = try buildNdjsonBody(alloc, specs[range.start .. range.start + range.count], scenario.points_per_writer, writer_idx);
+        defer alloc.free(body);
+        body_paths[writer_idx] = try std.fmt.allocPrint(alloc, "{s}/http-worker-{d}.ndjson", .{ server.workdir, writer_idx });
+        try std.fs.cwd().writeFile(.{ .sub_path = body_paths[writer_idx], .data = body });
+    }
 
     const threads = try alloc.alloc(std.Thread, scenario.writers);
     defer alloc.free(threads);
     const contexts = try alloc.alloc(HttpWorkerContext, scenario.writers);
     defer alloc.free(contexts);
 
-    var eng = try Engine.init(alloc, try makeConfig(alloc, data_path));
-    defer eng.deinit();
-
     const start_ns = std.time.nanoTimestamp();
     for (0..scenario.writers) |writer_idx| {
-        const range = partitionSeries(specs.len, scenario.writers, writer_idx);
         contexts[writer_idx] = .{
-            .eng = eng,
-            .specs = specs[range.start .. range.start + range.count],
-            .points = scenario.points_per_writer,
-            .writer_idx = writer_idx,
+            .alloc = alloc,
+            .port = server.http_port,
+            .body_path = body_paths[writer_idx],
         };
         threads[writer_idx] = try std.Thread.spawn(.{}, httpWorker, .{contexts[writer_idx]});
     }
     for (threads) |thread| thread.join();
-    _ = try eng.flushAndDrain(60_000);
+    try waitForQueryableOverHttp(alloc, server.http_port, 60_000);
     const elapsed_ns = @as(u64, @intCast(std.time.nanoTimestamp() - start_ns));
+    const metrics = try fetchMetrics(alloc, server.http_port);
 
     return .{
-        .transport = "http_ndjson_handler",
+        .transport = "http_ndjson",
         .points = scenario.points_per_writer * scenario.writers,
         .elapsed_ns = elapsed_ns,
-        .metrics = .{
-            .queue_pending_bytes_max = eng.metrics.queue_pending_bytes_max.load(.monotonic),
-        },
+        .metrics = metrics,
     };
 }
 
 fn runSocketBenchmark(alloc: std.mem.Allocator, scenario: Scenario, specs: []const SeriesSpec) !BenchmarkResult {
     var server = try startServerProcess(alloc, scenario.name, true);
     defer server.deinit();
-    try waitForServerReady(alloc, server.http_port);
+    try waitForServerReady(server.http_port);
 
     const states = try alloc.alloc(SocketWorkerState, scenario.writers);
     defer alloc.free(states);
@@ -586,8 +602,7 @@ fn pickHttpPort() !u16 {
     return listener.listen_address.getPort();
 }
 
-fn waitForServerReady(alloc: std.mem.Allocator, port: u16) !void {
-    _ = alloc;
+fn waitForServerReady(port: u16) !void {
     const deadline = std.time.milliTimestamp() + 10_000;
     const address = try std.net.Address.parseIp4("127.0.0.1", port);
     while (std.time.milliTimestamp() < deadline) {
@@ -604,7 +619,7 @@ fn waitForServerReady(alloc: std.mem.Allocator, port: u16) !void {
 fn waitForQueryableOverHttp(alloc: std.mem.Allocator, port: u16, timeout_ms: u64) !void {
     const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
     while (std.time.milliTimestamp() < deadline) {
-        const response = try httpRequest(alloc, port, "GET", "/status", "");
+        const response = try curlRequest(alloc, port, "/status", .{});
         defer alloc.free(response.body);
         if (response.status_code != 200) {
             std.Thread.sleep(20 * std.time.ns_per_ms);
@@ -613,14 +628,15 @@ fn waitForQueryableOverHttp(alloc: std.mem.Allocator, port: u16, timeout_ms: u64
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, response.body, .{});
         defer parsed.deinit();
         const runtime = parsed.value.object.get("runtime").?.object;
-        if (runtime.get("queue_depth").?.integer == 0 and runtime.get("memtable_bytes").?.integer == 0) return;
+        // Points are queryable once the ingest queue drains into the memtable/segments.
+        if (runtime.get("queue_depth").?.integer == 0) return;
         std.Thread.sleep(20 * std.time.ns_per_ms);
     }
     return error.Timeout;
 }
 
 fn fetchMetrics(alloc: std.mem.Allocator, port: u16) !TransportMetrics {
-    const response = try httpRequest(alloc, port, "GET", "/metrics", "");
+    const response = try curlRequest(alloc, port, "/metrics", .{});
     defer alloc.free(response.body);
     if (response.status_code != 200) return error.InvalidHttpStatus;
     return .{
@@ -641,36 +657,18 @@ const HttpResponse = struct {
     body: []u8,
 };
 
-fn httpRequest(alloc: std.mem.Allocator, port: u16, method: []const u8, path: []const u8, body: []const u8) !HttpResponse {
-    _ = method;
-    if (body.len != 0) return error.HttpBodyViaArgsUnsupported;
-    const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}{s}", .{ port, path });
-    defer alloc.free(url);
-    const result = try std.process.Child.run(.{
-        .allocator = alloc,
-        .argv = &.{ "curl", "-sS", url },
-        .max_output_bytes = 16 * 1024 * 1024,
-    });
-    defer alloc.free(result.stderr);
-    switch (result.term) {
-        .Exited => |code| if (code != 0) {
-            std.debug.print("curl failed ({d}): {s}\n", .{ code, result.stderr });
-            alloc.free(result.stdout);
-            return error.CurlFailed;
-        },
-        else => return error.CurlFailed,
-    }
-    return .{
-        .status_code = 200,
-        .body = result.stdout,
-    };
-}
+const CurlRequestOptions = struct {
+    method: []const u8 = "GET",
+    content_type: ?[]const u8 = null,
+    body_path: ?[]const u8 = null,
+};
 
-fn httpPostFile(alloc: std.mem.Allocator, port: u16, path: []const u8, body_path: []const u8) !HttpResponse {
-    return try curlRequest(alloc, port, path, body_path);
-}
-
-fn curlRequest(alloc: std.mem.Allocator, port: u16, path: []const u8, body_path: ?[]const u8) !HttpResponse {
+fn curlRequest(
+    alloc: std.mem.Allocator,
+    port: u16,
+    path: []const u8,
+    options: CurlRequestOptions,
+) !HttpResponse {
     const url = try std.fmt.allocPrint(alloc, "http://127.0.0.1:{d}{s}", .{ port, path });
     defer alloc.free(url);
 
@@ -678,12 +676,25 @@ fn curlRequest(alloc: std.mem.Allocator, port: u16, path: []const u8, body_path:
     defer argv.deinit();
     var body_arg: ?[]u8 = null;
     defer if (body_arg) |arg| alloc.free(arg);
+    var header_arg_storage: ?[]u8 = null;
+    defer if (header_arg_storage) |arg| alloc.free(arg);
+
     try argv.append("curl");
     try argv.append("-sS");
     try argv.append("-i");
-    if (body_path) |path_value| {
+    if (!std.mem.eql(u8, options.method, "GET")) {
         try argv.append("-X");
-        try argv.append("POST");
+        try argv.append(options.method);
+    }
+    if (options.content_type) |value| {
+        const header_arg = try std.fmt.allocPrint(alloc, "Content-Type: {s}", .{value});
+        header_arg_storage = header_arg;
+        try argv.append("-H");
+        try argv.append(header_arg);
+    }
+    if (options.body_path) |path_value| {
+        try argv.append("-H");
+        try argv.append("Expect:");
         try argv.append("--data-binary");
         body_arg = try std.fmt.allocPrint(alloc, "@{s}", .{path_value});
         try argv.append(body_arg.?);
@@ -693,44 +704,38 @@ fn curlRequest(alloc: std.mem.Allocator, port: u16, path: []const u8, body_path:
     const result = try std.process.Child.run(.{
         .allocator = alloc,
         .argv = argv.items,
-        .max_output_bytes = 16 * 1024 * 1024,
+        .max_output_bytes = 32 * 1024 * 1024,
     });
+    errdefer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
     switch (result.term) {
         .Exited => |code| if (code != 0) {
             std.debug.print("curl failed ({d}): {s}\n", .{ code, result.stderr });
             alloc.free(result.stdout);
-            alloc.free(result.stderr);
             return error.CurlFailed;
         },
         else => return error.CurlFailed,
     }
-    defer alloc.free(result.stderr);
 
     const header_end = std.mem.indexOf(u8, result.stdout, "\r\n\r\n") orelse {
         alloc.free(result.stdout);
         return error.InvalidHttpResponse;
     };
     const header_bytes = result.stdout[0..header_end];
-    const body_bytes = try alloc.dupe(u8, result.stdout[header_end + 4 ..]);
-    alloc.free(result.stdout);
-
-    const status_end = std.mem.indexOf(u8, header_bytes, "\r\n") orelse {
-        alloc.free(body_bytes);
-        return error.InvalidHttpResponse;
-    };
+    const status_end = std.mem.indexOf(u8, header_bytes, "\r\n") orelse return error.InvalidHttpResponse;
     const status_line = header_bytes[0..status_end];
     const status_prefix_len = if (std.mem.startsWith(u8, status_line, "HTTP/1.1 "))
         "HTTP/1.1 ".len
     else if (std.mem.startsWith(u8, status_line, "HTTP/1.0 "))
         "HTTP/1.0 ".len
-    else {
-        alloc.free(body_bytes);
+    else
         return error.InvalidHttpResponse;
-    };
     const status_code = try std.fmt.parseInt(u16, status_line[status_prefix_len .. status_prefix_len + 3], 10);
+    const body = try alloc.dupe(u8, result.stdout[header_end + 4 ..]);
+    alloc.free(result.stdout);
     return .{
         .status_code = status_code,
-        .body = body_bytes,
+        .body = body,
     };
 }
 
@@ -793,9 +798,13 @@ pub fn main() !void {
         defer freeSeriesSpecs(alloc, specs);
 
         std.debug.print("scenario {s}: {s}\n", .{ scenario.name, scenario.description });
+        std.debug.print("starting transport=direct_engine\n", .{});
         printResult(scenario, try runDirectEngineBenchmark(alloc, scenario, specs));
+        std.debug.print("starting transport=cli_direct_ndjson\n", .{});
         printResult(scenario, try runCliDirectBenchmark(alloc, scenario, specs));
+        std.debug.print("starting transport=http_ndjson\n", .{});
         printResult(scenario, try runHttpBenchmark(alloc, scenario, specs));
+        std.debug.print("starting transport={s}\n", .{if (scenario.warm_socket) "uds_binary_warm" else "uds_binary_cold"});
         printResult(scenario, try runSocketBenchmark(alloc, scenario, specs));
     }
 }

@@ -95,6 +95,18 @@ pub fn build(b: *std.Build) void {
     pgwire_smoke.step.dependOn(b.getInstallStep());
     demo_smoke.dependOn(&pgwire_smoke.step);
 
+    const local_ingest_socket_smoke = b.addSystemCommand(&.{ "bash", "-lc", "SYDRADB_BIN=\"$1\" bash demos/demo-local-ingest-socket.sh", "demo-local-ingest-socket" });
+    local_ingest_socket_smoke.addArtifactArg(exe);
+    local_ingest_socket_smoke.setCwd(repo_root);
+    local_ingest_socket_smoke.step.dependOn(b.getInstallStep());
+    demo_smoke.dependOn(&local_ingest_socket_smoke.step);
+
+    const combined_http_socket_smoke = b.addSystemCommand(&.{ "bash", "-lc", "SYDRADB_BIN=\"$1\" bash demos/demo-combined-http-socket.sh", "demo-combined-http-socket" });
+    combined_http_socket_smoke.addArtifactArg(exe);
+    combined_http_socket_smoke.setCwd(repo_root);
+    combined_http_socket_smoke.step.dependOn(b.getInstallStep());
+    demo_smoke.dependOn(&combined_http_socket_smoke.step);
+
     const unit_tests = if (is015) blk2: {
         const root_mod = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize });
         root_mod.addImport("build_options", build_options_module);
@@ -317,4 +329,9 @@ pub fn build(b: *std.Build) void {
     bench_transport_run.step.dependOn(b.getInstallStep());
     if (b.args) |args| bench_transport_run.addArgs(args);
     b.step("bench-ingest-transport", "Run same-host ingest transport benchmark scenarios").dependOn(&bench_transport_run.step);
+
+    const bench_transport_smoke_run = b.addRunArtifact(bench_transport_exe);
+    bench_transport_smoke_run.step.dependOn(b.getInstallStep());
+    bench_transport_smoke_run.addArgs(&.{ "--scenario", "one_hot_one_writer" });
+    bench_smoke.dependOn(&bench_transport_smoke_run.step);
 }
