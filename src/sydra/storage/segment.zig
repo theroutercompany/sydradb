@@ -78,6 +78,84 @@ pub const SegmentBlockStats = struct {
     values_size_bytes: u64,
 };
 
+pub const SegmentBlockView = struct {
+    stats: SegmentBlockStats,
+    ts_tree: extents.WriteResult,
+    values_tree: extents.WriteResult,
+};
+
+pub const SegmentBlockCursor = struct {
+    alloc: std.mem.Allocator,
+    store: *object_store.ObjectStore,
+    metadata: SegmentRootMetadata,
+    blocks: []TreeEntry,
+    next_idx: usize = 0,
+
+    pub fn open(
+        alloc: std.mem.Allocator,
+        store: *object_store.ObjectStore,
+        root_id: object_store.ObjectId,
+    ) !SegmentBlockCursor {
+        var root_tree = try loadTreeObject(alloc, store, root_id);
+        errdefer root_tree.deinit(alloc);
+
+        const meta_id = findTreeEntry(root_tree.entries, "meta", .blob) orelse return error.MissingSegmentRootMeta;
+        const blocks_id = findTreeEntry(root_tree.entries, "blocks", .tree) orelse return error.MissingSegmentRootBlocks;
+
+        const meta_payload = try loadBlobObject(alloc, store, meta_id);
+        defer alloc.free(meta_payload);
+        var metadata = try decodeSegmentRootMetadata(alloc, meta_payload);
+        errdefer metadata.deinit(alloc);
+
+        var blocks_tree = try loadTreeObject(alloc, store, blocks_id);
+        errdefer blocks_tree.deinit(alloc);
+
+        return .{
+            .alloc = alloc,
+            .store = store,
+            .metadata = metadata,
+            .blocks = blocks_tree.entries,
+        };
+    }
+
+    pub fn deinit(self: *SegmentBlockCursor) void {
+        self.metadata.deinit(self.alloc);
+        for (self.blocks) |*entry| entry.deinit(self.alloc);
+        self.alloc.free(self.blocks);
+    }
+
+    pub fn next(self: *SegmentBlockCursor) !?SegmentBlockView {
+        if (self.next_idx >= self.blocks.len) return null;
+        const block_entry = self.blocks[self.next_idx];
+        self.next_idx += 1;
+        if (block_entry.object_type != .tree) return error.InvalidSegmentBlockTree;
+
+        var block_tree = try loadTreeObject(self.alloc, self.store, block_entry.object_id);
+        defer block_tree.deinit(self.alloc);
+
+        const stats_id = findTreeEntry(block_tree.entries, "stats", .blob) orelse return error.MissingSegmentBlockStats;
+        const stats_payload = try loadBlobObject(self.alloc, self.store, stats_id);
+        defer self.alloc.free(stats_payload);
+        const stats = try decodeSegmentBlockStats(stats_payload);
+
+        const ts_root_id = findTreeEntry(block_tree.entries, "ts", .tree) orelse return error.MissingSegmentBlockTs;
+        const values_root_id = findTreeEntry(block_tree.entries, "values", .tree) orelse return error.MissingSegmentBlockValues;
+        return .{
+            .stats = stats,
+            .ts_tree = .{
+                .root_id = ts_root_id,
+                .size_bytes = stats.ts_size_bytes,
+                .chunk_bytes = self.metadata.extent_chunk_bytes,
+            },
+            .values_tree = .{
+                .root_id = values_root_id,
+                .size_bytes = stats.values_size_bytes,
+                .chunk_bytes = self.metadata.extent_chunk_bytes,
+            },
+        };
+    }
+};
+
 pub const segment_root_block_point_count: u32 = 4096;
 
 const segment_root_meta_version: u8 = 1;
@@ -913,6 +991,49 @@ test "segment root range queries stream from packed extents" {
     try std.testing.expectEqual(points[segment_root_block_point_count + 3].ts, out.items[out.items.len - 1].ts);
 }
 
+test "segment block cursor exposes block stats and extent roots" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/segment-block-cursor-store", .{tmp.sub_path});
+    defer alloc.free(store_path);
+    var store = try object_store.ObjectStore.init(alloc, store_path, .none);
+    defer store.deinit();
+
+    const point_count: usize = segment_root_block_point_count + 5;
+    const points = try alloc.alloc(types.Point, point_count);
+    defer alloc.free(points);
+    for (points, 0..) |*point, idx| {
+        point.* = .{
+            .ts = 300_000 + @as(i64, @intCast(idx)),
+            .value = @floatFromInt(idx),
+        };
+    }
+
+    const root_id = try writeSegmentRoot(alloc, &store, .{
+        .series_id = 21,
+        .hour_bucket = 0,
+        .ts_codec = 1,
+        .val_codec = 1,
+    }, points, 0);
+
+    var cursor = try SegmentBlockCursor.open(alloc, &store, root_id);
+    defer cursor.deinit();
+
+    const first = (try cursor.next()) orelse return error.MissingSegmentBlock;
+    try std.testing.expectEqual(segment_root_block_point_count, first.stats.count);
+    try std.testing.expectEqual(points[0].ts, first.stats.first_ts);
+    try std.testing.expectEqual(points[segment_root_block_point_count - 1].ts, first.stats.last_ts);
+
+    const second = (try cursor.next()) orelse return error.MissingSegmentBlock;
+    try std.testing.expectEqual(@as(u32, 5), second.stats.count);
+    try std.testing.expectEqual(points[segment_root_block_point_count].ts, second.stats.first_ts);
+    try std.testing.expectEqual(points[points.len - 1].ts, second.stats.last_ts);
+
+    try std.testing.expect((try cursor.next()) == null);
+}
+
 fn appendBlockPointsFromExtentTrees(
     alloc: std.mem.Allocator,
     store: *object_store.ObjectStore,
@@ -957,35 +1078,16 @@ fn appendSegmentRootPoints(
     maybe_end_ts: ?i64,
     out: *std.array_list.Managed(types.Point),
 ) !void {
-    var root_tree = try loadTreeObject(alloc, store, root_id);
-    defer root_tree.deinit(alloc);
-
-    const meta_id = findTreeEntry(root_tree.entries, "meta", .blob) orelse return error.MissingSegmentRootMeta;
-    const blocks_id = findTreeEntry(root_tree.entries, "blocks", .tree) orelse return error.MissingSegmentRootBlocks;
-
-    const meta_payload = try loadBlobObject(alloc, store, meta_id);
-    defer alloc.free(meta_payload);
-    var metadata = try decodeSegmentRootMetadata(alloc, meta_payload);
-    defer metadata.deinit(alloc);
+    var cursor = try SegmentBlockCursor.open(alloc, store, root_id);
+    defer cursor.deinit();
 
     if (maybe_start_ts == null and maybe_end_ts == null) {
-        try out.ensureUnusedCapacity(@intCast(metadata.count));
+        try out.ensureUnusedCapacity(@intCast(cursor.metadata.count));
     }
 
-    var blocks_tree = try loadTreeObject(alloc, store, blocks_id);
-    defer blocks_tree.deinit(alloc);
-
     var appended_count: usize = 0;
-    for (blocks_tree.entries) |block_entry| {
-        if (block_entry.object_type != .tree) return error.InvalidSegmentBlockTree;
-
-        var block_tree = try loadTreeObject(alloc, store, block_entry.object_id);
-        defer block_tree.deinit(alloc);
-
-        const stats_id = findTreeEntry(block_tree.entries, "stats", .blob) orelse return error.MissingSegmentBlockStats;
-        const stats_payload = try loadBlobObject(alloc, store, stats_id);
-        defer alloc.free(stats_payload);
-        const stats = try decodeSegmentBlockStats(stats_payload);
+    while (try cursor.next()) |block| {
+        const stats = block.stats;
 
         if (maybe_start_ts) |start_ts| {
             if (stats.max_ts < start_ts) continue;
@@ -994,20 +1096,19 @@ fn appendSegmentRootPoints(
             if (stats.min_ts > end_ts) continue;
         }
 
-        const ts_root_id = findTreeEntry(block_tree.entries, "ts", .tree) orelse return error.MissingSegmentBlockTs;
-        const values_root_id = findTreeEntry(block_tree.entries, "values", .tree) orelse return error.MissingSegmentBlockValues;
-        appended_count += try appendBlockPointsFromExtentTrees(alloc, store, .{
-            .root_id = ts_root_id,
-            .size_bytes = stats.ts_size_bytes,
-            .chunk_bytes = metadata.extent_chunk_bytes,
-        }, .{
-            .root_id = values_root_id,
-            .size_bytes = stats.values_size_bytes,
-            .chunk_bytes = metadata.extent_chunk_bytes,
-        }, stats, maybe_start_ts, maybe_end_ts, out);
+        appended_count += try appendBlockPointsFromExtentTrees(
+            alloc,
+            store,
+            block.ts_tree,
+            block.values_tree,
+            stats,
+            maybe_start_ts,
+            maybe_end_ts,
+            out,
+        );
     }
 
-    if (maybe_start_ts == null and maybe_end_ts == null and appended_count != metadata.count) {
+    if (maybe_start_ts == null and maybe_end_ts == null and appended_count != cursor.metadata.count) {
         return error.CorruptSegmentRoot;
     }
 }

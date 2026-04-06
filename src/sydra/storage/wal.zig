@@ -1,6 +1,7 @@
 const std = @import("std");
 const cfg = @import("../config.zig");
 const object_store = @import("object_store.zig");
+const extents = @import("extents.zig");
 
 // WAL v0:
 // Type 1 = Put: [u32 len][u8 type][u64 series_id][i64 ts][f64 value][u32 crc32]
@@ -22,6 +23,245 @@ pub const JournalFrameIndex = struct {
 pub const JournalMeta = struct {
     file_size: u64,
     frame_count: u32,
+};
+
+const LooseBytesReader = struct {
+    payload: []u8,
+    offset: usize = 0,
+
+    fn deinit(self: *LooseBytesReader, alloc: std.mem.Allocator) void {
+        alloc.free(self.payload);
+    }
+
+    fn read(self: *LooseBytesReader, dest: []u8) usize {
+        if (self.offset >= self.payload.len or dest.len == 0) return 0;
+        const read_len = @min(dest.len, self.payload.len - self.offset);
+        @memcpy(dest[0..read_len], self.payload[self.offset .. self.offset + read_len]);
+        self.offset += read_len;
+        return read_len;
+    }
+
+    fn readNoEof(self: *LooseBytesReader, dest: []u8) !void {
+        var copied: usize = 0;
+        while (copied < dest.len) {
+            const read_len = self.read(dest[copied..]);
+            if (read_len == 0) return error.EndOfStream;
+            copied += read_len;
+        }
+    }
+
+    fn readByte(self: *LooseBytesReader) !u8 {
+        var buf: [1]u8 = undefined;
+        try self.readNoEof(buf[0..]);
+        return buf[0];
+    }
+
+    fn finish(_: *LooseBytesReader) void {}
+
+    fn remaining(self: *const LooseBytesReader) usize {
+        return self.payload.len - self.offset;
+    }
+};
+
+const BlobObjectReader = union(enum) {
+    packed_blob: object_store.PackedBlobReader,
+    loose: LooseBytesReader,
+
+    fn deinit(self: *BlobObjectReader, alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .packed_blob => |*reader| reader.deinit(),
+            .loose => |*reader| reader.deinit(alloc),
+        }
+    }
+
+    fn read(self: *BlobObjectReader, dest: []u8) !usize {
+        return switch (self.*) {
+            .packed_blob => |*reader| try reader.read(dest),
+            .loose => |*reader| reader.read(dest),
+        };
+    }
+
+    fn readNoEof(self: *BlobObjectReader, dest: []u8) !void {
+        switch (self.*) {
+            .packed_blob => |*reader| try reader.readNoEof(dest),
+            .loose => |*reader| try reader.readNoEof(dest),
+        }
+    }
+
+    fn readByte(self: *BlobObjectReader) !u8 {
+        return switch (self.*) {
+            .packed_blob => |*reader| try reader.readByte(),
+            .loose => |*reader| try reader.readByte(),
+        };
+    }
+
+    fn finish(self: *BlobObjectReader) !void {
+        switch (self.*) {
+            .packed_blob => |*reader| try reader.finish(),
+            .loose => |*reader| reader.finish(),
+        }
+    }
+
+    fn remaining(self: *const BlobObjectReader) usize {
+        return switch (self.*) {
+            .packed_blob => |reader| reader.remaining,
+            .loose => |reader| reader.remaining(),
+        };
+    }
+};
+
+pub const JournalReader = struct {
+    alloc: std.mem.Allocator,
+    store: *object_store.ObjectStore,
+    frame_entries: []TreeEntry,
+    frame_index: JournalFrameIndex,
+    captured_bytes: u64,
+    next_frame_idx: usize = 0,
+    bytes_read: u64 = 0,
+    current_frame: ?BlobObjectReader = null,
+
+    pub fn open(
+        alloc: std.mem.Allocator,
+        store: *object_store.ObjectStore,
+        root_id: object_store.ObjectId,
+        captured_bytes: u64,
+    ) !JournalReader {
+        var root_tree = try loadTreeObject(alloc, store, root_id);
+        defer root_tree.deinit(alloc);
+
+        const meta_id = findTreeEntry(root_tree.entries, "meta", .blob) orelse return error.MissingJournalMeta;
+        const frame_index_id = findTreeEntry(root_tree.entries, "frame_index", .blob) orelse return error.MissingJournalFrameIndex;
+        const frames_id = findTreeEntry(root_tree.entries, "frames", .tree) orelse return error.MissingJournalFrames;
+
+        const meta_payload = try loadBlobObject(alloc, store, meta_id);
+        defer alloc.free(meta_payload);
+        const meta = try decodeJournalMeta(meta_payload);
+        if (captured_bytes > meta.file_size) return error.CorruptJournalRoot;
+
+        const frame_index_payload = try loadBlobObject(alloc, store, frame_index_id);
+        defer alloc.free(frame_index_payload);
+        var frame_index = try decodeJournalFrameIndex(alloc, frame_index_payload);
+        errdefer frame_index.deinit(alloc);
+
+        var frames_tree = try loadTreeObject(alloc, store, frames_id);
+        errdefer frames_tree.deinit(alloc);
+        if (frames_tree.entries.len != frame_index.entries.len) return error.CorruptJournalRoot;
+
+        return .{
+            .alloc = alloc,
+            .store = store,
+            .frame_entries = frames_tree.entries,
+            .frame_index = frame_index,
+            .captured_bytes = captured_bytes,
+        };
+    }
+
+    pub fn deinit(self: *JournalReader) void {
+        if (self.current_frame) |*reader| reader.deinit(self.alloc);
+        for (self.frame_entries) |*entry| entry.deinit(self.alloc);
+        self.alloc.free(self.frame_entries);
+        self.frame_index.deinit(self.alloc);
+    }
+
+    pub fn read(self: *JournalReader, dest: []u8) !usize {
+        if (dest.len == 0) return 0;
+        var total: usize = 0;
+        while (total < dest.len) {
+            if (!try self.ensureFrame()) break;
+            const read_len = try self.current_frame.?.read(dest[total..]);
+            if (read_len == 0) {
+                try self.finishCurrentFrame();
+                continue;
+            }
+            total += read_len;
+            self.bytes_read += read_len;
+        }
+        return total;
+    }
+
+    pub fn readNoEof(self: *JournalReader, dest: []u8) !void {
+        var copied: usize = 0;
+        while (copied < dest.len) {
+            const read_len = try self.read(dest[copied..]);
+            if (read_len == 0) return error.EndOfStream;
+            copied += read_len;
+        }
+    }
+
+    pub fn readByte(self: *JournalReader) !u8 {
+        var buf: [1]u8 = undefined;
+        try self.readNoEof(buf[0..]);
+        return buf[0];
+    }
+
+    pub fn finish(self: *JournalReader) !void {
+        if (self.current_frame != null) try self.finishCurrentFrame();
+        if (self.next_frame_idx != self.frame_entries.len) {
+            if (self.next_frame_idx < self.frame_index.entries.len and self.frame_index.entries[self.next_frame_idx].offset < self.captured_bytes) {
+                return error.UnconsumedJournalBytes;
+            }
+        }
+        if (self.bytes_read != self.captured_bytes) return error.CorruptJournalRoot;
+    }
+
+    fn ensureFrame(self: *JournalReader) !bool {
+        if (self.current_frame != null and self.current_frame.?.remaining() != 0) return true;
+        if (self.current_frame != null) try self.finishCurrentFrame();
+        if (self.next_frame_idx >= self.frame_entries.len) return false;
+        const next_entry = self.frame_index.entries[self.next_frame_idx];
+        if (next_entry.offset + next_entry.size_bytes > self.captured_bytes) return false;
+        if (self.frame_entries[self.next_frame_idx].object_type != .blob) return error.InvalidJournalFrameObject;
+        self.current_frame = try openBlobObjectReader(self.alloc, self.store, self.frame_entries[self.next_frame_idx].object_id);
+        self.next_frame_idx += 1;
+        return true;
+    }
+
+    fn finishCurrentFrame(self: *JournalReader) !void {
+        if (self.current_frame) |*reader| {
+            try reader.finish();
+            reader.deinit(self.alloc);
+            self.current_frame = null;
+        }
+    }
+};
+
+pub const ContentPrefixComparator = struct {
+    pub fn blobObjectMatchesFile(
+        alloc: std.mem.Allocator,
+        data_dir: std.fs.Dir,
+        store: *object_store.ObjectStore,
+        path: []const u8,
+        object_id: object_store.ObjectId,
+    ) !bool {
+        var reader = try openBlobObjectReader(alloc, store, object_id);
+        defer reader.deinit(alloc);
+        return try readerPrefixMatchesFile(&reader, data_dir, path);
+    }
+
+    pub fn extentTreeMatchesFile(
+        alloc: std.mem.Allocator,
+        data_dir: std.fs.Dir,
+        store: *object_store.ObjectStore,
+        path: []const u8,
+        tree_ref: extents.WriteResult,
+    ) !bool {
+        var reader = try extents.openReader(alloc, store, tree_ref);
+        defer reader.deinit();
+        return try readerPrefixMatchesFile(&reader, data_dir, path);
+    }
+
+    pub fn journalRootMatchesFile(
+        alloc: std.mem.Allocator,
+        data_dir: std.fs.Dir,
+        store: *object_store.ObjectStore,
+        path: []const u8,
+        root_id: object_store.ObjectId,
+        captured_bytes: u64,
+    ) !bool {
+        var reader = try JournalReader.open(alloc, store, root_id, captured_bytes);
+        defer reader.deinit();
+        return try readerPrefixMatchesFile(&reader, data_dir, path);
+    }
 };
 
 const journal_meta_version: u8 = 1;
@@ -286,6 +526,39 @@ pub fn filePrefixMatches(data_dir: std.fs.Dir, path: []const u8, expected_prefix
     return true;
 }
 
+fn openBlobObjectReader(
+    alloc: std.mem.Allocator,
+    store: *object_store.ObjectStore,
+    object_id: object_store.ObjectId,
+) !BlobObjectReader {
+    if (try store.openPackedBlobReader(alloc, object_id)) |packed_reader| {
+        return .{ .packed_blob = packed_reader };
+    }
+    const loaded = try store.get(alloc, object_id);
+    errdefer alloc.free(loaded.payload);
+    if (loaded.obj_type != .blob) return error.InvalidWalChunkObject;
+    return .{ .loose = .{ .payload = loaded.payload } };
+}
+
+fn readerPrefixMatchesFile(reader: anytype, data_dir: std.fs.Dir, path: []const u8) !bool {
+    var file = data_dir.openFile(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer file.close();
+
+    var file_scratch: [4096]u8 = undefined;
+    var reader_scratch: [4096]u8 = undefined;
+    while (true) {
+        const read_len = try reader.read(reader_scratch[0..]);
+        if (read_len == 0) break;
+        const file_read_len = try file.readAll(file_scratch[0..read_len]);
+        if (file_read_len != read_len) return false;
+        if (!std.mem.eql(u8, reader_scratch[0..read_len], file_scratch[0..read_len])) return false;
+    }
+    return true;
+}
+
 pub fn writeJournalRootForWalFile(
     alloc: std.mem.Allocator,
     data_dir: std.fs.Dir,
@@ -378,9 +651,10 @@ pub fn replayJournalRoot(
     captured_bytes: u64,
     ctx: anytype,
 ) !void {
-    const journal_bytes = try readJournalBytes(alloc, store, root_id, captured_bytes);
-    defer alloc.free(journal_bytes);
-    try replayBytes(alloc, journal_bytes, ctx);
+    var reader = try JournalReader.open(alloc, store, root_id, captured_bytes);
+    defer reader.deinit();
+    try replayReader(alloc, &reader, ctx);
+    try reader.finish();
 }
 
 pub fn journalPrefixMatchesFile(
@@ -391,9 +665,31 @@ pub fn journalPrefixMatchesFile(
     root_id: object_store.ObjectId,
     captured_bytes: u64,
 ) !bool {
-    const journal_bytes = try readJournalBytes(alloc, store, root_id, captured_bytes);
-    defer alloc.free(journal_bytes);
-    return try filePrefixMatches(data_dir, path, journal_bytes);
+    return try ContentPrefixComparator.journalRootMatchesFile(alloc, data_dir, store, path, root_id, captured_bytes);
+}
+
+pub fn replayBlobObject(
+    alloc: std.mem.Allocator,
+    store: *object_store.ObjectStore,
+    object_id: object_store.ObjectId,
+    ctx: anytype,
+) !void {
+    var reader = try openBlobObjectReader(alloc, store, object_id);
+    defer reader.deinit(alloc);
+    try replayReader(alloc, &reader, ctx);
+    try reader.finish();
+}
+
+pub fn replayExtentTree(
+    alloc: std.mem.Allocator,
+    store: *object_store.ObjectStore,
+    tree_ref: extents.WriteResult,
+    ctx: anytype,
+) !void {
+    var reader = try extents.openReader(alloc, store, tree_ref);
+    defer reader.deinit();
+    try replayReader(alloc, &reader, ctx);
+    try reader.finish();
 }
 
 fn readJournalBytes(
@@ -669,6 +965,37 @@ test "journal roots replay after packed storage prunes loose copies" {
     try replayJournalRoot(alloc, &store, root_id, registration_bytes + first_bytes, &ctx);
     try std.testing.expect(ctx.registered);
     try std.testing.expectEqual(@as(usize, 1), ctx.point_count);
+}
+
+test "content prefix comparator streams packed wal payloads" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/wal-prefix-packed-store", .{tmp.sub_path});
+    defer alloc.free(store_path);
+    var store = try object_store.ObjectStore.init(alloc, store_path, .none);
+    defer store.deinit();
+
+    var wal = try WAL.open(alloc, tmp.dir, .none);
+    defer wal.close();
+    _ = try wal.appendSeriesRegistration(99, "metric.room9", "{\"host\":\"z\"}");
+    _ = try wal.append(99, 3_000, 1.25);
+
+    const path = "wal/current.wal";
+    const bytes = try tmp.dir.readFileAlloc(alloc, path, 1024 * 1024);
+    defer alloc.free(bytes);
+    const written = try extents.writeAll(alloc, &store, bytes, extents.DefaultChunkBytes);
+    const ids = try store.listIds(alloc);
+    defer alloc.free(ids);
+    var pack_write = try store.writePack(alloc, ids);
+    defer pack_write.deinit(alloc);
+
+    try std.testing.expect(try ContentPrefixComparator.extentTreeMatchesFile(alloc, tmp.dir, &store, path, .{
+        .root_id = written.root_id,
+        .size_bytes = written.size_bytes,
+        .chunk_bytes = written.chunk_bytes,
+    }));
 }
 
 fn encodeJournalMeta(alloc: std.mem.Allocator, meta: JournalMeta) ![]u8 {
