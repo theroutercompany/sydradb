@@ -33,6 +33,9 @@ Returns a lightweight JSON health snapshot with:
 - `cas_mode`
 - `metadata_read_mode`
 - `query_compiler_mode`
+- `compatibility_debt.legacy_segment_descriptors`
+- `compatibility_debt.legacy_wal_descriptors`
+- `compatibility_debt.loose_refs_present`
 - `runtime.queue_depth`
 - `runtime.memtable_bytes`
 - `runtime.flush_total`
@@ -68,6 +71,11 @@ Example:
   "cas_mode": "dual_write",
   "metadata_read_mode": "primary",
   "query_compiler_mode": "compiled",
+  "compatibility_debt": {
+    "legacy_segment_descriptors": 0,
+    "legacy_wal_descriptors": 0,
+    "loose_refs_present": 0
+  },
   "runtime": {
     "queue_depth": 0,
     "memtable_bytes": 0,

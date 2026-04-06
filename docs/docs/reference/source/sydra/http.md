@@ -211,6 +211,7 @@ defer cursor.deinit();
 Returns lightweight runtime health JSON:
 
 - config mode snapshot (`cas_mode`, `metadata_read_mode`, `query_compiler_mode`)
+- current CAS compatibility debt snapshot (`legacy_segment_descriptors`, `legacy_wal_descriptors`, `loose_refs_present`)
 - queue depth and memtable bytes
 - ingest / flush / WAL counters, including writer-loop append timing/failure, quarantine, and CAS sync counters
 - ingest rejection counters

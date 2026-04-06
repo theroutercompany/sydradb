@@ -460,7 +460,106 @@ pub const SnapshotIndex = struct {
         }
         return .{ .status = .not_found };
     }
+
+    pub fn compatibilityDebt(self: *const SnapshotIndex) CompatibilityDebtReport {
+        var report = CompatibilityDebtReport{};
+        for (self.snapshot.segment_descriptors) |descriptor| {
+            if (descriptor.segmentRoot() == null) report.legacy_segment_descriptors += 1;
+        }
+        for (self.snapshot.wal_index.entries) |entry| {
+            if (entry.journalRoot() == null) report.legacy_wal_descriptors += 1;
+        }
+        return report;
+    }
 };
+
+test "snapshot index compatibility debt counts legacy descriptors" {
+    const alloc = std.testing.allocator;
+
+    const zero_id = object_store.ObjectId{ .hash = [_]u8{0} ** 32 };
+    const blob_id = object_store.ObjectId{ .hash = [_]u8{1} ** 32 };
+    const journal_id = object_store.ObjectId{ .hash = [_]u8{2} ** 32 };
+
+    const segment_descriptors = try alloc.alloc(SegmentDescriptor, 2);
+    errdefer alloc.free(segment_descriptors);
+    segment_descriptors[0] = .{
+        .path = try alloc.dupe(u8, "segments/legacy.seg"),
+        .file_hash = [_]u8{0} ** 32,
+        .file_size = 1,
+        .series_id = 1,
+        .hour_bucket = 0,
+        .start_ts = 0,
+        .end_ts = 0,
+        .count = 1,
+        .ts_codec = 0,
+        .val_codec = 0,
+        .content_id = blob_id,
+    };
+    segment_descriptors[1] = .{
+        .path = try alloc.dupe(u8, "segments/native.seg"),
+        .file_hash = [_]u8{0} ** 32,
+        .file_size = 1,
+        .series_id = 2,
+        .hour_bucket = 0,
+        .start_ts = 0,
+        .end_ts = 0,
+        .count = 1,
+        .ts_codec = 0,
+        .val_codec = 0,
+        .segment_root = zero_id,
+        .content = .{ .blob = blob_id },
+    };
+
+    const wal_entries = try alloc.alloc(WalChunkDescriptor, 2);
+    errdefer alloc.free(wal_entries);
+    wal_entries[0] = .{
+        .name = try alloc.dupe(u8, "current.wal"),
+        .file_size = 16,
+        .file_hash = [_]u8{0} ** 32,
+        .mutable = true,
+        .captured_bytes = 16,
+        .content_id = blob_id,
+    };
+    wal_entries[1] = .{
+        .name = try alloc.dupe(u8, "sealed.wal"),
+        .file_size = 32,
+        .file_hash = [_]u8{0} ** 32,
+        .mutable = false,
+        .captured_bytes = 32,
+        .journal_root = journal_id,
+        .content = .{ .blob = blob_id },
+    };
+
+    const tag_snapshot = try TagSnapshot.empty(alloc);
+    const series_catalog_snapshot = try SeriesCatalogSnapshot.empty(alloc);
+    const checkpoint_state = try CheckpointState.empty(alloc);
+    const parents = try alloc.alloc(object_store.ObjectId, 0);
+    const reason = try alloc.dupe(u8, "test");
+
+    var dummy_store: object_store.ObjectStore = undefined;
+    var snapshot_index = SnapshotIndex.init(alloc, &dummy_store, .{
+        .commit_id = zero_id,
+        .root_id = zero_id,
+        .commit = .{
+            .format_version = current_repository_format_version,
+            .root = zero_id,
+            .parents = parents,
+            .created_at_ms = 0,
+            .reason = reason,
+        },
+        .segment_descriptors = segment_descriptors,
+        .tag_snapshot = tag_snapshot,
+        .series_catalog_snapshot = series_catalog_snapshot,
+        .wal_index = .{ .entries = wal_entries },
+        .checkpoint_state = checkpoint_state,
+    });
+    defer snapshot_index.deinit();
+
+    const report = snapshot_index.compatibilityDebt();
+    try std.testing.expectEqual(@as(usize, 1), report.legacy_segment_descriptors);
+    try std.testing.expectEqual(@as(usize, 1), report.legacy_wal_descriptors);
+    try std.testing.expectEqual(@as(usize, 0), report.loose_refs_present);
+}
 
 pub const RefEntry = struct {
     name: []u8,
@@ -954,6 +1053,15 @@ pub const RefStore = struct {
             alloc.free(reftable_refs);
         }
         return try self.listLooseRefs(alloc);
+    }
+
+    pub fn countLooseRefs(self: *RefStore, alloc: std.mem.Allocator) !usize {
+        const refs = try self.listLooseRefs(alloc);
+        defer {
+            for (refs) |*entry| entry.deinit(alloc);
+            alloc.free(refs);
+        }
+        return refs.len;
     }
 
     fn listLooseRefs(self: *RefStore, alloc: std.mem.Allocator) ![]RefEntry {

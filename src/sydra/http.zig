@@ -3,6 +3,7 @@ const Engine = @import("engine.zig").Engine;
 const types = @import("types.zig");
 const config = @import("config.zig");
 const compat = @import("compat.zig");
+const cas_mod = @import("storage/cas.zig");
 const query_exec = @import("query/exec.zig");
 const plan = @import("query/plan.zig");
 const query_executor = @import("query/executor.zig");
@@ -351,6 +352,7 @@ const StatusSnapshot = struct {
     cas_mode: []const u8,
     metadata_read_mode: []const u8,
     query_compiler_mode: []const u8,
+    compatibility_debt: cas_mod.CompatibilityDebtReport,
     queue_depth: usize,
     memtable_bytes: usize,
     flush_total: u64,
@@ -380,10 +382,12 @@ const StatusSnapshot = struct {
 };
 
 fn buildStatusSnapshot(eng: *Engine) StatusSnapshot {
+    const compatibility_debt = eng.currentCompatibilityDebt() catch cas_mod.CompatibilityDebtReport{};
     return .{
         .cas_mode = @tagName(eng.config.cas_mode),
         .metadata_read_mode = @tagName(eng.config.metadata_read_mode),
         .query_compiler_mode = @tagName(eng.config.query_compiler_mode),
+        .compatibility_debt = compatibility_debt,
         .queue_depth = eng.queue.len(),
         .memtable_bytes = eng.mem.bytes.load(.monotonic),
         .flush_total = eng.metrics.flush_total.load(.monotonic),
@@ -449,6 +453,15 @@ fn writeStatusPayload(jw: *std.json.Stringify, snapshot: StatusSnapshot) !void {
     try jw.write(snapshot.metadata_read_mode);
     try jw.objectField("query_compiler_mode");
     try jw.write(snapshot.query_compiler_mode);
+    try jw.objectField("compatibility_debt");
+    try jw.beginObject();
+    try jw.objectField("legacy_segment_descriptors");
+    try jw.write(snapshot.compatibility_debt.legacy_segment_descriptors);
+    try jw.objectField("legacy_wal_descriptors");
+    try jw.write(snapshot.compatibility_debt.legacy_wal_descriptors);
+    try jw.objectField("loose_refs_present");
+    try jw.write(snapshot.compatibility_debt.loose_refs_present);
+    try jw.endObject();
 
     try jw.objectField("runtime");
     try jw.beginObject();
@@ -697,6 +710,11 @@ test "buildStatusPayload emits extended runtime counters" {
         .cas_mode = "dual_write",
         .metadata_read_mode = "primary",
         .query_compiler_mode = "compiled",
+        .compatibility_debt = .{
+            .legacy_segment_descriptors = 2,
+            .legacy_wal_descriptors = 1,
+            .loose_refs_present = 3,
+        },
         .queue_depth = 2,
         .memtable_bytes = 4096,
         .flush_total = 3,
@@ -734,6 +752,10 @@ test "buildStatusPayload emits extended runtime counters" {
     try std.testing.expectEqualStrings("dual_write", root.get("cas_mode").?.string);
     try std.testing.expectEqualStrings("primary", root.get("metadata_read_mode").?.string);
     try std.testing.expectEqualStrings("compiled", root.get("query_compiler_mode").?.string);
+    const compatibility_debt = root.get("compatibility_debt").?.object;
+    try std.testing.expectEqual(@as(i64, 2), compatibility_debt.get("legacy_segment_descriptors").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), compatibility_debt.get("legacy_wal_descriptors").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), compatibility_debt.get("loose_refs_present").?.integer);
 
     const runtime = root.get("runtime").?.object;
     try std.testing.expectEqual(@as(i64, 2), runtime.get("queue_depth").?.integer);
@@ -756,6 +778,7 @@ test "buildStatusPayload emits extended runtime counters" {
 }
 
 fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    const compatibility_debt = eng.currentCompatibilityDebt() catch cas_mod.CompatibilityDebtReport{};
     const ingest_total = eng.metrics.ingest_total.load(.monotonic);
     const ingest_rejected_total = eng.metrics.ingest_rejected_total.load(.monotonic);
     const ingest_rejected_mem_limit_total = eng.metrics.ingest_rejected_mem_limit_total.load(.monotonic);
@@ -805,6 +828,9 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     try writer.print("# HELP sydradb_cas_sync_total Total CAS snapshot sync operations completed by the engine\n# TYPE sydradb_cas_sync_total counter\nsydradb_cas_sync_total {d}\n", .{cas_sync_total});
     try writer.print("# HELP sydradb_cas_sync_failed_total Total CAS snapshot sync operations that failed\n# TYPE sydradb_cas_sync_failed_total counter\nsydradb_cas_sync_failed_total {d}\n", .{cas_sync_failed_total});
     try writer.print("# HELP sydradb_cas_sync_seconds_total Aggregate CAS snapshot sync duration in seconds\n# TYPE sydradb_cas_sync_seconds_total counter\nsydradb_cas_sync_seconds_total {d:.6}\n", .{cas_sync_seconds_total});
+    try writer.print("# HELP sydradb_compatibility_debt_legacy_segment_descriptors Current legacy segment descriptors still referenced by CAS metadata\n# TYPE sydradb_compatibility_debt_legacy_segment_descriptors gauge\nsydradb_compatibility_debt_legacy_segment_descriptors {d}\n", .{compatibility_debt.legacy_segment_descriptors});
+    try writer.print("# HELP sydradb_compatibility_debt_legacy_wal_descriptors Current legacy WAL descriptors still referenced by CAS metadata\n# TYPE sydradb_compatibility_debt_legacy_wal_descriptors gauge\nsydradb_compatibility_debt_legacy_wal_descriptors {d}\n", .{compatibility_debt.legacy_wal_descriptors});
+    try writer.print("# HELP sydradb_compatibility_debt_loose_refs_present Current loose refs still present alongside reftable metadata\n# TYPE sydradb_compatibility_debt_loose_refs_present gauge\nsydradb_compatibility_debt_loose_refs_present {d}\n", .{compatibility_debt.loose_refs_present});
     try writer.print("# HELP sydradb_query_compile_attempts_total Total compiled query attempts\n# TYPE sydradb_query_compile_attempts_total counter\nsydradb_query_compile_attempts_total {d}\n", .{query_compile_attempts_total});
     try writer.print("# HELP sydradb_query_compile_success_total Total compiled query lowerings that succeeded\n# TYPE sydradb_query_compile_success_total counter\nsydradb_query_compile_success_total {d}\n", .{query_compile_success_total});
     try writer.print("# HELP sydradb_query_compile_fallback_total Total query compiler fallbacks\n# TYPE sydradb_query_compile_fallback_total counter\nsydradb_query_compile_fallback_total {d}\n", .{query_compile_fallback_total});

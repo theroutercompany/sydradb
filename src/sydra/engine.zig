@@ -995,6 +995,22 @@ pub const Engine = struct {
         return (try self.resolveSelector(.{ .exact = .{ .series = series, .tags_json = tags_json } })).toMatch();
     }
 
+    pub fn currentCompatibilityDebt(self: *Engine) !cas_mod.CompatibilityDebtReport {
+        var report = cas_mod.CompatibilityDebtReport{};
+        self.metadata.cas_index_mu.lock();
+        if (self.metadata.cas_index) |*index| {
+            report = index.compatibilityDebt();
+        }
+        self.metadata.cas_index_mu.unlock();
+
+        if (self.cas) |*cas| {
+            if (cas.format.version >= cas_mod.current_repository_format_version and cas.format.ref_backend == .reftable) {
+                report.loose_refs_present = try cas.refs.countLooseRefs(self.alloc);
+            }
+        }
+        return report;
+    }
+
     pub fn deleteWhere(self: *Engine, series_id: types.SeriesId, predicate: ?*const query_ast.Expr) !usize {
         try pauseWriterForMaintenance(self);
         defer resumeWriterAfterMaintenance(self) catch |err| {
