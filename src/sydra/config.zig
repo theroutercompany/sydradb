@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const default_ingest_socket_path = "";
+
 pub const FsyncPolicy = enum { always, interval, none };
 pub const CasMode = enum { off, dual_write };
 pub const QueryCompilerMode = enum { legacy, shadow, compiled };
@@ -10,6 +12,8 @@ pub const MarketStorageReadMode = enum { fanout, shadow, native };
 pub const Config = struct {
     data_dir: []const u8,
     http_port: u16,
+    ingest_socket_path: []const u8 = default_ingest_socket_path,
+    ingest_socket_max_frame_bytes: usize = 8 * 1024 * 1024,
     fsync: FsyncPolicy,
     flush_interval_ms: u32,
     memtable_max_bytes: usize,
@@ -27,6 +31,9 @@ pub const Config = struct {
 
     pub fn deinit(self: *Config, alloc: std.mem.Allocator) void {
         alloc.free(self.data_dir);
+        if (self.ingest_socket_path.ptr != default_ingest_socket_path.ptr) {
+            alloc.free(self.ingest_socket_path);
+        }
         alloc.free(self.auth_token);
         self.retention_ns.deinit();
     }
@@ -46,6 +53,8 @@ fn parseToml(alloc: std.mem.Allocator, text: []const u8) !Config {
     var cfg = Config{
         .data_dir = try alloc.dupe(u8, "./data"),
         .http_port = 8080,
+        .ingest_socket_path = default_ingest_socket_path,
+        .ingest_socket_max_frame_bytes = 8 * 1024 * 1024,
         .fsync = .interval,
         .flush_interval_ms = 2000,
         .memtable_max_bytes = 8 * 1024 * 1024,
@@ -76,6 +85,19 @@ fn parseToml(alloc: std.mem.Allocator, text: []const u8) !Config {
             }
         } else if (std.mem.eql(u8, key_raw, "http_port")) {
             cfg.http_port = @intCast(try std.fmt.parseInt(u16, val_raw, 10));
+        } else if (std.mem.eql(u8, key_raw, "ingest_socket_path")) {
+            if (val_raw.len >= 2 and val_raw[0] == '"' and val_raw[val_raw.len - 1] == '"') {
+                const inner = val_raw[1 .. val_raw.len - 1];
+                if (cfg.ingest_socket_path.ptr != default_ingest_socket_path.ptr) {
+                    alloc.free(cfg.ingest_socket_path);
+                }
+                cfg.ingest_socket_path = if (inner.len == 0)
+                    default_ingest_socket_path
+                else
+                    try alloc.dupe(u8, inner);
+            }
+        } else if (std.mem.eql(u8, key_raw, "ingest_socket_max_frame_bytes")) {
+            cfg.ingest_socket_max_frame_bytes = @intCast(try std.fmt.parseInt(usize, val_raw, 10));
         } else if (std.mem.eql(u8, key_raw, "flush_interval_ms")) {
             cfg.flush_interval_ms = @intCast(try std.fmt.parseInt(u32, val_raw, 10));
         } else if (std.mem.eql(u8, key_raw, "memtable_max_bytes")) {

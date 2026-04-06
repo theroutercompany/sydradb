@@ -2,6 +2,8 @@ const std = @import("std");
 const config = @import("config.zig");
 const engine_mod = @import("engine.zig");
 const http = @import("http.zig");
+const ingest_service = @import("ingest/service.zig");
+const ingest_socket = @import("ingest/socket.zig");
 const catalog = @import("catalog.zig");
 const compat = @import("compat.zig");
 const alloc_mod = @import("alloc.zig");
@@ -9,6 +11,13 @@ const cas_mod = @import("storage/cas.zig");
 const object_store = @import("storage/object_store.zig");
 
 const cas_json_schema_version: u32 = 1;
+
+const ListenerMode = enum {
+    none,
+    http_only,
+    socket_only,
+    combined,
+};
 
 fn printInteractiveBanner(comptime fmt: []const u8, args: anytype) void {
     if (std.fs.File.stderr().isTty()) {
@@ -23,6 +32,28 @@ fn printStdout(alloc: std.mem.Allocator, comptime fmt: []const u8, args: anytype
     try stdout.writeAll(msg);
 }
 
+fn listenerMode(cfg: *const config.Config) ListenerMode {
+    const has_http = cfg.http_port != 0;
+    const has_socket = cfg.ingest_socket_path.len != 0;
+    return switch (has_http) {
+        true => if (has_socket) .combined else .http_only,
+        false => if (has_socket) .socket_only else .none,
+    };
+}
+
+fn validateConfiguredSocketPath(cfg: *const config.Config) !void {
+    if (cfg.ingest_socket_path.len == 0) return;
+    ingest_socket.validateSocketListenPath(cfg.ingest_socket_path) catch |err| {
+        switch (err) {
+            error.NameTooLong => std.log.err("local ingest socket path is too long: {s}", .{cfg.ingest_socket_path}),
+            error.PathAlreadyExists => std.log.err("local ingest socket path exists and is not a socket: {s}", .{cfg.ingest_socket_path}),
+            error.AlreadyListening => std.log.err("local ingest socket path is already in use by a live listener: {s}", .{cfg.ingest_socket_path}),
+            else => std.log.err("local ingest socket path validation failed for {s}: {s}", .{ cfg.ingest_socket_path, @errorName(err) }),
+        }
+        return err;
+    };
+}
+
 pub fn run(handle: *alloc_mod.AllocatorHandle) !void {
     const alloc = handle.allocator();
     const args = try std.process.argsAlloc(alloc);
@@ -32,9 +63,36 @@ pub fn run(handle: *alloc_mod.AllocatorHandle) !void {
         var eng = try initOwnedEngine(alloc, &cfg);
         defer eng.deinit();
         try catalog.bootstrap(alloc);
-        printInteractiveBanner("sydradb serve :{d}\n", .{eng.config.http_port});
-        try http.runHttp(handle, eng, eng.config.http_port);
-        return;
+        try validateConfiguredSocketPath(&eng.config);
+        switch (listenerMode(&eng.config)) {
+            .combined => {
+                const socket_thread = try std.Thread.spawn(.{}, localSocketListenerThread, .{
+                    eng,
+                    eng.config.ingest_socket_path,
+                    eng.config.ingest_socket_max_frame_bytes,
+                });
+                socket_thread.detach();
+                if (eng.config.ingest_socket_path.len != 0) {
+                    printInteractiveBanner("sydradb serve :{d} socket={s}\n", .{ eng.config.http_port, eng.config.ingest_socket_path });
+                } else {
+                    printInteractiveBanner("sydradb serve :{d}\n", .{eng.config.http_port});
+                }
+                try http.runHttp(handle, eng, eng.config.http_port);
+                return;
+            },
+            .http_only => {
+                printInteractiveBanner("sydradb serve :{d}\n", .{eng.config.http_port});
+                try http.runHttp(handle, eng, eng.config.http_port);
+                return;
+            },
+            .socket_only => {
+                std.log.warn("http listener disabled; local ingest socket is the only active ingest surface", .{});
+                printInteractiveBanner("sydradb serve socket={s}\n", .{eng.config.ingest_socket_path});
+                try ingest_socket.runUnixSocket(eng, eng.config.ingest_socket_path, eng.config.ingest_socket_max_frame_bytes);
+                return;
+            },
+            .none => return error.NoActiveListeners,
+        }
     }
 
     const cmd = args[1];
@@ -115,7 +173,24 @@ fn cmdPgWire(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     try compat.wire.server.run(alloc, server_cfg);
 }
 
-fn cmdIngest(alloc: std.mem.Allocator, _: [][:0]u8) !void {
+fn cmdIngest(alloc: std.mem.Allocator, args: [][:0]u8) !void {
+    var socket_path: ?[]const u8 = null;
+    var idx: usize = 2;
+    while (idx < args.len) : (idx += 1) {
+        const arg = std.mem.sliceTo(args[idx], 0);
+        if (std.mem.eql(u8, arg, "--socket")) {
+            idx += 1;
+            if (idx >= args.len) return error.Invalid;
+            socket_path = std.mem.sliceTo(args[idx], 0);
+        } else {
+            return error.Invalid;
+        }
+    }
+
+    if (socket_path) |path| {
+        return cmdIngestViaSocket(alloc, path);
+    }
+
     var cfg = try loadConfigOrDefault(alloc);
     var eng = try initOwnedEngine(alloc, &cfg);
     defer eng.deinit();
@@ -132,7 +207,7 @@ fn cmdIngest(alloc: std.mem.Allocator, _: [][:0]u8) !void {
             else => return err,
         };
         const slice = maybe_slice orelse break;
-        const parsed = http.parseIngestLine(alloc, slice) catch |err| switch (err) {
+        const parsed = ingest_service.parseIngestLine(alloc, slice) catch |err| switch (err) {
             error.EmptyLine,
             error.InvalidRecord,
             error.MissingSeries,
@@ -143,12 +218,55 @@ fn cmdIngest(alloc: std.mem.Allocator, _: [][:0]u8) !void {
             else => return err,
         };
         defer parsed.deinit(alloc);
-        _ = try http.applyIngestLine(eng, parsed);
-        count += 1;
+        _ = try ingest_service.applyParsedIngestLine(eng, parsed);
+        count += parsed.writes.len;
     }
-    _ = try eng.flushNow();
-    try eng.waitForDrained(1_000);
+    _ = try eng.flushAndDrain(1_000);
     printInteractiveBanner("ingested {d} points\n", .{count});
+}
+
+fn cmdIngestViaSocket(alloc: std.mem.Allocator, socket_path: []const u8) !void {
+    const batch_options = ingest_socket.BatchOptions{};
+    var client = try ingest_socket.Client.connectWithRetry(alloc, socket_path, batch_options.connect_attempts, batch_options.connect_retry_delay_ms);
+    defer client.deinit();
+    var batcher = ingest_socket.ParsedLineBatcher.init(alloc, &client, batch_options);
+    defer batcher.deinit();
+
+    var stdin_file = std.fs.File.stdin();
+    var stdin_buf: [4096]u8 = undefined;
+    var reader_state = stdin_file.reader(&stdin_buf);
+    const reader = std.Io.Reader.adaptToOldInterface(&reader_state.interface);
+    var line_buf: [4096]u8 = undefined;
+    var count: usize = 0;
+
+    while (true) {
+        const maybe_slice = reader.readUntilDelimiterOrEof(&line_buf, '\n') catch |err| switch (err) {
+            error.StreamTooLong => return error.StreamTooLong,
+            else => return err,
+        };
+        const slice = maybe_slice orelse break;
+        const parsed = ingest_service.parseIngestLine(alloc, slice) catch |err| switch (err) {
+            error.EmptyLine,
+            error.InvalidRecord,
+            error.MissingSeries,
+            error.MissingTimestamp,
+            error.InvalidSeries,
+            error.InvalidTimestamp,
+            => continue,
+            else => return err,
+        };
+        count += try batcher.push(parsed);
+    }
+
+    count += try batcher.flush();
+    _ = try client.flushAndDrain(1_000);
+    printInteractiveBanner("ingested {d} points\n", .{count});
+}
+
+fn localSocketListenerThread(eng: *engine_mod.Engine, socket_path: []const u8, max_frame_bytes: usize) void {
+    ingest_socket.runUnixSocket(eng, socket_path, max_frame_bytes) catch |err| {
+        std.log.err("local ingest socket listener exited: {s}", .{@errorName(err)});
+    };
 }
 
 fn cmdQuery(alloc: std.mem.Allocator, args: [][:0]u8) !void {
@@ -1339,6 +1457,79 @@ test "loadConfigOrDefault prefers primary defaults for fresh repositories" {
 
     try std.testing.expectEqual(config.CasMode.dual_write, cfg.cas_mode);
     try std.testing.expectEqual(config.MetadataReadMode.primary, cfg.metadata_read_mode);
+}
+
+test "listenerMode classifies active listeners" {
+    const alloc = std.testing.allocator;
+    var cfg_none = config.Config{
+        .data_dir = try alloc.dupe(u8, "./none"),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 1,
+        .memtable_max_bytes = 1,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1,
+        .cas_mode = .off,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    defer cfg_none.deinit(alloc);
+    try std.testing.expectEqual(ListenerMode.none, listenerMode(&cfg_none));
+
+    var cfg_http = config.Config{
+        .data_dir = try alloc.dupe(u8, "./http"),
+        .http_port = 8080,
+        .fsync = .none,
+        .flush_interval_ms = 1,
+        .memtable_max_bytes = 1,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1,
+        .cas_mode = .off,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    defer cfg_http.deinit(alloc);
+    try std.testing.expectEqual(ListenerMode.http_only, listenerMode(&cfg_http));
+
+    var cfg_socket = config.Config{
+        .data_dir = try alloc.dupe(u8, "./socket"),
+        .http_port = 0,
+        .ingest_socket_path = try alloc.dupe(u8, "./ingest.sock"),
+        .fsync = .none,
+        .flush_interval_ms = 1,
+        .memtable_max_bytes = 1,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1,
+        .cas_mode = .off,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    defer cfg_socket.deinit(alloc);
+    try std.testing.expectEqual(ListenerMode.socket_only, listenerMode(&cfg_socket));
+
+    var cfg_combined = config.Config{
+        .data_dir = try alloc.dupe(u8, "./combined"),
+        .http_port = 8080,
+        .ingest_socket_path = try alloc.dupe(u8, "./ingest.sock"),
+        .fsync = .none,
+        .flush_interval_ms = 1,
+        .memtable_max_bytes = 1,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1,
+        .cas_mode = .off,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    defer cfg_combined.deinit(alloc);
+    try std.testing.expectEqual(ListenerMode.combined, listenerMode(&cfg_combined));
 }
 
 test "loadConfigOrDefault preserves legacy defaults for existing legacy repositories" {

@@ -396,16 +396,56 @@ pub const Engine = struct {
         series_id: types.SeriesId,
         ts: i64,
         value: f64,
-        // Queue-owned copy of the canonical tags JSON kept for parity across
-        // async ingest entrypoints.
         tags_json: []const u8,
+    };
+
+    pub const ResolvedIngestPoint = struct {
+        series_id: types.SeriesId,
+        ts: i64,
+        value: f64,
+    };
+
+    pub const AppendBatchReceipt = struct {
+        accepted_points: usize,
+        queue_depth: usize,
+        pending_bytes: usize,
+    };
+
+    pub const ExactSeriesDeclarationInput = struct {
+        name: []const u8,
+        tags_json: []const u8,
+        descriptor: ?metric_catalog_mod.DescriptorInput = null,
+    };
+
+    pub const ExactSeriesDeclarationResult = struct {
+        series_id: types.SeriesId,
+        canonical_tags: []u8,
+
+        pub fn deinit(self: *ExactSeriesDeclarationResult, alloc: std.mem.Allocator) void {
+            alloc.free(self.canonical_tags);
+            self.* = undefined;
+        }
+    };
+
+    const QueuedBatch = struct {
+        points: []ResolvedIngestPoint,
+        bytes: usize,
+
+        fn deinit(self: *QueuedBatch, alloc: std.mem.Allocator) void {
+            alloc.free(self.points);
+            self.* = undefined;
+        }
     };
 
     pub const Queue = struct {
         alloc: std.mem.Allocator,
         mu: std.Thread.Mutex = .{},
         cv: std.Thread.Condition = .{},
-        buf: std.array_list.Managed(IngestItem),
+        buf: []QueuedBatch = &.{},
+        head: usize = 0,
+        count: usize = 0,
+        pending_points: usize = 0,
+        pending_bytes: usize = 0,
         closed: bool = false,
         metrics: *Metrics,
         const lock_wait_threshold_ns: i64 = 1_000;
@@ -414,16 +454,37 @@ pub const Engine = struct {
             const q = try alloc.create(Queue);
             q.* = .{
                 .alloc = alloc,
-                .buf = try std.array_list.Managed(IngestItem).initCapacity(alloc, 0),
                 .metrics = metrics,
             };
             return q;
         }
         pub fn deinit(self: *Queue) void {
-            for (self.buf.items) |item| self.alloc.free(item.tags_json);
-            self.buf.deinit();
+            var idx: usize = 0;
+            while (idx < self.count) : (idx += 1) {
+                var batch = self.buf[self.activeIndex(idx)];
+                batch.deinit(self.alloc);
+            }
+            if (self.buf.len != 0) self.alloc.free(self.buf);
         }
-        pub fn push(self: *Queue, item: IngestItem) !void {
+        pub fn push(self: *Queue, point: ResolvedIngestPoint) !void {
+            const owned_points = try self.alloc.alloc(ResolvedIngestPoint, 1);
+            errdefer self.alloc.free(owned_points);
+            owned_points[0] = point;
+            return self.pushOwned(.{
+                .points = owned_points,
+                .bytes = @sizeOf(ResolvedIngestPoint),
+            });
+        }
+        pub fn pushBatch(self: *Queue, points: []const ResolvedIngestPoint) !void {
+            if (points.len == 0) return;
+            const owned_points = try self.alloc.dupe(ResolvedIngestPoint, points);
+            errdefer self.alloc.free(owned_points);
+            return self.pushOwned(.{
+                .points = owned_points,
+                .bytes = points.len * @sizeOf(ResolvedIngestPoint),
+            });
+        }
+        fn pushOwned(self: *Queue, batch: QueuedBatch) !void {
             const wait_start = std.time.nanoTimestamp();
             self.mu.lock();
             const acquired_ns = std.time.nanoTimestamp();
@@ -439,43 +500,20 @@ pub const Engine = struct {
                 _ = self.metrics.queue_push_lock_hold_ns_total.fetchAdd(@as(u64, @intCast(hold_ns)), .monotonic);
                 self.mu.unlock();
             }
-            if (self.closed) return error.Closed;
-            const owned_tags = try self.alloc.dupe(u8, item.tags_json);
-            errdefer self.alloc.free(owned_tags);
-            try self.buf.append(.{
-                .series_id = item.series_id,
-                .ts = item.ts,
-                .value = item.value,
-                .tags_json = owned_tags,
-            });
+            if (self.closed) {
+                var rejected = batch;
+                rejected.deinit(self.alloc);
+                return error.Closed;
+            }
+            try self.ensureCapacity(self.count + 1);
+            const insert_idx = if (self.buf.len == 0) 0 else (self.head + self.count) % self.buf.len;
+            self.buf[insert_idx] = batch;
+            self.count += 1;
+            self.pending_points += batch.points.len;
+            self.pending_bytes += batch.bytes;
             self.cv.signal();
         }
-        pub fn pushBatch(self: *Queue, items: []const IngestItem) !void {
-            if (items.len == 0) return;
-            self.mu.lock();
-            defer self.mu.unlock();
-            if (self.closed) return error.Closed;
-
-            const start_len = self.buf.items.len;
-            errdefer {
-                while (self.buf.items.len > start_len) {
-                    const removed = self.buf.pop().?;
-                    self.alloc.free(removed.tags_json);
-                }
-            }
-            for (items) |item| {
-                const owned_tags = try self.alloc.dupe(u8, item.tags_json);
-                errdefer self.alloc.free(owned_tags);
-                try self.buf.append(.{
-                    .series_id = item.series_id,
-                    .ts = item.ts,
-                    .value = item.value,
-                    .tags_json = owned_tags,
-                });
-            }
-            self.cv.signal();
-        }
-        pub fn pop(self: *Queue) ?IngestItem {
+        pub fn pop(self: *Queue) ?QueuedBatch {
             const lock_begin = std.time.nanoTimestamp();
             self.mu.lock();
             var acquired_ns = std.time.nanoTimestamp();
@@ -486,7 +524,7 @@ pub const Engine = struct {
                 _ = self.metrics.queue_pop_lock_contention.fetchAdd(1, .monotonic);
             }
             var hold_start_ns = acquired_ns;
-            while (self.buf.items.len == 0 and !self.closed) {
+            while (self.count == 0 and !self.closed) {
                 const before_wait_ns = std.time.nanoTimestamp();
                 const hold_ns = before_wait_ns - hold_start_ns;
                 _ = self.metrics.queue_pop_lock_hold_ns_total.fetchAdd(@as(u64, @intCast(hold_ns)), .monotonic);
@@ -499,19 +537,24 @@ pub const Engine = struct {
                 }
                 hold_start_ns = acquired_ns;
             }
-            if (self.buf.items.len == 0) {
+            if (self.count == 0) {
                 const release_ns = std.time.nanoTimestamp();
                 const hold_ns = release_ns - hold_start_ns;
                 _ = self.metrics.queue_pop_lock_hold_ns_total.fetchAdd(@as(u64, @intCast(hold_ns)), .monotonic);
                 self.mu.unlock();
                 return null;
             }
-            const point = self.buf.orderedRemove(0);
+            const batch = self.buf[self.head];
+            self.head = if (self.buf.len == 0) 0 else (self.head + 1) % self.buf.len;
+            self.count -= 1;
+            self.pending_points -= batch.points.len;
+            self.pending_bytes -= batch.bytes;
+            if (self.count == 0) self.head = 0;
             const release_ns = std.time.nanoTimestamp();
             const hold_ns = release_ns - hold_start_ns;
             _ = self.metrics.queue_pop_lock_hold_ns_total.fetchAdd(@as(u64, @intCast(hold_ns)), .monotonic);
             self.mu.unlock();
-            return point;
+            return batch;
         }
         pub fn close(self: *Queue) void {
             self.mu.lock();
@@ -527,7 +570,29 @@ pub const Engine = struct {
         pub fn len(self: *Queue) usize {
             self.mu.lock();
             defer self.mu.unlock();
-            return self.buf.items.len;
+            return self.pending_points;
+        }
+        pub fn pendingBytes(self: *Queue) usize {
+            self.mu.lock();
+            defer self.mu.unlock();
+            return self.pending_bytes;
+        }
+        fn activeIndex(self: *const Queue, logical_idx: usize) usize {
+            return (self.head + logical_idx) % self.buf.len;
+        }
+        fn ensureCapacity(self: *Queue, needed: usize) !void {
+            if (needed <= self.buf.len) return;
+            var new_cap: usize = if (self.buf.len == 0) 8 else self.buf.len * 2;
+            while (new_cap < needed) : (new_cap *= 2) {}
+            const new_buf = try self.alloc.alloc(QueuedBatch, new_cap);
+            if (self.count != 0) {
+                for (0..self.count) |idx| {
+                    new_buf[idx] = self.buf[self.activeIndex(idx)];
+                }
+            }
+            if (self.buf.len != 0) self.alloc.free(self.buf);
+            self.buf = new_buf;
+            self.head = 0;
         }
     };
 
@@ -543,6 +608,7 @@ pub const Engine = struct {
         queue_pop_total: AtomicU64,
         queue_wait_ns_total: AtomicU64,
         queue_max_len: std.atomic.Value(usize),
+        queue_pending_bytes_max: std.atomic.Value(usize),
         queue_len_sum: AtomicU64,
         queue_len_samples: AtomicU64,
         maintenance_pause_active: std.atomic.Value(bool),
@@ -571,6 +637,21 @@ pub const Engine = struct {
         cas_sync_failed_total: AtomicU64,
         cas_sync_ns_total: AtomicU64,
         cas_shadow_mismatch_total: AtomicU64,
+        local_ingest_connections_total: AtomicU64,
+        local_ingest_connections_current: AtomicU64,
+        local_ingest_frames_total: AtomicU64,
+        local_ingest_frame_bytes_total: AtomicU64,
+        local_ingest_declare_batches_total: AtomicU64,
+        local_ingest_declare_total: AtomicU64,
+        local_ingest_declare_ns_total: AtomicU64,
+        local_ingest_append_batches_total: AtomicU64,
+        local_ingest_append_points_total: AtomicU64,
+        local_ingest_append_ns_total: AtomicU64,
+        local_ingest_append_batch_points_max: std.atomic.Value(usize),
+        local_ingest_rejected_total: AtomicU64,
+        local_ingest_unknown_decl_total: AtomicU64,
+        local_ingest_frame_too_large_total: AtomicU64,
+        local_ingest_protocol_error_total: AtomicU64,
 
         pub fn init() Metrics {
             return .{
@@ -585,6 +666,7 @@ pub const Engine = struct {
                 .queue_pop_total = AtomicU64.init(0),
                 .queue_wait_ns_total = AtomicU64.init(0),
                 .queue_max_len = std.atomic.Value(usize).init(0),
+                .queue_pending_bytes_max = std.atomic.Value(usize).init(0),
                 .queue_len_sum = AtomicU64.init(0),
                 .queue_len_samples = AtomicU64.init(0),
                 .maintenance_pause_active = std.atomic.Value(bool).init(false),
@@ -613,6 +695,21 @@ pub const Engine = struct {
                 .cas_sync_failed_total = AtomicU64.init(0),
                 .cas_sync_ns_total = AtomicU64.init(0),
                 .cas_shadow_mismatch_total = AtomicU64.init(0),
+                .local_ingest_connections_total = AtomicU64.init(0),
+                .local_ingest_connections_current = AtomicU64.init(0),
+                .local_ingest_frames_total = AtomicU64.init(0),
+                .local_ingest_frame_bytes_total = AtomicU64.init(0),
+                .local_ingest_declare_batches_total = AtomicU64.init(0),
+                .local_ingest_declare_total = AtomicU64.init(0),
+                .local_ingest_declare_ns_total = AtomicU64.init(0),
+                .local_ingest_append_batches_total = AtomicU64.init(0),
+                .local_ingest_append_points_total = AtomicU64.init(0),
+                .local_ingest_append_ns_total = AtomicU64.init(0),
+                .local_ingest_append_batch_points_max = std.atomic.Value(usize).init(0),
+                .local_ingest_rejected_total = AtomicU64.init(0),
+                .local_ingest_unknown_decl_total = AtomicU64.init(0),
+                .local_ingest_frame_too_large_total = AtomicU64.init(0),
+                .local_ingest_protocol_error_total = AtomicU64.init(0),
             };
         }
     };
@@ -731,18 +828,32 @@ pub const Engine = struct {
         try resumeWriterAfterMaintenance(self);
     }
 
-    pub fn ingest(self: *Engine, item: IngestItem) !void {
+    pub fn appendResolvedPoint(self: *Engine, point: ResolvedIngestPoint) !AppendBatchReceipt {
+        const one = [_]ResolvedIngestPoint{point};
+        return try self.appendResolvedBatch(one[0..]);
+    }
+
+    pub fn appendResolvedBatch(self: *Engine, points: []const ResolvedIngestPoint) !AppendBatchReceipt {
+        if (points.len == 0) {
+            return .{
+                .accepted_points = 0,
+                .queue_depth = self.queue.len(),
+                .pending_bytes = self.queue.pendingBytes(),
+            };
+        }
+        const batch_bytes = points.len * @sizeOf(ResolvedIngestPoint);
         if (self.config.mem_limit_bytes != 0) {
-            const queued_bytes = self.queue.len() * @sizeOf(IngestItem);
-            const resident_bytes = self.mem.bytes.load(.monotonic) + queued_bytes;
+            const queued_bytes = self.queue.pendingBytes();
+            const resident_bytes = self.mem.bytes.load(.monotonic) + queued_bytes + batch_bytes;
             if (resident_bytes >= self.config.mem_limit_bytes) {
                 _ = self.metrics.ingest_rejected_total.fetchAdd(1, .monotonic);
                 _ = self.metrics.ingest_rejected_mem_limit_total.fetchAdd(1, .monotonic);
                 return error.MemoryLimitExceeded;
             }
         }
-        try self.queue.push(item);
+        try self.queue.pushBatch(points);
         const len_now = self.queue.len();
+        const pending_bytes_now = self.queue.pendingBytes();
         const len_now_u64: u64 = @intCast(len_now);
         _ = self.metrics.queue_len_sum.fetchAdd(len_now_u64, .monotonic);
         _ = self.metrics.queue_len_samples.fetchAdd(1, .monotonic);
@@ -753,31 +864,41 @@ pub const Engine = struct {
             else
                 break;
         }
+        var current_pending_max = self.metrics.queue_pending_bytes_max.load(.monotonic);
+        while (pending_bytes_now > current_pending_max) {
+            if (self.metrics.queue_pending_bytes_max.cmpxchgWeak(current_pending_max, pending_bytes_now, .monotonic, .monotonic)) |prev|
+                current_pending_max = prev
+            else
+                break;
+        }
+        return .{
+            .accepted_points = points.len,
+            .queue_depth = len_now,
+            .pending_bytes = pending_bytes_now,
+        };
+    }
+
+    pub fn ingest(self: *Engine, item: IngestItem) !void {
+        _ = item.tags_json;
+        _ = try self.appendResolvedPoint(.{
+            .series_id = item.series_id,
+            .ts = item.ts,
+            .value = item.value,
+        });
     }
 
     pub fn ingestBatch(self: *Engine, items: []const IngestItem) !void {
         if (items.len == 0) return;
-        if (self.config.mem_limit_bytes != 0) {
-            const queued_bytes = self.queue.len() * @sizeOf(IngestItem);
-            const resident_bytes = self.mem.bytes.load(.monotonic) + queued_bytes + items.len * @sizeOf(IngestItem);
-            if (resident_bytes >= self.config.mem_limit_bytes) {
-                _ = self.metrics.ingest_rejected_total.fetchAdd(1, .monotonic);
-                _ = self.metrics.ingest_rejected_mem_limit_total.fetchAdd(1, .monotonic);
-                return error.MemoryLimitExceeded;
-            }
+        var points = try self.alloc.alloc(ResolvedIngestPoint, items.len);
+        defer self.alloc.free(points);
+        for (items, 0..) |item, idx| {
+            points[idx] = .{
+                .series_id = item.series_id,
+                .ts = item.ts,
+                .value = item.value,
+            };
         }
-        try self.queue.pushBatch(items);
-        const len_now = self.queue.len();
-        const len_now_u64: u64 = @intCast(len_now);
-        _ = self.metrics.queue_len_sum.fetchAdd(len_now_u64, .monotonic);
-        _ = self.metrics.queue_len_samples.fetchAdd(1, .monotonic);
-        var current_max = self.metrics.queue_max_len.load(.monotonic);
-        while (len_now > current_max) {
-            if (self.metrics.queue_max_len.cmpxchgWeak(current_max, len_now, .monotonic, .monotonic)) |prev|
-                current_max = prev
-            else
-                break;
-        }
+        _ = try self.appendResolvedBatch(points);
     }
 
     fn writerLoop(self: *Engine) void {
@@ -785,39 +906,42 @@ pub const Engine = struct {
         var last_sync = last_flush;
         var last_pop_ns = std.time.nanoTimestamp();
         while (true) {
-            if (self.queue.pop()) |it| {
-                defer self.alloc.free(it.tags_json);
+            if (self.queue.pop()) |batch| {
+                defer {
+                    var cleanup = batch;
+                    cleanup.deinit(self.alloc);
+                }
                 const now_ns = std.time.nanoTimestamp();
                 const wait_delta = now_ns - last_pop_ns;
-                _ = self.metrics.queue_pop_total.fetchAdd(1, .monotonic);
+                _ = self.metrics.queue_pop_total.fetchAdd(@intCast(batch.points.len), .monotonic);
                 if (wait_delta > 0) {
                     _ = self.metrics.queue_wait_ns_total.fetchAdd(@as(u64, @intCast(wait_delta)), .monotonic);
                 }
                 last_pop_ns = now_ns;
-                // WAL append
-                const wal_start_ns = std.time.nanoTimestamp();
-                const wal_bytes = self.wal.append(it.series_id, it.ts, it.value) catch |err| blk: {
-                    _ = self.metrics.wal_append_failed_total.fetchAdd(1, .monotonic);
-                    self.quarantineFailedIngest(it, "wal_append", @errorName(err));
-                    std.log.warn("wal append failed: {s}", .{@errorName(err)});
-                    break :blk 0;
-                };
-                const wal_elapsed_ns_i128 = std.time.nanoTimestamp() - wal_start_ns;
-                const wal_elapsed_ns: u64 = @intCast(wal_elapsed_ns_i128);
-                _ = self.metrics.wal_append_total.fetchAdd(1, .monotonic);
-                _ = self.metrics.wal_append_ns_total.fetchAdd(wal_elapsed_ns, .monotonic);
-                if (wal_bytes != 0) {
-                    const wal_bytes_u64: u64 = @intCast(wal_bytes);
-                    _ = self.metrics.wal_bytes_total.fetchAdd(wal_bytes_u64, .monotonic);
-                }
-                // Memtable insert
-                if (self.appendMemtablePoint(it.series_id, it.ts, it.value)) |_| {
-                    _ = self.metrics.ingest_total.fetchAdd(1, .monotonic);
-                } else |err| {
-                    _ = self.metrics.memtable_append_failed_total.fetchAdd(1, .monotonic);
-                    self.quarantineFailedIngest(it, "memtable_append", @errorName(err));
-                    std.log.warn("failed to append to memtable: {s}", .{@errorName(err)});
-                    continue;
+                for (batch.points) |point| {
+                    const wal_start_ns = std.time.nanoTimestamp();
+                    const wal_bytes = self.wal.append(point.series_id, point.ts, point.value) catch |err| blk: {
+                        _ = self.metrics.wal_append_failed_total.fetchAdd(1, .monotonic);
+                        self.quarantineFailedIngest(point, "wal_append", @errorName(err));
+                        std.log.warn("wal append failed: {s}", .{@errorName(err)});
+                        break :blk 0;
+                    };
+                    const wal_elapsed_ns_i128 = std.time.nanoTimestamp() - wal_start_ns;
+                    const wal_elapsed_ns: u64 = @intCast(wal_elapsed_ns_i128);
+                    _ = self.metrics.wal_append_total.fetchAdd(1, .monotonic);
+                    _ = self.metrics.wal_append_ns_total.fetchAdd(wal_elapsed_ns, .monotonic);
+                    if (wal_bytes != 0) {
+                        const wal_bytes_u64: u64 = @intCast(wal_bytes);
+                        _ = self.metrics.wal_bytes_total.fetchAdd(wal_bytes_u64, .monotonic);
+                    }
+                    if (self.appendMemtablePoint(point.series_id, point.ts, point.value)) |_| {
+                        _ = self.metrics.ingest_total.fetchAdd(1, .monotonic);
+                    } else |err| {
+                        _ = self.metrics.memtable_append_failed_total.fetchAdd(1, .monotonic);
+                        self.quarantineFailedIngest(point, "memtable_append", @errorName(err));
+                        std.log.warn("failed to append to memtable: {s}", .{@errorName(err)});
+                        continue;
+                    }
                 }
             } else {
                 if (self.stop_flag) break;
@@ -1815,7 +1939,7 @@ pub const Engine = struct {
         return segments_written > 0;
     }
 
-    fn quarantineFailedIngest(self: *Engine, item: IngestItem, stage: []const u8, err_name: []const u8) void {
+    fn quarantineFailedIngest(self: *Engine, item: ResolvedIngestPoint, stage: []const u8, err_name: []const u8) void {
         var payload = std.array_list.Managed(u8).init(self.alloc);
         defer payload.deinit();
 
@@ -1827,7 +1951,7 @@ pub const Engine = struct {
 
         const resolution = self.metadata.series_catalog.resolveBySeriesId(item.series_id);
         const series = resolution.series;
-        const canonical_tags = resolution.canonical_tags orelse item.tags_json;
+        const canonical_tags = resolution.canonical_tags orelse "{}";
 
         jw.beginObject() catch |err| {
             _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
@@ -2005,6 +2129,16 @@ pub const Engine = struct {
 
     pub fn registerSeries(self: *Engine, series: []const u8, tags: []const u8, series_id: types.SeriesId) !void {
         try self.registerSeriesInternal(series, tags, series_id, true);
+    }
+
+    pub fn declareExactSeries(self: *Engine, input: ExactSeriesDeclarationInput) !ExactSeriesDeclarationResult {
+        const canonical_tags = try series_catalog_mod.canonicalizeTagsJson(self.alloc, input.tags_json);
+        errdefer self.alloc.free(canonical_tags);
+        const series_id = try self.declareExactSeriesCanonical(input.name, canonical_tags, input.descriptor);
+        return .{
+            .series_id = series_id,
+            .canonical_tags = canonical_tags,
+        };
     }
 
     pub fn registerMetricDescriptor(self: *Engine, input: metric_catalog_mod.DescriptorInput) !metric_catalog_mod.RegisterResult {
@@ -2232,17 +2366,18 @@ pub const Engine = struct {
         value: f64,
         descriptor: ?metric_catalog_mod.DescriptorInput,
     ) !types.SeriesId {
-        if (descriptor) |input| _ = try self.registerMetricDescriptor(input);
-        const sid = types.seriesIdFrom(metric, tags_json);
-        try self.registerSeries(metric, tags_json, sid);
-        try self.ingest(.{
-            .series_id = sid,
+        var declared = try self.declareExactSeries(.{
+            .name = metric,
+            .tags_json = tags_json,
+            .descriptor = descriptor,
+        });
+        defer declared.deinit(self.alloc);
+        _ = try self.appendResolvedPoint(.{
+            .series_id = declared.series_id,
             .ts = ts,
             .value = value,
-            .tags_json = tags_json,
         });
-        self.noteTags(sid, tags_json);
-        return sid;
+        return declared.series_id;
     }
 
     pub fn metricDescriptor(self: *Engine, metric: []const u8) ?metric_catalog_mod.Descriptor {
@@ -2512,18 +2647,26 @@ pub const Engine = struct {
         return flushed;
     }
 
+    pub fn flushAndDrain(self: *Engine, timeout_ms: u64) !bool {
+        const flushed = try self.flushNow();
+        try self.waitForDrained(timeout_ms);
+        return flushed;
+    }
+
     pub fn waitForDrained(self: *Engine, timeout_ms: u64) WaitError!void {
         const deadline: i64 = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
-        while (std.time.milliTimestamp() < deadline) {
+        while (true) {
             if (self.queue.len() == 0 and self.mem.bytes.load(.monotonic) == 0) {
                 if (self.cas != null) {
                     self.verifyCasState() catch {
+                        if (std.time.milliTimestamp() >= deadline) break;
                         sleepMs(10);
                         continue;
                     };
                 }
                 return;
             }
+            if (std.time.milliTimestamp() >= deadline) break;
             sleepMs(10);
         }
         _ = self.metrics.drain_timeout_total.fetchAdd(1, .monotonic);
@@ -2711,6 +2854,21 @@ pub const Engine = struct {
         const series_name = resolution.series orelse series;
         const canonical_tags = resolution.canonical_tags orelse tags;
         _ = try self.wal.appendSeriesRegistration(series_id, series_name, canonical_tags);
+    }
+
+    pub fn declareExactSeriesCanonical(
+        self: *Engine,
+        name: []const u8,
+        canonical_tags: []const u8,
+        descriptor: ?metric_catalog_mod.DescriptorInput,
+    ) !types.SeriesId {
+        if (descriptor) |descriptor_input| {
+            _ = try self.registerMetricDescriptor(descriptor_input);
+        }
+        const series_id = types.seriesIdFrom(name, canonical_tags);
+        try self.registerSeries(name, canonical_tags, series_id);
+        self.noteTags(series_id, canonical_tags);
+        return series_id;
     }
 
     fn collectSegmentHighwater(highwater: *std.AutoHashMap(types.SeriesId, i64), entries: anytype) !void {
@@ -3370,16 +3528,18 @@ pub const WaitError = waitError;
 
 fn waitForFlush(engine: *Engine, expected_entries: usize, timeout_ms: u64) waitError!void {
     const deadline: i64 = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
-    while (std.time.milliTimestamp() < deadline) {
+    while (true) {
         if (engine.metadata.manifest.entries.items.len >= expected_entries and engine.mem.bytes.load(.monotonic) == 0 and engine.queue.len() == 0) {
             if (engine.cas != null) {
                 engine.verifyCasState() catch {
+                    if (std.time.milliTimestamp() >= deadline) break;
                     sleepMs(10);
                     continue;
                 };
             }
             return;
         }
+        if (std.time.milliTimestamp() >= deadline) break;
         sleepMs(10);
     }
     return waitError.Timeout;
@@ -3387,8 +3547,9 @@ fn waitForFlush(engine: *Engine, expected_entries: usize, timeout_ms: u64) waitE
 
 fn waitForQueueEmpty(engine: *Engine, timeout_ms: u64) waitError!void {
     const deadline: i64 = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
-    while (std.time.milliTimestamp() < deadline) {
+    while (true) {
         if (engine.queue.len() == 0) return;
+        if (std.time.milliTimestamp() >= deadline) break;
         sleepMs(10);
     }
     return waitError.Timeout;
@@ -3509,6 +3670,160 @@ fn rewriteSeriesPoints(self: *Engine, series_id: types.SeriesId, points: []types
 
     self.metadata.manifest.entries = rebuilt;
     try self.metadata.manifest.rewriteCheckpoint(self.data_dir);
+}
+
+fn testConfig(talloc: std.mem.Allocator, data_path: []const u8) !cfg.Config {
+    return .{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+}
+
+test "engine queue wraps around and preserves order" {
+    const talloc = std.testing.allocator;
+    var metrics = Engine.Metrics.init();
+    const queue = try Engine.Queue.init(talloc, &metrics);
+    defer {
+        queue.deinit();
+        talloc.destroy(queue);
+    }
+
+    try queue.push(.{ .series_id = 1, .ts = 1, .value = 1 });
+    try queue.push(.{ .series_id = 2, .ts = 2, .value = 2 });
+    try queue.push(.{ .series_id = 3, .ts = 3, .value = 3 });
+
+    var first = queue.pop().?;
+    defer first.deinit(talloc);
+    var second = queue.pop().?;
+    defer second.deinit(talloc);
+    try std.testing.expectEqual(@as(types.SeriesId, 1), first.points[0].series_id);
+    try std.testing.expectEqual(@as(types.SeriesId, 2), second.points[0].series_id);
+
+    try queue.push(.{ .series_id = 4, .ts = 4, .value = 4 });
+    try queue.push(.{ .series_id = 5, .ts = 5, .value = 5 });
+
+    var third = queue.pop().?;
+    defer third.deinit(talloc);
+    var fourth = queue.pop().?;
+    defer fourth.deinit(talloc);
+    var fifth = queue.pop().?;
+    defer fifth.deinit(talloc);
+
+    try std.testing.expectEqual(@as(types.SeriesId, 3), third.points[0].series_id);
+    try std.testing.expectEqual(@as(types.SeriesId, 4), fourth.points[0].series_id);
+    try std.testing.expectEqual(@as(types.SeriesId, 5), fifth.points[0].series_id);
+    try std.testing.expectEqual(@as(usize, 0), queue.len());
+    try std.testing.expectEqual(@as(usize, 0), queue.pendingBytes());
+}
+
+test "engine exact-series declaration is idempotent and indexes tags once" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/declare-once", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const config = try testConfig(talloc, data_path);
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    var first = try engine.declareExactSeries(.{
+        .name = "svc.req",
+        .tags_json = "{\"b\":\"2\",\"a\":\"1\"}",
+        .descriptor = .{
+            .metric = "svc.req",
+            .kind = .counter,
+            .unit = "requests",
+        },
+    });
+    defer first.deinit(talloc);
+
+    const second_sid = try engine.declareExactSeriesCanonical("svc.req", first.canonical_tags, .{
+        .metric = "svc.req",
+        .kind = .counter,
+        .unit = "requests",
+    });
+    try std.testing.expectEqual(first.series_id, second_sid);
+    try std.testing.expectEqualStrings("{\"a\":\"1\",\"b\":\"2\"}", first.canonical_tags);
+
+    _ = try engine.appendResolvedBatch(&.{
+        .{ .series_id = first.series_id, .ts = 10, .value = 1.0 },
+        .{ .series_id = first.series_id, .ts = 20, .value = 2.0 },
+    });
+    _ = try engine.flushAndDrain(1_000);
+
+    const matches_a = engine.metadata.tags.get("a=1");
+    const matches_b = engine.metadata.tags.get("b=2");
+    try std.testing.expectEqual(@as(usize, 1), matches_a.len);
+    try std.testing.expectEqual(@as(usize, 1), matches_b.len);
+    try std.testing.expectEqual(first.series_id, matches_a[0]);
+    try std.testing.expectEqual(first.series_id, matches_b[0]);
+
+    const descriptor = engine.metricDescriptor("svc.req").?;
+    try std.testing.expectEqual(metric_catalog_mod.MetricKind.counter, descriptor.kind.?);
+    try std.testing.expectEqualStrings("requests", descriptor.unit.?);
+}
+
+test "engine appendResolvedBatch rejects atomically when memory limit is exceeded" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/mem-limit", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var config = try testConfig(talloc, data_path);
+    config.mem_limit_bytes = @sizeOf(Engine.ResolvedIngestPoint) * 2;
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const sid = try engine.declareExactSeriesCanonical("svc.limit", "{}", null);
+    try std.testing.expectError(error.MemoryLimitExceeded, engine.appendResolvedBatch(&.{
+        .{ .series_id = sid, .ts = 1, .value = 1.0 },
+        .{ .series_id = sid, .ts = 2, .value = 2.0 },
+    }));
+    try std.testing.expectEqual(@as(usize, 0), engine.queue.len());
+    try std.testing.expectEqual(@as(usize, 0), engine.queue.pendingBytes());
+
+    var results = std.array_list.Managed(types.Point).init(talloc);
+    defer results.deinit();
+    try engine.queryRange(sid, 0, 10, &results);
+    try std.testing.expectEqual(@as(usize, 0), results.items.len);
+}
+
+test "engine flushAndDrain is a queryable barrier and zero timeout succeeds when already drained" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/flush-and-drain", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var engine = try Engine.init(talloc, try testConfig(talloc, data_path));
+    defer engine.deinit();
+
+    const sid = try engine.declareExactSeriesCanonical("svc.flush", "{}", null);
+    _ = try engine.appendResolvedPoint(.{ .series_id = sid, .ts = 7, .value = 3.5 });
+    try std.testing.expect(try engine.flushAndDrain(1_000));
+    try std.testing.expect(!(try engine.flushAndDrain(0)));
+
+    var results = std.array_list.Managed(types.Point).init(talloc);
+    defer results.deinit();
+    try engine.queryRange(sid, 0, 10, &results);
+    try std.testing.expectEqual(@as(usize, 1), results.items.len);
+    try std.testing.expectEqual(@as(i64, 7), results.items[0].ts);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.5), results.items[0].value, 1e-9);
 }
 
 test "engine ingests, flushes, and queries range" {

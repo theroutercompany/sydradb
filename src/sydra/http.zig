@@ -2,6 +2,7 @@ const std = @import("std");
 const Engine = @import("engine.zig").Engine;
 const types = @import("types.zig");
 const config = @import("config.zig");
+const ingest_service = @import("ingest/service.zig");
 const compat = @import("compat.zig");
 const cas_mod = @import("storage/cas.zig");
 const annotations_mod = @import("storage/annotations.zig");
@@ -492,7 +493,12 @@ const StatusSnapshot = struct {
     metadata_read_mode: []const u8,
     query_compiler_mode: []const u8,
     compatibility_debt: cas_mod.CompatibilityDebtReport,
+    local_ingest_enabled: bool,
+    local_ingest_connections_current: u64,
+    local_ingest_append_points_total: u64,
+    local_ingest_rejected_total: u64,
     queue_depth: usize,
+    queue_pending_bytes_max: usize,
     maintenance_pause_active: bool,
     memtable_bytes: usize,
     drain_timeout_total: u64,
@@ -529,7 +535,12 @@ fn buildStatusSnapshot(eng: *Engine) StatusSnapshot {
         .metadata_read_mode = @tagName(eng.config.metadata_read_mode),
         .query_compiler_mode = @tagName(eng.config.query_compiler_mode),
         .compatibility_debt = compatibility_debt,
+        .local_ingest_enabled = eng.config.ingest_socket_path.len != 0,
+        .local_ingest_connections_current = eng.metrics.local_ingest_connections_current.load(.monotonic),
+        .local_ingest_append_points_total = eng.metrics.local_ingest_append_points_total.load(.monotonic),
+        .local_ingest_rejected_total = eng.metrics.local_ingest_rejected_total.load(.monotonic),
         .queue_depth = eng.queue.len(),
+        .queue_pending_bytes_max = eng.metrics.queue_pending_bytes_max.load(.monotonic),
         .maintenance_pause_active = eng.metrics.maintenance_pause_active.load(.monotonic),
         .memtable_bytes = eng.mem.bytes.load(.monotonic),
         .drain_timeout_total = eng.metrics.drain_timeout_total.load(.monotonic),
@@ -608,8 +619,18 @@ fn writeStatusPayload(jw: *std.json.Stringify, snapshot: StatusSnapshot) !void {
 
     try jw.objectField("runtime");
     try jw.beginObject();
+    try jw.objectField("local_ingest_enabled");
+    try jw.write(snapshot.local_ingest_enabled);
+    try jw.objectField("local_ingest_connections_current");
+    try jw.write(snapshot.local_ingest_connections_current);
+    try jw.objectField("local_ingest_append_points_total");
+    try jw.write(snapshot.local_ingest_append_points_total);
+    try jw.objectField("local_ingest_rejected_total");
+    try jw.write(snapshot.local_ingest_rejected_total);
     try jw.objectField("queue_depth");
     try jw.write(snapshot.queue_depth);
+    try jw.objectField("queue_pending_bytes_max");
+    try jw.write(snapshot.queue_pending_bytes_max);
     try jw.objectField("maintenance_pause_active");
     try jw.write(snapshot.maintenance_pause_active);
     try jw.objectField("memtable_bytes");
@@ -914,7 +935,12 @@ test "buildStatusPayload emits extended runtime counters" {
             .legacy_wal_descriptors = 1,
             .loose_refs_present = 3,
         },
+        .local_ingest_enabled = true,
+        .local_ingest_connections_current = 2,
+        .local_ingest_append_points_total = 9,
+        .local_ingest_rejected_total = 4,
         .queue_depth = 2,
+        .queue_pending_bytes_max = 8192,
         .maintenance_pause_active = true,
         .memtable_bytes = 4096,
         .drain_timeout_total = 6,
@@ -959,7 +985,12 @@ test "buildStatusPayload emits extended runtime counters" {
     try std.testing.expectEqual(@as(i64, 3), compatibility_debt.get("loose_refs_present").?.integer);
 
     const runtime = root.get("runtime").?.object;
+    try std.testing.expectEqual(true, runtime.get("local_ingest_enabled").?.bool);
+    try std.testing.expectEqual(@as(i64, 2), runtime.get("local_ingest_connections_current").?.integer);
+    try std.testing.expectEqual(@as(i64, 9), runtime.get("local_ingest_append_points_total").?.integer);
+    try std.testing.expectEqual(@as(i64, 4), runtime.get("local_ingest_rejected_total").?.integer);
     try std.testing.expectEqual(@as(i64, 2), runtime.get("queue_depth").?.integer);
+    try std.testing.expectEqual(@as(i64, 8192), runtime.get("queue_pending_bytes_max").?.integer);
     try std.testing.expectEqual(true, runtime.get("maintenance_pause_active").?.bool);
     try std.testing.expectEqual(@as(i64, 4096), runtime.get("memtable_bytes").?.integer);
     try std.testing.expectEqual(@as(i64, 6), runtime.get("drain_timeout_total").?.integer);
@@ -1118,9 +1149,7 @@ test "writeMarkoutAnalysisResult groups by venue" {
     _ = try eng.ingestExactMetric("market.trade.price", bats_labels, 110, 22.0, null);
     _ = try eng.ingestExactMetric("market.trade.size", bats_labels, 110, 1.0, null);
 
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        talloc,
+    var parsed = try std.json.parseFromSlice(std.json.Value, talloc,
         \\{"symbol":"AAPL","start_ts_ns":100,"end_ts_ns":110,"group_by":"venue","horizons_ns":[10]}
     , .{});
     defer parsed.deinit();
@@ -1202,9 +1231,7 @@ test "writeSlippageAnalysisResult groups by symbol" {
     _ = try eng.ingestExactMetric("market.quote.bid", tsla_labels, 100, 19.0, null);
     _ = try eng.ingestExactMetric("market.quote.ask", tsla_labels, 100, 21.0, null);
 
-    var parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        talloc,
+    var parsed = try std.json.parseFromSlice(std.json.Value, talloc,
         \\{"venue":"XNAS","start_ts_ns":100,"end_ts_ns":100,"group_by":"symbol"}
     , .{});
     defer parsed.deinit();
@@ -1262,7 +1289,23 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     const query_compile_ambiguous_selector_total = eng.metrics.query_compile_ambiguous_selector_total.load(.monotonic);
     const query_compile_shadow_mismatch_total = eng.metrics.query_compile_shadow_mismatch_total.load(.monotonic);
     const cas_shadow_mismatch_total = eng.metrics.cas_shadow_mismatch_total.load(.monotonic);
+    const local_ingest_connections_current = eng.metrics.local_ingest_connections_current.load(.monotonic);
+    const local_ingest_connections_total = eng.metrics.local_ingest_connections_total.load(.monotonic);
+    const local_ingest_frames_total = eng.metrics.local_ingest_frames_total.load(.monotonic);
+    const local_ingest_frame_bytes_total = eng.metrics.local_ingest_frame_bytes_total.load(.monotonic);
+    const local_ingest_declare_batches_total = eng.metrics.local_ingest_declare_batches_total.load(.monotonic);
+    const local_ingest_declare_total = eng.metrics.local_ingest_declare_total.load(.monotonic);
+    const local_ingest_declare_seconds_total = @as(f64, @floatFromInt(eng.metrics.local_ingest_declare_ns_total.load(.monotonic))) / 1_000_000_000.0;
+    const local_ingest_append_batches_total = eng.metrics.local_ingest_append_batches_total.load(.monotonic);
+    const local_ingest_append_points_total = eng.metrics.local_ingest_append_points_total.load(.monotonic);
+    const local_ingest_append_seconds_total = @as(f64, @floatFromInt(eng.metrics.local_ingest_append_ns_total.load(.monotonic))) / 1_000_000_000.0;
+    const local_ingest_append_batch_points_max = eng.metrics.local_ingest_append_batch_points_max.load(.monotonic);
+    const local_ingest_rejected_total = eng.metrics.local_ingest_rejected_total.load(.monotonic);
+    const local_ingest_unknown_decl_total = eng.metrics.local_ingest_unknown_decl_total.load(.monotonic);
+    const local_ingest_frame_too_large_total = eng.metrics.local_ingest_frame_too_large_total.load(.monotonic);
+    const local_ingest_protocol_error_total = eng.metrics.local_ingest_protocol_error_total.load(.monotonic);
     const queue_depth = eng.queue.len();
+    const queue_pending_bytes_max = eng.metrics.queue_pending_bytes_max.load(.monotonic);
     const maintenance_pause_active = eng.metrics.maintenance_pause_active.load(.monotonic);
     const memtable_bytes = eng.mem.bytes.load(.monotonic);
     const flush_seconds_total = @as(f64, @floatFromInt(flush_ns_total)) / 1_000_000_000.0;
@@ -1300,7 +1343,23 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     try writer.print("# HELP sydradb_query_compile_ambiguous_selector_total Total query compiler fallbacks caused by ambiguous selectors\n# TYPE sydradb_query_compile_ambiguous_selector_total counter\nsydradb_query_compile_ambiguous_selector_total {d}\n", .{query_compile_ambiguous_selector_total});
     try writer.print("# HELP sydradb_query_compile_shadow_mismatch_total Total query compiler fallbacks caused by shadow mismatches\n# TYPE sydradb_query_compile_shadow_mismatch_total counter\nsydradb_query_compile_shadow_mismatch_total {d}\n", .{query_compile_shadow_mismatch_total});
     try writer.print("# HELP sydradb_cas_shadow_mismatch_total Total CAS shadow mismatches observed in runtime verification paths\n# TYPE sydradb_cas_shadow_mismatch_total counter\nsydradb_cas_shadow_mismatch_total {d}\n", .{cas_shadow_mismatch_total});
+    try writer.print("# HELP sydradb_local_ingest_connections_total Total accepted local ingest socket connections\n# TYPE sydradb_local_ingest_connections_total counter\nsydradb_local_ingest_connections_total {d}\n", .{local_ingest_connections_total});
+    try writer.print("# HELP sydradb_local_ingest_connections_current Current active local ingest socket connections\n# TYPE sydradb_local_ingest_connections_current gauge\nsydradb_local_ingest_connections_current {d}\n", .{local_ingest_connections_current});
+    try writer.print("# HELP sydradb_local_ingest_frames_total Total local ingest protocol frames received\n# TYPE sydradb_local_ingest_frames_total counter\nsydradb_local_ingest_frames_total {d}\n", .{local_ingest_frames_total});
+    try writer.print("# HELP sydradb_local_ingest_frame_bytes_total Total bytes received in local ingest protocol frames including headers\n# TYPE sydradb_local_ingest_frame_bytes_total counter\nsydradb_local_ingest_frame_bytes_total {d}\n", .{local_ingest_frame_bytes_total});
+    try writer.print("# HELP sydradb_local_ingest_declare_batches_total Total local ingest declaration batches accepted\n# TYPE sydradb_local_ingest_declare_batches_total counter\nsydradb_local_ingest_declare_batches_total {d}\n", .{local_ingest_declare_batches_total});
+    try writer.print("# HELP sydradb_local_ingest_declare_total Total local ingest declarations accepted\n# TYPE sydradb_local_ingest_declare_total counter\nsydradb_local_ingest_declare_total {d}\n", .{local_ingest_declare_total});
+    try writer.print("# HELP sydradb_local_ingest_declare_seconds_total Aggregate local ingest declaration handling time in seconds\n# TYPE sydradb_local_ingest_declare_seconds_total counter\nsydradb_local_ingest_declare_seconds_total {d:.6}\n", .{local_ingest_declare_seconds_total});
+    try writer.print("# HELP sydradb_local_ingest_append_batches_total Total local ingest append batches accepted\n# TYPE sydradb_local_ingest_append_batches_total counter\nsydradb_local_ingest_append_batches_total {d}\n", .{local_ingest_append_batches_total});
+    try writer.print("# HELP sydradb_local_ingest_append_points_total Total points accepted through the local ingest socket\n# TYPE sydradb_local_ingest_append_points_total counter\nsydradb_local_ingest_append_points_total {d}\n", .{local_ingest_append_points_total});
+    try writer.print("# HELP sydradb_local_ingest_append_seconds_total Aggregate local ingest append handling time in seconds\n# TYPE sydradb_local_ingest_append_seconds_total counter\nsydradb_local_ingest_append_seconds_total {d:.6}\n", .{local_ingest_append_seconds_total});
+    try writer.print("# HELP sydradb_local_ingest_append_batch_points_max Largest local ingest append batch accepted since start\n# TYPE sydradb_local_ingest_append_batch_points_max gauge\nsydradb_local_ingest_append_batch_points_max {d}\n", .{local_ingest_append_batch_points_max});
+    try writer.print("# HELP sydradb_local_ingest_rejected_total Total local ingest requests rejected before enqueue\n# TYPE sydradb_local_ingest_rejected_total counter\nsydradb_local_ingest_rejected_total {d}\n", .{local_ingest_rejected_total});
+    try writer.print("# HELP sydradb_local_ingest_unknown_decl_total Total local ingest append batches rejected due to unknown declarations\n# TYPE sydradb_local_ingest_unknown_decl_total counter\nsydradb_local_ingest_unknown_decl_total {d}\n", .{local_ingest_unknown_decl_total});
+    try writer.print("# HELP sydradb_local_ingest_frame_too_large_total Total local ingest frames rejected for exceeding the configured size limit\n# TYPE sydradb_local_ingest_frame_too_large_total counter\nsydradb_local_ingest_frame_too_large_total {d}\n", .{local_ingest_frame_too_large_total});
+    try writer.print("# HELP sydradb_local_ingest_protocol_error_total Total local ingest protocol errors observed by the socket server\n# TYPE sydradb_local_ingest_protocol_error_total counter\nsydradb_local_ingest_protocol_error_total {d}\n", .{local_ingest_protocol_error_total});
     try writer.print("# HELP sydradb_queue_depth Current ingest queue depth\n# TYPE sydradb_queue_depth gauge\nsydradb_queue_depth {d}\n", .{queue_depth});
+    try writer.print("# HELP sydradb_queue_pending_bytes_max Largest pending ingest queue footprint in bytes since start\n# TYPE sydradb_queue_pending_bytes_max gauge\nsydradb_queue_pending_bytes_max {d}\n", .{queue_pending_bytes_max});
     try writer.print("# HELP sydradb_maintenance_pause_active 1 when the writer loop is paused for maintenance, 0 otherwise\n# TYPE sydradb_maintenance_pause_active gauge\nsydradb_maintenance_pause_active {d}\n", .{@intFromBool(maintenance_pause_active)});
     try writer.print("# HELP sydradb_memtable_bytes Current memtable size in bytes\n# TYPE sydradb_memtable_bytes gauge\nsydradb_memtable_bytes {d}\n", .{memtable_bytes});
 
@@ -1727,21 +1786,11 @@ fn collectMatchingSeriesIds(
     return try eng.collectMatchingSeriesIds(alloc, tags_value, op_and);
 }
 
-fn handleIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
-    var body_buf: [4096]u8 = undefined;
-    const body_reader = req.readerExpectNone(&body_buf);
+pub fn ingestRequestBody(alloc: std.mem.Allocator, eng: *Engine, body_slice: []const u8) !usize {
     var count: usize = 0;
-
-    while (true) {
-        const slice = body_reader.*.takeDelimiterExclusive('\n') catch |err| switch (err) {
-            error.StreamTooLong => {
-                _ = respondJsonError(alloc, req, .payload_too_large, "line_too_long", "line too long") catch {};
-                return;
-            },
-            error.EndOfStream => break,
-            else => return err,
-        };
-        const parsed = parseIngestLine(alloc, slice) catch |err| switch (err) {
+    var lines = std.mem.splitScalar(u8, body_slice, '\n');
+    while (lines.next()) |slice| {
+        const parsed = ingest_service.parseIngestLine(alloc, slice) catch |err| switch (err) {
             error.EmptyLine,
             error.InvalidRecord,
             error.MissingSeries,
@@ -1756,30 +1805,67 @@ fn handleIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Re
             error.InvalidTelemetryFields,
             error.TelemetryFieldsMustBeNumeric,
             error.MissingMetricValue,
-            => {
-                _ = respondJsonError(alloc, req, .bad_request, "invalid_telemetry_record", @errorName(err)) catch {};
-                return;
-            },
+            => return error.InvalidTelemetryRecord,
             else => return err,
         };
         defer parsed.deinit(alloc);
 
-        _ = applyIngestLine(eng, parsed) catch |err| switch (err) {
-            error.MemoryLimitExceeded => {
-                return respondJsonError(alloc, req, .service_unavailable, "ingest_backpressure", "ingest backpressure: memory limit exceeded");
-            },
-            error.MetricDescriptorConflict => {
-                return respondJsonError(alloc, req, .conflict, "metric_descriptor_conflict", "metric descriptor conflict");
-            },
+        _ = ingest_service.applyParsedIngestLine(eng, parsed) catch |err| switch (err) {
+            error.MemoryLimitExceeded,
+            error.MetricDescriptorConflict,
+            => return err,
             else => return err,
         };
-        count += 1;
+        count += parsed.writes.len;
     }
+    return count;
+}
+
+fn handleIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    var body_buf: [4096]u8 = undefined;
+    const body_reader = req.readerExpectNone(&body_buf);
+    const content_len = req.head.content_length orelse {
+        return respondJsonError(alloc, req, .length_required, "length_required", "length required");
+    };
+    if (content_len > 64 * 1024 * 1024) {
+        return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large");
+    }
+
+    const body_slice = try body_reader.*.take(@intCast(content_len));
+    const count = ingestRequestBody(alloc, eng, body_slice) catch |err| switch (err) {
+        error.InvalidTelemetryRecord => {
+            return respondJsonError(alloc, req, .bad_request, "invalid_telemetry_record", "invalid telemetry record");
+        },
+        error.MemoryLimitExceeded => {
+            return respondJsonError(alloc, req, .service_unavailable, "ingest_backpressure", "ingest backpressure: memory limit exceeded");
+        },
+        error.MetricDescriptorConflict => {
+            return respondJsonError(alloc, req, .conflict, "metric_descriptor_conflict", "metric descriptor conflict");
+        },
+        else => return err,
+    };
 
     var buf: [64]u8 = undefined;
     const body = try std.fmt.bufPrint(&buf, "{{\"ingested\":{d}}}", .{count});
     const headers = [_]std.http.Header{.{ .name = "Content-Type", .value = "application/json" }};
     try req.respond(body, .{ .extra_headers = &headers });
+}
+
+fn testConfig(alloc: std.mem.Allocator, data_path: []const u8) !config.Config {
+    return .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
 }
 
 test "parseIngestLine mirrors HTTP numeric and tags behavior" {
@@ -1816,6 +1902,63 @@ test "parseIngestLine fans out telemetry fields into sibling metrics" {
     try std.testing.expectEqualStrings("system.cpu.user", parsed.writes[1].series);
     try std.testing.expectEqualStrings("system.cpu.system", parsed.writes[2].series);
     try std.testing.expectEqualStrings("{\"host\":\"web-1\"}", parsed.tags_json);
+}
+
+test "ingestRequestBody ingests multiline NDJSON and ignores malformed legacy rows" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/http-ingest-body", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var eng = try Engine.init(talloc, try testConfig(talloc, data_path));
+    defer eng.deinit();
+
+    const body =
+        \\{"series":"weather.room1","ts":10,"value":24}
+        \\
+        \\not-json
+        \\{"metric":"system.cpu","ts":20,"value":0.5,"fields":{"user":0.3},"labels":{"host":"web-1"},"kind":"gauge"}
+        \\
+    ;
+    const ingested = try ingestRequestBody(talloc, eng, body);
+    try std.testing.expectEqual(@as(usize, 3), ingested);
+    _ = try eng.flushAndDrain(1_000);
+
+    var room_points = std.array_list.Managed(types.Point).init(talloc);
+    defer room_points.deinit();
+    try eng.queryRange(types.seriesIdFrom("weather.room1", "{}"), 0, 100, &room_points);
+    try std.testing.expectEqual(@as(usize, 1), room_points.items.len);
+
+    const cpu_sid = types.seriesIdFrom("system.cpu", "{\"host\":\"web-1\"}");
+    const user_sid = types.seriesIdFrom("system.cpu.user", "{\"host\":\"web-1\"}");
+    var cpu_points = std.array_list.Managed(types.Point).init(talloc);
+    defer cpu_points.deinit();
+    var user_points = std.array_list.Managed(types.Point).init(talloc);
+    defer user_points.deinit();
+    try eng.queryRange(cpu_sid, 0, 100, &cpu_points);
+    try eng.queryRange(user_sid, 0, 100, &user_points);
+    try std.testing.expectEqual(@as(usize, 1), cpu_points.items.len);
+    try std.testing.expectEqual(@as(usize, 1), user_points.items.len);
+}
+
+test "ingestRequestBody rejects invalid telemetry rows" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/http-invalid-telemetry", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var eng = try Engine.init(talloc, try testConfig(talloc, data_path));
+    defer eng.deinit();
+
+    try std.testing.expectError(error.InvalidTelemetryRecord, ingestRequestBody(
+        talloc,
+        eng,
+        "{\"metric\":\"system.cpu\",\"ts\":20,\"fields\":{\"user\":\"oops\"},\"labels\":{\"host\":\"web-1\"}}\n",
+    ));
 }
 
 fn handleQuery(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
@@ -2072,7 +2215,7 @@ fn handleMarketSchemaRegister(alloc: std.mem.Allocator, eng: *Engine, req: *std.
         error.MarketSchemaConflict => return respondJsonError(alloc, req, .conflict, "market_schema_conflict", "market schema conflict"),
         else => return respondJsonError(alloc, req, .internal_server_error, "market_schema_register_failed", @errorName(err)),
     };
-    defer stored.deinit(alloc);
+    defer stored.deinit(eng.alloc);
 
     var send_buffer: [1024]u8 = undefined;
     var response = try req.respondStreaming(&send_buffer, .{
@@ -2087,11 +2230,11 @@ fn handleMarketSchemaRegister(alloc: std.mem.Allocator, eng: *Engine, req: *std.
     try response.end();
 }
 
-fn handleMarketSchemaList(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+fn handleMarketSchemaList(_: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
     const schemas = try eng.listMarketSchemas();
     defer {
-        for (schemas) |*entry| entry.deinit(alloc);
-        alloc.free(schemas);
+        for (schemas) |*entry| entry.deinit(eng.alloc);
+        eng.alloc.free(schemas);
     }
 
     var send_buffer: [1024]u8 = undefined;
@@ -2110,7 +2253,7 @@ fn handleMarketSchemaList(alloc: std.mem.Allocator, eng: *Engine, req: *std.http
 
 fn handleMarketSchemaGet(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request, metric: []const u8) !void {
     var stored = eng.marketSchema(metric) orelse return respondJsonError(alloc, req, .not_found, "market_schema_not_found", "market schema not found");
-    defer stored.deinit(alloc);
+    defer stored.deinit(eng.alloc);
 
     var send_buffer: [512]u8 = undefined;
     var response = try req.respondStreaming(&send_buffer, .{
@@ -2154,7 +2297,7 @@ fn handleBarPolicyRegister(alloc: std.mem.Allocator, eng: *Engine, req: *std.htt
         .correction_policy = correction_value.string,
         .trade_filter = if (obj.get("trade_filter")) |value| if (value == .string) value.string else null else null,
     });
-    defer stored.deinit(alloc);
+    defer stored.deinit(eng.alloc);
 
     var send_buffer: [1024]u8 = undefined;
     var response = try req.respondStreaming(&send_buffer, .{
@@ -2169,11 +2312,11 @@ fn handleBarPolicyRegister(alloc: std.mem.Allocator, eng: *Engine, req: *std.htt
     try response.end();
 }
 
-fn handleBarPolicyList(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+fn handleBarPolicyList(_: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
     const entries = try eng.listBarPolicies();
     defer {
-        for (entries) |*entry| entry.deinit(alloc);
-        alloc.free(entries);
+        for (entries) |*entry| entry.deinit(eng.alloc);
+        eng.alloc.free(entries);
     }
     var send_buffer: [1024]u8 = undefined;
     var response = try req.respondStreaming(&send_buffer, .{
@@ -2211,7 +2354,7 @@ fn handleRollupRegister(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.S
         .policy_id = policy_value.string,
         .transform_kind = transform_kind,
     });
-    defer stored.deinit(alloc);
+    defer stored.deinit(eng.alloc);
 
     var send_buffer: [1024]u8 = undefined;
     var response = try req.respondStreaming(&send_buffer, .{
@@ -2226,11 +2369,11 @@ fn handleRollupRegister(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.S
     try response.end();
 }
 
-fn handleRollupList(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+fn handleRollupList(_: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
     const entries = try eng.listRollups();
     defer {
-        for (entries) |*entry| entry.deinit(alloc);
-        alloc.free(entries);
+        for (entries) |*entry| entry.deinit(eng.alloc);
+        eng.alloc.free(entries);
     }
     var send_buffer: [1024]u8 = undefined;
     var response = try req.respondStreaming(&send_buffer, .{
@@ -2241,7 +2384,7 @@ fn handleRollupList(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Serve
     try jw.beginArray();
     for (entries) |entry| {
         var runtime = eng.rollupRuntime(entry.id, entry.version);
-        defer if (runtime) |*value| value.deinit(alloc);
+        defer if (runtime) |*value| value.deinit(eng.alloc);
         try writeRollupWithRuntimeAndStats(&jw, eng, entry, runtime);
     }
     try jw.endArray();
@@ -2275,7 +2418,7 @@ fn handleSignalRegister(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.S
         .params_json = params_json,
         .emit_rule = emit_value.string,
     });
-    defer stored.deinit(alloc);
+    defer stored.deinit(eng.alloc);
 
     var send_buffer: [1024]u8 = undefined;
     var response = try req.respondStreaming(&send_buffer, .{
@@ -2290,11 +2433,11 @@ fn handleSignalRegister(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.S
     try response.end();
 }
 
-fn handleSignalList(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+fn handleSignalList(_: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
     const entries = try eng.listSignals();
     defer {
-        for (entries) |*entry| entry.deinit(alloc);
-        alloc.free(entries);
+        for (entries) |*entry| entry.deinit(eng.alloc);
+        eng.alloc.free(entries);
     }
     var send_buffer: [1024]u8 = undefined;
     var response = try req.respondStreaming(&send_buffer, .{
@@ -2305,7 +2448,7 @@ fn handleSignalList(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Serve
     try jw.beginArray();
     for (entries) |entry| {
         var runtime = eng.signalRuntime(entry.id, entry.version);
-        defer if (runtime) |*value| value.deinit(alloc);
+        defer if (runtime) |*value| value.deinit(eng.alloc);
         try writeSignalWithRuntimeAndStats(&jw, eng, entry, runtime);
     }
     try jw.endArray();
@@ -2376,9 +2519,9 @@ fn handleSignalAction(
 
 fn handleRollupDetail(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request, id: []const u8) !void {
     var entry = try eng.latestRollup(id) orelse return respondJsonError(alloc, req, .not_found, "rollup_not_found", "rollup not found");
-    defer entry.deinit(alloc);
+    defer entry.deinit(eng.alloc);
     var runtime = eng.rollupRuntime(entry.id, entry.version);
-    defer if (runtime) |*value| value.deinit(alloc);
+    defer if (runtime) |*value| value.deinit(eng.alloc);
 
     var send_buffer: [1024]u8 = undefined;
     var response = try req.respondStreaming(&send_buffer, .{
@@ -2392,9 +2535,9 @@ fn handleRollupDetail(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Ser
 
 fn handleSignalDetail(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request, id: []const u8) !void {
     var entry = try eng.latestSignal(id) orelse return respondJsonError(alloc, req, .not_found, "signal_not_found", "signal not found");
-    defer entry.deinit(alloc);
+    defer entry.deinit(eng.alloc);
     var runtime = eng.signalRuntime(entry.id, entry.version);
-    defer if (runtime) |*value| value.deinit(alloc);
+    defer if (runtime) |*value| value.deinit(eng.alloc);
 
     var send_buffer: [1024]u8 = undefined;
     var response = try req.respondStreaming(&send_buffer, .{
@@ -2581,7 +2724,7 @@ fn handleMarketIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Ser
         }
 
         var schema = eng.marketSchema(metric_value.string) orelse return respondJsonError(alloc, req, .not_found, "market_schema_not_found", "market schema not found");
-        defer schema.deinit(alloc);
+        defer schema.deinit(eng.alloc);
         if (!marketLabelsSatisfySchema(labels_value, schema)) {
             return respondJsonError(alloc, req, .bad_request, "invalid_market_labels", "invalid market labels");
         }
@@ -2684,7 +2827,7 @@ fn handleSignalHistory(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Se
     const end_ts_ns = if (queryParam(query, "end_ts_ns")) |value| std.fmt.parseInt(i64, value, 10) catch return respondJsonError(alloc, req, .bad_request, "invalid_end_ts_ns", "invalid end_ts_ns") else std.math.maxInt(i64);
     const revision = queryParam(query, "revision");
     var signal = try eng.latestSignal(name) orelse return respondJsonError(alloc, req, .not_found, "signal_not_found", "signal not found");
-    defer signal.deinit(alloc);
+    defer signal.deinit(eng.alloc);
     const rows = try querySignalHistoryRows(alloc, eng, signal.id, signal.version, start_ts_ns, end_ts_ns, revision);
     defer freeSignalHistoryRows(alloc, rows);
 
@@ -2735,8 +2878,8 @@ fn handleCasRefs(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     var cas = eng.cas orelse return respondJsonError(alloc, req, .not_found, "cas_disabled", "cas disabled");
     const refs = try cas.listRefs();
     defer {
-        for (refs) |*entry| entry.deinit(alloc);
-        alloc.free(refs);
+        for (refs) |*entry| entry.deinit(eng.alloc);
+        eng.alloc.free(refs);
     }
     var send_buffer: [1024]u8 = undefined;
     var response = try req.respondStreaming(&send_buffer, .{
@@ -2768,8 +2911,8 @@ fn handleCasLog(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Re
     const limit = if (queryParam(query, "limit")) |value| std.fmt.parseInt(usize, value, 10) catch 32 else 32;
     const entries = try cas.loadLog(spec, limit);
     defer {
-        for (entries) |*entry| entry.deinit(alloc);
-        alloc.free(entries);
+        for (entries) |*entry| entry.deinit(eng.alloc);
+        eng.alloc.free(entries);
     }
 
     var send_buffer: [1024]u8 = undefined;
@@ -2805,8 +2948,8 @@ fn handleCasResolve(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Serve
     };
     const entries = try cas.loadLog(spec, 1);
     defer {
-        for (entries) |*entry| entry.deinit(alloc);
-        alloc.free(entries);
+        for (entries) |*entry| entry.deinit(eng.alloc);
+        eng.alloc.free(entries);
     }
     if (entries.len == 0) return respondJsonError(alloc, req, .not_found, "commit_not_found", "commit not found");
 
@@ -2879,7 +3022,7 @@ fn handleReplaySignals(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Se
     const end_ts_ns = if (obj.get("end_ts_ns")) |value| if (value == .integer) value.integer else return respondJsonError(alloc, req, .bad_request, "invalid_end_ts_ns", "invalid end_ts_ns") else std.math.maxInt(i64);
 
     var signal = try eng.latestSignal(signal_name) orelse return respondJsonError(alloc, req, .not_found, "signal_not_found", "signal not found");
-    defer signal.deinit(alloc);
+    defer signal.deinit(eng.alloc);
     const revisions = collectReplayEntries(alloc, &cas, from_revision, to_revision, 4096) catch |err| switch (err) {
         error.InvalidReplayRange => return respondJsonError(alloc, req, .bad_request, "invalid_replay_range", "invalid replay range"),
         error.RefNotFound => return respondJsonError(alloc, req, .not_found, "revision_not_found", "revision not found"),
@@ -3002,7 +3145,7 @@ fn handleReplayAnalysis(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.S
 fn handleSignalSubscribe(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request, query: []const u8) !void {
     const name = queryParam(query, "name") orelse return respondJsonError(alloc, req, .bad_request, "missing_name", "missing name");
     var signal = try eng.latestSignal(name) orelse return respondJsonError(alloc, req, .not_found, "signal_not_found", "signal not found");
-    defer signal.deinit(alloc);
+    defer signal.deinit(eng.alloc);
     const after_sequence = if (findHeader(req, "last-event-id")) |value|
         eventIdSequence(value)
     else if (queryParam(query, "after_sequence")) |value|
@@ -3497,7 +3640,7 @@ fn queryMarketRows(
     revision: ?[]const u8,
 ) ![]MarketQueryRow {
     var schema = eng.marketSchema(metric) orelse return error.MarketSchemaNotFound;
-    defer schema.deinit(alloc);
+    defer schema.deinit(eng.alloc);
 
     const columns = if (requested_columns) |value| blk: {
         for (value) |column| {
@@ -3522,7 +3665,7 @@ fn queryMarketRows(
     if (revision) |spec| {
         var cas = eng.cas orelse return error.CasDisabled;
         const snapshot = try cas.loadSnapshotForSpec(spec);
-        snapshot_index = cas_mod.SnapshotIndex.init(alloc, &cas.store, snapshot);
+        snapshot_index = cas_mod.SnapshotIndex.init(cas.alloc, &cas.store, snapshot);
     }
     defer if (snapshot_index) |*index| index.deinit();
 
@@ -3625,7 +3768,7 @@ fn querySignalHistoryRows(
     if (revision) |spec| {
         var cas = eng.cas orelse return error.CasDisabled;
         const snapshot = try cas.loadSnapshotForSpec(spec);
-        snapshot_index = cas_mod.SnapshotIndex.init(alloc, &cas.store, snapshot);
+        snapshot_index = cas_mod.SnapshotIndex.init(cas.alloc, &cas.store, snapshot);
     }
     defer if (snapshot_index) |*index| index.deinit();
 
@@ -4066,8 +4209,8 @@ fn collectReplayEntries(alloc: std.mem.Allocator, cas: *cas_mod.CasManager, from
     const from_id = try cas.resolveCommitSpec(from_spec);
     const raw = try cas.loadLog(to_spec, max_entries);
     errdefer {
-        for (raw) |*entry| entry.deinit(alloc);
-        alloc.free(raw);
+        for (raw) |*entry| entry.deinit(cas.alloc);
+        cas.alloc.free(raw);
     }
 
     var found_from = false;
@@ -4088,8 +4231,8 @@ fn collectReplayEntries(alloc: std.mem.Allocator, cas: *cas_mod.CasManager, from
             break;
         }
     }
-    for (raw) |*entry| entry.deinit(alloc);
-    alloc.free(raw);
+    for (raw) |*entry| entry.deinit(cas.alloc);
+    cas.alloc.free(raw);
     if (!found_from) return error.InvalidReplayRange;
 
     std.mem.reverse(cas_mod.LogEntry, selected.items);
@@ -4155,7 +4298,7 @@ fn writeMarkoutAnalysisResult(
     var signal_version: ?u32 = null;
     const signal_rows = if (signal_name) |signal_id| blk: {
         var signal = try eng.latestSignal(signal_id) orelse return error.SignalNotFound;
-        defer signal.deinit(alloc);
+        defer signal.deinit(eng.alloc);
         signal_version = signal.version;
         break :blk try querySignalHistoryRows(alloc, eng, signal_id, signal.version, start_ts, end_ts, revision);
     } else try alloc.alloc(SignalHistoryRow, 0);
@@ -4268,7 +4411,7 @@ fn writeMarkoutAnalysisResult(
     }
     if (bar_policy_id) |value| {
         var policy = eng.latestBarPolicy(value) orelse return error.BarPolicyNotFound;
-        defer policy.deinit(alloc);
+        defer policy.deinit(eng.alloc);
         try jw.beginObject();
         try jw.objectField("kind");
         try jw.write("bar_policy");
