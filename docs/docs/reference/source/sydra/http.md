@@ -212,7 +212,7 @@ Returns lightweight runtime health JSON:
 
 - config mode snapshot (`cas_mode`, `metadata_read_mode`, `query_compiler_mode`)
 - queue depth and memtable bytes
-- ingest / flush / WAL counters, including writer-loop append failure and quarantine counters
+- ingest / flush / WAL counters, including writer-loop append failure, quarantine, and CAS sync counters
 - ingest rejection counters
 - compiler attempt / success / fallback counters
 - compiler series-not-found / ambiguous-selector / shadow-mismatch counters

@@ -436,6 +436,9 @@ pub const Engine = struct {
         memtable_append_failed_total: AtomicU64,
         ingest_quarantined_total: AtomicU64,
         ingest_quarantine_write_failed_total: AtomicU64,
+        cas_sync_total: AtomicU64,
+        cas_sync_failed_total: AtomicU64,
+        cas_sync_ns_total: AtomicU64,
         cas_shadow_mismatch_total: AtomicU64,
 
         pub fn init() Metrics {
@@ -471,6 +474,9 @@ pub const Engine = struct {
                 .memtable_append_failed_total = AtomicU64.init(0),
                 .ingest_quarantined_total = AtomicU64.init(0),
                 .ingest_quarantine_write_failed_total = AtomicU64.init(0),
+                .cas_sync_total = AtomicU64.init(0),
+                .cas_sync_failed_total = AtomicU64.init(0),
+                .cas_sync_ns_total = AtomicU64.init(0),
                 .cas_shadow_mismatch_total = AtomicU64.init(0),
             };
         }
@@ -1139,8 +1145,14 @@ pub const Engine = struct {
 
     fn syncCasSnapshot(self: *Engine, reason: []const u8) !void {
         if (self.cas) |*cas| {
+            const start_ns = std.time.nanoTimestamp();
+            errdefer _ = self.metrics.cas_sync_failed_total.fetchAdd(1, .monotonic);
             _ = try cas.syncLegacySnapshot(self.data_dir, &self.metadata.manifest, &self.metadata.tags, &self.metadata.series_catalog, reason);
             try self.metadata.refreshCasIndex(cas);
+            const elapsed_ns_i128 = std.time.nanoTimestamp() - start_ns;
+            const elapsed_ns: u64 = @intCast(elapsed_ns_i128);
+            _ = self.metrics.cas_sync_total.fetchAdd(1, .monotonic);
+            _ = self.metrics.cas_sync_ns_total.fetchAdd(elapsed_ns, .monotonic);
         }
     }
 
@@ -2352,6 +2364,43 @@ test "engine metrics track ingest and flush" {
     try std.testing.expect(wal_bytes > 0);
     const flush_ns = engine.metrics.flush_ns_total.load(.monotonic);
     try std.testing.expect(flush_ns > 0);
+}
+
+test "engine records CAS sync metrics after dual-write flush" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/cas-sync-metrics", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .dual_write,
+        .metadata_read_mode = .primary,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const sid = types.hash64("cas.sync.metrics");
+    try engine.registerSeries("cas.sync.metrics", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.0, .tags_json = "{}" });
+    try waitForFlush(engine, 1, 1_000);
+
+    try std.testing.expect(engine.metrics.cas_sync_total.load(.monotonic) > 0);
+    try std.testing.expectEqual(@as(u64, 0), engine.metrics.cas_sync_failed_total.load(.monotonic));
+    try std.testing.expect(engine.metrics.cas_sync_ns_total.load(.monotonic) > 0);
 }
 
 test "engine quarantines failed ingest payloads with selector metadata" {

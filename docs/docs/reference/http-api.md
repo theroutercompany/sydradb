@@ -46,6 +46,9 @@ Returns a lightweight JSON health snapshot with:
 - `runtime.memtable_append_failed_total`
 - `runtime.ingest_quarantined_total`
 - `runtime.ingest_quarantine_write_failed_total`
+- `runtime.cas_sync_total`
+- `runtime.cas_sync_failed_total`
+- `runtime.cas_sync_seconds_total`
 - `runtime.query_compile_attempts_total`
 - `runtime.query_compile_success_total`
 - `runtime.query_compile_fallback_total`
@@ -77,6 +80,9 @@ Example:
     "memtable_append_failed_total": 0,
     "ingest_quarantined_total": 0,
     "ingest_quarantine_write_failed_total": 0,
+    "cas_sync_total": 3,
+    "cas_sync_failed_total": 0,
+    "cas_sync_seconds_total": 0.031,
     "query_compile_attempts_total": 9,
     "query_compile_success_total": 6,
     "query_compile_fallback_total": 3,

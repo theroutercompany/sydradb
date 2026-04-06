@@ -364,6 +364,9 @@ const StatusSnapshot = struct {
     memtable_append_failed_total: u64,
     ingest_quarantined_total: u64,
     ingest_quarantine_write_failed_total: u64,
+    cas_sync_total: u64,
+    cas_sync_failed_total: u64,
+    cas_sync_seconds_total: f64,
     query_compile_attempts_total: u64,
     query_compile_success_total: u64,
     query_compile_fallback_total: u64,
@@ -392,6 +395,9 @@ fn buildStatusSnapshot(eng: *Engine) StatusSnapshot {
         .memtable_append_failed_total = eng.metrics.memtable_append_failed_total.load(.monotonic),
         .ingest_quarantined_total = eng.metrics.ingest_quarantined_total.load(.monotonic),
         .ingest_quarantine_write_failed_total = eng.metrics.ingest_quarantine_write_failed_total.load(.monotonic),
+        .cas_sync_total = eng.metrics.cas_sync_total.load(.monotonic),
+        .cas_sync_failed_total = eng.metrics.cas_sync_failed_total.load(.monotonic),
+        .cas_sync_seconds_total = @as(f64, @floatFromInt(eng.metrics.cas_sync_ns_total.load(.monotonic))) / 1_000_000_000.0,
         .query_compile_attempts_total = eng.metrics.query_compile_attempts_total.load(.monotonic),
         .query_compile_success_total = eng.metrics.query_compile_success_total.load(.monotonic),
         .query_compile_fallback_total = eng.metrics.query_compile_fallback_total.load(.monotonic),
@@ -468,6 +474,12 @@ fn writeStatusPayload(jw: *std.json.Stringify, snapshot: StatusSnapshot) !void {
     try jw.write(snapshot.ingest_quarantined_total);
     try jw.objectField("ingest_quarantine_write_failed_total");
     try jw.write(snapshot.ingest_quarantine_write_failed_total);
+    try jw.objectField("cas_sync_total");
+    try jw.write(snapshot.cas_sync_total);
+    try jw.objectField("cas_sync_failed_total");
+    try jw.write(snapshot.cas_sync_failed_total);
+    try jw.objectField("cas_sync_seconds_total");
+    try jw.write(snapshot.cas_sync_seconds_total);
     try jw.objectField("query_compile_attempts_total");
     try jw.write(snapshot.query_compile_attempts_total);
     try jw.objectField("query_compile_success_total");
@@ -690,6 +702,9 @@ test "buildStatusPayload emits extended runtime counters" {
         .memtable_append_failed_total = 2,
         .ingest_quarantined_total = 3,
         .ingest_quarantine_write_failed_total = 4,
+        .cas_sync_total = 5,
+        .cas_sync_failed_total = 1,
+        .cas_sync_seconds_total = 0.25,
         .query_compile_attempts_total = 9,
         .query_compile_success_total = 6,
         .query_compile_fallback_total = 3,
@@ -720,6 +735,9 @@ test "buildStatusPayload emits extended runtime counters" {
     try std.testing.expectEqual(@as(i64, 2), runtime.get("memtable_append_failed_total").?.integer);
     try std.testing.expectEqual(@as(i64, 3), runtime.get("ingest_quarantined_total").?.integer);
     try std.testing.expectEqual(@as(i64, 4), runtime.get("ingest_quarantine_write_failed_total").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), runtime.get("cas_sync_total").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), runtime.get("cas_sync_failed_total").?.integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.25), runtime.get("cas_sync_seconds_total").?.float, 0.0001);
     try std.testing.expectEqual(@as(i64, 9), runtime.get("query_compile_attempts_total").?.integer);
     try std.testing.expectEqual(@as(i64, 1), runtime.get("query_compile_shadow_mismatch_total").?.integer);
     try std.testing.expectEqual(@as(i64, 5), runtime.get("cas_shadow_mismatch_total").?.integer);
@@ -737,6 +755,9 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     const memtable_append_failed_total = eng.metrics.memtable_append_failed_total.load(.monotonic);
     const ingest_quarantined_total = eng.metrics.ingest_quarantined_total.load(.monotonic);
     const ingest_quarantine_write_failed_total = eng.metrics.ingest_quarantine_write_failed_total.load(.monotonic);
+    const cas_sync_total = eng.metrics.cas_sync_total.load(.monotonic);
+    const cas_sync_failed_total = eng.metrics.cas_sync_failed_total.load(.monotonic);
+    const cas_sync_seconds_total = @as(f64, @floatFromInt(eng.metrics.cas_sync_ns_total.load(.monotonic))) / 1_000_000_000.0;
     const query_compile_attempts_total = eng.metrics.query_compile_attempts_total.load(.monotonic);
     const query_compile_success_total = eng.metrics.query_compile_success_total.load(.monotonic);
     const query_compile_fallback_total = eng.metrics.query_compile_fallback_total.load(.monotonic);
@@ -765,6 +786,9 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     try writer.print("# HELP sydradb_memtable_append_failed_total Total memtable append failures observed by the writer loop\n# TYPE sydradb_memtable_append_failed_total counter\nsydradb_memtable_append_failed_total {d}\n", .{memtable_append_failed_total});
     try writer.print("# HELP sydradb_ingest_quarantined_total Total ingest records written to quarantine after writer-loop failures\n# TYPE sydradb_ingest_quarantined_total counter\nsydradb_ingest_quarantined_total {d}\n", .{ingest_quarantined_total});
     try writer.print("# HELP sydradb_ingest_quarantine_write_failed_total Total failures while writing ingest quarantine records\n# TYPE sydradb_ingest_quarantine_write_failed_total counter\nsydradb_ingest_quarantine_write_failed_total {d}\n", .{ingest_quarantine_write_failed_total});
+    try writer.print("# HELP sydradb_cas_sync_total Total CAS snapshot sync operations completed by the engine\n# TYPE sydradb_cas_sync_total counter\nsydradb_cas_sync_total {d}\n", .{cas_sync_total});
+    try writer.print("# HELP sydradb_cas_sync_failed_total Total CAS snapshot sync operations that failed\n# TYPE sydradb_cas_sync_failed_total counter\nsydradb_cas_sync_failed_total {d}\n", .{cas_sync_failed_total});
+    try writer.print("# HELP sydradb_cas_sync_seconds_total Aggregate CAS snapshot sync duration in seconds\n# TYPE sydradb_cas_sync_seconds_total counter\nsydradb_cas_sync_seconds_total {d:.6}\n", .{cas_sync_seconds_total});
     try writer.print("# HELP sydradb_query_compile_attempts_total Total compiled query attempts\n# TYPE sydradb_query_compile_attempts_total counter\nsydradb_query_compile_attempts_total {d}\n", .{query_compile_attempts_total});
     try writer.print("# HELP sydradb_query_compile_success_total Total compiled query lowerings that succeeded\n# TYPE sydradb_query_compile_success_total counter\nsydradb_query_compile_success_total {d}\n", .{query_compile_success_total});
     try writer.print("# HELP sydradb_query_compile_fallback_total Total query compiler fallbacks\n# TYPE sydradb_query_compile_fallback_total counter\nsydradb_query_compile_fallback_total {d}\n", .{query_compile_fallback_total});
