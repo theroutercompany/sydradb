@@ -115,7 +115,7 @@ The CAS layer stores immutable objects addressed by a BLAKE3 hash of `(type, pay
 
 - Loose objects live under `objects/<prefix>/<hex>`.
 - Packed objects live in `objects/packs/*.pack` and are indexed by `objects/packs/*.idx`.
-- `objects/info/store-format` version 2 marks repositories that default to the reftable ref backend and CAS-primary startup; version 1 remains the compatibility format for pre-migration repositories.
+- `objects/info/store-format` version 3 marks canonical repositories that default to the reftable ref backend, CAS-primary startup, and canonical `segment_root` / `journal_root` metadata for active reachable commits. Versions 1 and 2 remain readable compatibility formats for pre-normalization repositories.
 - `objects/info/multi-pack-index` provides an optional cross-pack fanout table so lookups can resolve mixed pack sets without scanning every individual `.idx` file first. Version 2 also records whether each active pack has a reverse index sidecar.
 - `objects/info/object-refs` records typed object-to-child edges explicitly, so reachability, `fsck`, and bitmap refresh no longer need to infer every edge by reparsing arbitrary blob payloads.
 - `objects/info/reachability-bitmap` caches the exact reachable object-id set for the current sorted ref snapshot, so `cas pack`, bundle selection, and non-reflog reachability checks can fall back to a side index instead of walking the full DAG every time.
@@ -184,6 +184,8 @@ Operational notes:
 - Active packs now carry adjacent `.manifest` files with per-type object counts and pack checksums; `cas fsck` validates those manifests before trusting mixed-pack reachability.
 - Reftable writes now use update-indexed table names, a persisted `reftable/state` counter, and block-indexed v3 tables with separate ref and reflog block indexes plus a footer checksum. Readers remain compatible with older flat v1/v2 tables and rewrite them into the current format during compaction or upgrade.
 - Runtime reftable lookups now use `reftable/info/summary` plus block-level cursor reads so `readRef`, `listRefs`, and ref-scoped reflog reads no longer decode entire v3 tables by default.
+- `cas upgrade` normalizes the active reachable commit graph before finalizing a v3 repository. After normalization, active refs emit canonical segment descriptors with `segment_root`, canonical WAL descriptors with `journal_root`, and a reftable-backed `HEAD` symref; loose refs and older descriptor payloads remain readable for compatibility and export paths but are no longer emitted for active history.
+- `cas fsck` reports compatibility debt separately from corruption: reachable legacy segment descriptors, reachable legacy WAL descriptors, and loose refs that still exist in migrated v3 repositories.
 - `cas fsck --repair` only rebuilds derivable metadata: active-pack reverse indexes and manifests, `objects/info/*` side indexes, and `reftable/state` plus `reftable/tables.list`. It never rewrites commit, tree, or blob payloads.
 - `cas fsck --connectivity-only` limits validation to refs, reflogs, reachable objects, commit-graph consistency, and dangling detection.
 - `cas fsck --lost-found` writes dangling commit/blob/tree ids into `lost-found/`.

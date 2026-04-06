@@ -457,13 +457,17 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     if (std.mem.eql(u8, sub, "upgrade")) {
         const result = try cas.upgradeRepository(data_dir);
         std.debug.print(
-            "cas upgrade migrated_reftable={} format_version={d} ref_backend={s} reachable={d} rewritten={d}\n",
+            "cas upgrade migrated_reftable={} format_version={d} ref_backend={s} reachable={d} rewritten={d} normalized_commits={d} compatibility_legacy_segments={d} compatibility_legacy_wal={d} compatibility_loose_refs={d}\n",
             .{
                 result.migrated_reftable,
                 result.format_version,
                 if (result.ref_backend == .reftable) "reftable" else "loose",
                 result.reachable_objects,
                 result.rewritten_objects,
+                result.normalized_commits,
+                result.compatibility_debt.legacy_segment_descriptors,
+                result.compatibility_debt.legacy_wal_descriptors,
+                result.compatibility_debt.loose_refs_present,
             },
         );
         return;
@@ -635,7 +639,7 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
             cas_mod.RepairReport{};
         const report = try cas.fsck(data_dir, options);
         std.debug.print(
-            "cas fsck mode={s} repair={} refs={d} reachable={d} reflog_heads={d} reflog_protected={d} commits={d} trees={d} blobs={d} dangling={d} lost_found={d} commit_graph_entries_checked={d} segment_contents_checked={d} wal_contents_checked={d} missing_segment_mirrors={d} missing_wal_mirrors={d} reflog_files_checked={d} stale_reflog_files={d} repaired_side_indexes={} pack_sidecars_rebuilt={d} reftable_state_rebuilt={} reftable_tables_list_rebuilt={}\n",
+            "cas fsck mode={s} repair={} refs={d} reachable={d} reflog_heads={d} reflog_protected={d} commits={d} trees={d} blobs={d} dangling={d} lost_found={d} commit_graph_entries_checked={d} segment_contents_checked={d} wal_contents_checked={d} missing_segment_mirrors={d} missing_wal_mirrors={d} reflog_files_checked={d} stale_reflog_files={d} compatibility_legacy_segments={d} compatibility_legacy_wal={d} compatibility_loose_refs={d} repaired_side_indexes={} pack_sidecars_rebuilt={d} reftable_state_rebuilt={} reftable_tables_list_rebuilt={}\n",
             .{
                 if (options.mode == .connectivity_only) "connectivity-only" else "full",
                 repair,
@@ -655,6 +659,9 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
                 report.missing_wal_mirrors,
                 report.reflog_files_checked,
                 report.stale_reflog_files,
+                report.compatibility_debt.legacy_segment_descriptors,
+                report.compatibility_debt.legacy_wal_descriptors,
+                report.compatibility_debt.loose_refs_present,
                 repair_report.side_indexes_rebuilt,
                 repair_report.pack_sidecars_rebuilt,
                 repair_report.reftable_state_rebuilt,
