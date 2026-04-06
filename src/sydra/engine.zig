@@ -8,6 +8,7 @@ const market_runtime_mod = @import("storage/market_runtime.zig");
 const metric_catalog_mod = @import("storage/metric_catalog.zig");
 const object_store = @import("storage/object_store.zig");
 const series_catalog_mod = @import("storage/series_catalog.zig");
+const signal_events_mod = @import("storage/signal_events.zig");
 const wal_mod = @import("storage/wal.zig");
 const segment_mod = @import("storage/segment.zig");
 const tags_mod = @import("storage/tags.zig");
@@ -43,9 +44,15 @@ pub const Engine = struct {
     queue: *Queue,
     cas: ?cas_mod.CasManager = null,
     market_runtime: market_runtime_mod.State,
+    signal_events: signal_events_mod.Store,
     derived_mu: std.Thread.Mutex = .{},
     derived_cv: std.Thread.Condition = .{},
     derived_pending: bool = false,
+    derived_full_refresh: bool = false,
+    derived_dirty: std.array_list.Managed(DirtyMetricWork),
+    signal_event_mu: std.Thread.Mutex = .{},
+    signal_event_cv: std.Thread.Condition = .{},
+    signal_event_epoch: u64 = 0,
 
     pub const SelectorLookup = union(enum) {
         by_id: types.SeriesId,
@@ -64,6 +71,11 @@ pub const Engine = struct {
         last_ts: ?i64 = null,
     };
 
+    pub const PendingStats = struct {
+        pending_instances: usize,
+        max_lag_ns: ?i64,
+    };
+
     const MetricSeriesGroup = struct {
         labels_json: []u8,
         series_ids: []types.SeriesId,
@@ -71,6 +83,18 @@ pub const Engine = struct {
         fn deinit(self: *MetricSeriesGroup, alloc: std.mem.Allocator) void {
             alloc.free(self.labels_json);
             alloc.free(self.series_ids);
+        }
+    };
+
+    const DirtyMetricWork = struct {
+        metric: []u8,
+        labels_json: []u8,
+        queued_at_ns: i64,
+
+        fn deinit(self: *DirtyMetricWork, alloc: std.mem.Allocator) void {
+            alloc.free(self.metric);
+            alloc.free(self.labels_json);
+            self.* = undefined;
         }
     };
 
@@ -626,10 +650,14 @@ pub const Engine = struct {
             .queue = undefined,
             .cas = cas_manager,
             .market_runtime = undefined,
+            .signal_events = undefined,
+            .derived_dirty = std.array_list.Managed(DirtyMetricWork).init(alloc),
         };
         metadata_transferred = true;
         cas_manager_transferred = true;
         errdefer {
+            for (engine.derived_dirty.items) |*item| item.deinit(engine.alloc);
+            engine.derived_dirty.deinit();
             engine.mem.deinit();
             engine.metadata.deinit();
             engine.wal.close();
@@ -643,6 +671,8 @@ pub const Engine = struct {
         }
         engine.market_runtime = try market_runtime_mod.State.loadOrInit(alloc, engine.data_dir, engine.config.fsync);
         errdefer engine.market_runtime.deinit();
+        engine.signal_events = try signal_events_mod.Store.loadOrInit(alloc, engine.data_dir, engine.config.fsync);
+        errdefer engine.signal_events.deinit();
         if (engine.cas) |*cas| {
             _ = try cas.bootstrapIfMissingWithMarket(
                 engine.data_dir,
@@ -670,6 +700,8 @@ pub const Engine = struct {
         self.derived_cv.broadcast();
         if (self.writer_thread) |t| t.join();
         if (self.derived_thread) |t| t.join();
+        for (self.derived_dirty.items) |*item| item.deinit(self.alloc);
+        self.derived_dirty.deinit();
         self.mem.deinit();
         self.metadata.deinit();
         self.wal.close();
@@ -677,6 +709,7 @@ pub const Engine = struct {
         self.queue.deinit();
         self.alloc.destroy(self.queue);
         self.market_runtime.deinit();
+        self.signal_events.deinit();
         if (self.cas) |*cas| cas.deinit();
         self.config.deinit(self.alloc);
         self.alloc.destroy(self);
@@ -841,24 +874,107 @@ pub const Engine = struct {
 
     fn scheduleDerivedRefresh(self: *Engine) void {
         self.derived_mu.lock();
+        self.derived_full_refresh = true;
         self.derived_pending = true;
         self.derived_mu.unlock();
         self.derived_cv.signal();
     }
 
+    pub fn scheduleDerivedMetric(self: *Engine, metric: []const u8, labels_json: []const u8) !void {
+        self.derived_mu.lock();
+        defer self.derived_mu.unlock();
+
+        for (self.derived_dirty.items) |entry| {
+            if (std.mem.eql(u8, entry.metric, metric) and std.mem.eql(u8, entry.labels_json, labels_json)) {
+                self.derived_pending = true;
+                self.derived_cv.signal();
+                return;
+            }
+        }
+        try self.derived_dirty.append(.{
+            .metric = try self.alloc.dupe(u8, metric),
+            .labels_json = try self.alloc.dupe(u8, labels_json),
+            .queued_at_ns = @intCast(std.time.nanoTimestamp()),
+        });
+        self.derived_pending = true;
+        self.derived_cv.signal();
+    }
+
     fn derivedLoop(self: *Engine) void {
         while (true) {
+            var full_refresh = false;
+            var work_items = std.array_list.Managed(DirtyMetricWork).init(self.alloc);
+            defer {
+                for (work_items.items) |*item| item.deinit(self.alloc);
+                work_items.deinit();
+            }
             self.derived_mu.lock();
-            while (!self.derived_pending and !self.stop_flag) {
+            while (!self.derived_pending and !self.stop_flag and !self.derived_full_refresh and self.derived_dirty.items.len == 0) {
                 self.derived_cv.wait(&self.derived_mu);
             }
             const should_stop = self.stop_flag;
-            self.derived_pending = false;
+            full_refresh = self.derived_full_refresh;
+            self.derived_full_refresh = false;
+            if (full_refresh) {
+                for (self.derived_dirty.items) |*item| item.deinit(self.alloc);
+                self.derived_dirty.clearRetainingCapacity();
+            } else if (self.derived_dirty.items.len != 0) {
+                std.mem.swap(std.array_list.Managed(DirtyMetricWork), &work_items, &self.derived_dirty);
+            }
+            self.derived_pending = self.derived_full_refresh or self.derived_dirty.items.len != 0;
             self.derived_mu.unlock();
             if (should_stop) break;
-            self.processDerivedDefinitions() catch |err| {
-                std.log.warn("derived worker failed: {s}", .{@errorName(err)});
-            };
+            if (full_refresh or work_items.items.len == 0) {
+                self.processDerivedDefinitions() catch |err| {
+                    std.log.warn("derived worker failed: {s}", .{@errorName(err)});
+                };
+            } else {
+                self.processDerivedDirtyItems(work_items.items) catch |err| {
+                    std.log.warn("derived worker failed: {s}", .{@errorName(err)});
+                };
+            }
+        }
+    }
+
+    fn processDerivedDirtyItems(self: *Engine, items: []DirtyMetricWork) !void {
+        for (items) |item| {
+            {
+                const rollups = try self.metadata.market_catalog.listRollups();
+                defer {
+                    for (rollups) |*entry| entry.deinit(self.alloc);
+                    self.alloc.free(rollups);
+                }
+                for (rollups) |rollup| {
+                    if (!std.mem.eql(u8, rollup.source_metric, item.metric)) continue;
+                    if (self.market_runtime.isPaused("rollup", rollup.id, rollup.version)) continue;
+                    const now_ts = std.time.nanoTimestamp();
+                    try self.market_runtime.reportStart("rollup", rollup.id, rollup.version, @intCast(now_ts));
+                    const report = self.processRollupDefinitionFiltered(rollup, item.labels_json) catch |err| blk: {
+                        std.log.warn("rollup processing failed for {s}: {s}", .{ rollup.id, @errorName(err) });
+                        break :blk market_runtime_mod.ProcessingReport{ .success = false, .error_message = @errorName(err) };
+                    };
+                    try self.market_runtime.reportResult("rollup", rollup.id, rollup.version, @intCast(std.time.nanoTimestamp()), report);
+                }
+            }
+
+            {
+                const signals = try self.metadata.market_catalog.listSignals();
+                defer {
+                    for (signals) |*entry| entry.deinit(self.alloc);
+                    self.alloc.free(signals);
+                }
+                for (signals) |signal| {
+                    if (!std.mem.eql(u8, signal.input_metric, item.metric)) continue;
+                    if (self.market_runtime.isPaused("signal", signal.id, signal.version)) continue;
+                    const now_ts = std.time.nanoTimestamp();
+                    try self.market_runtime.reportStart("signal", signal.id, signal.version, @intCast(now_ts));
+                    const report = self.processSignalDefinitionFiltered(signal, item.labels_json) catch |err| blk: {
+                        std.log.warn("signal processing failed for {s}: {s}", .{ signal.id, @errorName(err) });
+                        break :blk market_runtime_mod.ProcessingReport{ .success = false, .error_message = @errorName(err) };
+                    };
+                    try self.market_runtime.reportResult("signal", signal.id, signal.version, @intCast(std.time.nanoTimestamp()), report);
+                }
+            }
         }
     }
 
@@ -872,7 +988,7 @@ pub const Engine = struct {
             if (self.market_runtime.isPaused("rollup", rollup.id, rollup.version)) continue;
             const now_ts = std.time.nanoTimestamp();
             try self.market_runtime.reportStart("rollup", rollup.id, rollup.version, @intCast(now_ts));
-            const report = self.processRollupDefinition(rollup) catch |err| blk: {
+            const report = self.processRollupDefinitionFiltered(rollup, null) catch |err| blk: {
                 std.log.warn("rollup processing failed for {s}: {s}", .{ rollup.id, @errorName(err) });
                 break :blk market_runtime_mod.ProcessingReport{ .success = false, .error_message = @errorName(err) };
             };
@@ -888,7 +1004,7 @@ pub const Engine = struct {
             if (self.market_runtime.isPaused("signal", signal.id, signal.version)) continue;
             const now_ts = std.time.nanoTimestamp();
             try self.market_runtime.reportStart("signal", signal.id, signal.version, @intCast(now_ts));
-            const report = self.processSignalDefinition(signal) catch |err| blk: {
+            const report = self.processSignalDefinitionFiltered(signal, null) catch |err| blk: {
                 std.log.warn("signal processing failed for {s}: {s}", .{ signal.id, @errorName(err) });
                 break :blk market_runtime_mod.ProcessingReport{ .success = false, .error_message = @errorName(err) };
             };
@@ -896,11 +1012,11 @@ pub const Engine = struct {
         }
     }
 
-    fn processRollupDefinition(self: *Engine, rollup: market_catalog_mod.RollupDefinition) !market_runtime_mod.ProcessingReport {
+    fn processRollupDefinitionFiltered(self: *Engine, rollup: market_catalog_mod.RollupDefinition, labels_filter: ?[]const u8) !market_runtime_mod.ProcessingReport {
         return switch (rollup.transform_kind) {
-            .trade_to_bar => try self.processTradeToBar(rollup),
-            .quote_to_spread_mid => try self.processQuoteToSpreadMid(rollup),
-            .bar_to_bar => try self.processBarToBar(rollup),
+            .trade_to_bar => try self.processTradeToBar(rollup, labels_filter),
+            .quote_to_spread_mid => try self.processQuoteToSpreadMid(rollup, labels_filter),
+            .bar_to_bar => try self.processBarToBar(rollup, labels_filter),
         };
     }
 
@@ -928,7 +1044,7 @@ pub const Engine = struct {
         return .{ .rows_processed = rows_processed, .emissions_total = emissions_total };
     }
 
-    fn processTradeToBar(self: *Engine, rollup: market_catalog_mod.RollupDefinition) !market_runtime_mod.ProcessingReport {
+    fn processTradeToBar(self: *Engine, rollup: market_catalog_mod.RollupDefinition, labels_filter: ?[]const u8) !market_runtime_mod.ProcessingReport {
         var policy = self.latestBarPolicy(rollup.policy_id) orelse return .{};
         defer policy.deinit(self.alloc);
         const groups = try self.collectMetricSeriesGroups(rollup.source_metric, &.{ "price", "size" });
@@ -947,6 +1063,9 @@ pub const Engine = struct {
         var last_emitted_ts: ?i64 = null;
         var last_emitted_labels: ?[]const u8 = null;
         for (groups) |group| {
+            if (labels_filter) |filter| {
+                if (!std.mem.eql(u8, group.labels_json, filter)) continue;
+            }
             const checkpoint = self.market_runtime.getHighwater("rollup", rollup.id, rollup.version, group.labels_json) orelse std.math.minInt(i64);
             const start_ts = if (checkpoint == std.math.minInt(i64)) checkpoint else checkpoint + 1;
             const price_points = try self.querySeriesPoints(group.series_ids[0], start_ts, std.math.maxInt(i64));
@@ -1011,12 +1130,13 @@ pub const Engine = struct {
 
             if (emitted_highwater) |highwater| {
                 try self.market_runtime.upsertHighwater("rollup", rollup.id, rollup.version, group.labels_json, highwater);
+                try self.scheduleDerivedMetric(rollup.target_metric, output_labels);
             }
         }
         return try self.reportWithEvent(rows_processed, emissions_total, rollup.target_metric, last_emitted_labels orelse "{}", last_emitted_ts);
     }
 
-    fn processQuoteToSpreadMid(self: *Engine, rollup: market_catalog_mod.RollupDefinition) !market_runtime_mod.ProcessingReport {
+    fn processQuoteToSpreadMid(self: *Engine, rollup: market_catalog_mod.RollupDefinition, labels_filter: ?[]const u8) !market_runtime_mod.ProcessingReport {
         const groups = try self.collectMetricSeriesGroups(rollup.source_metric, &.{ "bid", "ask", "bid_size", "ask_size" });
         defer self.freeMetricSeriesGroups(groups);
         if (groups.len == 0) return .{};
@@ -1031,6 +1151,9 @@ pub const Engine = struct {
         var last_emitted_ts: ?i64 = null;
         var last_emitted_labels: ?[]const u8 = null;
         for (groups) |group| {
+            if (labels_filter) |filter| {
+                if (!std.mem.eql(u8, group.labels_json, filter)) continue;
+            }
             const checkpoint = self.market_runtime.getHighwater("rollup", rollup.id, rollup.version, group.labels_json) orelse std.math.minInt(i64);
             const start_ts = if (checkpoint == std.math.minInt(i64)) checkpoint else checkpoint + 1;
             const bid_points = try self.querySeriesPoints(group.series_ids[0], start_ts, std.math.maxInt(i64));
@@ -1065,11 +1188,12 @@ pub const Engine = struct {
                 last_emitted_labels = group.labels_json;
             }
             try self.market_runtime.upsertHighwater("rollup", rollup.id, rollup.version, group.labels_json, quotes[quotes.len - 1].ts);
+            try self.scheduleDerivedMetric(rollup.target_metric, output_labels);
         }
         return try self.reportWithEvent(rows_processed, emissions_total, rollup.target_metric, last_emitted_labels orelse "{}", last_emitted_ts);
     }
 
-    fn processBarToBar(self: *Engine, rollup: market_catalog_mod.RollupDefinition) !market_runtime_mod.ProcessingReport {
+    fn processBarToBar(self: *Engine, rollup: market_catalog_mod.RollupDefinition, labels_filter: ?[]const u8) !market_runtime_mod.ProcessingReport {
         var policy = self.latestBarPolicy(rollup.policy_id) orelse return .{};
         defer policy.deinit(self.alloc);
         const groups = try self.collectMetricSeriesGroups(rollup.source_metric, &.{ "open", "high", "low", "close", "volume", "vwap" });
@@ -1088,6 +1212,14 @@ pub const Engine = struct {
         var last_emitted_ts: ?i64 = null;
         var last_emitted_labels: ?[]const u8 = null;
         for (groups) |group| {
+            if (labels_filter) |filter| {
+                if (!std.mem.eql(u8, group.labels_json, filter)) continue;
+            }
+            const source_interval_text = try marketLabelValueFromJson(self.alloc, group.labels_json, "interval") orelse continue;
+            defer self.alloc.free(source_interval_text);
+            const source_interval_ns = std.fmt.parseInt(i64, source_interval_text, 10) catch continue;
+            if (source_interval_ns <= 0) continue;
+            if (policy.interval_ns <= source_interval_ns or @mod(policy.interval_ns, source_interval_ns) != 0) continue;
             const checkpoint = self.market_runtime.getHighwater("rollup", rollup.id, rollup.version, group.labels_json) orelse std.math.minInt(i64);
             const start_ts = if (checkpoint == std.math.minInt(i64)) checkpoint else checkpoint + 1;
             const bars = try self.queryBarSamples(group.series_ids, start_ts);
@@ -1145,12 +1277,13 @@ pub const Engine = struct {
             }
             if (emitted_highwater) |highwater| {
                 try self.market_runtime.upsertHighwater("rollup", rollup.id, rollup.version, group.labels_json, highwater);
+                try self.scheduleDerivedMetric(rollup.target_metric, output_labels);
             }
         }
         return try self.reportWithEvent(rows_processed, emissions_total, rollup.target_metric, last_emitted_labels orelse "{}", last_emitted_ts);
     }
 
-    fn processSignalDefinition(self: *Engine, signal: market_catalog_mod.SignalDefinition) !market_runtime_mod.ProcessingReport {
+    fn processSignalDefinitionFiltered(self: *Engine, signal: market_catalog_mod.SignalDefinition, labels_filter: ?[]const u8) !market_runtime_mod.ProcessingReport {
         const signal_column = try signalColumnConfig(self.alloc, signal);
         defer self.alloc.free(signal_column.primary);
         if (signal_column.secondary) |secondary| {
@@ -1177,6 +1310,9 @@ pub const Engine = struct {
         var last_emitted_ts: ?i64 = null;
         var last_emitted_labels: ?[]const u8 = null;
         for (groups) |group| {
+            if (labels_filter) |filter| {
+                if (!std.mem.eql(u8, group.labels_json, filter)) continue;
+            }
             const checkpoint = self.market_runtime.getHighwater("signal", signal.id, signal.version, group.labels_json) orelse std.math.minInt(i64);
             const primary_points = try self.querySeriesPoints(group.series_ids[0], std.math.minInt(i64), std.math.maxInt(i64));
             defer self.alloc.free(primary_points);
@@ -1196,7 +1332,7 @@ pub const Engine = struct {
 
             const output_metric = try std.fmt.allocPrint(self.alloc, "_signal.{s}", .{signal.id});
             defer self.alloc.free(output_metric);
-            const signal_report = try self.emitSignalPoints(output_metric, output_labels, signal, primary_points, secondary_points, checkpoint);
+            const signal_report = try self.emitSignalPoints(output_metric, output_labels, group.labels_json, revision, signal, primary_points, secondary_points, checkpoint);
             emissions_total += signal_report.emissions_total;
             if (signal_report.last_event_id != null) {
                 last_emitted_ts = if (primary_points.len != 0) primary_points[primary_points.len - 1].ts else last_emitted_ts;
@@ -1213,6 +1349,8 @@ pub const Engine = struct {
         self: *Engine,
         output_metric: []const u8,
         output_labels: []const u8,
+        raw_labels_json: []const u8,
+        data_revision: []const u8,
         signal: market_catalog_mod.SignalDefinition,
         primary_points: []const types.Point,
         secondary_points: []const types.Point,
@@ -1243,7 +1381,7 @@ pub const Engine = struct {
                     try self.emitDerivedMetric(output_metric, output_labels, point.ts, ema_value, signal.input_metric, signal.expression_kind.text());
                     emissions_total += 1;
                     if (last_event_id) |event_id| self.alloc.free(event_id);
-                    last_event_id = try makeEventId(self.alloc, output_metric, output_labels, point.ts);
+                    last_event_id = try self.recordSignalEmission(signal, raw_labels_json, data_revision, point.ts, ema_value);
                 }
             },
             .moving_avg => {
@@ -1257,10 +1395,11 @@ pub const Engine = struct {
                         start_idx += 1;
                     }
                     if (idx + 1 < period or point.ts <= checkpoint) continue;
-                    try self.emitDerivedMetric(output_metric, output_labels, point.ts, sum / @as(f64, @floatFromInt(period)), signal.input_metric, signal.expression_kind.text());
+                    const avg_value = sum / @as(f64, @floatFromInt(period));
+                    try self.emitDerivedMetric(output_metric, output_labels, point.ts, avg_value, signal.input_metric, signal.expression_kind.text());
                     emissions_total += 1;
                     if (last_event_id) |event_id| self.alloc.free(event_id);
-                    last_event_id = try makeEventId(self.alloc, output_metric, output_labels, point.ts);
+                    last_event_id = try self.recordSignalEmission(signal, raw_labels_json, data_revision, point.ts, avg_value);
                 }
             },
             .threshold_cross => {
@@ -1274,7 +1413,7 @@ pub const Engine = struct {
                     try self.emitDerivedMetric(output_metric, output_labels, point.ts, 1.0, signal.input_metric, signal.expression_kind.text());
                     emissions_total += 1;
                     if (last_event_id) |event_id| self.alloc.free(event_id);
-                    last_event_id = try makeEventId(self.alloc, output_metric, output_labels, point.ts);
+                    last_event_id = try self.recordSignalEmission(signal, raw_labels_json, data_revision, point.ts, 1.0);
                 }
             },
             .spread_gt => {
@@ -1284,7 +1423,7 @@ pub const Engine = struct {
                     try self.emitDerivedMetric(output_metric, output_labels, point.ts, 1.0, signal.input_metric, signal.expression_kind.text());
                     emissions_total += 1;
                     if (last_event_id) |event_id| self.alloc.free(event_id);
-                    last_event_id = try makeEventId(self.alloc, output_metric, output_labels, point.ts);
+                    last_event_id = try self.recordSignalEmission(signal, raw_labels_json, data_revision, point.ts, 1.0);
                 }
             },
             .vwap_deviation => {
@@ -1300,7 +1439,7 @@ pub const Engine = struct {
                     try self.emitDerivedMetric(output_metric, output_labels, point.ts, 1.0, signal.input_metric, signal.expression_kind.text());
                     emissions_total += 1;
                     if (last_event_id) |event_id| self.alloc.free(event_id);
-                    last_event_id = try makeEventId(self.alloc, output_metric, output_labels, point.ts);
+                    last_event_id = try self.recordSignalEmission(signal, raw_labels_json, data_revision, point.ts, 1.0);
                 }
             },
             .crossover, .crossunder => {
@@ -1322,7 +1461,7 @@ pub const Engine = struct {
                             try self.emitDerivedMetric(output_metric, output_labels, point.ts, 1.0, signal.input_metric, signal.expression_kind.text());
                             emissions_total += 1;
                             if (last_event_id) |event_id| self.alloc.free(event_id);
-                            last_event_id = try makeEventId(self.alloc, output_metric, output_labels, point.ts);
+                            last_event_id = try self.recordSignalEmission(signal, raw_labels_json, data_revision, point.ts, 1.0);
                         }
                     }
                     prev_fast = fast;
@@ -1335,6 +1474,23 @@ pub const Engine = struct {
             .emissions_total = emissions_total,
             .last_event_id = last_event_id,
         };
+    }
+
+    fn recordSignalEmission(
+        self: *Engine,
+        signal: market_catalog_mod.SignalDefinition,
+        raw_labels_json: []const u8,
+        data_revision: []const u8,
+        ts_ns: i64,
+        value: f64,
+    ) ![]u8 {
+        var event = try self.signal_events.append(signal.id, signal.version, data_revision, raw_labels_json, ts_ns, value);
+        defer event.deinit(self.alloc);
+        self.signal_event_mu.lock();
+        self.signal_event_epoch += 1;
+        self.signal_event_mu.unlock();
+        self.signal_event_cv.broadcast();
+        return try self.alloc.dupe(u8, event.event_id);
     }
 
     fn emitBarMetrics(
@@ -1492,7 +1648,9 @@ pub const Engine = struct {
         if (input.interval_ns <= 0) return error.InvalidBarPolicyInterval;
         var source_schema = self.marketSchema(input.source_metric) orelse return error.InvalidBarPolicySource;
         defer source_schema.deinit(self.alloc);
-        if (!std.mem.eql(u8, input.source_metric, "market.trade")) return error.InvalidBarPolicySource;
+        if (!std.mem.eql(u8, input.source_metric, "market.trade") and !std.mem.eql(u8, input.source_metric, "market.bar")) {
+            return error.InvalidBarPolicySource;
+        }
         if (!stringInSlice(input.session_rule, &.{ "regular_hours", "all_sessions" })) return error.InvalidSessionRule;
         if (!stringInSlice(input.no_trade_rule, &.{ "skip_empty", "carry_forward_none" })) return error.InvalidNoTradeRule;
         if (!stringInSlice(input.halt_rule, &.{ "skip_halts", "treat_as_gap" })) return error.InvalidHaltRule;
@@ -1500,11 +1658,13 @@ pub const Engine = struct {
     }
 
     fn validateRollupInput(self: *Engine, input: market_catalog_mod.RollupDefinitionInput) !void {
-        _ = self.latestBarPolicy(input.policy_id) orelse return error.InvalidRollupPolicy;
+        var policy = self.latestBarPolicy(input.policy_id) orelse return error.InvalidRollupPolicy;
+        defer policy.deinit(self.alloc);
         switch (input.transform_kind) {
             .trade_to_bar => {
                 if (!std.mem.eql(u8, input.source_metric, "market.trade")) return error.InvalidRollupSource;
                 if (!std.mem.eql(u8, input.target_metric, "market.bar")) return error.InvalidRollupTarget;
+                if (!std.mem.eql(u8, policy.source_metric, "market.trade")) return error.InvalidRollupPolicy;
             },
             .quote_to_spread_mid => {
                 if (!std.mem.eql(u8, input.source_metric, "market.quote")) return error.InvalidRollupSource;
@@ -1512,6 +1672,7 @@ pub const Engine = struct {
             .bar_to_bar => {
                 if (!std.mem.eql(u8, input.source_metric, "market.bar")) return error.InvalidRollupSource;
                 if (!std.mem.eql(u8, input.target_metric, "market.bar")) return error.InvalidRollupTarget;
+                if (!std.mem.eql(u8, policy.source_metric, "market.bar")) return error.InvalidRollupPolicy;
             },
         }
     }
@@ -1856,6 +2017,84 @@ pub const Engine = struct {
 
     pub fn signalRuntime(self: *Engine, id: []const u8, version: u32) ?market_runtime_mod.DefinitionRuntime {
         return self.market_runtime.runtimeFor("signal", id, version);
+    }
+
+    pub fn latestRollup(self: *Engine, id: []const u8) !?market_catalog_mod.RollupDefinition {
+        const rollups = try self.metadata.market_catalog.listRollups();
+        defer {
+            for (rollups) |*entry| entry.deinit(self.alloc);
+            self.alloc.free(rollups);
+        }
+        var best: ?market_catalog_mod.RollupDefinition = null;
+        errdefer if (best) |*entry| entry.deinit(self.alloc);
+        for (rollups) |entry| {
+            if (!std.mem.eql(u8, entry.id, id)) continue;
+            if (best == null or entry.version > best.?.version) {
+                if (best) |*existing| existing.deinit(self.alloc);
+                best = try entry.clone(self.alloc);
+            }
+        }
+        return best;
+    }
+
+    pub fn latestSignal(self: *Engine, id: []const u8) !?market_catalog_mod.SignalDefinition {
+        const signals = try self.metadata.market_catalog.listSignals();
+        defer {
+            for (signals) |*entry| entry.deinit(self.alloc);
+            self.alloc.free(signals);
+        }
+        var best: ?market_catalog_mod.SignalDefinition = null;
+        errdefer if (best) |*entry| entry.deinit(self.alloc);
+        for (signals) |entry| {
+            if (!std.mem.eql(u8, entry.id, id)) continue;
+            if (best == null or entry.version > best.?.version) {
+                if (best) |*existing| existing.deinit(self.alloc);
+                best = try entry.clone(self.alloc);
+            }
+        }
+        return best;
+    }
+
+    pub fn pendingStatsForMetric(self: *Engine, metric: []const u8) PendingStats {
+        self.derived_mu.lock();
+        defer self.derived_mu.unlock();
+        var pending_instances: usize = 0;
+        var max_lag_ns: ?i64 = null;
+        const now_ts: i64 = @intCast(std.time.nanoTimestamp());
+        for (self.derived_dirty.items) |entry| {
+            if (!std.mem.eql(u8, entry.metric, metric)) continue;
+            pending_instances += 1;
+            const lag: i64 = now_ts - entry.queued_at_ns;
+            if (max_lag_ns == null or lag > max_lag_ns.?) max_lag_ns = lag;
+        }
+        return .{ .pending_instances = pending_instances, .max_lag_ns = max_lag_ns };
+    }
+
+    pub fn listSignalEvents(
+        self: *Engine,
+        definition_id: []const u8,
+        definition_version: ?u32,
+        after_sequence: ?u64,
+        start_ts_ns: ?i64,
+        end_ts_ns: ?i64,
+        limit: usize,
+    ) ![]signal_events_mod.Event {
+        return try self.signal_events.listAfter(definition_id, definition_version, after_sequence, start_ts_ns, end_ts_ns, limit);
+    }
+
+    pub fn currentSignalEventEpoch(self: *Engine) u64 {
+        self.signal_event_mu.lock();
+        defer self.signal_event_mu.unlock();
+        return self.signal_event_epoch;
+    }
+
+    pub fn waitForSignalEvents(self: *Engine, previous_epoch: u64, timeout_ns: u64) u64 {
+        self.signal_event_mu.lock();
+        defer self.signal_event_mu.unlock();
+        if (self.signal_event_epoch == previous_epoch and !self.stop_flag) {
+            self.signal_event_cv.timedWait(&self.signal_event_mu, timeout_ns) catch {};
+        }
+        return self.signal_event_epoch;
     }
 
     pub fn pauseRollup(self: *Engine, id: []const u8) !void {
@@ -3375,6 +3614,16 @@ fn jsonParamFloat(obj: std.json.ObjectMap, key: []const u8, default: f64) f64 {
         };
     }
     return default;
+}
+
+fn marketLabelValueFromJson(alloc: std.mem.Allocator, labels_json: []const u8, key: []const u8) !?[]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, labels_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+    if (parsed.value.object.get(key)) |value| {
+        if (value == .string) return try alloc.dupe(u8, value.string);
+    }
+    return null;
 }
 
 fn pointValues(alloc: std.mem.Allocator, points: []const types.Point) ![]f64 {
