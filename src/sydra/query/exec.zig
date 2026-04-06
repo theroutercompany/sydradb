@@ -872,6 +872,51 @@ test "executeWithMode compiled compiles constant scalar functions and records su
     try std.testing.expect((try cursor.next()) == null);
 }
 
+test "executeWithMode compiled supports coalesce in constant and row projections" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/compiled-coalesce", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .compiled,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try engine_mod.Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const sid: u64 = 7555;
+    try engine.registerSeries("coalesce.room1", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.5, .tags_json = "{}" });
+    try waitForFlushForTest(engine, 1, 1_000);
+
+    var constant_cursor = try executeWithMode(talloc, engine, "select coalesce(null, 7)", .compiled);
+    defer constant_cursor.deinit();
+    const constant_row = (try constant_cursor.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 7), constant_row.values[0].integer);
+    try std.testing.expect((try constant_cursor.next()) == null);
+
+    var row_cursor = try executeWithMode(talloc, engine, "select coalesce(value, 0) as value_or_zero from coalesce.room1 where time >= 0 order by time asc limit 1", .compiled);
+    defer row_cursor.deinit();
+    const row = (try row_cursor.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), try row.values[0].asFloat(), 1e-9);
+    try std.testing.expect((try row_cursor.next()) == null);
+}
+
 test "executeWithMode compiled falls back to legacy for fill clauses and records metrics" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });

@@ -335,6 +335,13 @@ fn ensureRawRowScalarSupported(expr: *const ast.Expr, allow_tag_identifiers: boo
                 try ensureTimeBucketSupported(expr);
                 return;
             }
+            if (std.ascii.eqlIgnoreCase(call.callee.value, "coalesce")) {
+                if (call.args.len == 0) return error.UnsupportedFunction;
+                for (call.args) |arg| {
+                    try ensureRawRowScalarSupported(arg, allow_tag_identifiers);
+                }
+                return;
+            }
             if (isSupportedUnaryRawRowFunction(call.callee.value)) {
                 if (call.args.len != 1) return error.UnsupportedFunction;
                 try ensureRawRowScalarSupported(call.args[0], allow_tag_identifiers);
@@ -399,6 +406,7 @@ fn isSupportedUnaryRawRowFunction(name: []const u8) bool {
 fn isSupportedConstantScalarFunction(name: []const u8, arg_count: usize) bool {
     if (std.ascii.eqlIgnoreCase(name, "now")) return arg_count == 0;
     if (std.ascii.eqlIgnoreCase(name, "time_bucket")) return arg_count == 2 or arg_count == 3;
+    if (std.ascii.eqlIgnoreCase(name, "coalesce")) return arg_count != 0;
     if (isSupportedUnaryRawRowFunction(name)) return arg_count == 1;
     if (std.ascii.eqlIgnoreCase(name, "pow")) return arg_count == 2;
     return false;

@@ -204,6 +204,14 @@ fn evaluateScalarCall(call: ast.Call, resolver: *const Resolver) EvalError!Value
         const rhs = try (try evaluate(call.args[1], resolver)).asFloat();
         return Value{ .float = std.math.pow(f64, lhs, rhs) };
     }
+    if (std.ascii.eqlIgnoreCase(call.callee.value, "coalesce")) {
+        if (call.args.len == 0) return EvalError.UnsupportedExpression;
+        for (call.args) |arg| {
+            const value = try evaluate(arg, resolver);
+            if (!value.isNull()) return value;
+        }
+        return Value.null;
+    }
     return EvalError.UnsupportedExpression;
 }
 
@@ -424,4 +432,65 @@ test "scalar math functions evaluate on row inputs" {
 
     try std.testing.expectApproxEqAbs(@as(f64, 2.25), (try evaluateRow(pow_expr, &ctx)).float, 1e-9);
     try std.testing.expectApproxEqAbs(@as(f64, 2.0), (try evaluateRow(ceil_expr, &ctx)).float, 1e-9);
+}
+
+test "coalesce evaluates for constant and row expressions" {
+    const common = @import("common.zig");
+    const alloc = std.testing.allocator;
+    const base_span = common.Span.init(0, 0);
+
+    const null_expr = try alloc.create(ast.Expr);
+    defer alloc.destroy(null_expr);
+    null_expr.* = .{ .literal = .{ .value = .null, .span = base_span } };
+
+    const int_expr = try alloc.create(ast.Expr);
+    defer alloc.destroy(int_expr);
+    int_expr.* = .{ .literal = .{ .value = .{ .integer = 7 }, .span = base_span } };
+
+    const coalesce_name = try alloc.dupe(u8, "coalesce");
+    defer alloc.free(coalesce_name);
+    const constant_args = try alloc.alloc(*const ast.Expr, 2);
+    defer alloc.free(constant_args);
+    constant_args[0] = null_expr;
+    constant_args[1] = int_expr;
+    const constant_expr = try alloc.create(ast.Expr);
+    defer alloc.destroy(constant_expr);
+    constant_expr.* = .{ .call = .{
+        .callee = .{ .value = coalesce_name, .quoted = false, .span = base_span },
+        .args = constant_args,
+        .span = base_span,
+    } };
+
+    try std.testing.expectEqual(@as(i64, 7), (try evaluateConstant(constant_expr)).integer);
+
+    const value_name = try alloc.dupe(u8, "value");
+    defer alloc.free(value_name);
+    const value_expr = try alloc.create(ast.Expr);
+    defer alloc.destroy(value_expr);
+    value_expr.* = .{ .identifier = .{ .value = value_name, .quoted = false, .span = base_span } };
+
+    const zero_expr = try alloc.create(ast.Expr);
+    defer alloc.destroy(zero_expr);
+    zero_expr.* = .{ .literal = .{ .value = .{ .integer = 0 }, .span = base_span } };
+
+    const row_args = try alloc.alloc(*const ast.Expr, 2);
+    defer alloc.free(row_args);
+    row_args[0] = value_expr;
+    row_args[1] = zero_expr;
+    const row_expr = try alloc.create(ast.Expr);
+    defer alloc.destroy(row_expr);
+    row_expr.* = .{ .call = .{
+        .callee = .{ .value = coalesce_name, .quoted = false, .span = base_span },
+        .args = row_args,
+        .span = base_span,
+    } };
+
+    const schema = [_]plan.ColumnInfo{
+        .{ .name = value_name, .expr = value_expr },
+    };
+    const values = [_]Value{
+        .null,
+    };
+    const ctx = RowContext{ .schema = schema[0..], .values = values[0..] };
+    try std.testing.expectEqual(@as(i64, 0), (try evaluateRow(row_expr, &ctx)).integer);
 }
