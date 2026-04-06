@@ -1,8 +1,15 @@
-import { fireEvent, render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { DemoStateResponse } from "../../shared/contracts.js";
-import { ShowcaseDashboard } from "./App.js";
+import App, { ShowcaseDashboard } from "./App.js";
+import { fetchState } from "./api.js";
+
+vi.mock("./api.js", () => ({
+  fetchState: vi.fn(),
+  resetSession: vi.fn(),
+  runScenario: vi.fn(),
+}));
 
 const mockState: DemoStateResponse = {
   sessionId: "session-1",
@@ -58,6 +65,17 @@ const mockState: DemoStateResponse = {
 };
 
 describe("ShowcaseDashboard", () => {
+  beforeEach(() => {
+    vi.resetAllMocks();
+    window.localStorage.clear();
+    delete document.documentElement.dataset.theme;
+    document.documentElement.style.colorScheme = "";
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
   it("filters experimental scenarios in release mode", () => {
     const onToggleReleaseMode = vi.fn();
     render(
@@ -66,9 +84,12 @@ describe("ShowcaseDashboard", () => {
         selectedScenarioId="candidate-scenario"
         releaseMode={false}
         runResult={null}
+        theme="dark"
+        error={null}
         loading={false}
         running={false}
         onSelectScenario={vi.fn()}
+        onThemeChange={vi.fn()}
         onToggleReleaseMode={onToggleReleaseMode}
         onResetSession={vi.fn()}
         onRunScenario={vi.fn()}
@@ -78,5 +99,30 @@ describe("ShowcaseDashboard", () => {
     expect(screen.getByText("Experimental scenario")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("checkbox"));
     expect(onToggleReleaseMode).toHaveBeenCalledWith(true);
+  });
+
+  it("defaults to dark mode and persists theme changes", async () => {
+    vi.mocked(fetchState).mockResolvedValue(mockState);
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "Run scenario" }).length).toBeGreaterThan(0));
+    await waitFor(() => expect(document.documentElement.dataset.theme).toBe("dark"));
+
+    fireEvent.click(screen.getByRole("button", { name: "Light" }));
+
+    expect(document.documentElement.dataset.theme).toBe("light");
+    expect(document.documentElement.style.colorScheme).toBe("light");
+    expect(window.localStorage.getItem("sydra-showcase-theme")).toBe("light");
+  });
+
+  it("reads a persisted theme on first render", async () => {
+    vi.mocked(fetchState).mockResolvedValue(mockState);
+    window.localStorage.setItem("sydra-showcase-theme", "light");
+
+    render(<App />);
+
+    await waitFor(() => expect(screen.getAllByRole("button", { name: "Run scenario" }).length).toBeGreaterThan(0));
+    await waitFor(() => expect(document.documentElement.dataset.theme).toBe("light"));
   });
 });
