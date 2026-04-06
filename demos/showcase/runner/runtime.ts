@@ -207,8 +207,20 @@ export async function seedWorkspaceFromFixtures(
   fixtureFiles: string[],
 ): Promise<void> {
   await startWorkspaceServer(workspace, binaryPath);
+  const baselineMetrics = await fetchMetricsCounters(workspace, [
+    "sydradb_ingest_total",
+    "sydradb_flush_total",
+    "sydradb_flush_points_total",
+    "sydradb_queue_depth",
+  ]);
   const payloadChunks = await Promise.all(fixtureFiles.map((filePath) => fs.readFile(filePath, "utf8")));
-  const payload = payloadChunks.map((chunk) => chunk.trim()).filter(Boolean).join("\n") + "\n";
+  const records = payloadChunks.flatMap((chunk) =>
+    chunk
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean),
+  );
+  const payload = records.join("\n") + "\n";
   const response = await fetch(`${workspace.baseUrl}/api/v1/ingest`, {
     method: "POST",
     body: payload,
@@ -217,8 +229,74 @@ export async function seedWorkspaceFromFixtures(
   if (!response.ok) {
     throw new Error(`Failed to seed ${workspace.name}: ${response.status} ${await response.text()}`);
   }
-  await new Promise((resolve) => setTimeout(resolve, 150));
+  await waitForWorkspaceFlush(workspace, {
+    binaryPath,
+    expectedPoints: records.length,
+    baselineMetrics: baselineMetrics.counters,
+  });
   await stopWorkspaceServer(workspace);
+}
+
+async function waitForWorkspaceFlush(
+  workspace: WorkspaceRuntime,
+  {
+    binaryPath,
+    expectedPoints,
+    baselineMetrics,
+    timeoutMs = 5_000,
+  }: {
+    binaryPath: string;
+    expectedPoints: number;
+    baselineMetrics: Record<string, number>;
+    timeoutMs?: number;
+  },
+): Promise<void> {
+  const startedAt = Date.now();
+  let lastObserved: Record<string, number> | null = null;
+  let lastCanaryError: string | null = null;
+  while (Date.now() - startedAt < timeoutMs) {
+    const snapshot = await fetchMetricsCounters(workspace, [
+      "sydradb_ingest_total",
+      "sydradb_flush_total",
+      "sydradb_flush_points_total",
+      "sydradb_queue_depth",
+    ]);
+    lastObserved = snapshot.counters;
+
+    const ingestDelta =
+      snapshot.counters.sydradb_ingest_total - (baselineMetrics.sydradb_ingest_total ?? 0);
+    const flushDelta =
+      snapshot.counters.sydradb_flush_total - (baselineMetrics.sydradb_flush_total ?? 0);
+    const flushPointsDelta =
+      snapshot.counters.sydradb_flush_points_total - (baselineMetrics.sydradb_flush_points_total ?? 0);
+    const queueDepth = snapshot.counters.sydradb_queue_depth;
+
+    if (
+      Number.isFinite(ingestDelta) &&
+      Number.isFinite(flushDelta) &&
+      Number.isFinite(flushPointsDelta) &&
+      Number.isFinite(queueDepth) &&
+      ingestDelta >= expectedPoints &&
+      flushDelta >= 1 &&
+      flushPointsDelta >= expectedPoints &&
+      queueDepth === 0
+    ) {
+      try {
+        await runBinary(workspace, binaryPath, ["cas", "--json", "fsck", "--connectivity-only"]);
+        return;
+      } catch (error) {
+        lastCanaryError = error instanceof Error ? error.message : String(error);
+      }
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+
+  throw new Error(
+    `Timed out waiting for ${workspace.name} to flush seeded ingest. Last metrics: ${JSON.stringify(lastObserved)}${
+      lastCanaryError ? `\nLast CAS canary error: ${lastCanaryError}` : ""
+    }`,
+  );
 }
 
 export async function postSydraqlQuery(workspace: WorkspaceRuntime, query: string): Promise<unknown> {
