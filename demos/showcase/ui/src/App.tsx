@@ -49,7 +49,7 @@ const LAUNCH_CARDS: LaunchCardDefinition[] = [
     order: "01",
     eyebrow: "Incident setup",
     title: "Edge fleet story",
-    body: "This demo starts with three local repos: edge-east, edge-west, and HQ. Edge-east receives a bad rollout and becomes the problem site; the rest of the fleet gives you the control group.",
+    body: "This demo starts with three local SydraDB storage instances: edge-east, edge-west, and HQ. Edge-east receives a bad rollout and becomes the problem site; the rest of the fleet gives you the control group.",
     bullets: [
       "Baseline telemetry is seeded into both edge sites before the incident lands.",
       "Only edge-east picks up the bad state, so CAS history has something concrete to investigate and reverse.",
@@ -63,7 +63,7 @@ const LAUNCH_CARDS: LaunchCardDefinition[] = [
     order: "02",
     eyebrow: "Operational proof",
     title: "Ops and exchange lane",
-    body: "Once the rollback story makes sense, the next question is whether the repository remains inspectable, repairable, and movable under operational pressure.",
+    body: "Once the rollback story makes sense, the next question is whether the storage remains inspectable, repairable, and movable under operational pressure.",
     bullets: [
       "Pack, fsck, GC, and vacuum show the storage stays healthy after the incident and rollback path.",
       "Bundle, clone, fetch, and push show that the same state can move toward HQ without inventing a separate replication demo.",
@@ -95,7 +95,7 @@ const SCENARIO_READING_GUIDES: Record<string, ScenarioReadingGuide> = {
     manager:
       "Read this as proof that SydraDB can explain a production-facing problem in plain operational terms: what changed, what was rolled back, and whether the live view returned to normal.",
     engineer:
-      "Read the refs, log, diff, and reflog as the storage-side timeline. Each step is showing that rollback is grounded in repository history rather than an ad hoc restore script.",
+      "Read the refs, log, diff, and reflog as the storage-side timeline. Each step is showing that rollback is grounded in storage history rather than an ad hoc restore script.",
     operator:
       "Treat this like an incident drill. The important signals are that the baseline checkpoint exists, the diff shows the bad change, and the post-rollback range query confirms the bad state is no longer live.",
     summaryEvidence:
@@ -103,19 +103,19 @@ const SCENARIO_READING_GUIDES: Record<string, ScenarioReadingGuide> = {
   },
   "cas-maintenance": {
     story:
-      "This run asks the next practical question after recovery: can the repository still be trusted, repaired, and maintained over time? It turns the fleet story from a one-off rollback into an operational model.",
+      "This run asks the next practical question after recovery: can the storage still be trusted, repaired, and maintained over time? It turns the fleet story from a one-off rollback into an operational model.",
     manager:
       "Read this as long-term operability. The value is that maintenance is built into the storage model rather than bolted on around a database file.",
     engineer:
-      "Use the outputs to confirm that packing, integrity checks, cleanup, and one-shot maintenance all work against the same repository state produced by the incident story.",
+      "Use the outputs to confirm that packing, integrity checks, cleanup, and one-shot maintenance all work against the same storage state produced by the incident story.",
     operator:
       "Focus on whether fsck sees a healthy graph, whether pack finds reachable objects, and whether GC or vacuum report anything unexpectedly unreachable or deleted.",
     summaryEvidence:
-      "The summary evidence is the fastest way to judge whether the repository is healthy enough to keep operating after the earlier incident path.",
+      "The summary evidence is the fastest way to judge whether the storage is healthy enough to keep operating after the earlier incident path.",
   },
   "cas-sync": {
     story:
-      "This run widens the story from one site to many. After state changes at the edge, the repository can be packaged, verified, cloned, fetched, and pushed toward HQ without inventing a separate replication narrative.",
+      "This run widens the story from one site to many. After state changes at the edge, the storage can be packaged, verified, cloned, fetched, and pushed toward HQ without inventing a separate replication narrative.",
     manager:
       "Read this as portability and controlled movement. The system can move state between installations with verification instead of relying on manual file copying or external choreography.",
     engineer:
@@ -155,7 +155,7 @@ const SCENARIO_READING_GUIDES: Record<string, ScenarioReadingGuide> = {
     manager:
       "Read this as continuity of service. The outcome should show that restart and checkpoint workflows preserve the state the team expects users to see.",
     engineer:
-      "The useful comparison is before-versus-after: whether the engine restarts cleanly and whether the recovery anchor becomes visible as part of the repository story.",
+      "The useful comparison is before-versus-after: whether the engine restarts cleanly and whether the recovery anchor becomes visible as part of the storage story.",
     operator:
       "Read the control actions and the following verification together. A restart step matters only if the data view after restart still matches the intended state.",
     summaryEvidence:
@@ -166,9 +166,9 @@ const SCENARIO_READING_GUIDES: Record<string, ScenarioReadingGuide> = {
 const STEP_KIND_GUIDES: Record<ScenarioStepResult["kind"], StepReadingGuide> = {
   cas_command: {
     meaning:
-      "This step is reading or mutating the storage repository through a native CAS command. It is evidence about the repository itself, not just application output.",
+      "This step is reading or mutating SydraDB storage through a native CAS command. It is evidence about the storage model itself, not just application output.",
     lookFor:
-      "Start with the top-level counts, entries, refs, or status fields. Those are the fastest signals for whether the repository structure looks healthy.",
+      "Start with the top-level counts, entries, refs, or status fields. Those are the fastest signals for whether the storage structure looks healthy.",
     managerLens:
       "For managers and non-specialists, the value here is that SydraDB can explain storage state in reviewable steps instead of hiding it behind a single opaque file.",
     operatorLens:
@@ -230,7 +230,7 @@ const STEP_GUIDE_OVERRIDES: Record<string, Record<string, Partial<StepReadingGui
   "cas-history": {
     refs: {
       meaning:
-        "This confirms the repository has a live named head before anyone is asked to trust the rollback story.",
+        "This confirms the storage has a live named head before anyone is asked to trust the rollback story.",
       lookFor:
         "If heads/main is present, there is a concrete active pointer the rest of the incident narrative can anchor to.",
     },
@@ -264,7 +264,7 @@ const STEP_GUIDE_OVERRIDES: Record<string, Record<string, Partial<StepReadingGui
   "cas-maintenance": {
     pack: {
       meaning:
-        "Packing turns loose reachable objects into a more maintainable storage shape without changing the meaning of the repository.",
+        "Packing turns loose reachable objects into a more maintainable storage shape without changing the meaning of the active storage state.",
     },
     fsck: {
       meaning:
@@ -276,7 +276,7 @@ const STEP_GUIDE_OVERRIDES: Record<string, Record<string, Partial<StepReadingGui
     },
     vacuum: {
       meaning:
-        "Vacuum is the combined maintenance path. It gives non-specialists a single command to associate with “make the repository healthy again.”",
+        "Vacuum is the combined maintenance path. It gives non-specialists a single command to associate with “make the storage healthy again.”",
     },
   },
   "sydraql-compiler": {
@@ -298,19 +298,19 @@ const STEP_GUIDE_OVERRIDES: Record<string, Record<string, Partial<StepReadingGui
 const SCENARIO_MODEL_GUIDES: Record<string, ScenarioModelGuide> = {
   "cas-history": {
     focus:
-      "This scenario proves that an incident on edge-east is stored as repository history inside SydraDB itself, which is why diff, rollback, and reflog operations are meaningful in the first place.",
+      "This scenario proves that an incident on edge-east is stored as history inside SydraDB itself, which is why diff, rollback, and reflog operations are meaningful in the first place.",
     operatorQuestion:
       "If a site goes bad, can I inspect the storage timeline, identify the safe checkpoint, and move the active head back without rebuilding the whole system by hand?",
   },
   "cas-maintenance": {
     focus:
-      "This scenario proves that once the repository has lived through writes and recovery, it can still be packed, validated, cleaned up, and repaired as part of normal operations.",
+      "This scenario proves that once the storage has lived through writes and recovery, it can still be packed, validated, cleaned up, and repaired as part of normal operations.",
     operatorQuestion:
       "After a recovery, does the storage remain healthy and maintainable, or do we need a second toolchain to make it trustworthy again?",
   },
   "cas-sync": {
     focus:
-      "This scenario proves that the same storage state can move between edge and HQ as repository state, not just as copied files or ad hoc export/import scripts.",
+      "This scenario proves that the same storage state can move between edge and HQ as SydraDB state, not just as copied files or ad hoc export/import scripts.",
     operatorQuestion:
       "Can I move or clone the storage state between sites while preserving refs, packs, and verifiable history?",
   },
@@ -330,7 +330,7 @@ const SCENARIO_MODEL_GUIDES: Record<string, ScenarioModelGuide> = {
     focus:
       "This scenario proves that the service lifecycle and the storage lifecycle line up: restart, recovery anchors, and query continuity all stay part of one operational model.",
     operatorQuestion:
-      "When the service restarts or maintenance runs, does the live view stay consistent with the repository state I expect?",
+      "When the service restarts or maintenance runs, does the live view stay consistent with the storage state I expect?",
   },
 };
 
@@ -623,11 +623,13 @@ export function ShowcaseDashboard({
           {selected ? (
             <>
               <div className="main__header">
-                <h1 className="main__title">{selected.manifest.title}</h1>
-                <p className="main__description">{selected.manifest.summary}</p>
+                <div className="main__header-text">
+                  <h1 className="main__title">{selected.manifest.title}</h1>
+                  <p className="main__description">{selected.manifest.summary}</p>
+                </div>
                 <div className="main__clarifier">
-                  Git-like terms here refer to SydraDB&apos;s internal CAS storage repository. `heads/main`, commits,
-                  reflogs, and checkpoints are storage-state concepts, not the application&apos;s source-code Git branch.
+                  Git-like terms here refer to SydraDB&apos;s internal storage model. `heads/main`, commits, reflogs,
+                  and checkpoints are storage-state concepts, not the application&apos;s source-code Git branch.
                 </div>
               </div>
 
@@ -794,7 +796,7 @@ export function ShowcaseDashboard({
                       <h3 className="context-section__title">Where SydraDB sits</h3>
                       <ul>
                         <li>SydraDB is the local time-series database and storage engine running on each site.</li>
-                        <li>In this demo, `edge-east`, `edge-west`, and `hq` are separate SydraDB repositories.</li>
+                        <li>In this demo, `edge-east`, `edge-west`, and `hq` are separate SydraDB storage instances.</li>
                         <li>The fictional application is not talking to Git here. It is talking to SydraDB over HTTP and CLI surfaces.</li>
                       </ul>
                     </div>
