@@ -1484,6 +1484,19 @@ test "prepared VM supports aggregate reads and grouped time buckets" {
     try std.testing.expectApproxEqAbs(@as(f64, 3.5), try second_group.row[1].asFloat(), 1e-9);
     try std.testing.expect((try grouped_stmt.step()) == .done);
 
+    var ordered_grouped_stmt = try prepareSydraQL(
+        alloc,
+        engine,
+        "select time_bucket(60, time) as bucket, max(value) as max_value from stage3.agg where time >= 0 group by time_bucket(60, time) order by time_bucket(60, time) desc limit 1",
+        .{},
+    );
+    defer ordered_grouped_stmt.finalize();
+    const ordered_group = try ordered_grouped_stmt.step();
+    try std.testing.expect(ordered_group == .row);
+    try std.testing.expectEqual(@as(i64, 60), ordered_group.row[0].integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.5), try ordered_group.row[1].asFloat(), 1e-9);
+    try std.testing.expect((try ordered_grouped_stmt.step()) == .done);
+
     const tagged_sid = @import("../types.zig").seriesIdFrom("tagged.room1", "{\"host\":\"web\",\"rack\":\"r1\"}");
     try engine.registerSeries("tagged.room1", "{\"host\":\"web\",\"rack\":\"r1\"}", tagged_sid);
     try engine.ingest(.{ .series_id = tagged_sid, .ts = 10, .value = 1.0, .tags_json = "{\"host\":\"web\",\"rack\":\"r1\"}" });

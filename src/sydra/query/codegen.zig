@@ -3,6 +3,7 @@ const std = @import("std");
 const ast = @import("ast.zig");
 const bytecode = @import("bytecode.zig");
 const compiler = @import("compiler.zig");
+const expression = @import("expression.zig");
 const plan = @import("plan.zig");
 const value_mod = @import("value.zig");
 
@@ -20,8 +21,6 @@ pub const CodegenResult = struct {
 
 pub fn buildProgram(allocator: std.mem.Allocator, compiled: compiler.CompiledSelect) CodegenError!CodegenResult {
     if (compiled.typed_query.is_aggregate_query) {
-        if (compiled.typed_query.ordering.len != 0) return error.UnsupportedPreparedQuery;
-        if (compiled.typed_query.select.limit != null) return error.UnsupportedPreparedQuery;
         return try buildAggregateProgram(allocator, compiled);
     }
 
@@ -90,6 +89,7 @@ fn buildScanProgram(allocator: std.mem.Allocator, compiled: compiler.CompiledSel
     const typed = compiled.typed_query;
     const columns = try buildColumns(allocator, typed.projections);
     errdefer allocator.free(columns);
+    const orderings = try buildExecutableOrderings(allocator, typed.ordering, typed.projections);
     const hidden_order_columns = try buildHiddenOrderingColumns(allocator, typed.ordering, columns);
     errdefer if (hidden_order_columns.len != 0) allocator.free(hidden_order_columns);
     const sorter_columns = if (hidden_order_columns.len != 0)
@@ -185,7 +185,7 @@ fn buildScanProgram(allocator: std.mem.Allocator, compiled: compiler.CompiledSel
             .selectors = try allocator.dupe(compiler.BoundSelector, &.{selector}),
             .schemas = try allocator.dupe([]const plan.ColumnInfo, &.{sorter_columns}),
             .orderings = if (typed.ordering.len != 0)
-                try allocator.dupe([]const ast.OrderExpr, &.{typed.select.ordering})
+                try allocator.dupe([]const ast.OrderExpr, &.{orderings})
             else
                 &.{},
             .cursors = try allocator.dupe(bytecode.CursorDecl, &.{.{ .id = 0, .name = "series0" }}),
@@ -205,6 +205,7 @@ fn buildAggregateProgram(allocator: std.mem.Allocator, compiled: compiler.Compil
     const selector = typed.bound_selector orelse return error.UnsupportedPreparedQuery;
     const columns = try buildColumns(allocator, typed.projections);
     errdefer allocator.free(columns);
+    const orderings = try buildExecutableOrderings(allocator, typed.ordering, typed.projections);
 
     var instructions = std.array_list.Managed(bytecode.Instruction).init(allocator);
     errdefer instructions.deinit();
@@ -217,6 +218,17 @@ fn buildAggregateProgram(allocator: std.mem.Allocator, compiled: compiler.Compil
 
     const start_ts = if (typed.time_range.start) |bound| bound.value else std.math.minInt(i64);
     const end_ts = if (typed.time_range.end) |bound| bound.value else std.math.maxInt(i64);
+    const uses_sorter = typed.ordering.len != 0 or typed.select.limit != null;
+
+    if (uses_sorter) {
+        try instructions.append(.{
+            .opcode = .sorter_open,
+            .p1 = 0,
+            .p2 = if (typed.select.limit) |limit_clause| @intCast(limit_clause.offset orelse 0) else 0,
+            .p3 = if (typed.select.limit) |limit_clause| @intCast(limit_clause.limit) else -1,
+            .p4 = if (typed.ordering.len != 0) .{ .ordering = 0 } else .none,
+        });
+    }
     try instructions.append(.{
         .opcode = .open_series,
         .p1 = 0,
@@ -253,14 +265,41 @@ fn buildAggregateProgram(allocator: std.mem.Allocator, compiled: compiler.Compil
         .p2 = 0,
         .p3 = 0,
     });
-    try instructions.append(.{
-        .opcode = .result_row,
-        .p1 = 0,
-        .p2 = @intCast(typed.projections.len),
-        .p4 = .{ .schema = 0 },
-    });
-    try instructions.append(.{ .opcode = .jump, .p2 = @intCast(final_pc) });
+    if (uses_sorter) {
+        try instructions.append(.{
+            .opcode = .sorter_insert,
+            .p1 = 0,
+            .p2 = 0,
+            .p3 = @intCast(typed.projections.len),
+        });
+        try instructions.append(.{ .opcode = .jump, .p2 = @intCast(final_pc) });
+    } else {
+        try instructions.append(.{
+            .opcode = .result_row,
+            .p1 = 0,
+            .p2 = @intCast(typed.projections.len),
+            .p4 = .{ .schema = 0 },
+        });
+        try instructions.append(.{ .opcode = .jump, .p2 = @intCast(final_pc) });
+    }
     instructions.items[final_pc].p2 = @intCast(instructions.items.len);
+    if (uses_sorter) {
+        const sorter_pc = instructions.items.len;
+        try instructions.append(.{
+            .opcode = .sorter_next,
+            .p1 = 0,
+            .p2 = 0,
+            .p3 = 0,
+        });
+        try instructions.append(.{
+            .opcode = .result_row,
+            .p1 = 0,
+            .p2 = @intCast(typed.projections.len),
+            .p4 = .{ .schema = 0 },
+        });
+        try instructions.append(.{ .opcode = .jump, .p2 = @intCast(sorter_pc) });
+        instructions.items[sorter_pc].p2 = @intCast(instructions.items.len);
+    }
     try instructions.append(.{ .opcode = .halt });
 
     return .{
@@ -271,9 +310,16 @@ fn buildAggregateProgram(allocator: std.mem.Allocator, compiled: compiler.Compil
             .exprs = try exprs.toOwnedSlice(),
             .selectors = try allocator.dupe(compiler.BoundSelector, &.{selector}),
             .schemas = try allocator.dupe([]const plan.ColumnInfo, &.{columns}),
+            .orderings = if (typed.ordering.len != 0)
+                try allocator.dupe([]const ast.OrderExpr, &.{orderings})
+            else
+                &.{},
             .aggregates = try allocator.dupe(compiler.AggregateSpec, typed.aggregates),
             .cursors = try allocator.dupe(bytecode.CursorDecl, &.{.{ .id = 0, .name = "series0" }}),
-            .temp_stores = try allocator.dupe(bytecode.TempStoreDecl, &.{.{ .id = 0, .name = "aggregate0" }}),
+            .temp_stores = if (uses_sorter)
+                try allocator.dupe(bytecode.TempStoreDecl, &.{.{ .id = 0, .name = "sorter0" }})
+            else
+                &.{},
             .register_count = @max(typed.projections.len, 3),
             .source_name = "prepared_series_aggregate",
         },
@@ -425,6 +471,66 @@ fn buildColumns(allocator: std.mem.Allocator, projections: []const compiler.Type
         columns[idx] = .{ .name = projection.name, .expr = projection.expr.expr };
     }
     return columns;
+}
+
+fn buildExecutableOrderings(
+    allocator: std.mem.Allocator,
+    ordering: []const compiler.TypedOrdering,
+    projections: []const compiler.TypedProjection,
+) ![]const ast.OrderExpr {
+    if (ordering.len == 0) return &.{};
+
+    const executable = try allocator.alloc(ast.OrderExpr, ordering.len);
+    for (ordering, 0..) |ordering_expr, idx| {
+        const expr = try rewriteOrderingExpr(allocator, ordering_expr.expr.expr, projections);
+        executable[idx] = .{
+            .expr = expr,
+            .direction = ordering_expr.direction,
+            .span = spanForExpr(expr),
+        };
+    }
+    return executable;
+}
+
+fn astSpan() @import("common.zig").Span {
+    return @import("common.zig").Span.init(0, 0);
+}
+
+fn rewriteOrderingExpr(
+    allocator: std.mem.Allocator,
+    expr: *const ast.Expr,
+    projections: []const compiler.TypedProjection,
+) !*const ast.Expr {
+    if (expr.* == .identifier) return expr;
+
+    for (projections) |projection| {
+        if (!expression.expressionsEqual(expr, projection.expr.expr)) continue;
+        return identifierExpr(allocator, projection.name);
+    }
+    return expr;
+}
+
+fn identifierExpr(allocator: std.mem.Allocator, name: []const u8) !*const ast.Expr {
+    const stored_name = try allocator.dupe(u8, name);
+    const expr = try allocator.create(ast.Expr);
+    expr.* = .{
+        .identifier = .{
+            .value = stored_name,
+            .quoted = false,
+            .span = astSpan(),
+        },
+    };
+    return expr;
+}
+
+fn spanForExpr(expr: *const ast.Expr) @import("common.zig").Span {
+    return switch (expr.*) {
+        .identifier => |ident| ident.span,
+        .literal => |literal| literal.span,
+        .call => |call| call.span,
+        .binary => |binary| binary.span,
+        .unary => |unary| unary.span,
+    };
 }
 
 fn buildHiddenOrderingColumns(
