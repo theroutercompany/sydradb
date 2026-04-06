@@ -10,6 +10,12 @@ const object_store = @import("storage/object_store.zig");
 
 const cas_json_schema_version: u32 = 1;
 
+fn printInteractiveBanner(comptime fmt: []const u8, args: anytype) void {
+    if (std.fs.File.stderr().isTty()) {
+        std.debug.print(fmt, args);
+    }
+}
+
 pub fn run(handle: *alloc_mod.AllocatorHandle) !void {
     const alloc = handle.allocator();
     const args = try std.process.argsAlloc(alloc);
@@ -19,7 +25,7 @@ pub fn run(handle: *alloc_mod.AllocatorHandle) !void {
         var eng = try initOwnedEngine(alloc, &cfg);
         defer eng.deinit();
         try catalog.bootstrap(alloc);
-        std.debug.print("sydradb serve :{d}\n", .{eng.config.http_port});
+        printInteractiveBanner("sydradb serve :{d}\n", .{eng.config.http_port});
         try http.runHttp(handle, eng, eng.config.http_port);
         return;
     }
@@ -98,7 +104,7 @@ fn cmdPgWire(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         .engine = eng,
     };
 
-    std.debug.print("sydradb pgwire {s}:{d}\n", .{ server_cfg.address, server_cfg.port });
+    printInteractiveBanner("sydradb pgwire {s}:{d}\n", .{ server_cfg.address, server_cfg.port });
     try compat.wire.server.run(alloc, server_cfg);
 }
 
@@ -135,7 +141,7 @@ fn cmdIngest(alloc: std.mem.Allocator, _: [][:0]u8) !void {
     }
     _ = try eng.flushNow();
     try eng.waitForDrained(1_000);
-    std.debug.print("ingested {d} points\n", .{count});
+    printInteractiveBanner("ingested {d} points\n", .{count});
 }
 
 fn cmdQuery(alloc: std.mem.Allocator, args: [][:0]u8) !void {
@@ -421,7 +427,7 @@ fn writeCasDiffJson(alloc: std.mem.Allocator, lhs: []const u8, rhs: []const u8, 
     try writeJsonBufferToStdout(buf.items);
 }
 
-fn writeCasBundleJson(alloc: std.mem.Allocator, action: []const u8, result: cas_mod.BundleResult) !void {
+fn writeCasBundleJson(alloc: std.mem.Allocator, command: []const u8, action: ?[]const u8, result: cas_mod.BundleResult) !void {
     var buf = std.array_list.Managed(u8).init(alloc);
     defer buf.deinit();
     var writer = buf.writer();
@@ -429,7 +435,7 @@ fn writeCasBundleJson(alloc: std.mem.Allocator, action: []const u8, result: cas_
     var adapter = writer.adaptToNewApi(&tmp);
     var iface = &adapter.new_interface;
     var jw = std.json.Stringify{ .writer = iface };
-    try beginCasJsonEnvelope(&jw, "bundle", action);
+    try beginCasJsonEnvelope(&jw, command, action);
     try jw.objectField("ref_count");
     try jw.write(result.ref_count);
     try jw.objectField("prerequisite_count");
@@ -710,7 +716,7 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
                 .pack_count = result.pack_count,
                 .reftable_file_count = result.reftable_file_count,
             };
-            try writeCasBundleJson(alloc, "clone", bundle_result);
+            try writeCasBundleJson(alloc, "clone", null, bundle_result);
         } else {
             std.debug.print(
                 "cas clone refs={d} prerequisites={d} objects={d} packs={d} reftable_files={d}\n",
@@ -761,7 +767,7 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         if (rest.len < 2) return error.Invalid;
         const result = try cas_mod.verifyBundle(alloc, std.mem.sliceTo(rest[1], 0));
         if (json_output) {
-            try writeCasBundleJson(alloc, "verify-bundle", result);
+            try writeCasBundleJson(alloc, "verify-bundle", null, result);
         } else {
             std.debug.print(
                 "cas verify-bundle refs={d} prerequisites={d} objects={d} packs={d} reftable_files={d}\n",
@@ -784,7 +790,7 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
             }
             const result = try cas_mod.createBundle(alloc, cfg.data_dir, dst, cfg.fsync, since_spec);
             if (json_output) {
-                try writeCasBundleJson(alloc, "create", result);
+                try writeCasBundleJson(alloc, "bundle", "create", result);
             } else {
                 std.debug.print(
                     "cas bundle create refs={d} prerequisites={d} objects={d} packs={d} reftable_files={d}\n",
@@ -796,7 +802,7 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         if (std.mem.eql(u8, action, "verify")) {
             const result = try cas_mod.verifyBundle(alloc, std.mem.sliceTo(rest[2], 0));
             if (json_output) {
-                try writeCasBundleJson(alloc, "verify", result);
+                try writeCasBundleJson(alloc, "bundle", "verify", result);
             } else {
                 std.debug.print(
                     "cas bundle verify refs={d} prerequisites={d} objects={d} packs={d} reftable_files={d}\n",
@@ -808,7 +814,7 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         if (std.mem.eql(u8, action, "apply")) {
             const result = try cas_mod.applyBundle(alloc, std.mem.sliceTo(rest[2], 0), cfg.data_dir, cfg.fsync);
             if (json_output) {
-                try writeCasBundleJson(alloc, "apply", result);
+                try writeCasBundleJson(alloc, "bundle", "apply", result);
             } else {
                 std.debug.print(
                     "cas bundle apply refs={d} prerequisites={d} objects={d} packs={d} reftable_files={d}\n",

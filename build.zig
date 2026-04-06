@@ -55,6 +55,46 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
     b.step("run", "Run sydraDB").dependOn(&run_cmd.step);
 
+    const demo_smoke = b.step("demo-smoke", "Run alpha demo and CLI ingest smoke checks");
+    const cli_ingest_smoke_step = b.step("cli-ingest-smoke", "Run CLI ingest regression smoke");
+    const repo_root = b.path(".");
+
+    const cli_ingest_smoke = b.addSystemCommand(&.{
+        "bash",
+        "-lc",
+        "tmpdir=$(mktemp -d \"${TMPDIR:-/tmp}/sydra-cli-ingest.XXXXXX\") && trap 'rm -rf \"$tmpdir\"' EXIT && cat >\"$tmpdir/sydradb.toml\" <<'EOF'\n" ++ "data_dir = \"./data\"\n" ++ "http_port = 0\n" ++ "fsync = \"none\"\n" ++ "flush_interval_ms = 25\n" ++ "memtable_max_bytes = 32768\n" ++ "mem_limit_bytes = 268435456\n" ++ "auth_token = \"\"\n" ++ "enable_influx = false\n" ++ "enable_prom = false\n" ++ "cas_mode = \"dual_write\"\n" ++ "metadata_read_mode = \"primary\"\n" ++ "query_compiler_mode = \"compiled\"\n" ++ "retention_days = 0\n" ++ "EOF\n" ++ "(cd \"$tmpdir\" && printf '{\"series\":\"smoke.cli\",\"ts\":10,\"value\":1.0}\\n{\"series\":\"smoke.cli\",\"ts\":20,\"value\":2.0}\\n' | \"$1\" ingest >/dev/null)",
+        "cli-ingest-smoke",
+    });
+    cli_ingest_smoke.addArtifactArg(exe);
+    cli_ingest_smoke.setCwd(repo_root);
+    cli_ingest_smoke.step.dependOn(b.getInstallStep());
+    cli_ingest_smoke_step.dependOn(&cli_ingest_smoke.step);
+    demo_smoke.dependOn(&cli_ingest_smoke.step);
+
+    const quickstart_smoke = b.addSystemCommand(&.{ "bash", "-lc", "SYDRADB_BIN=\"$1\" bash demos/demo-quickstart.sh", "demo-quickstart" });
+    quickstart_smoke.addArtifactArg(exe);
+    quickstart_smoke.setCwd(repo_root);
+    quickstart_smoke.step.dependOn(b.getInstallStep());
+    demo_smoke.dependOn(&quickstart_smoke.step);
+
+    const sydraql_smoke = b.addSystemCommand(&.{ "bash", "-lc", "SYDRADB_BIN=\"$1\" bash demos/demo-sydraql-compiled.sh", "demo-sydraql-compiled" });
+    sydraql_smoke.addArtifactArg(exe);
+    sydraql_smoke.setCwd(repo_root);
+    sydraql_smoke.step.dependOn(b.getInstallStep());
+    demo_smoke.dependOn(&sydraql_smoke.step);
+
+    const cas_smoke = b.addSystemCommand(&.{ "bash", "-lc", "SYDRADB_BIN=\"$1\" bash demos/demo-cas-lifecycle.sh", "demo-cas-lifecycle" });
+    cas_smoke.addArtifactArg(exe);
+    cas_smoke.setCwd(repo_root);
+    cas_smoke.step.dependOn(b.getInstallStep());
+    demo_smoke.dependOn(&cas_smoke.step);
+
+    const pgwire_smoke = b.addSystemCommand(&.{ "bash", "-lc", "SYDRADB_BIN=\"$1\" bash demos/demo-pgwire-preview.sh", "demo-pgwire-preview" });
+    pgwire_smoke.addArtifactArg(exe);
+    pgwire_smoke.setCwd(repo_root);
+    pgwire_smoke.step.dependOn(b.getInstallStep());
+    demo_smoke.dependOn(&pgwire_smoke.step);
+
     const unit_tests = if (is015) blk2: {
         const root_mod = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize });
         root_mod.addImport("build_options", build_options_module);

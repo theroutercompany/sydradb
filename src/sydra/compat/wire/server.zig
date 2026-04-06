@@ -1721,6 +1721,54 @@ test "extended protocol rejects binary result formats" {
     try std.testing.expect(std.mem.indexOf(u8, written, "binary result formats are not supported") != null);
 }
 
+test "extended protocol rejects unsupported direct prepare with stable feature-not-supported error" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/pgwire-extended-unsupported-prepare", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .compiled,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    var input = std.array_list.Managed(u8).init(alloc);
+    defer input.deinit();
+    try appendParseMessage(&input, "stmt1", "SELECT value FROM ext.regex WHERE value =~ '1'", 0);
+    try appendFrontendMessage(&input, 'S', &.{});
+
+    var read_stream = std.io.fixedBufferStream(input.items);
+    var read_state = read_stream.reader();
+    const reader = read_state.any();
+
+    var allocating_writer: std.Io.Writer.Allocating = .init(alloc);
+    defer allocating_writer.deinit();
+
+    try messageLoop(alloc, reader, anyWriter(&allocating_writer.writer), &allocating_writer.writer, engine);
+
+    const written = allocating_writer.written();
+    const message_types = try collectBackendMessageTypes(alloc, written);
+    defer alloc.free(message_types);
+    try std.testing.expectEqualSlices(u8, &.{ 'E', 'Z' }, message_types);
+    try std.testing.expect(std.mem.indexOf(u8, written, "0A000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "SQL parse unsupported by direct prepare") != null);
+}
+
 fn appendFrontendMessage(buffer: *std.array_list.Managed(u8), msg_type: u8, payload: []const u8) !void {
     try buffer.append(msg_type);
     var len_buf: [4]u8 = undefined;

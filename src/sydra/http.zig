@@ -97,7 +97,7 @@ fn handleRequest(handle: *alloc_mod.AllocatorHandle, alloc: std.mem.Allocator, e
         return try handleAllocStats(handle, req);
     }
     if (std.mem.eql(u8, path, "/status") and method == .GET) {
-        return try handleStatus(req);
+        return try handleStatus(alloc, eng, req);
     }
     if (std.mem.eql(u8, path, "/api/v1/ingest") and method == .POST) {
         return try handleIngest(alloc, eng, req);
@@ -347,15 +347,70 @@ fn respondExecutionError(alloc: std.mem.Allocator, req: *std.http.Server.Request
     return respondJsonError(alloc, req, contract.status, contract.code, contract.message);
 }
 
-fn respondJsonError(
+const StatusSnapshot = struct {
+    cas_mode: []const u8,
+    metadata_read_mode: []const u8,
+    query_compiler_mode: []const u8,
+    queue_depth: usize,
+    memtable_bytes: usize,
+    flush_total: u64,
+    flush_points_total: u64,
+    flush_seconds_total: f64,
+    ingest_total: u64,
+    ingest_rejected_total: u64,
+    ingest_rejected_mem_limit_total: u64,
+    wal_bytes_total: u64,
+    wal_append_failed_total: u64,
+    memtable_append_failed_total: u64,
+    ingest_quarantined_total: u64,
+    ingest_quarantine_write_failed_total: u64,
+    query_compile_attempts_total: u64,
+    query_compile_success_total: u64,
+    query_compile_fallback_total: u64,
+    query_compile_unsupported_total: u64,
+    query_compile_series_not_found_total: u64,
+    query_compile_ambiguous_selector_total: u64,
+    query_compile_shadow_mismatch_total: u64,
+    cas_shadow_mismatch_total: u64,
+};
+
+fn buildStatusSnapshot(eng: *Engine) StatusSnapshot {
+    return .{
+        .cas_mode = @tagName(eng.config.cas_mode),
+        .metadata_read_mode = @tagName(eng.config.metadata_read_mode),
+        .query_compiler_mode = @tagName(eng.config.query_compiler_mode),
+        .queue_depth = eng.queue.len(),
+        .memtable_bytes = eng.mem.bytes.load(.monotonic),
+        .flush_total = eng.metrics.flush_total.load(.monotonic),
+        .flush_points_total = eng.metrics.flush_points_total.load(.monotonic),
+        .flush_seconds_total = @as(f64, @floatFromInt(eng.metrics.flush_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .ingest_total = eng.metrics.ingest_total.load(.monotonic),
+        .ingest_rejected_total = eng.metrics.ingest_rejected_total.load(.monotonic),
+        .ingest_rejected_mem_limit_total = eng.metrics.ingest_rejected_mem_limit_total.load(.monotonic),
+        .wal_bytes_total = eng.metrics.wal_bytes_total.load(.monotonic),
+        .wal_append_failed_total = eng.metrics.wal_append_failed_total.load(.monotonic),
+        .memtable_append_failed_total = eng.metrics.memtable_append_failed_total.load(.monotonic),
+        .ingest_quarantined_total = eng.metrics.ingest_quarantined_total.load(.monotonic),
+        .ingest_quarantine_write_failed_total = eng.metrics.ingest_quarantine_write_failed_total.load(.monotonic),
+        .query_compile_attempts_total = eng.metrics.query_compile_attempts_total.load(.monotonic),
+        .query_compile_success_total = eng.metrics.query_compile_success_total.load(.monotonic),
+        .query_compile_fallback_total = eng.metrics.query_compile_fallback_total.load(.monotonic),
+        .query_compile_unsupported_total = eng.metrics.query_compile_unsupported_total.load(.monotonic),
+        .query_compile_series_not_found_total = eng.metrics.query_compile_series_not_found_total.load(.monotonic),
+        .query_compile_ambiguous_selector_total = eng.metrics.query_compile_ambiguous_selector_total.load(.monotonic),
+        .query_compile_shadow_mismatch_total = eng.metrics.query_compile_shadow_mismatch_total.load(.monotonic),
+        .cas_shadow_mismatch_total = eng.metrics.cas_shadow_mismatch_total.load(.monotonic),
+    };
+}
+
+fn buildJsonErrorPayload(
     alloc: std.mem.Allocator,
-    req: *std.http.Server.Request,
     status: std.http.Status,
     code: []const u8,
     message: []const u8,
-) !void {
+) ![]u8 {
     var payload = std.array_list.Managed(u8).init(alloc);
-    defer payload.deinit();
+    errdefer payload.deinit();
     var writer = payload.writer();
     var tmp: [128]u8 = undefined;
     var adapter = writer.adaptToNewApi(&tmp);
@@ -371,8 +426,94 @@ fn respondJsonError(
     try jw.endObject();
     try iface.flush();
     if (adapter.err) |write_err| return write_err;
+    return try payload.toOwnedSlice();
+}
+
+fn writeStatusPayload(jw: *std.json.Stringify, snapshot: StatusSnapshot) !void {
+    try jw.beginObject();
+    try jw.objectField("status");
+    try jw.write("ok");
+    try jw.objectField("cas_mode");
+    try jw.write(snapshot.cas_mode);
+    try jw.objectField("metadata_read_mode");
+    try jw.write(snapshot.metadata_read_mode);
+    try jw.objectField("query_compiler_mode");
+    try jw.write(snapshot.query_compiler_mode);
+
+    try jw.objectField("runtime");
+    try jw.beginObject();
+    try jw.objectField("queue_depth");
+    try jw.write(snapshot.queue_depth);
+    try jw.objectField("memtable_bytes");
+    try jw.write(snapshot.memtable_bytes);
+    try jw.objectField("flush_total");
+    try jw.write(snapshot.flush_total);
+    try jw.objectField("flush_points_total");
+    try jw.write(snapshot.flush_points_total);
+    try jw.objectField("flush_seconds_total");
+    try jw.write(snapshot.flush_seconds_total);
+    try jw.objectField("ingest_total");
+    try jw.write(snapshot.ingest_total);
+    try jw.objectField("ingest_rejected_total");
+    try jw.write(snapshot.ingest_rejected_total);
+    try jw.objectField("ingest_rejected_mem_limit_total");
+    try jw.write(snapshot.ingest_rejected_mem_limit_total);
+    try jw.objectField("wal_bytes_total");
+    try jw.write(snapshot.wal_bytes_total);
+    try jw.objectField("wal_append_failed_total");
+    try jw.write(snapshot.wal_append_failed_total);
+    try jw.objectField("memtable_append_failed_total");
+    try jw.write(snapshot.memtable_append_failed_total);
+    try jw.objectField("ingest_quarantined_total");
+    try jw.write(snapshot.ingest_quarantined_total);
+    try jw.objectField("ingest_quarantine_write_failed_total");
+    try jw.write(snapshot.ingest_quarantine_write_failed_total);
+    try jw.objectField("query_compile_attempts_total");
+    try jw.write(snapshot.query_compile_attempts_total);
+    try jw.objectField("query_compile_success_total");
+    try jw.write(snapshot.query_compile_success_total);
+    try jw.objectField("query_compile_fallback_total");
+    try jw.write(snapshot.query_compile_fallback_total);
+    try jw.objectField("query_compile_unsupported_total");
+    try jw.write(snapshot.query_compile_unsupported_total);
+    try jw.objectField("query_compile_series_not_found_total");
+    try jw.write(snapshot.query_compile_series_not_found_total);
+    try jw.objectField("query_compile_ambiguous_selector_total");
+    try jw.write(snapshot.query_compile_ambiguous_selector_total);
+    try jw.objectField("query_compile_shadow_mismatch_total");
+    try jw.write(snapshot.query_compile_shadow_mismatch_total);
+    try jw.objectField("cas_shadow_mismatch_total");
+    try jw.write(snapshot.cas_shadow_mismatch_total);
+    try jw.endObject();
+
+    try jw.endObject();
+}
+
+fn buildStatusPayload(alloc: std.mem.Allocator, snapshot: StatusSnapshot) ![]u8 {
+    var payload = std.array_list.Managed(u8).init(alloc);
+    errdefer payload.deinit();
+    var writer = payload.writer();
+    var tmp: [256]u8 = undefined;
+    var adapter = writer.adaptToNewApi(&tmp);
+    var iface = &adapter.new_interface;
+    var jw = std.json.Stringify{ .writer = iface };
+    try writeStatusPayload(&jw, snapshot);
+    try iface.flush();
+    if (adapter.err) |write_err| return write_err;
+    return try payload.toOwnedSlice();
+}
+
+fn respondJsonError(
+    alloc: std.mem.Allocator,
+    req: *std.http.Server.Request,
+    status: std.http.Status,
+    code: []const u8,
+    message: []const u8,
+) !void {
+    const payload = try buildJsonErrorPayload(alloc, status, code, message);
+    defer alloc.free(payload);
     const headers = [_]std.http.Header{.{ .name = "Content-Type", .value = "application/json" }};
-    try req.respond(payload.items, .{ .status = status, .keep_alive = false, .extra_headers = &headers });
+    try req.respond(payload, .{ .status = status, .keep_alive = false, .extra_headers = &headers });
 }
 
 fn writeJsonValue(jw: *std.json.Stringify, value: query_value.Value) !void {
@@ -516,6 +657,74 @@ test "writeStatsObject emits operator metrics" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"nullable\":true") != null);
 }
 
+test "buildJsonErrorPayload emits structured contract" {
+    const alloc = std.testing.allocator;
+    const payload = try buildJsonErrorPayload(alloc, .service_unavailable, "ingest_backpressure", "ingest backpressure: memory limit exceeded");
+    defer alloc.free(payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("ingest backpressure: memory limit exceeded", obj.get("error").?.string);
+    try std.testing.expectEqualStrings("ingest_backpressure", obj.get("code").?.string);
+    try std.testing.expectEqual(@as(i64, 503), obj.get("status").?.integer);
+}
+
+test "buildStatusPayload emits extended runtime counters" {
+    const alloc = std.testing.allocator;
+    const payload = try buildStatusPayload(alloc, .{
+        .cas_mode = "dual_write",
+        .metadata_read_mode = "primary",
+        .query_compiler_mode = "compiled",
+        .queue_depth = 2,
+        .memtable_bytes = 4096,
+        .flush_total = 3,
+        .flush_points_total = 17,
+        .flush_seconds_total = 0.125,
+        .ingest_total = 42,
+        .ingest_rejected_total = 4,
+        .ingest_rejected_mem_limit_total = 4,
+        .wal_bytes_total = 2048,
+        .wal_append_failed_total = 1,
+        .memtable_append_failed_total = 2,
+        .ingest_quarantined_total = 3,
+        .ingest_quarantine_write_failed_total = 4,
+        .query_compile_attempts_total = 9,
+        .query_compile_success_total = 6,
+        .query_compile_fallback_total = 3,
+        .query_compile_unsupported_total = 2,
+        .query_compile_series_not_found_total = 1,
+        .query_compile_ambiguous_selector_total = 1,
+        .query_compile_shadow_mismatch_total = 1,
+        .cas_shadow_mismatch_total = 5,
+    });
+    defer alloc.free(payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try std.testing.expectEqualStrings("ok", root.get("status").?.string);
+    try std.testing.expectEqualStrings("dual_write", root.get("cas_mode").?.string);
+    try std.testing.expectEqualStrings("primary", root.get("metadata_read_mode").?.string);
+    try std.testing.expectEqualStrings("compiled", root.get("query_compiler_mode").?.string);
+
+    const runtime = root.get("runtime").?.object;
+    try std.testing.expectEqual(@as(i64, 2), runtime.get("queue_depth").?.integer);
+    try std.testing.expectEqual(@as(i64, 4096), runtime.get("memtable_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, 17), runtime.get("flush_points_total").?.integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.125), runtime.get("flush_seconds_total").?.float, 0.0001);
+    try std.testing.expectEqual(@as(i64, 2048), runtime.get("wal_bytes_total").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), runtime.get("wal_append_failed_total").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), runtime.get("memtable_append_failed_total").?.integer);
+    try std.testing.expectEqual(@as(i64, 3), runtime.get("ingest_quarantined_total").?.integer);
+    try std.testing.expectEqual(@as(i64, 4), runtime.get("ingest_quarantine_write_failed_total").?.integer);
+    try std.testing.expectEqual(@as(i64, 9), runtime.get("query_compile_attempts_total").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), runtime.get("query_compile_shadow_mismatch_total").?.integer);
+    try std.testing.expectEqual(@as(i64, 5), runtime.get("cas_shadow_mismatch_total").?.integer);
+}
+
 fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
     const ingest_total = eng.metrics.ingest_total.load(.monotonic);
     const ingest_rejected_total = eng.metrics.ingest_rejected_total.load(.monotonic);
@@ -524,6 +733,10 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     const flush_ns_total = eng.metrics.flush_ns_total.load(.monotonic);
     const flush_points_total = eng.metrics.flush_points_total.load(.monotonic);
     const wal_bytes_total = eng.metrics.wal_bytes_total.load(.monotonic);
+    const wal_append_failed_total = eng.metrics.wal_append_failed_total.load(.monotonic);
+    const memtable_append_failed_total = eng.metrics.memtable_append_failed_total.load(.monotonic);
+    const ingest_quarantined_total = eng.metrics.ingest_quarantined_total.load(.monotonic);
+    const ingest_quarantine_write_failed_total = eng.metrics.ingest_quarantine_write_failed_total.load(.monotonic);
     const query_compile_attempts_total = eng.metrics.query_compile_attempts_total.load(.monotonic);
     const query_compile_success_total = eng.metrics.query_compile_success_total.load(.monotonic);
     const query_compile_fallback_total = eng.metrics.query_compile_fallback_total.load(.monotonic);
@@ -548,6 +761,10 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     try writer.print("# HELP sydradb_flush_seconds_total Aggregate flush duration in seconds\n# TYPE sydradb_flush_seconds_total counter\nsydradb_flush_seconds_total {d:.6}\n", .{flush_seconds_total});
     try writer.print("# HELP sydradb_flush_points_total Total points flushed to disk\n# TYPE sydradb_flush_points_total counter\nsydradb_flush_points_total {d}\n", .{flush_points_total});
     try writer.print("# HELP sydradb_wal_bytes_total Total bytes written to WAL\n# TYPE sydradb_wal_bytes_total counter\nsydradb_wal_bytes_total {d}\n", .{wal_bytes_total});
+    try writer.print("# HELP sydradb_wal_append_failed_total Total WAL append failures observed by the writer loop\n# TYPE sydradb_wal_append_failed_total counter\nsydradb_wal_append_failed_total {d}\n", .{wal_append_failed_total});
+    try writer.print("# HELP sydradb_memtable_append_failed_total Total memtable append failures observed by the writer loop\n# TYPE sydradb_memtable_append_failed_total counter\nsydradb_memtable_append_failed_total {d}\n", .{memtable_append_failed_total});
+    try writer.print("# HELP sydradb_ingest_quarantined_total Total ingest records written to quarantine after writer-loop failures\n# TYPE sydradb_ingest_quarantined_total counter\nsydradb_ingest_quarantined_total {d}\n", .{ingest_quarantined_total});
+    try writer.print("# HELP sydradb_ingest_quarantine_write_failed_total Total failures while writing ingest quarantine records\n# TYPE sydradb_ingest_quarantine_write_failed_total counter\nsydradb_ingest_quarantine_write_failed_total {d}\n", .{ingest_quarantine_write_failed_total});
     try writer.print("# HELP sydradb_query_compile_attempts_total Total compiled query attempts\n# TYPE sydradb_query_compile_attempts_total counter\nsydradb_query_compile_attempts_total {d}\n", .{query_compile_attempts_total});
     try writer.print("# HELP sydradb_query_compile_success_total Total compiled query lowerings that succeeded\n# TYPE sydradb_query_compile_success_total counter\nsydradb_query_compile_success_total {d}\n", .{query_compile_success_total});
     try writer.print("# HELP sydradb_query_compile_fallback_total Total query compiler fallbacks\n# TYPE sydradb_query_compile_fallback_total counter\nsydradb_query_compile_fallback_total {d}\n", .{query_compile_fallback_total});
@@ -709,9 +926,11 @@ fn handleCompatCatalog(alloc: std.mem.Allocator, req: *std.http.Server.Request) 
     try req.respond(buf.items, .{ .extra_headers = &headers });
 }
 
-fn handleStatus(req: *std.http.Server.Request) !void {
+fn handleStatus(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    const payload = try buildStatusPayload(alloc, buildStatusSnapshot(eng));
+    defer alloc.free(payload);
     const headers = [_]std.http.Header{.{ .name = "Content-Type", .value = "application/json" }};
-    try req.respond("{\"status\":\"ok\"}", .{ .extra_headers = &headers });
+    try req.respond(payload, .{ .extra_headers = &headers });
 }
 
 const default_tags_json = "{}";

@@ -22,6 +22,9 @@ fn sleepMs(ms: u64) void {
     }
 }
 
+const failed_ingest_quarantine_dir = "quarantine";
+const failed_ingest_quarantine_path = "quarantine/failed_ingest.jsonl";
+
 pub const Engine = struct {
     alloc: std.mem.Allocator,
     config: cfg.Config,
@@ -429,6 +432,10 @@ pub const Engine = struct {
         query_compile_shadow_mismatch_total: AtomicU64,
         ingest_rejected_total: AtomicU64,
         ingest_rejected_mem_limit_total: AtomicU64,
+        wal_append_failed_total: AtomicU64,
+        memtable_append_failed_total: AtomicU64,
+        ingest_quarantined_total: AtomicU64,
+        ingest_quarantine_write_failed_total: AtomicU64,
         cas_shadow_mismatch_total: AtomicU64,
 
         pub fn init() Metrics {
@@ -460,6 +467,10 @@ pub const Engine = struct {
                 .query_compile_shadow_mismatch_total = AtomicU64.init(0),
                 .ingest_rejected_total = AtomicU64.init(0),
                 .ingest_rejected_mem_limit_total = AtomicU64.init(0),
+                .wal_append_failed_total = AtomicU64.init(0),
+                .memtable_append_failed_total = AtomicU64.init(0),
+                .ingest_quarantined_total = AtomicU64.init(0),
+                .ingest_quarantine_write_failed_total = AtomicU64.init(0),
                 .cas_shadow_mismatch_total = AtomicU64.init(0),
             };
         }
@@ -593,7 +604,12 @@ pub const Engine = struct {
                 }
                 last_pop_ns = now_ns;
                 // WAL append
-                const wal_bytes = self.wal.append(it.series_id, it.ts, it.value) catch 0;
+                const wal_bytes = self.wal.append(it.series_id, it.ts, it.value) catch |err| blk: {
+                    _ = self.metrics.wal_append_failed_total.fetchAdd(1, .monotonic);
+                    self.quarantineFailedIngest(it, "wal_append", @errorName(err));
+                    std.log.warn("wal append failed: {s}", .{@errorName(err)});
+                    break :blk 0;
+                };
                 if (wal_bytes != 0) {
                     const wal_bytes_u64: u64 = @intCast(wal_bytes);
                     _ = self.metrics.wal_bytes_total.fetchAdd(wal_bytes_u64, .monotonic);
@@ -602,6 +618,8 @@ pub const Engine = struct {
                 if (self.appendMemtablePoint(it.series_id, it.ts, it.value)) |_| {
                     _ = self.metrics.ingest_total.fetchAdd(1, .monotonic);
                 } else |err| {
+                    _ = self.metrics.memtable_append_failed_total.fetchAdd(1, .monotonic);
+                    self.quarantineFailedIngest(it, "memtable_append", @errorName(err));
                     std.log.warn("failed to append to memtable: {s}", .{@errorName(err)});
                     continue;
                 }
@@ -718,6 +736,151 @@ pub const Engine = struct {
             std.log.warn("tag index save failed: {s}", .{@errorName(err)});
         };
         return segments_written > 0;
+    }
+
+    fn quarantineFailedIngest(self: *Engine, item: IngestItem, stage: []const u8, err_name: []const u8) void {
+        var payload = std.array_list.Managed(u8).init(self.alloc);
+        defer payload.deinit();
+
+        var writer = payload.writer();
+        var tmp: [256]u8 = undefined;
+        var adapter = writer.adaptToNewApi(&tmp);
+        var iface = &adapter.new_interface;
+        var jw = std.json.Stringify{ .writer = iface };
+
+        const resolution = self.metadata.series_catalog.resolveBySeriesId(item.series_id);
+        const series = resolution.series;
+        const canonical_tags = resolution.canonical_tags orelse item.tags_json;
+
+        jw.beginObject() catch |err| {
+            _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
+            std.log.warn("failed to build ingest quarantine payload: {s}", .{@errorName(err)});
+            return;
+        };
+        jw.objectField("series_id") catch |err| {
+            _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
+            std.log.warn("failed to build ingest quarantine payload: {s}", .{@errorName(err)});
+            return;
+        };
+        jw.write(item.series_id) catch |err| {
+            _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
+            std.log.warn("failed to build ingest quarantine payload: {s}", .{@errorName(err)});
+            return;
+        };
+        jw.objectField("series") catch |err| {
+            _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
+            std.log.warn("failed to build ingest quarantine payload: {s}", .{@errorName(err)});
+            return;
+        };
+        if (series) |name| {
+            jw.write(name) catch |err| {
+                _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
+                std.log.warn("failed to build ingest quarantine payload: {s}", .{@errorName(err)});
+                return;
+            };
+        } else {
+            jw.write(null) catch |err| {
+                _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
+                std.log.warn("failed to build ingest quarantine payload: {s}", .{@errorName(err)});
+                return;
+            };
+        }
+        jw.objectField("ts") catch |err| {
+            _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
+            std.log.warn("failed to build ingest quarantine payload: {s}", .{@errorName(err)});
+            return;
+        };
+        jw.write(item.ts) catch |err| {
+            _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
+            std.log.warn("failed to build ingest quarantine payload: {s}", .{@errorName(err)});
+            return;
+        };
+        jw.objectField("value") catch |err| {
+            _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
+            std.log.warn("failed to build ingest quarantine payload: {s}", .{@errorName(err)});
+            return;
+        };
+        jw.write(item.value) catch |err| {
+            _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
+            std.log.warn("failed to build ingest quarantine payload: {s}", .{@errorName(err)});
+            return;
+        };
+        jw.objectField("tags_json") catch |err| {
+            _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
+            std.log.warn("failed to build ingest quarantine payload: {s}", .{@errorName(err)});
+            return;
+        };
+        jw.write(canonical_tags) catch |err| {
+            _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
+            std.log.warn("failed to build ingest quarantine payload: {s}", .{@errorName(err)});
+            return;
+        };
+        jw.objectField("stage") catch |err| {
+            _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
+            std.log.warn("failed to build ingest quarantine payload: {s}", .{@errorName(err)});
+            return;
+        };
+        jw.write(stage) catch |err| {
+            _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
+            std.log.warn("failed to build ingest quarantine payload: {s}", .{@errorName(err)});
+            return;
+        };
+        jw.objectField("error") catch |err| {
+            _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
+            std.log.warn("failed to build ingest quarantine payload: {s}", .{@errorName(err)});
+            return;
+        };
+        jw.write(err_name) catch |err| {
+            _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
+            std.log.warn("failed to build ingest quarantine payload: {s}", .{@errorName(err)});
+            return;
+        };
+        jw.endObject() catch |err| {
+            _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
+            std.log.warn("failed to build ingest quarantine payload: {s}", .{@errorName(err)});
+            return;
+        };
+        iface.flush() catch |err| {
+            _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
+            std.log.warn("failed to build ingest quarantine payload: {s}", .{@errorName(err)});
+            return;
+        };
+        if (adapter.err) |err| {
+            _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
+            std.log.warn("failed to build ingest quarantine payload: {s}", .{@errorName(err)});
+            return;
+        }
+
+        self.data_dir.makePath(failed_ingest_quarantine_dir) catch |err| {
+            _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
+            std.log.warn("failed to create ingest quarantine dir: {s}", .{@errorName(err)});
+            return;
+        };
+
+        var file = self.data_dir.createFile(failed_ingest_quarantine_path, .{ .read = true, .truncate = false }) catch |err| {
+            _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
+            std.log.warn("failed to open ingest quarantine file: {s}", .{@errorName(err)});
+            return;
+        };
+        defer file.close();
+
+        file.seekFromEnd(0) catch |err| {
+            _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
+            std.log.warn("failed to seek ingest quarantine file: {s}", .{@errorName(err)});
+            return;
+        };
+        file.writeAll(payload.items) catch |err| {
+            _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
+            std.log.warn("failed to write ingest quarantine payload: {s}", .{@errorName(err)});
+            return;
+        };
+        file.writeAll("\n") catch |err| {
+            _ = self.metrics.ingest_quarantine_write_failed_total.fetchAdd(1, .monotonic);
+            std.log.warn("failed to write ingest quarantine payload: {s}", .{@errorName(err)});
+            return;
+        };
+
+        _ = self.metrics.ingest_quarantined_total.fetchAdd(1, .monotonic);
     }
 
     fn hourBucket(ts: i64) i64 {
@@ -2121,6 +2284,66 @@ test "engine metrics track ingest and flush" {
     try std.testing.expect(flush_ns > 0);
 }
 
+test "engine quarantines failed ingest payloads with selector metadata" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/quarantine-data", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    const input_tags = "{\"rack\":\"r1\",\"host\":\"a\"}";
+    const sid = types.seriesIdFrom("quarantine.series", input_tags);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    try engine.registerSeries("quarantine.series", input_tags, sid);
+    engine.quarantineFailedIngest(.{
+        .series_id = sid,
+        .ts = 123,
+        .value = 4.5,
+        .tags_json = input_tags,
+    }, "wal_append", "SyntheticFailure");
+
+    try std.testing.expectEqual(@as(u64, 1), engine.metrics.ingest_quarantined_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), engine.metrics.ingest_quarantine_write_failed_total.load(.monotonic));
+
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var quarantine_file = try data_dir.openFile(failed_ingest_quarantine_path, .{});
+    defer quarantine_file.close();
+    const contents = try quarantine_file.readToEndAlloc(talloc, 4096);
+    defer talloc.free(contents);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, talloc, std.mem.trim(u8, contents, "\r\n"), .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    try std.testing.expectEqual(@as(i64, @intCast(sid)), obj.get("series_id").?.integer);
+    try std.testing.expectEqualStrings("quarantine.series", obj.get("series").?.string);
+    try std.testing.expectEqual(@as(i64, 123), obj.get("ts").?.integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 4.5), obj.get("value").?.float, 1e-9);
+    try std.testing.expectEqualStrings("{\"host\":\"a\",\"rack\":\"r1\"}", obj.get("tags_json").?.string);
+    try std.testing.expectEqualStrings("wal_append", obj.get("stage").?.string);
+    try std.testing.expectEqualStrings("SyntheticFailure", obj.get("error").?.string);
+}
+
 test "engine snapshotTo captures a restorable CAS bundle" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -2624,6 +2847,95 @@ test "engine resolveSelector surfaces metadata for by-id and exact lookups" {
     } });
     try std.testing.expectEqual(series_catalog_mod.ResolutionStatus.exact_match, exact.status);
     try std.testing.expectEqual(sid, exact.series_id.?);
+}
+
+test "engine selector resolution stays deterministic across legacy shadow and primary modes" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/selector-parity-data", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const tags_a = "{\"rack\":\"r1\",\"host\":\"a\"}";
+    const tags_b = "{\"rack\":\"r2\",\"host\":\"b\"}";
+    const canonical_tags_a = "{\"host\":\"a\",\"rack\":\"r1\"}";
+    const canonical_tags_b = "{\"host\":\"b\",\"rack\":\"r2\"}";
+    const sid_a = types.seriesIdFrom("parity.series", tags_a);
+    const sid_b = types.seriesIdFrom("parity.series", tags_b);
+
+    {
+        const config = cfg.Config{
+            .data_dir = try talloc.dupe(u8, data_path),
+            .http_port = 0,
+            .fsync = .none,
+            .flush_interval_ms = 5,
+            .memtable_max_bytes = 512,
+            .retention_days = 0,
+            .auth_token = try talloc.dupe(u8, ""),
+            .enable_influx = false,
+            .enable_prom = false,
+            .mem_limit_bytes = 1024 * 1024,
+            .cas_mode = .dual_write,
+            .retention_ns = std.StringHashMap(u32).init(talloc),
+        };
+
+        var engine = try Engine.init(talloc, config);
+        defer engine.deinit();
+
+        try engine.registerSeries("parity.series", tags_a, sid_a);
+        try engine.ingest(.{ .series_id = sid_a, .ts = 10, .value = 1.0, .tags_json = tags_a });
+        try engine.registerSeries("parity.series", tags_b, sid_b);
+        try engine.ingest(.{ .series_id = sid_b, .ts = 20, .value = 2.0, .tags_json = tags_b });
+        try waitForFlush(engine, 1, 1_000);
+        try engine.verifyCasState();
+    }
+
+    const modes = [_]cfg.MetadataReadMode{ .legacy, .shadow, .primary };
+    for (modes) |mode| {
+        const config = cfg.Config{
+            .data_dir = try talloc.dupe(u8, data_path),
+            .http_port = 0,
+            .fsync = .none,
+            .flush_interval_ms = 5,
+            .memtable_max_bytes = 512,
+            .retention_days = 0,
+            .auth_token = try talloc.dupe(u8, ""),
+            .enable_influx = false,
+            .enable_prom = false,
+            .mem_limit_bytes = 1024 * 1024,
+            .cas_mode = .dual_write,
+            .metadata_read_mode = mode,
+            .retention_ns = std.StringHashMap(u32).init(talloc),
+        };
+
+        var engine = try Engine.init(talloc, config);
+        defer engine.deinit();
+
+        try std.testing.expect(engine.resolveUniqueSeriesName("parity.series") == .ambiguous);
+
+        try std.testing.expectEqual(sid_a, switch (try engine.resolveExactSeries("parity.series", tags_a)) {
+            .resolved => |resolved| resolved,
+            else => return error.TestUnexpectedResult,
+        });
+        try std.testing.expectEqual(sid_b, switch (try engine.resolveExactSeries("parity.series", canonical_tags_b)) {
+            .resolved => |resolved| resolved,
+            else => return error.TestUnexpectedResult,
+        });
+        try std.testing.expect((try engine.resolveExactSeries("parity.series", "{\"host\":\"missing\"}")) == .not_found);
+
+        const by_id = try engine.resolveSelector(.{ .by_id = sid_a });
+        try std.testing.expectEqual(series_catalog_mod.ResolutionStatus.resolved, by_id.status);
+        try std.testing.expectEqualStrings("parity.series", by_id.series.?);
+        try std.testing.expectEqualStrings(canonical_tags_a, by_id.canonical_tags.?);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, talloc, "{\"host\":\"a\"}", .{});
+        defer parsed.deinit();
+        var matches = try engine.collectMatchingSeriesIds(talloc, parsed.value, true);
+        defer matches.deinit();
+        try std.testing.expectEqual(@as(usize, 1), matches.items.len);
+        try std.testing.expectEqual(sid_a, matches.items[0]);
+    }
 }
 
 test "engine rebuilds missing series catalog from segment metadata and wal registrations" {

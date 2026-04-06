@@ -22,7 +22,7 @@ Process entrypoint for the SydraDB binary.
 High-level behavior:
 
 1. Initializes `alloc_mod.AllocatorHandle`.
-2. Prints `sydraDB pre-alpha`.
+2. Prints `sydraDB pre-alpha` only when stderr is attached to a TTY.
 3. Calls `server.run(&alloc_handle)`.
 
 Notes:
@@ -41,7 +41,9 @@ pub fn main() !void {
     var alloc_handle = alloc_mod.AllocatorHandle.init();
     defer alloc_handle.deinit();
 
-    std.debug.print("sydraDB pre-alpha\n", .{});
+    if (std.fs.File.stderr().isTty()) {
+        std.debug.print("sydraDB pre-alpha\n", .{});
+    }
     try server.run(&alloc_handle);
 }
 ```

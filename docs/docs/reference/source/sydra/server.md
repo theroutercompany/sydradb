@@ -114,6 +114,8 @@ It constructs:
 
 And runs `compat.wire.server.run(alloc, server_cfg)`.
 
+The startup banner is now only printed when stderr is attached to a TTY, so background automation does not need to filter it.
+
 ### `fn cmdIngest(alloc: std.mem.Allocator, args: [][:0]u8) !void`
 
 Reads NDJSON from stdin and ingests each line into the engine.
@@ -130,12 +132,13 @@ Series IDs:
 
 - This command now uses the same `types.seriesIdFrom(series, tags_json)` derivation as HTTP ingest.
 - The command flushes before exit, so a successful return means the ingested points are queryable from local state.
+- The human-readable `ingested {n} points` summary is only printed when stderr is attached to a TTY.
 
 ```zig title="cmdIngest shared parse + apply (excerpt)"
-const parsed = ingest_mod.parseLine(alloc, slice) catch continue;
+const parsed = http.parseIngestLine(alloc, slice) catch continue;
 defer parsed.deinit(alloc);
 
-_ = try ingest_mod.applyParsedLine(eng, parsed);
+_ = try http.applyIngestLine(eng, parsed);
 _ = try eng.flushNow();
 ```
 

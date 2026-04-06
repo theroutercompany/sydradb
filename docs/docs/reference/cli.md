@@ -40,6 +40,8 @@ Defaults:
 
 Current support is intentionally narrow and should be treated as a preview alpha surface: startup/auth flow, simple query execution, and a preview prepared/extended flow. `COPY` and broader compatibility layers remain out of scope for the current alpha cycle.
 
+When a direct prepared/extended query falls outside that preview subset, the current contract is to fail fast with PostgreSQL-style `0A000` (`feature not supported`) errors rather than silently widening support claims.
+
 Implementation: [`cmdPgWire`](./source/sydra/server.md#fn-cmdpgwirealloc-stdmemallocator-args-0u8-void).
 
 ## `ingest`
@@ -58,6 +60,8 @@ Each line uses the same parser as `POST /api/v1/ingest`:
 - `tags` participate in canonical series-id derivation
 
 The command flushes before exit, so a successful return means the ingested points are queryable from the local repository state.
+
+The human-readable success summary is only printed when stderr is attached to a TTY, which keeps noninteractive smoke runs and scripts quieter.
 
 Implementation: [`cmdIngest`](./source/sydra/server.md#fn-cmdingestalloc-stdmemallocator-args-0u8-void).
 

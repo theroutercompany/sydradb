@@ -25,6 +25,70 @@ Returns Prometheus text exposition.
 
 Implementation: [`handleMetrics`](./source/sydra/http.md#fn-handlemetrics-void).
 
+## `GET /status`
+
+Returns a lightweight JSON health snapshot with:
+
+- `status`
+- `cas_mode`
+- `metadata_read_mode`
+- `query_compiler_mode`
+- `runtime.queue_depth`
+- `runtime.memtable_bytes`
+- `runtime.flush_total`
+- `runtime.flush_points_total`
+- `runtime.flush_seconds_total`
+- `runtime.ingest_total`
+- `runtime.ingest_rejected_total`
+- `runtime.ingest_rejected_mem_limit_total`
+- `runtime.wal_bytes_total`
+- `runtime.wal_append_failed_total`
+- `runtime.memtable_append_failed_total`
+- `runtime.ingest_quarantined_total`
+- `runtime.ingest_quarantine_write_failed_total`
+- `runtime.query_compile_attempts_total`
+- `runtime.query_compile_success_total`
+- `runtime.query_compile_fallback_total`
+- `runtime.query_compile_unsupported_total`
+- `runtime.query_compile_series_not_found_total`
+- `runtime.query_compile_ambiguous_selector_total`
+- `runtime.query_compile_shadow_mismatch_total`
+- `runtime.cas_shadow_mismatch_total`
+
+Example:
+
+```json
+{
+  "status": "ok",
+  "cas_mode": "dual_write",
+  "metadata_read_mode": "primary",
+  "query_compiler_mode": "compiled",
+  "runtime": {
+    "queue_depth": 0,
+    "memtable_bytes": 0,
+    "flush_total": 3,
+    "flush_points_total": 17,
+    "flush_seconds_total": 0.125,
+    "ingest_total": 42,
+    "ingest_rejected_total": 1,
+    "ingest_rejected_mem_limit_total": 1,
+    "wal_bytes_total": 2048,
+    "wal_append_failed_total": 0,
+    "memtable_append_failed_total": 0,
+    "ingest_quarantined_total": 0,
+    "ingest_quarantine_write_failed_total": 0,
+    "query_compile_attempts_total": 9,
+    "query_compile_success_total": 6,
+    "query_compile_fallback_total": 3,
+    "query_compile_unsupported_total": 2,
+    "query_compile_series_not_found_total": 1,
+    "query_compile_ambiguous_selector_total": 0,
+    "query_compile_shadow_mismatch_total": 0,
+    "cas_shadow_mismatch_total": 0
+  }
+}
+```
+
 ## `POST /api/v1/ingest`
 
 Consumes NDJSON (newline-delimited JSON). Each line is an object with:

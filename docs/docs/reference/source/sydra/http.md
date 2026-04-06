@@ -98,7 +98,7 @@ Route table (path + method → handler):
 - `GET /debug/compat/stats` → `handleCompatStats`
 - `GET /debug/compat/catalog` → `handleCompatCatalog`
 - `GET /debug/alloc/stats` → `handleAllocStats`
-- `GET /status` → `handleStatus` (see “Known issues” below)
+- `GET /status` → `handleStatus`
 - `POST /api/v1/ingest` → `handleIngest`
 - `POST /api/v1/query/range` → `handleQuery`
 - `GET /api/v1/query/range` → `handleQueryGet`
@@ -201,7 +201,20 @@ defer cursor.deinit();
 - `const default_tags_json = "{}"`
 - `const TagsJson = struct { value: []const u8, owned: ?[]u8 }`
 - `fn extractTagsJson(...) !TagsJson` – converts a JSON object into a JSON string
+- `fn buildJsonErrorPayload(...) ![]u8` – serializes the structured JSON error contract before `req.respond(...)`
+- `fn buildStatusPayload(...) ![]u8` – serializes the `/status` payload so it can be tested directly
 - `fn respondJsonError(...) !void` – JSON error payloads with `error`, `code`, and `status`
 - `fn writeStatsObject(...) !void` – emits the `stats` object for sydraQL responses
-- `fn findHeader(...) ?[]const u8` – case-insensitive header lookup
 
+### `fn handleStatus(...) !void`
+
+Returns lightweight runtime health JSON:
+
+- config mode snapshot (`cas_mode`, `metadata_read_mode`, `query_compiler_mode`)
+- queue depth and memtable bytes
+- ingest / flush / WAL counters, including writer-loop append failure and quarantine counters
+- ingest rejection counters
+- compiler attempt / success / fallback counters
+- compiler series-not-found / ambiguous-selector / shadow-mismatch counters
+- CAS shadow mismatch counter
+- `fn findHeader(...) ?[]const u8` – case-insensitive header lookup
