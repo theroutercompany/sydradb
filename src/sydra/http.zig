@@ -356,6 +356,8 @@ const StatusSnapshot = struct {
     flush_total: u64,
     flush_points_total: u64,
     flush_seconds_total: f64,
+    wal_append_total: u64,
+    wal_append_seconds_total: f64,
     ingest_total: u64,
     ingest_rejected_total: u64,
     ingest_rejected_mem_limit_total: u64,
@@ -387,6 +389,8 @@ fn buildStatusSnapshot(eng: *Engine) StatusSnapshot {
         .flush_total = eng.metrics.flush_total.load(.monotonic),
         .flush_points_total = eng.metrics.flush_points_total.load(.monotonic),
         .flush_seconds_total = @as(f64, @floatFromInt(eng.metrics.flush_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .wal_append_total = eng.metrics.wal_append_total.load(.monotonic),
+        .wal_append_seconds_total = @as(f64, @floatFromInt(eng.metrics.wal_append_ns_total.load(.monotonic))) / 1_000_000_000.0,
         .ingest_total = eng.metrics.ingest_total.load(.monotonic),
         .ingest_rejected_total = eng.metrics.ingest_rejected_total.load(.monotonic),
         .ingest_rejected_mem_limit_total = eng.metrics.ingest_rejected_mem_limit_total.load(.monotonic),
@@ -458,6 +462,10 @@ fn writeStatusPayload(jw: *std.json.Stringify, snapshot: StatusSnapshot) !void {
     try jw.write(snapshot.flush_points_total);
     try jw.objectField("flush_seconds_total");
     try jw.write(snapshot.flush_seconds_total);
+    try jw.objectField("wal_append_total");
+    try jw.write(snapshot.wal_append_total);
+    try jw.objectField("wal_append_seconds_total");
+    try jw.write(snapshot.wal_append_seconds_total);
     try jw.objectField("ingest_total");
     try jw.write(snapshot.ingest_total);
     try jw.objectField("ingest_rejected_total");
@@ -694,6 +702,8 @@ test "buildStatusPayload emits extended runtime counters" {
         .flush_total = 3,
         .flush_points_total = 17,
         .flush_seconds_total = 0.125,
+        .wal_append_total = 11,
+        .wal_append_seconds_total = 0.02,
         .ingest_total = 42,
         .ingest_rejected_total = 4,
         .ingest_rejected_mem_limit_total = 4,
@@ -730,6 +740,8 @@ test "buildStatusPayload emits extended runtime counters" {
     try std.testing.expectEqual(@as(i64, 4096), runtime.get("memtable_bytes").?.integer);
     try std.testing.expectEqual(@as(i64, 17), runtime.get("flush_points_total").?.integer);
     try std.testing.expectApproxEqAbs(@as(f64, 0.125), runtime.get("flush_seconds_total").?.float, 0.0001);
+    try std.testing.expectEqual(@as(i64, 11), runtime.get("wal_append_total").?.integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.02), runtime.get("wal_append_seconds_total").?.float, 0.0001);
     try std.testing.expectEqual(@as(i64, 2048), runtime.get("wal_bytes_total").?.integer);
     try std.testing.expectEqual(@as(i64, 1), runtime.get("wal_append_failed_total").?.integer);
     try std.testing.expectEqual(@as(i64, 2), runtime.get("memtable_append_failed_total").?.integer);
@@ -750,6 +762,8 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     const flush_total = eng.metrics.flush_total.load(.monotonic);
     const flush_ns_total = eng.metrics.flush_ns_total.load(.monotonic);
     const flush_points_total = eng.metrics.flush_points_total.load(.monotonic);
+    const wal_append_total = eng.metrics.wal_append_total.load(.monotonic);
+    const wal_append_seconds_total = @as(f64, @floatFromInt(eng.metrics.wal_append_ns_total.load(.monotonic))) / 1_000_000_000.0;
     const wal_bytes_total = eng.metrics.wal_bytes_total.load(.monotonic);
     const wal_append_failed_total = eng.metrics.wal_append_failed_total.load(.monotonic);
     const memtable_append_failed_total = eng.metrics.memtable_append_failed_total.load(.monotonic);
@@ -781,6 +795,8 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     try writer.print("# HELP sydradb_flush_total Total flush operations\n# TYPE sydradb_flush_total counter\nsydradb_flush_total {d}\n", .{flush_total});
     try writer.print("# HELP sydradb_flush_seconds_total Aggregate flush duration in seconds\n# TYPE sydradb_flush_seconds_total counter\nsydradb_flush_seconds_total {d:.6}\n", .{flush_seconds_total});
     try writer.print("# HELP sydradb_flush_points_total Total points flushed to disk\n# TYPE sydradb_flush_points_total counter\nsydradb_flush_points_total {d}\n", .{flush_points_total});
+    try writer.print("# HELP sydradb_wal_append_total Total WAL append operations performed by the writer loop\n# TYPE sydradb_wal_append_total counter\nsydradb_wal_append_total {d}\n", .{wal_append_total});
+    try writer.print("# HELP sydradb_wal_append_seconds_total Aggregate WAL append duration in seconds\n# TYPE sydradb_wal_append_seconds_total counter\nsydradb_wal_append_seconds_total {d:.6}\n", .{wal_append_seconds_total});
     try writer.print("# HELP sydradb_wal_bytes_total Total bytes written to WAL\n# TYPE sydradb_wal_bytes_total counter\nsydradb_wal_bytes_total {d}\n", .{wal_bytes_total});
     try writer.print("# HELP sydradb_wal_append_failed_total Total WAL append failures observed by the writer loop\n# TYPE sydradb_wal_append_failed_total counter\nsydradb_wal_append_failed_total {d}\n", .{wal_append_failed_total});
     try writer.print("# HELP sydradb_memtable_append_failed_total Total memtable append failures observed by the writer loop\n# TYPE sydradb_memtable_append_failed_total counter\nsydradb_memtable_append_failed_total {d}\n", .{memtable_append_failed_total});

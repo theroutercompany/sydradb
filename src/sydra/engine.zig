@@ -409,6 +409,8 @@ pub const Engine = struct {
         flush_total: AtomicU64,
         flush_ns_total: AtomicU64,
         flush_points_total: AtomicU64,
+        wal_append_total: AtomicU64,
+        wal_append_ns_total: AtomicU64,
         wal_bytes_total: AtomicU64,
         queue_pop_total: AtomicU64,
         queue_wait_ns_total: AtomicU64,
@@ -447,6 +449,8 @@ pub const Engine = struct {
                 .flush_total = AtomicU64.init(0),
                 .flush_ns_total = AtomicU64.init(0),
                 .flush_points_total = AtomicU64.init(0),
+                .wal_append_total = AtomicU64.init(0),
+                .wal_append_ns_total = AtomicU64.init(0),
                 .wal_bytes_total = AtomicU64.init(0),
                 .queue_pop_total = AtomicU64.init(0),
                 .queue_wait_ns_total = AtomicU64.init(0),
@@ -610,12 +614,17 @@ pub const Engine = struct {
                 }
                 last_pop_ns = now_ns;
                 // WAL append
+                const wal_start_ns = std.time.nanoTimestamp();
                 const wal_bytes = self.wal.append(it.series_id, it.ts, it.value) catch |err| blk: {
                     _ = self.metrics.wal_append_failed_total.fetchAdd(1, .monotonic);
                     self.quarantineFailedIngest(it, "wal_append", @errorName(err));
                     std.log.warn("wal append failed: {s}", .{@errorName(err)});
                     break :blk 0;
                 };
+                const wal_elapsed_ns_i128 = std.time.nanoTimestamp() - wal_start_ns;
+                const wal_elapsed_ns: u64 = @intCast(wal_elapsed_ns_i128);
+                _ = self.metrics.wal_append_total.fetchAdd(1, .monotonic);
+                _ = self.metrics.wal_append_ns_total.fetchAdd(wal_elapsed_ns, .monotonic);
                 if (wal_bytes != 0) {
                     const wal_bytes_u64: u64 = @intCast(wal_bytes);
                     _ = self.metrics.wal_bytes_total.fetchAdd(wal_bytes_u64, .monotonic);
@@ -2360,8 +2369,12 @@ test "engine metrics track ingest and flush" {
     try std.testing.expectEqual(@as(u64, 1), flush_total);
     const flush_points = engine.metrics.flush_points_total.load(.monotonic);
     try std.testing.expectEqual(@as(u64, 3), flush_points);
+    const wal_append_total = engine.metrics.wal_append_total.load(.monotonic);
+    try std.testing.expectEqual(@as(u64, 3), wal_append_total);
     const wal_bytes = engine.metrics.wal_bytes_total.load(.monotonic);
     try std.testing.expect(wal_bytes > 0);
+    const wal_append_ns = engine.metrics.wal_append_ns_total.load(.monotonic);
+    try std.testing.expect(wal_append_ns > 0);
     const flush_ns = engine.metrics.flush_ns_total.load(.monotonic);
     try std.testing.expect(flush_ns > 0);
 }

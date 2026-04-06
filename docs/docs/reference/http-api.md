@@ -38,6 +38,8 @@ Returns a lightweight JSON health snapshot with:
 - `runtime.flush_total`
 - `runtime.flush_points_total`
 - `runtime.flush_seconds_total`
+- `runtime.wal_append_total`
+- `runtime.wal_append_seconds_total`
 - `runtime.ingest_total`
 - `runtime.ingest_rejected_total`
 - `runtime.ingest_rejected_mem_limit_total`
@@ -72,6 +74,8 @@ Example:
     "flush_total": 3,
     "flush_points_total": 17,
     "flush_seconds_total": 0.125,
+    "wal_append_total": 19,
+    "wal_append_seconds_total": 0.004,
     "ingest_total": 42,
     "ingest_rejected_total": 1,
     "ingest_rejected_mem_limit_total": 1,
