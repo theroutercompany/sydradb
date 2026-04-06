@@ -10185,6 +10185,110 @@ test "local fetch borrows source repositories and tracks source refs" {
     try std.testing.expectEqualStrings(tracking_name, remote_head);
 }
 
+test "local fetch tracks remote symbolic HEAD for non-main branches" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const src_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/fetch-head-src", .{tmp.sub_path});
+    defer talloc.free(src_path);
+    const dst_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/fetch-head-dst", .{tmp.sub_path});
+    defer talloc.free(dst_path);
+    try std.fs.cwd().makePath(src_path);
+    try std.fs.cwd().makePath(dst_path);
+
+    var src_dir = try std.fs.cwd().openDir(src_path, .{ .iterate = true });
+    defer src_dir.close();
+    var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, src_dir, .none);
+    defer series_catalog.deinit();
+    const sid = types.hash64("fetch.head.series");
+    _ = try series_catalog.register("fetch.head.series", "{}", sid);
+    const points = [_]types.Point{.{ .ts = 1_000, .value = 1.0 }};
+    const seg_path = try segment_mod.writeSegment(talloc, src_dir, sid, 0, points[0..]);
+    defer talloc.free(seg_path);
+    try manifest.add(src_dir, sid, 0, 1_000, 1_000, 1, seg_path);
+
+    var src = try CasManager.init(talloc, src_path, .none);
+    defer src.deinit();
+    const src_head = try src.bootstrapIfMissing(src_dir, &manifest, &tags, &series_catalog);
+    const feature_ref = "heads/feature";
+    try src.refs.updateHeadAtomic(feature_ref, src_head);
+    try src.writeHeadSymRef(feature_ref);
+
+    _ = try fetchLocalRepository(talloc, src_path, dst_path, .none);
+
+    var dst = try CasManager.init(talloc, dst_path, .none);
+    defer dst.deinit();
+    const tracking_feature = try trackingRefName(talloc, src.repository_id, feature_ref);
+    defer talloc.free(tracking_feature);
+    const tracked_feature = try dst.refs.readHead(tracking_feature) orelse return error.MissingCasHead;
+    try std.testing.expect(tracked_feature.eql(src_head));
+
+    const remote_head_name = try trackingHeadSymRefName(talloc, src.repository_id);
+    defer talloc.free(remote_head_name);
+    const remote_head = try dst.refs.readSymRef(remote_head_name) orelse return error.MissingCasHead;
+    defer talloc.free(remote_head);
+    try std.testing.expectEqualStrings(tracking_feature, remote_head);
+}
+
+test "clone local preserves symbolic HEAD target for bundle and borrow modes" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const src_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/clone-head-src", .{tmp.sub_path});
+    defer talloc.free(src_path);
+    const bundle_clone_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/clone-head-bundle", .{tmp.sub_path});
+    defer talloc.free(bundle_clone_path);
+    const borrow_clone_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/clone-head-borrow", .{tmp.sub_path});
+    defer talloc.free(borrow_clone_path);
+    try std.fs.cwd().makePath(src_path);
+    try std.fs.cwd().makePath(bundle_clone_path);
+    try std.fs.cwd().makePath(borrow_clone_path);
+
+    var src_dir = try std.fs.cwd().openDir(src_path, .{ .iterate = true });
+    defer src_dir.close();
+    var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, src_dir, .none);
+    defer series_catalog.deinit();
+    const sid = types.hash64("clone.head.series");
+    _ = try series_catalog.register("clone.head.series", "{}", sid);
+    const points = [_]types.Point{.{ .ts = 1_000, .value = 1.0 }};
+    const seg_path = try segment_mod.writeSegment(talloc, src_dir, sid, 0, points[0..]);
+    defer talloc.free(seg_path);
+    try manifest.add(src_dir, sid, 0, 1_000, 1_000, 1, seg_path);
+
+    var src = try CasManager.init(talloc, src_path, .none);
+    defer src.deinit();
+    const src_head = try src.bootstrapIfMissing(src_dir, &manifest, &tags, &series_catalog);
+    const feature_ref = "heads/feature";
+    try src.refs.updateHeadAtomic(feature_ref, src_head);
+    try src.writeHeadSymRef(feature_ref);
+
+    _ = try cloneLocalRepositoryWithOptions(talloc, src_path, bundle_clone_path, .none, .{});
+    _ = try cloneLocalRepositoryWithOptions(talloc, src_path, borrow_clone_path, .none, .{ .borrow = true });
+
+    var bundle_clone = try CasManager.init(talloc, bundle_clone_path, .none);
+    defer bundle_clone.deinit();
+    var borrow_clone = try CasManager.init(talloc, borrow_clone_path, .none);
+    defer borrow_clone.deinit();
+
+    const bundle_head = try bundle_clone.readHeadSymRef() orelse return error.MissingCasHead;
+    defer talloc.free(bundle_head);
+    try std.testing.expectEqualStrings(feature_ref, bundle_head);
+
+    const borrow_head = try borrow_clone.readHeadSymRef() orelse return error.MissingCasHead;
+    defer talloc.free(borrow_head);
+    try std.testing.expectEqualStrings(feature_ref, borrow_head);
+}
+
 test "local fetch can materialize borrowed content" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
