@@ -62,8 +62,21 @@ export function createShowcaseApp(manager = new ShowcaseSessionManager()) {
 
 export async function startShowcaseServer(port = runnerPort, host = runnerHost) {
   const { app, manager } = createShowcaseApp();
-  const server = await new Promise<import("node:http").Server>((resolve) => {
-    const httpServer = app.listen(port, host, () => resolve(httpServer));
+  const server = await new Promise<import("node:http").Server>((resolve, reject) => {
+    const httpServer = app.listen(port, host);
+    const onError = (error: Error) => {
+      httpServer.off("listening", onListening);
+      reject(error);
+    };
+    const onListening = () => {
+      httpServer.off("error", onError);
+      resolve(httpServer);
+    };
+    httpServer.once("error", onError);
+    httpServer.once("listening", onListening);
+  }).catch(async (error) => {
+    await manager.close().catch(() => {});
+    throw error;
   });
   return {
     port,

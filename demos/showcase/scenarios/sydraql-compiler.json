@@ -33,10 +33,10 @@
     {
       "id": "compiled-fallback",
       "title": "Trigger a compiled fallback",
-      "summary": "Run a fill clause that the compiler does not yet own so compiled mode reports a clean legacy fallback instead of failing opaquely.",
+      "summary": "Run a linear fill clause that still falls back cleanly today so compiled mode reports legacy takeover instead of failing opaquely.",
       "kind": "sydraql_query",
       "workspace": "compiled",
-      "query": "select time_bucket(60, time) as bucket, avg(value) as avg_value from edge.power_kw where time >= 0 group by time_bucket(60, time) fill(previous) order by bucket desc",
+      "query": "select time_bucket(60, time) as bucket, avg(value) as avg_value from edge.power_kw where time >= 0 group by time_bucket(60, time) fill(linear) order by bucket desc",
       "evidencePanels": [
         { "id": "compiled-fallback-stats", "title": "Fallback stats", "kind": "query-stats", "sourcePath": "stats" }
       ],
@@ -49,10 +49,10 @@
     {
       "id": "shadow-fallback",
       "title": "Compare shadow-mode fallback behavior",
-      "summary": "Run the same fill query under shadow mode so the UI can highlight mode-specific fallback behavior during compiler rollout.",
+      "summary": "Run the same linear fill query under shadow mode so the UI can highlight mode-specific fallback behavior during compiler rollout.",
       "kind": "sydraql_query",
       "workspace": "shadow",
-      "query": "select time_bucket(60, time) as bucket, avg(value) as avg_value from edge.power_kw where time >= 0 group by time_bucket(60, time) fill(previous) order by bucket desc",
+      "query": "select time_bucket(60, time) as bucket, avg(value) as avg_value from edge.power_kw where time >= 0 group by time_bucket(60, time) fill(linear) order by bucket desc",
       "evidencePanels": [
         { "id": "shadow-stats", "title": "Shadow stats", "kind": "query-stats", "sourcePath": "stats" }
       ],

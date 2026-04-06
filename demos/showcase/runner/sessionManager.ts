@@ -11,6 +11,7 @@ import { fixturesDir, findRepoRoot, resolveSydraBinary } from "./paths.js";
 import {
   cleanupSandbox,
   createWorkspace,
+  postRangeQuery,
   postSydraqlQuery,
   runBinary,
   seedWorkspaceFromFixtures,
@@ -30,10 +31,77 @@ interface SessionSnapshot {
 
 export class ShowcaseSessionManager {
   private session: SessionSnapshot | null = null;
+  private operationChain: Promise<void> = Promise.resolve();
 
   async reset(): Promise<DemoStateResponse> {
-    await this.close();
+    return this.withLock(async () => this.resetUnlocked());
+  }
 
+  async getState(): Promise<DemoStateResponse> {
+    return this.withLock(async () => {
+      if (!this.session) {
+        return this.resetUnlocked();
+      }
+      return this.toState();
+    });
+  }
+
+  async runScenario(scenarioId: string): Promise<ScenarioRunResult> {
+    return this.withLock(async () => {
+      const state = this.session ? this.toState() : await this.resetUnlocked();
+      const session = this.session!;
+      const manifest = session.manifests.find((entry) => entry.id === scenarioId);
+      if (!manifest) {
+        throw new Error(`Unknown scenario ${scenarioId}`);
+      }
+
+      const availability = buildScenarioAvailability([manifest], session.capabilities)[0];
+      if (!availability.available) {
+        return {
+          scenarioId,
+          status: "blocked",
+          startedAt: new Date().toISOString(),
+          finishedAt: new Date().toISOString(),
+          sessionId: state.sessionId,
+          workspaceRoot: session.rootDir,
+          steps: [],
+        };
+      }
+
+      const scenarioRoot = path.join(session.rootDir, "runs", `${scenarioId}-${Date.now()}`);
+      await fsp.mkdir(scenarioRoot, { recursive: true });
+      const seedRoutine = seedRoutines[manifest.seedRoutine];
+      const cleanupRoutine = cleanupRoutines[manifest.cleanupRoutine] ?? cleanupSandbox;
+      if (!seedRoutine) {
+        throw new Error(`Unknown seed routine ${manifest.seedRoutine}`);
+      }
+
+      const sandbox = await seedRoutine(scenarioRoot, session.binaryPath);
+      try {
+        return await runScenarioManifest(manifest, sandbox, session.binaryPath, session.id);
+      } finally {
+        await cleanupRoutine(sandbox, true);
+      }
+    });
+  }
+
+  async close(): Promise<void> {
+    await this.withLock(async () => {
+      await this.closeUnlocked();
+    });
+  }
+
+  private async withLock<T>(operation: () => Promise<T>): Promise<T> {
+    const run = this.operationChain.then(operation, operation);
+    this.operationChain = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    return run;
+  }
+
+  private async resetUnlocked(): Promise<DemoStateResponse> {
+    await this.closeUnlocked();
     const repoRoot = process.env.SYDRADB_BIN ? process.cwd() : findRepoRoot();
     const binaryPath = resolveSydraBinary(repoRoot);
     const sessionId = randomUUID();
@@ -53,51 +121,7 @@ export class ShowcaseSessionManager {
     return this.toState();
   }
 
-  async getState(): Promise<DemoStateResponse> {
-    if (!this.session) {
-      return this.reset();
-    }
-    return this.toState();
-  }
-
-  async runScenario(scenarioId: string): Promise<ScenarioRunResult> {
-    const state = await this.getState();
-    const session = this.session!;
-    const manifest = session.manifests.find((entry) => entry.id === scenarioId);
-    if (!manifest) {
-      throw new Error(`Unknown scenario ${scenarioId}`);
-    }
-
-    const availability = buildScenarioAvailability([manifest], session.capabilities)[0];
-    if (!availability.available) {
-      return {
-        scenarioId,
-        status: "blocked",
-        startedAt: new Date().toISOString(),
-        finishedAt: new Date().toISOString(),
-        sessionId: state.sessionId,
-        workspaceRoot: session.rootDir,
-        steps: [],
-      };
-    }
-
-    const scenarioRoot = path.join(session.rootDir, "runs", `${scenarioId}-${Date.now()}`);
-    await fsp.mkdir(scenarioRoot, { recursive: true });
-    const seedRoutine = seedRoutines[manifest.seedRoutine];
-    const cleanupRoutine = cleanupRoutines[manifest.cleanupRoutine] ?? cleanupSandbox;
-    if (!seedRoutine) {
-      throw new Error(`Unknown seed routine ${manifest.seedRoutine}`);
-    }
-
-    const sandbox = await seedRoutine(scenarioRoot, session.binaryPath);
-    try {
-      return await runScenarioManifest(manifest, sandbox, session.binaryPath, session.id);
-    } finally {
-      await cleanupRoutine(sandbox, true);
-    }
-  }
-
-  async close(): Promise<void> {
+  private async closeUnlocked(): Promise<void> {
     if (!this.session) {
       return;
     }
@@ -111,11 +135,11 @@ export class ShowcaseSessionManager {
       "binary.present": binaryPresent,
       "cas.json": false,
       "cas.history": false,
-      "sydraql.http": binaryPresent,
-      "compiler.telemetry": binaryPresent,
-      "cas.maintenance": binaryPresent,
-      "cas.bundle": binaryPresent,
-      "compiler.modes": binaryPresent,
+      "sydraql.http": false,
+      "compiler.telemetry": false,
+      "cas.maintenance": false,
+      "cas.bundle": false,
+      "compiler.modes": false,
       "multi_writer_head_writes": false,
     };
 
@@ -130,6 +154,32 @@ export class ShowcaseSessionManager {
       capabilities["cas.json"] = parsed.schema_version === 1 && parsed.command === "refs";
     } catch {
       capabilities["cas.json"] = false;
+    }
+
+    const httpWorkspace = await createWorkspace(path.join(sessionRoot, "capability-probe"), "http");
+    try {
+      await seedWorkspaceFromFixtures(
+        httpWorkspace,
+        binaryPath,
+        [path.join(fixturesDir, "edge-incident", "edge-east-baseline.ndjson")],
+      );
+      await startWorkspaceServer(httpWorkspace, binaryPath);
+      const rangeResult = await postRangeQuery(httpWorkspace, {
+        series: "edge.power_kw",
+        tags: {
+          site: "edge-east",
+          host: "edge-east-gw-1",
+          firmware: "1.2.0",
+          sensor: "power",
+        },
+        start: 1700000000,
+        end: 1700000400,
+      });
+      capabilities["sydraql.http"] = Array.isArray(rangeResult) && rangeResult.length >= 1;
+    } catch {
+      capabilities["sydraql.http"] = false;
+    } finally {
+      await stopWorkspaceServer(httpWorkspace).catch(() => {});
     }
 
     if (capabilities["cas.json"]) {
@@ -185,12 +235,6 @@ export class ShowcaseSessionManager {
           binaryPath,
           [path.join(fixturesDir, "edge-incident", "edge-east-baseline.ndjson")],
         );
-        await seedWorkspaceFromFixtures(
-          shadowWorkspace,
-          binaryPath,
-          [path.join(fixturesDir, "edge-incident", "edge-east-baseline.ndjson")],
-        );
-
         await startWorkspaceServer(compilerWorkspace, binaryPath);
         const compiledResult = (await postSydraqlQuery(
           compilerWorkspace,
@@ -207,10 +251,15 @@ export class ShowcaseSessionManager {
       }
 
       try {
+        await seedWorkspaceFromFixtures(
+          shadowWorkspace,
+          binaryPath,
+          [path.join(fixturesDir, "edge-incident", "edge-east-baseline.ndjson")],
+        );
         await startWorkspaceServer(shadowWorkspace, binaryPath);
         const shadowResult = (await postSydraqlQuery(
           shadowWorkspace,
-          "select time_bucket(60, time) as bucket, avg(value) as avg_value from edge.power_kw where time >= 0 group by time_bucket(60, time) fill(previous) order by bucket desc",
+          "select time_bucket(60, time) as bucket, avg(value) as avg_value from edge.power_kw where time >= 0 group by time_bucket(60, time) fill(linear) order by bucket desc",
         )) as {
           stats?: { execution_mode?: string; legacy_fallback?: boolean; fallback_reason?: string };
         };
