@@ -1,0 +1,17 @@
+{
+  "suite": "bench-alloc",
+  "release": "v0.4.0",
+  "dimensions": {
+    "ops": 10000,
+    "concurrency": 4,
+    "series": [1, 100, 10000]
+  },
+  "metrics": [
+    "throughput_ops_per_s",
+    "latency_p50_us",
+    "latency_p95_us",
+    "latency_p99_us",
+    "flush_total",
+    "wal_bytes_total"
+  ]
+}

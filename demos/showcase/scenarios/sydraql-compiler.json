@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "id": "sydraql-compiler",
+  "title": "Compiler Modes and Fallbacks",
+  "summary": "Exercise compiled, shadow, and legacy execution paths while surfacing the fallback counters that matter during rapid compiler iteration.",
+  "maturity": "alpha",
+  "subsystems": ["sydraql", "compiler", "engine"],
+  "requiredCapabilities": ["binary.present", "sydraql.http", "compiler.telemetry", "compiler.modes"],
+  "minimumOutputs": ["compiled.stats.execution_mode", "compiled.stats.fallback_reason", "metrics.counters"],
+  "seedRoutine": "seedSydraqlCompiler",
+  "cleanupRoutine": "cleanupWorkspaceSandbox",
+  "whySQLiteFallsShort": [
+    "SQLite does not expose a native query-compiler rollout story with shadow mode and explicit fallback metrics as part of the product contract.",
+    "SydraDB's compiler work can be demonstrated honestly while it evolves because execution mode and fallback reasons are visible in query responses and metrics.",
+    "This lets the team ship compiler improvements incrementally instead of treating the engine as a black box until release day."
+  ],
+  "steps": [
+    {
+      "id": "compiled-supported",
+      "title": "Run a compiled-supported query",
+      "summary": "Confirm the compiled mode stays on the native path for a supported aggregate query.",
+      "kind": "sydraql_query",
+      "workspace": "compiled",
+      "query": "select tag.host as host, avg(value) as avg_value from edge.power_kw where tag.site = 'edge-east' group by tag.host",
+      "evidencePanels": [
+        { "id": "compiled-supported-stats", "title": "Compiled stats", "kind": "query-stats", "sourcePath": "stats" }
+      ],
+      "assertions": [
+        { "path": "stats.execution_mode", "operator": "equals", "value": "compiled" },
+        { "path": "stats.legacy_fallback", "operator": "equals", "value": false }
+      ]
+    },
+    {
+      "id": "compiled-fallback",
+      "title": "Trigger a compiled fallback",
+      "summary": "Run an unsupported function shape to prove compiled mode reports a clean legacy fallback instead of failing opaquely.",
+      "kind": "sydraql_query",
+      "workspace": "compiled",
+      "query": "select abs(-1)",
+      "evidencePanels": [
+        { "id": "compiled-fallback-stats", "title": "Fallback stats", "kind": "query-stats", "sourcePath": "stats" }
+      ],
+      "assertions": [
+        { "path": "stats.execution_mode", "operator": "equals", "value": "compiled" },
+        { "path": "stats.legacy_fallback", "operator": "equals", "value": true },
+        { "path": "stats.fallback_reason", "operator": "equals", "value": "unsupported_function" }
+      ]
+    },
+    {
+      "id": "shadow-fallback",
+      "title": "Compare shadow-mode fallback behavior",
+      "summary": "Run the same unsupported query under shadow mode so the UI can highlight mode-specific behavior during compiler rollout.",
+      "kind": "sydraql_query",
+      "workspace": "shadow",
+      "query": "select abs(-1)",
+      "evidencePanels": [
+        { "id": "shadow-stats", "title": "Shadow stats", "kind": "query-stats", "sourcePath": "stats" }
+      ],
+      "assertions": [
+        { "path": "stats.execution_mode", "operator": "equals", "value": "shadow" },
+        { "path": "stats.legacy_fallback", "operator": "equals", "value": true }
+      ]
+    },
+    {
+      "id": "compiler-metrics",
+      "title": "Read compiler fallback counters",
+      "summary": "Fetch the Prometheus counters that track compiler attempts and fallback volume for the running compiled server.",
+      "kind": "metrics_snapshot",
+      "workspace": "compiled",
+      "counters": [
+        "sydradb_query_compile_attempts_total",
+        "sydradb_query_compile_fallback_total"
+      ],
+      "evidencePanels": [
+        { "id": "compiler-metrics", "title": "Compiler counters", "kind": "metrics", "sourcePath": "counters" }
+      ],
+      "assertions": [
+        { "path": "counters.sydradb_query_compile_attempts_total", "operator": "gte", "value": 2 },
+        { "path": "counters.sydradb_query_compile_fallback_total", "operator": "gte", "value": 1 }
+      ]
+    }
+  ]
+}

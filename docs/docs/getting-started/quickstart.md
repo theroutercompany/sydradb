@@ -56,6 +56,17 @@ curl -XPOST localhost:8080/api/v1/query/range \\
 
 See: [HTTP API – `POST /api/v1/query/range`](../reference/http-api.md#post-apiv1queryrange).
 
+## Run a compiled sydraQL query
+
+The default `v0.4.0` alpha path is the compiled sydraQL executor with visible fallback metrics for unsupported shapes:
+
+```sh
+curl -XPOST localhost:8080/api/v1/sydraql \\
+  --data-binary "select time, value from weather.room1 where time >= 1694290000 order by time limit 10"
+```
+
+See: [HTTP API – `POST /api/v1/sydraql`](../reference/http-api.md#post-apiv1sydraql).
+
 ## Nix (pinned toolchain)
 
 ```sh
@@ -74,3 +85,4 @@ See also:
 
 - [Running the server](./running-the-server.md)
 - [Ingest and query](./ingest-and-query.md)
+- [`demos/demo-quickstart.sh`](/Users/rexliu/sydradb/demos/demo-quickstart.sh)

@@ -8,11 +8,12 @@ Current alpha focus:
 
 - HTTP ingest
 - HTTP range queries
-- Basic sydraQL
-- Snapshot/restore
-- Narrow PostgreSQL simple-query compatibility
+- Compiled sydraQL as the default execution path for the supported subset
+- CAS-native snapshot, bundle, verify, clone, fetch/push, fsck, vacuum, and upgrade workflows
+- Snapshot/restore via CAS bundles
+- PostgreSQL wire protocol preview, including the current simple-query path and preview prepared/extended flow
 
-This is intentionally not a broad PostgreSQL replacement. The current compatibility layer is a small bridge for startup/auth flow, simple query execution, the current SQL translator subset, and standard `CommandComplete` behavior.
+This is intentionally not a broad PostgreSQL replacement. The current compatibility layer is a narrow alpha bridge: startup/auth flow, simple query execution, and a preview prepared/extended path. `COPY`, broader catalog emulation, and wider compatibility claims remain out of scope.
 
 ## Supported contract
 
@@ -25,14 +26,14 @@ This is intentionally not a broad PostgreSQL replacement. The current compatibil
 - Supported allocator modes:
   - `mimalloc` (default)
   - `default`
-- Experimental, not a release gate this cycle:
+- Alpha-only / preview surfaces:
   - `small_pool`
-  - `cas_mode = "dual_write"` metadata-first CAS commit graph
+  - PostgreSQL prepared statements / extended protocol through `pgwire`
 - Explicitly unsupported this cycle:
   - 32-bit targets
   - Influx LP / Prom remote_write adapters
   - full PostgreSQL catalog coverage
-  - prepared statements / extended protocol / COPY
+  - COPY
   - migration tooling
 
 ## Quick start
@@ -82,7 +83,34 @@ From now on, entering the directory will auto‑activate the correct toolchain.
 
 ## Status
 
-Pre-alpha. The goal of the current cycle is to make the existing TSDB core and narrow compatibility surface more honest, tighter, and better documented rather than broader.
+Alpha. The current cycle is a stabilization-and-truthfulness push: make the CAS-backed storage path, compiled sydraQL path, and benchmark/demo surface honest and reproducible before broadening the product contract again.
+
+## Benchmarks
+
+The repo now carries three benchmark entrypoints for the `v0.4.0` alpha cycle:
+
+```bash
+zig build bench-alloc -- --ops 10000 --concurrency 4 --series 1
+zig build bench-sydraql -- --points-per-series 32 --iterations 5
+zig build bench-cas
+```
+
+Scenario definitions live under [`benchmarks/README.md`](/Users/rexliu/sydradb/benchmarks/README.md), [`benchmarks/alloc/scenarios.json`](/Users/rexliu/sydradb/benchmarks/alloc/scenarios.json), [`benchmarks/sydraql/scenarios.json`](/Users/rexliu/sydradb/benchmarks/sydraql/scenarios.json), and [`benchmarks/cas/scenarios.json`](/Users/rexliu/sydradb/benchmarks/cas/scenarios.json).
+
+One checked-in sample run is published in [`benchmarks/v0.4.0-summary.md`](/Users/rexliu/sydradb/benchmarks/v0.4.0-summary.md).
+
+## Demos
+
+The repo also carries four reproducible demo scripts:
+
+```bash
+bash demos/demo-quickstart.sh
+bash demos/demo-sydraql-compiled.sh
+bash demos/demo-cas-lifecycle.sh
+bash demos/demo-pgwire-preview.sh
+```
+
+See [`demos/README.md`](/Users/rexliu/sydradb/demos/README.md) for the current checklist.
 
 ## License
 
@@ -92,6 +120,7 @@ Apache-2.0
 
 ```bash
 ./zig-out/bin/sydradb             # serve (HTTP): /api/v1/ingest, /api/v1/query/range, /api/v1/sydraql, /metrics
+./zig-out/bin/sydradb pgwire      # PostgreSQL wire protocol preview (simple query + preview prepared flow)
 ./zig-out/bin/sydradb ingest      # read NDJSON from stdin into local WAL
 ./zig-out/bin/sydradb query <series_id> <start_ts> <end_ts>
 ./zig-out/bin/sydradb compact     # merge small→large segments (v2 stub)
@@ -142,6 +171,7 @@ enable_influx = false
 enable_prom = true
 cas_mode = "off"  # off|dual_write
 metadata_read_mode = "legacy"  # legacy|shadow|primary
+query_compiler_mode = "compiled"  # legacy|shadow|compiled
 # Per-namespace TTL
 retention.weather = 30
 ```
@@ -152,6 +182,7 @@ Config notes:
 - `cas_mode = "dual_write"` writes immutable metadata commits and `refs/heads/main` alongside the legacy storage path.
 - `metadata_read_mode = "shadow"` serves from legacy metadata and cross-checks answers against the CAS snapshot.
 - `metadata_read_mode = "primary"` serves metadata from CAS and can boot even if `MANIFEST`, `tags.json`, or `series_catalog.jsonl` are missing.
+- `query_compiler_mode = "compiled"` is the default execution mode. Unsupported query shapes fall back to the legacy pipeline and emit visible fallback metrics.
 - Without `sydradb.toml`, fresh repositories default to `cas_mode = "dual_write"` plus `metadata_read_mode = "primary"`. Existing repositories without a migrated `objects/info/store-format` marker stay on `off` plus `legacy` until `cas migrate-reftable` or `cas upgrade` is run.
 - CAS repositories persist `objects/info/store-format` to version repository-wide storage behavior separately from per-object codecs. Fresh repositories initialize format v3 with a reftable ref backend plus canonical `segment_root` / `journal_root` metadata for active history. Legacy repositories stay in the older compatibility format until explicitly migrated and normalized.
 - WAL recovery order is sourced from the CAS commit graph when CAS is enabled, with any uncaptured live WAL files appended as tail replay.
@@ -177,3 +208,4 @@ Config notes:
 - `cas vacuum` is the one-shot maintenance path: it runs `fsck`, optionally repairs derivable metadata, applies expiry/materialization policy, repacks reachable loose objects, and then applies GC with the current prune-grace policy.
 - `enable_influx` and `enable_prom` remain parseable config flags, but they should be treated as placeholder or experimental toggles until real adapter surfaces land.
 - `auth_token` is the only built-in API auth mechanism today; if it is empty, `/api/*` is unauthenticated.
+- `pgwire` should be treated as a preview alpha interface for `v0.4.0`: useful for smoke tests and demos, but not yet a broad PostgreSQL compatibility promise.

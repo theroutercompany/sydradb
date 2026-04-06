@@ -5,7 +5,7 @@ title: Compatibility layer overview (src/sydra/compat)
 
 # Compatibility layer overview (`src/sydra/compat*`)
 
-This set of modules provides SydraDB’s PostgreSQL-compatibility “edges”:
+This set of modules provides SydraDB’s PostgreSQL-compatibility “edges” for the current alpha surface:
 
 - A minimal SQLSTATE mapping and error payload format
 - A tiny, in-memory catalog snapshot builder (namespaces/relations/attributes/types)
@@ -55,7 +55,7 @@ This set of modules provides SydraDB’s PostgreSQL-compatibility “edges”:
 
 - SSL/TLS: not implemented (SSLRequest is declined).
 - Cancel requests: not supported.
-- Extended query protocol: not implemented (Parse message returns a `0A000` error).
+- Extended query protocol: preview-only. Direct `Parse`/`Bind`/`Describe`/`Execute`/`Close` support exists for the narrow SQL-core prepared path exercised by `compat-wire-test`, but broader PostgreSQL session semantics are still out of scope.
 - Types: `RowDescription` uses a single “default” type mapping for all columns.
 
 ## Code excerpt (root re-exports)

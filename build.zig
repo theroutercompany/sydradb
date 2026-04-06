@@ -94,9 +94,9 @@ pub fn build(b: *std.Build) void {
             mod.addIncludePath(mimalloc_include);
             mod.addIncludePath(mimalloc_src_dir);
         }
-        break :blk3 b.addTest(.{ .root_module = mod });
+        break :blk3 b.addTest(.{ .root_module = mod, .filters = &.{"sydra.compat.wire"} });
     } else blk3: {
-        const compat_step = b.addTest(.{ .root_source_file = b.path("src/compat_wire_tests.zig"), .target = target, .optimize = optimize });
+        const compat_step = b.addTest(.{ .root_source_file = b.path("src/compat_wire_tests.zig"), .target = target, .optimize = optimize, .filters = &.{"sydra.compat.wire"} });
         compat_step.root_module.addImport("build_options", build_options_module);
         if (use_mimalloc) {
             compat_step.addIncludePath(mimalloc_include);
@@ -164,4 +164,76 @@ pub fn build(b: *std.Build) void {
     const bench_run = b.addRunArtifact(bench_exe);
     if (b.args) |args| bench_run.addArgs(args);
     b.step("bench-alloc", "Run allocator ingest benchmark").dependOn(&bench_run.step);
+
+    const bench_sydraql_exe = if (is015) blk5: {
+        const root_mod = b.createModule(.{ .root_source_file = b.path("tools/bench_sydraql.zig"), .target = target, .optimize = optimize });
+        root_mod.addImport("build_options", build_options_module);
+        root_mod.addImport("sydra_tooling", tooling_module);
+        if (use_mimalloc) {
+            root_mod.addIncludePath(mimalloc_include);
+            root_mod.addIncludePath(mimalloc_src_dir);
+        }
+        break :blk5 b.addExecutable(.{ .name = "bench_sydraql", .root_module = root_mod });
+    } else blk5: {
+        const exe_inner = b.addExecutable(.{ .name = "bench_sydraql", .root_source_file = b.path("tools/bench_sydraql.zig"), .target = target, .optimize = optimize });
+        exe_inner.root_module.addImport("build_options", build_options_module);
+        exe_inner.root_module.addImport("sydra_tooling", tooling_module);
+        if (use_mimalloc) {
+            exe_inner.addIncludePath(mimalloc_include);
+            exe_inner.addIncludePath(mimalloc_src_dir);
+            exe_inner.addCSourceFile(.{ .file = mimalloc_c_file, .flags = mimalloc_flags });
+            exe_inner.linkLibC();
+            exe_inner.linkSystemLibrary("pthread");
+        }
+        break :blk5 exe_inner;
+    };
+
+    if (use_mimalloc and is015) {
+        bench_sydraql_exe.addCSourceFile(.{ .file = mimalloc_c_file, .flags = mimalloc_flags });
+        bench_sydraql_exe.linkLibC();
+        bench_sydraql_exe.linkSystemLibrary("pthread");
+    } else if (!use_mimalloc) {
+        bench_sydraql_exe.linkLibC();
+        if (os_tag == .linux) bench_sydraql_exe.linkSystemLibrary("pthread");
+    }
+
+    const bench_sydraql_run = b.addRunArtifact(bench_sydraql_exe);
+    if (b.args) |args| bench_sydraql_run.addArgs(args);
+    b.step("bench-sydraql", "Run compiled SydraQL benchmark scenarios").dependOn(&bench_sydraql_run.step);
+
+    const bench_cas_exe = if (is015) blk6: {
+        const root_mod = b.createModule(.{ .root_source_file = b.path("tools/bench_cas.zig"), .target = target, .optimize = optimize });
+        root_mod.addImport("build_options", build_options_module);
+        root_mod.addImport("sydra_tooling", tooling_module);
+        if (use_mimalloc) {
+            root_mod.addIncludePath(mimalloc_include);
+            root_mod.addIncludePath(mimalloc_src_dir);
+        }
+        break :blk6 b.addExecutable(.{ .name = "bench_cas", .root_module = root_mod });
+    } else blk6: {
+        const exe_inner = b.addExecutable(.{ .name = "bench_cas", .root_source_file = b.path("tools/bench_cas.zig"), .target = target, .optimize = optimize });
+        exe_inner.root_module.addImport("build_options", build_options_module);
+        exe_inner.root_module.addImport("sydra_tooling", tooling_module);
+        if (use_mimalloc) {
+            exe_inner.addIncludePath(mimalloc_include);
+            exe_inner.addIncludePath(mimalloc_src_dir);
+            exe_inner.addCSourceFile(.{ .file = mimalloc_c_file, .flags = mimalloc_flags });
+            exe_inner.linkLibC();
+            exe_inner.linkSystemLibrary("pthread");
+        }
+        break :blk6 exe_inner;
+    };
+
+    if (use_mimalloc and is015) {
+        bench_cas_exe.addCSourceFile(.{ .file = mimalloc_c_file, .flags = mimalloc_flags });
+        bench_cas_exe.linkLibC();
+        bench_cas_exe.linkSystemLibrary("pthread");
+    } else if (!use_mimalloc) {
+        bench_cas_exe.linkLibC();
+        if (os_tag == .linux) bench_cas_exe.linkSystemLibrary("pthread");
+    }
+
+    const bench_cas_run = b.addRunArtifact(bench_cas_exe);
+    if (b.args) |args| bench_cas_run.addArgs(args);
+    b.step("bench-cas", "Run CAS bundle maintenance and local transfer benchmarks").dependOn(&bench_cas_run.step);
 }

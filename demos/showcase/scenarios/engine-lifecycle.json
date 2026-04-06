@@ -1,0 +1,114 @@
+{
+  "schemaVersion": 1,
+  "id": "engine-lifecycle",
+  "title": "Engine Lifecycle and Checkpoints",
+  "summary": "Start, restart, query, and mark a recovery anchor so the core engine lifecycle stays demonstrable while maintenance work keeps moving.",
+  "maturity": "candidate",
+  "subsystems": ["engine", "cas"],
+  "requiredCapabilities": ["binary.present", "cas.json", "sydraql.http"],
+  "minimumOutputs": ["range-before", "range-after-restart", "checkpoint-ref"],
+  "seedRoutine": "seedEngineLifecycle",
+  "cleanupRoutine": "cleanupWorkspaceSandbox",
+  "whySQLiteFallsShort": [
+    "SQLite persistence is file-centric, but SydraDB combines engine lifecycle, ingest/query, and CAS-backed recovery anchors in one storage model.",
+    "This makes restart behavior and maintenance history part of the product demonstration, not a side exercise around a generic embedded database file.",
+    "Engine work can be validated end-to-end with real restart and checkpoint flows as the core continues to change."
+  ],
+  "steps": [
+    {
+      "id": "start-server",
+      "title": "Start the engine",
+      "summary": "Bring the edge-east server online in its fresh scenario workspace.",
+      "kind": "server_control",
+      "workspace": "edge-east",
+      "action": "start",
+      "evidencePanels": [
+        { "id": "engine-start", "title": "Server state", "kind": "json" }
+      ]
+    },
+    {
+      "id": "range-before",
+      "title": "Query before restart",
+      "summary": "Confirm the seeded points are visible from the live engine before any restart happens.",
+      "kind": "query_range",
+      "workspace": "edge-east",
+      "payload": {
+        "series": "edge.power_kw",
+        "tags": {
+          "site": "edge-east",
+          "host": "edge-east-gw-1",
+          "firmware": "1.2.0",
+          "sensor": "power"
+        },
+        "start": 1700000000,
+        "end": 1700000400
+      },
+      "evidencePanels": [
+        { "id": "range-before-panel", "title": "Range before restart", "kind": "rows" }
+      ],
+      "assertions": [
+        { "path": "", "operator": "minLength", "value": 4 }
+      ]
+    },
+    {
+      "id": "restart-server",
+      "title": "Restart the engine",
+      "summary": "Restart the live process so recovery and replay behavior become visible in the same workflow.",
+      "kind": "server_control",
+      "workspace": "edge-east",
+      "action": "restart",
+      "evidencePanels": [
+        { "id": "restart-panel", "title": "Restart state", "kind": "json" }
+      ]
+    },
+    {
+      "id": "range-after-restart",
+      "title": "Query after restart",
+      "summary": "Re-run the range query after restart to prove the engine still serves the expected points.",
+      "kind": "query_range",
+      "workspace": "edge-east",
+      "payload": {
+        "series": "edge.power_kw",
+        "tags": {
+          "site": "edge-east",
+          "host": "edge-east-gw-1",
+          "firmware": "1.2.0",
+          "sensor": "power"
+        },
+        "start": 1700000000,
+        "end": 1700000400
+      },
+      "evidencePanels": [
+        { "id": "range-after-panel", "title": "Range after restart", "kind": "rows" }
+      ],
+      "assertions": [
+        { "path": "", "operator": "minLength", "value": 4 }
+      ]
+    },
+    {
+      "id": "anchor-ref",
+      "title": "Create a named recovery anchor",
+      "summary": "Mark the current head with a Git-like branch so later engine work has a known-good state to compare and restore.",
+      "kind": "shell_command",
+      "workspace": "edge-east",
+      "args": ["cas", "branch", "lifecycle-anchor"],
+      "evidencePanels": [
+        { "id": "anchor-command", "title": "Anchor command", "kind": "command" }
+      ]
+    },
+    {
+      "id": "refs-after-compact",
+      "title": "Inspect refs after anchoring",
+      "summary": "Confirm the repository now exposes the lifecycle anchor alongside heads/main.",
+      "kind": "cas_command",
+      "workspace": "edge-east",
+      "args": ["refs"],
+      "evidencePanels": [
+        { "id": "refs-after-compact-panel", "title": "Refs after anchoring", "kind": "json", "sourcePath": "entries" }
+      ],
+      "assertions": [
+        { "path": "entries", "operator": "minLength", "value": 2 }
+      ]
+    }
+  ]
+}

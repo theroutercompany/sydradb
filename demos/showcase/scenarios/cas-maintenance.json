@@ -1,0 +1,75 @@
+{
+  "schemaVersion": 1,
+  "id": "cas-maintenance",
+  "title": "Pack, fsck, GC, Vacuum",
+  "summary": "Exercise the maintenance plane that keeps a content-addressed repository inspectable and repairable over time.",
+  "maturity": "alpha",
+  "subsystems": ["cas", "git-model", "engine"],
+  "requiredCapabilities": ["binary.present", "cas.json", "cas.maintenance"],
+  "minimumOutputs": ["fsck.compatibility_debt", "fsck.repair", "vacuum.gc"],
+  "seedRoutine": "seedCasMaintenance",
+  "cleanupRoutine": "cleanupWorkspaceSandbox",
+  "whySQLiteFallsShort": [
+    "SQLite can validate page-level integrity, but it does not provide Git-like reachability, cruft quarantine, reflog-aware GC, and pack management as first-class maintenance primitives.",
+    "SydraDB exposes maintenance as repository-native commands instead of requiring opaque vendor tooling around a monolithic file.",
+    "The fsck, gc, and vacuum surface lets storage engineering validate behavior as the core engine changes rapidly."
+  ],
+  "steps": [
+    {
+      "id": "pack",
+      "title": "Pack reachable loose objects",
+      "summary": "Seal reachable loose objects into a pack set without collapsing older active packs.",
+      "kind": "cas_command",
+      "workspace": "edge-east",
+      "args": ["pack"],
+      "evidencePanels": [
+        { "id": "pack-output", "title": "Pack result", "kind": "json" }
+      ],
+      "assertions": [
+        { "path": "reachable_objects", "operator": "gte", "value": 1 }
+      ]
+    },
+    {
+      "id": "fsck",
+      "title": "Validate and repair derivable metadata",
+      "summary": "Run fsck with repair enabled to validate graph integrity and rebuild safe side indexes when needed.",
+      "kind": "cas_command",
+      "workspace": "edge-east",
+      "args": ["fsck", "--repair"],
+      "evidencePanels": [
+        { "id": "fsck-output", "title": "fsck report", "kind": "json" }
+      ],
+      "assertions": [
+        { "path": "refs", "operator": "gte", "value": 1 }
+      ]
+    },
+    {
+      "id": "gc",
+      "title": "Measure reachability and cruft handling",
+      "summary": "Dry-run reflog-aware GC to see what would be quarantined or pruned without mutating the repository.",
+      "kind": "cas_command",
+      "workspace": "edge-east",
+      "args": ["gc"],
+      "evidencePanels": [
+        { "id": "gc-output", "title": "GC report", "kind": "json" }
+      ],
+      "assertions": [
+        { "path": "reachable", "operator": "gte", "value": 1 }
+      ]
+    },
+    {
+      "id": "vacuum",
+      "title": "Run one-shot maintenance",
+      "summary": "Execute vacuum as the combined integrity, packing, expiry, and GC path for the repository.",
+      "kind": "cas_command",
+      "workspace": "edge-east",
+      "args": ["vacuum", "--repair"],
+      "evidencePanels": [
+        { "id": "vacuum-output", "title": "Vacuum report", "kind": "json" }
+      ],
+      "assertions": [
+        { "path": "pack.reachable_objects", "operator": "gte", "value": 1 }
+      ]
+    }
+  ]
+}

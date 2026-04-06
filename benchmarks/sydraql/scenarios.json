@@ -1,0 +1,44 @@
+{
+  "suite": "bench-sydraql",
+  "release": "v0.4.0",
+  "dataset_series": [2, 100, 10000],
+  "points_per_series": 32,
+  "iterations": 5,
+  "queries": [
+    {
+      "name": "constant",
+      "query": "select 1"
+    },
+    {
+      "name": "raw_scan_limit",
+      "query": "select time, value from weather.room1 where time >= 0 order by time limit 10"
+    },
+    {
+      "name": "grouped_aggregate",
+      "query": "select avg(value) from weather.room1 where time >= 0 group by time_bucket(60, time)"
+    },
+    {
+      "name": "selector_tag_read",
+      "query": "select tag.host as host, avg(value) as avg_value from tagged.room1 where tag.host = 'web' group by tag.host"
+    },
+    {
+      "name": "unsupported_fallback",
+      "query": "select abs(-1)"
+    }
+  ],
+  "metrics": [
+    "avg_elapsed_ms",
+    "avg_rows",
+    "avg_rows_scanned",
+    "parse_ms",
+    "validate_ms",
+    "bind_ms",
+    "compile_ms",
+    "logical_ms",
+    "optimize_ms",
+    "physical_ms",
+    "pipeline_ms",
+    "fallback_count",
+    "fallback_reason"
+  ]
+}

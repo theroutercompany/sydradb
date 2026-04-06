@@ -25,4 +25,4 @@ This page records the current alpha realignment at the documentation level. It e
 
 ## Current product statement
 
-SydraDB alpha is a single-node time-series database with HTTP ingest, HTTP range queries, basic sydraQL, snapshot/restore, and narrow PostgreSQL simple-query compatibility.
+SydraDB alpha is a single-node time-series database with HTTP ingest, HTTP range queries, compiled sydraQL as the default execution path for the supported subset, CAS-backed snapshot/bundle/maintenance workflows, and a preview PostgreSQL wire surface.

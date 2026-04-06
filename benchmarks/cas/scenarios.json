@@ -1,0 +1,30 @@
+{
+  "suite": "bench-cas",
+  "release": "v0.4.0",
+  "scenarios": [
+    {
+      "name": "fresh_primary",
+      "steps": ["bootstrap", "upgrade", "bundle_create", "bundle_verify", "bundle_apply", "fsck"]
+    },
+    {
+      "name": "packed_local",
+      "steps": ["bootstrap", "upgrade", "pack", "clone", "fetch_materialize", "push_owned"]
+    },
+    {
+      "name": "migrated_legacy",
+      "steps": ["bootstrap", "upgrade", "vacuum", "fsck"]
+    }
+  ],
+  "metrics": [
+    "elapsed_ms",
+    "ref_count",
+    "object_count",
+    "pack_count",
+    "reftable_file_count",
+    "reachable_objects",
+    "rewritten_objects",
+    "unreachable_count",
+    "pruned_count",
+    "deleted"
+  ]
+}

@@ -1,0 +1,104 @@
+{
+  "schemaVersion": 1,
+  "id": "cas-sync",
+  "title": "Bundle, Clone, Fetch, Push",
+  "summary": "Move repository state between local installations using pack-preserving bundles and Git-like local exchange workflows.",
+  "maturity": "alpha",
+  "subsystems": ["cas", "git-model", "engine"],
+  "requiredCapabilities": ["binary.present", "cas.json", "cas.bundle"],
+  "minimumOutputs": ["bundle.create.pack_count", "bundle.apply.ref_count", "clone.ref_count"],
+  "seedRoutine": "seedCasSync",
+  "cleanupRoutine": "cleanupWorkspaceSandbox",
+  "whySQLiteFallsShort": [
+    "SQLite can ship a database file, but it does not give you native bundle verification, prerequisite-aware apply, or local push/fetch workflows over immutable metadata objects.",
+    "SydraDB can exchange storage state as refs plus packed objects without inventing a second replication layer just for demos and ops.",
+    "Local clone, fetch, and push semantics let engineering teams rehearse multi-site workflows with the same primitives the storage layer already understands."
+  ],
+  "steps": [
+    {
+      "id": "bundle-create",
+      "title": "Create a portable bundle",
+      "summary": "Package the edge-east repository into a portable bundle with object and reftable metadata preserved.",
+      "kind": "cas_command",
+      "workspace": "edge-east",
+      "args": ["bundle", "create", "{{vars.bundle_dir}}"],
+      "evidencePanels": [
+        { "id": "bundle-create-output", "title": "Bundle create", "kind": "json" }
+      ],
+      "assertions": [
+        { "path": "pack_count", "operator": "gte", "value": 0 },
+        { "path": "ref_count", "operator": "gte", "value": 1 }
+      ]
+    },
+    {
+      "id": "bundle-verify",
+      "title": "Verify bundle integrity",
+      "summary": "Inspect the bundle manifest before apply so portability does not come at the cost of silent corruption.",
+      "kind": "cas_command",
+      "workspace": "edge-east",
+      "args": ["bundle", "verify", "{{vars.bundle_dir}}"],
+      "evidencePanels": [
+        { "id": "bundle-verify-output", "title": "Bundle verify", "kind": "json" }
+      ],
+      "assertions": [
+        { "path": "ref_count", "operator": "gte", "value": 1 }
+      ]
+    },
+    {
+      "id": "bundle-apply",
+      "title": "Apply bundle into HQ",
+      "summary": "Restore the bundle into the HQ workspace without rebuilding the repository one object at a time.",
+      "kind": "cas_command",
+      "workspace": "hq",
+      "args": ["bundle", "apply", "{{vars.bundle_dir}}"],
+      "evidencePanels": [
+        { "id": "bundle-apply-output", "title": "Bundle apply", "kind": "json" }
+      ],
+      "assertions": [
+        { "path": "ref_count", "operator": "gte", "value": 1 }
+      ]
+    },
+    {
+      "id": "clone",
+      "title": "Clone the repository locally",
+      "summary": "Use CAS clone to materialize a second local repository with refs and packed data preserved.",
+      "kind": "cas_command",
+      "workspace": "edge-east",
+      "args": ["clone", "{{vars.edge_east_data_dir}}", "{{vars.clone_target_data_dir}}"],
+      "evidencePanels": [
+        { "id": "clone-output", "title": "Local clone", "kind": "json" }
+      ],
+      "assertions": [
+        { "path": "ref_count", "operator": "gte", "value": 1 }
+      ]
+    },
+    {
+      "id": "fetch-local",
+      "title": "Fetch and materialize borrowed objects",
+      "summary": "Bring edge-west content into a prepared local target while materializing borrowed objects into owned storage.",
+      "kind": "cas_command",
+      "workspace": "fetch-target",
+      "args": ["fetch-local", "{{vars.edge_west_data_dir}}", "--materialize"],
+      "evidencePanels": [
+        { "id": "fetch-output", "title": "Fetch local", "kind": "json" }
+      ],
+      "assertions": [
+        { "path": "ref_count", "operator": "gte", "value": 1 }
+      ]
+    },
+    {
+      "id": "push-local",
+      "title": "Push owned state into another repository",
+      "summary": "Fast-forward another repository while keeping the destination independent of the source after transfer.",
+      "kind": "cas_command",
+      "workspace": "edge-east",
+      "args": ["push-local", "{{vars.push_target_data_dir}}"],
+      "evidencePanels": [
+        { "id": "push-output", "title": "Push local", "kind": "json" }
+      ],
+      "assertions": [
+        { "path": "ref_count", "operator": "gte", "value": 1 }
+      ]
+    }
+  ]
+}

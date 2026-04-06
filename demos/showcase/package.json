@@ -1,0 +1,41 @@
+{
+  "name": "@sydra/showcase",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Engineering-first showcase harness for SydraDB",
+  "scripts": {
+    "dev": "concurrently -n runner,ui -c cyan,magenta \"npm:dev:runner\" \"npm:dev:ui\"",
+    "dev:runner": "tsx watch runner/server.ts",
+    "dev:ui": "vite --config ui/vite.config.ts",
+    "build": "npm run build:runner && npm run build:ui",
+    "build:runner": "tsc -p runner/tsconfig.json",
+    "build:ui": "vite build --config ui/vite.config.ts",
+    "test": "vitest run",
+    "preview": "node dist/runner/server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@testing-library/jest-dom": "^6.6.3",
+    "@testing-library/react": "^16.1.0",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.13.4",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "concurrently": "^9.1.2",
+    "jsdom": "^25.0.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.3",
+    "vite": "^6.0.11",
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

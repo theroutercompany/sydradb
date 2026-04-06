@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "multi-writer-heads",
+  "title": "Multi-Writer Head Writes",
+  "summary": "Reserved scenario slot for conflict-aware ref advance and multi-writer head semantics as that work stabilizes.",
+  "maturity": "experimental",
+  "subsystems": ["cas", "git-model", "engine"],
+  "requiredCapabilities": ["binary.present", "cas.json", "multi_writer_head_writes"],
+  "minimumOutputs": ["reserved"],
+  "seedRoutine": "seedMultiWriterHeadsPlaceholder",
+  "cleanupRoutine": "cleanupWorkspaceSandbox",
+  "whySQLiteFallsShort": [
+    "SQLite does not ship with Git-like concurrent head-management semantics, so this showcase slot is reserved until SydraDB's multi-writer story is ready to demonstrate honestly.",
+    "Keeping the slot visible but gated makes the roadmap explicit without pretending the feature is already stable.",
+    "The showcase can absorb the feature later through a new scenario pack instead of a UI rewrite."
+  ],
+  "steps": []
+}

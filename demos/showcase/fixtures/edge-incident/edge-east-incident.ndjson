@@ -1,0 +1,2 @@
+{"series":"edge.power_kw","ts":1700000240,"value":34.0,"tags":{"site":"edge-east","host":"edge-east-gw-1","firmware":"1.2.0","sensor":"power"}}
+{"series":"edge.power_kw","ts":1700000300,"value":36.0,"tags":{"site":"edge-east","host":"edge-east-gw-1","firmware":"1.2.0","sensor":"power"}}

@@ -1,0 +1,8 @@
+{
+  "host": "edge-east-gw-1",
+  "avgValue": 20.75,
+  "executionMode": "compiled",
+  "legacyFallback": false,
+  "firstValue": 20,
+  "lastValue": 21.5
+}

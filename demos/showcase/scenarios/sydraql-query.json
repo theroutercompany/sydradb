@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "id": "sydraql-query",
+  "title": "sydraQL Query Telemetry",
+  "summary": "Run real sydraQL queries and surface execution mode, fallback behavior, trace ids, and operator timings directly in the UI.",
+  "maturity": "candidate",
+  "subsystems": ["sydraql", "compiler", "engine"],
+  "requiredCapabilities": ["binary.present", "sydraql.http", "compiler.telemetry"],
+  "minimumOutputs": ["query.stats.execution_mode", "query.stats.trace_id", "query.stats.operators"],
+  "seedRoutine": "seedSydraqlQuery",
+  "cleanupRoutine": "cleanupWorkspaceSandbox",
+  "whySQLiteFallsShort": [
+    "SQLite can execute SQL, but SydraDB exposes time-series-native query telemetry and compiler state as part of the product surface instead of an afterthought.",
+    "The query response explains how the engine executed the request, which makes compiler rollout and performance work visible while the product is still changing quickly.",
+    "Native time-series selectors and telemetry let storage and compiler engineers validate behavior against real data without bolting on external tracing first."
+  ],
+  "steps": [
+    {
+      "id": "host-average",
+      "title": "Compute a host-level aggregate",
+      "summary": "Run a grouped aggregate over tagged time-series data and inspect the execution telemetry returned with the rows.",
+      "kind": "sydraql_query",
+      "workspace": "edge-east",
+      "query": "select tag.host as host, avg(value) as avg_value from edge.power_kw where tag.site = 'edge-east' group by tag.host",
+      "evidencePanels": [
+        { "id": "avg-rows", "title": "Rows", "kind": "rows", "sourcePath": "rows" },
+        { "id": "avg-stats", "title": "Execution stats", "kind": "query-stats", "sourcePath": "stats" }
+      ],
+      "assertions": [
+        { "path": "rows", "operator": "minLength", "value": 1 },
+        { "path": "stats.execution_mode", "operator": "equals", "value": "compiled" },
+        { "path": "stats.legacy_fallback", "operator": "equals", "value": false },
+        { "path": "stats.trace_id", "operator": "truthy" },
+        { "path": "stats.operators", "operator": "minLength", "value": 1 }
+      ]
+    },
+    {
+      "id": "power-window",
+      "title": "Inspect first and last values",
+      "summary": "Use first/last aggregates to demonstrate stateful operators and confirm the baseline time window is read correctly.",
+      "kind": "sydraql_query",
+      "workspace": "edge-east",
+      "query": "select first(value) as first_value, last(value) as last_value from edge.power_kw where time >= 1700000000",
+      "evidencePanels": [
+        { "id": "window-rows", "title": "Window summary", "kind": "rows", "sourcePath": "rows" },
+        { "id": "window-stats", "title": "Operator timings", "kind": "query-stats", "sourcePath": "stats" }
+      ],
+      "assertions": [
+        { "path": "rows", "operator": "minLength", "value": 1 },
+        { "path": "rows.0.0", "operator": "equals", "value": 20 },
+        { "path": "rows.0.1", "operator": "equals", "value": 21.5 }
+      ]
+    }
+  ]
+}

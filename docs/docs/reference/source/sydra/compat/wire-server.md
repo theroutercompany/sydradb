@@ -7,13 +7,13 @@ title: src/sydra/compat/wire/server.zig
 
 ## Purpose
 
-Provides a simple PostgreSQL wire-protocol (`pgwire`) listener suitable for basic compatibility testing with clients like `psql`.
+Provides a preview PostgreSQL wire-protocol (`pgwire`) listener suitable for basic compatibility testing with clients like `psql`.
 
 The server:
 
 - accepts a TCP connection
 - performs a minimal startup handshake
-- supports a small subset of frontend messages
+- supports simple queries plus a preview extended-query path
 - translates SQL → sydraQL and executes it via the regular query pipeline
 - writes results as `RowDescription` + `DataRow` messages
 
@@ -63,7 +63,12 @@ Handled message types:
 
 - `'X'` – Terminate: close the connection.
 - `'Q'` – Simple Query: handled by `handleSimpleQuery` (SQL→sydraQL→execute).
-- `'P'` – Parse (extended protocol): `handleParseMessage` validates framing but returns `0A000` on success (“not implemented yet”).
+- `'P'` – Parse: prepares a narrow direct SQL-core statement shape for the preview extended path.
+- `'B'` – Bind: binds text parameters to a parsed statement and creates a portal.
+- `'D'` – Describe: describes a prepared statement or portal.
+- `'E'` – Execute: runs a bound portal, streaming rows or a command tag.
+- `'C'` – Close: closes a prepared statement or portal.
+- `'H'` – Flush: drains buffered backend output.
 - `'S'` – Responds with `ReadyForQuery('I')` (acts as a simple sync/flush).
 - Anything else:
   - `ErrorResponse("0A000", "message type not implemented")`
@@ -76,7 +81,19 @@ switch (type_byte) {
         try handleSimpleQuery(alloc, writer, payload_storage, engine);
     },
     'P' => {
-        try handleParseMessage(alloc, writer, payload_storage);
+        try handleParseMessage(alloc, writer, payload_storage, engine, &extended_state);
+    },
+    'B' => {
+        try handleBindMessage(alloc, writer, payload_storage, engine, &extended_state);
+    },
+    'D' => {
+        try handleDescribeMessage(writer, payload_storage, &extended_state);
+    },
+    'E' => {
+        try handleExecuteMessage(alloc, writer, payload_storage, &extended_state);
+    },
+    'C' => {
+        try handleCloseMessage(writer, payload_storage, &extended_state);
     },
     'S' => {
         try protocol.writeReadyForQuery(writer, 'I');
@@ -131,24 +148,34 @@ switch (translation) {
 }
 ```
 
-## Extended protocol parse (partial)
+## Extended protocol (preview)
 
-### `fn handleParseMessage(alloc, writer, payload) !void`
+### `fn handleParseMessage(...) !void`
 
-Parses enough of the frontend `Parse` message to report a deterministic response:
+- Parses the frontend `Parse` message fields (`statement_name`, SQL text, parameter slots/OIDs).
+- Attempts `prepared_query.prepareSqlCore` against the current engine.
+- Stores prepared statement state in `ExtendedQueryState`.
+- On unsupported shapes, returns preview errors such as `0A000` and leaves the session usable.
 
-- Reads:
-  - `statement_name` as NUL-terminated string
-  - `query` as NUL-terminated string
-  - `parameter_count` (`u16be`)
-  - validates presence of `parameter_count * 4` bytes for parameter type OIDs
-- Translates `query` via `translator.translate`.
-- If translation succeeds, responds:
-  - `ErrorResponse(ERROR, 0A000, "extended protocol not implemented yet")`
-- If translation fails, responds with the translator’s SQLSTATE/message.
-- Always ends with `ReadyForQuery('I')`.
+### `fn handleBindMessage(...) !void`
 
-No prepared statement state is stored, and no subsequent `Bind/Execute` messages are handled.
+- Resolves the named prepared statement from `ExtendedQueryState`.
+- Accepts text parameters only and binds them positionally.
+- Creates or replaces a named portal.
+
+### `fn handleDescribeMessage(...) !void`
+
+- Describes either a prepared statement (`'S'`) or portal (`'P'`).
+- Uses the same default column/type mapping as the simple-query path.
+
+### `fn handleExecuteMessage(...) !void`
+
+- Executes a bound portal, streaming `DataRow` messages until completion or suspension.
+- Emits `CommandComplete` for completed portals and `PortalSuspended` when `max_rows` is hit.
+
+### `fn handleCloseMessage(...) !void`
+
+- Closes a prepared statement or portal and releases the associated state.
 
 ## SydraQL execution + result encoding
 

@@ -148,6 +148,8 @@ Built-in startup default when `sydradb.toml` is absent:
 - Fresh repositories: `dual_write`
 - Existing legacy repositories: `off`
 
+In the `v0.4.0` alpha contract, `dual_write` is the supported CAS write mode for fresh repositories.
+
 ### `metadata_read_mode` (string enum)
 
 Controls whether reads use legacy mirrors, compare against CAS in shadow mode, or serve from CAS directly.
@@ -160,3 +162,16 @@ Built-in startup default when `sydradb.toml` is absent:
 
 - Fresh repositories: `primary`
 - Existing legacy repositories: `legacy`
+
+### `query_compiler_mode` (string enum)
+
+Controls whether sydraQL uses the legacy pipeline only, compares compiled vs. legacy in shadow mode, or prefers the compiled executor and falls back when needed.
+
+Accepted values: `legacy`, `shadow`, `compiled`
+
+Default: `compiled`
+
+Notes:
+
+- `compiled` is the intended `v0.4.0` alpha default.
+- Unsupported query shapes fall back to the legacy pipeline and increment the compiler fallback metrics exposed on `/metrics`.

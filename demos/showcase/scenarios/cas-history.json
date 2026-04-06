@@ -1,0 +1,111 @@
+{
+  "schemaVersion": 1,
+  "id": "cas-history",
+  "title": "CAS History and Recovery",
+  "summary": "Inspect Git-like history, compare snapshots, and roll back an edge-site incident using SydraDB's immutable metadata model.",
+  "maturity": "alpha",
+  "subsystems": ["cas", "git-model", "engine"],
+  "requiredCapabilities": ["binary.present", "cas.json", "cas.history", "sydraql.http"],
+  "minimumOutputs": ["refs.entries", "diff.segments_added", "verify-rollback"],
+  "seedRoutine": "seedCasHistory",
+  "cleanupRoutine": "cleanupWorkspaceSandbox",
+  "whySQLiteFallsShort": [
+    "SQLite gives you tables and transactions, but not a built-in commit graph with named refs, reflogs, and snapshot diffs over storage metadata.",
+    "Rolling metadata back to a known-good commit in SydraDB is a first-class storage workflow instead of an app-specific migration and backup exercise.",
+    "Operational history is queryable and reviewable through CAS commands rather than hidden in ad-hoc side tables."
+  ],
+  "steps": [
+    {
+      "id": "refs",
+      "title": "Inspect named refs",
+      "summary": "List the active refs in the edge-east repository and confirm the current head is visible before we compare it to a captured baseline commit.",
+      "kind": "cas_command",
+      "workspace": "edge-east",
+      "args": ["refs"],
+      "evidencePanels": [
+        { "id": "ref-list", "title": "Ref snapshot", "kind": "json", "sourcePath": "entries" }
+      ],
+      "assertions": [
+        { "path": "entries", "operator": "minLength", "value": 1, "message": "Expected at least heads/main to be visible." }
+      ]
+    },
+    {
+      "id": "log",
+      "title": "Read commit history",
+      "summary": "Show the CAS log for heads/main so the incident and rollback context are visible as commit history, not side notes.",
+      "kind": "cas_command",
+      "workspace": "edge-east",
+      "args": ["log"],
+      "evidencePanels": [
+        { "id": "log-entries", "title": "Commit log", "kind": "json", "sourcePath": "entries" }
+      ],
+      "assertions": [
+        { "path": "entries", "operator": "minLength", "value": 2, "message": "Expected more than one commit after baseline plus incident ingestion." }
+      ]
+    },
+    {
+      "id": "diff",
+      "title": "Compare checkpoint to current head",
+      "summary": "Diff the pre-incident baseline commit against heads/main to show what changed before any recovery action is taken.",
+      "kind": "cas_command",
+      "workspace": "edge-east",
+      "args": ["diff", "{{vars.checkpoint_ref}}", "heads/main"],
+      "evidencePanels": [
+        { "id": "diff-summary", "title": "Snapshot diff", "kind": "json" }
+      ],
+      "assertions": [
+        { "path": "segments_added", "operator": "gte", "value": 1, "message": "Incident ingestion should create additional segment or WAL history." }
+      ]
+    },
+    {
+      "id": "rollback",
+      "title": "Roll back main to the checkpoint",
+      "summary": "Move heads/main back to the captured baseline commit to prove CAS history is operational, not just diagnostic.",
+      "kind": "shell_command",
+      "workspace": "edge-east",
+      "args": ["cas", "rollback", "{{vars.checkpoint_ref}}"],
+      "evidencePanels": [
+        { "id": "rollback-command", "title": "Rollback command", "kind": "command" }
+      ]
+    },
+    {
+      "id": "verify-rollback",
+      "title": "Verify live data after rollback",
+      "summary": "Query the series over HTTP after the rollback and confirm the incident points are gone from the active head.",
+      "kind": "query_range",
+      "workspace": "edge-east",
+      "payload": {
+        "series": "edge.power_kw",
+        "tags": {
+          "site": "edge-east",
+          "host": "edge-east-gw-1",
+          "firmware": "1.2.0",
+          "sensor": "power"
+        },
+        "start": 1700000000,
+        "end": 1700000400
+      },
+      "evidencePanels": [
+        { "id": "range-after-rollback", "title": "Live range result", "kind": "rows" }
+      ],
+      "assertions": [
+        { "path": "", "operator": "minLength", "value": 4, "message": "Baseline points should still be queryable after rollback." },
+        { "path": "3.value", "operator": "equals", "value": 20.5, "message": "The active head should stop at the baseline point after rollback." }
+      ]
+    },
+    {
+      "id": "reflog",
+      "title": "Inspect reflog protection",
+      "summary": "Show the reflog so the rollback event itself is preserved as part of repository history.",
+      "kind": "cas_command",
+      "workspace": "edge-east",
+      "args": ["reflog", "heads/main", "8"],
+      "evidencePanels": [
+        { "id": "reflog-entries", "title": "Reflog entries", "kind": "json", "sourcePath": "entries" }
+      ],
+      "assertions": [
+        { "path": "entries", "operator": "minLength", "value": 1 }
+      ]
+    }
+  ]
+}

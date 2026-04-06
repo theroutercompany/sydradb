@@ -17,3 +17,6 @@ logs/
 
 bench-data-*/
 sqlcore-debug-*.zig
+demos/showcase/node_modules/
+demos/showcase/ui/dist/
+demos/showcase/dist/

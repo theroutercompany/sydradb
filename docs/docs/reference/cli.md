@@ -38,7 +38,7 @@ Defaults:
 - `address`: `127.0.0.1`
 - `port`: `6432`
 
-Current support is intentionally narrow: startup/auth flow, simple query execution, and the current SQL translator subset. Extended protocol, prepared statements, COPY, and broader compatibility layers remain out of scope for the current alpha cycle.
+Current support is intentionally narrow and should be treated as a preview alpha surface: startup/auth flow, simple query execution, and a preview prepared/extended flow. `COPY` and broader compatibility layers remain out of scope for the current alpha cycle.
 
 Implementation: [`cmdPgWire`](./source/sydra/server.md#fn-cmdpgwirealloc-stdmemallocator-args-0u8-void).
 
