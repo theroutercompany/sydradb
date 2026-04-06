@@ -16,7 +16,7 @@ See also:
 
 - [x] A basic statement surface exists (`SELECT`, `INSERT`, `DELETE`, `EXPLAIN`)
 - [x] Function metadata exists for a non-trivial builtin set
-- [ ] Grammar and precedence are fully documented as a stable user-facing contract
+- [x] Grammar and precedence are documented as a stable user-facing contract for the current alpha subset
 - [ ] Error codes/messages are documented as a stable public API
 - [x] Practical examples cover the main compiled read path, selector tag reads, and explicit fallback behavior
 
@@ -42,7 +42,7 @@ See also:
 - [x] Unit coverage exists in the query pipeline modules
 - [x] Translator fixtures exist for the SQL bridge
 - [ ] Golden suites for parser/plan/exec are in place
-- [ ] Fuzz smoke tests run in CI
+- [x] Fuzz smoke tests run in CI via the main `zig build test` lane
 - [x] Query benchmarks are published for the hot paths we care about
 
 ## Docs readiness

@@ -47,6 +47,35 @@ sydraQL exposes a small number of statement types:
 | `DELETE` | `delete from <series> where time >= … and time < … [and tags …]` | retention / manual deletes |
 | `EXPLAIN` | `explain <select>` | planner debugging (future) |
 
+## Stable v0 subset
+
+For the current `v0.4.0` alpha cycle, the user-facing contract is intentionally narrower than the aspirational grammar sketches that follow.
+
+Supported and exercised today:
+
+- `SELECT` against one resolved series or `by_id(...)`
+- projections over `time`, `value`, and `tag.*`
+- raw-row scalar functions currently exercised on the compiled path:
+  - `abs`, `ceil`, `floor`, `round`, `sqrt`, `ln`, `pow`, `coalesce`
+- aggregate queries using:
+  - `min`, `max`, `avg`, `sum`, `count`, `first`, `last`
+- grouping by:
+  - one `time_bucket(...)`
+  - one selector tag such as `tag.host`
+  - or the combination `time_bucket(...)` plus one selector tag
+- ordering by projection aliases or projected expressions on the supported raw-row path
+- `EXPLAIN BYTECODE` and `EXPLAIN TABLES_USED`
+
+Explicitly out of the current compiled subset:
+
+- selector `tag_filter` syntax on the `FROM` selector itself
+- `fill(...)` on the compiled path
+- broader window-function coverage (`moving_avg`, `ema`, `lag`, `lead`)
+- regex predicates as part of the compiled VM path
+- multi-series expressions / joins
+
+When a query falls outside the compiled subset, the current contract is to fall back visibly or fail explicitly rather than pretend broader support.
+
 ### Selectors
 ```
 selector := series_ref [tag_filter]
@@ -87,12 +116,18 @@ limit 1000 [offset N]
 ```
 
 ## Syntax Overview
-- Case-insensitive keywords, case-sensitive identifiers unless quoted.
-- Identifiers follow `[A-Za-z_][A-Za-z0-9_]*` or quoted `"mixed-case"`.
-- Literals: numbers (`123`, `3.14`), strings (`'foo'`), durations (`1s`, `5m30s`, `2h`), ISO8601 timestamps, epoch ints.
+- Keywords are case-insensitive.
+- Unquoted identifiers follow `[A-Za-z_][A-Za-z0-9_]*`; dotted identifiers such as `weather.room1` and `tag.host` are accepted.
+- Quoted identifiers are supported.
+- Literals currently exercised in parser/tests:
+  - integers and floats (`123`, `3.14`)
+  - strings (`'foo'`)
+  - durations (`5m`, `1h`)
+  - ISO-8601 timestamps
+  - booleans (`true`, `false`)
+  - `null`
 - Comments: `-- line comment`, `/* block comment */`.
-- Functions & operators use lower-case names: `avg`, `rate`, `delta`, `abs`, `ln`.
-- JSON literal support restricted to insert payloads.
+- JSON literal handling remains restricted to insert-style payloads rather than general query expressions.
 
 ## Grammar Sketch (EBNF)
 ```
@@ -120,22 +155,41 @@ comp_op        = "=" | "!=" | "<" | "<=" | ">" | ">=" | "=~" | "!~" ;
 expr           = additive_expr ;
 ```
 
-(Full grammar will enumerate arithmetic, function calls, literals, and precedence levels.)
+The current handwritten parser and generated shadow parser already implement a concrete precedence ladder for the supported subset.
+
+## Expression precedence (current contract)
+
+Highest to lowest:
+
+1. parenthesized expressions and function calls
+2. unary `+`, unary `-`, `not`
+3. `*`, `/`, `%`
+4. `+`, `-`
+5. comparison operators: `=`, `!=`, `<`, `<=`, `>`, `>=`, `=~`, `!~`
+6. logical `and` / `&&`
+7. logical `or` / `||`
+
+Notes:
+
+- `ORDER BY` direction defaults to ascending when omitted.
+- `LIMIT` may include `OFFSET`.
+- `time_bucket(step, time [, origin])` is the only bucketed grouping form in the supported compiled subset.
 
 ## Function Library
-- **Aggregates**: `min`, `max`, `avg`, `sum`, `count`, `last`, `first`, `percentile(value, 0.99)`.
-- **Transformations**: `abs`, `ceil`, `floor`, `round`, `pow`, `ln`, `sqrt`.
-- **Time utilities**: `now()`, `time_bucket(step, ts, [origin])`, `lag`, `lead`.
-- **Rates/Windows**: `rate`, `irate`, `delta`, `integral`, `moving_avg`, `ema(step, alpha)`.
-- **Fill helpers**: `coalesce`, `fill_forward`.
+- **Compiled today**
+  - Aggregates: `min`, `max`, `avg`, `sum`, `count`, `last`, `first`
+  - Scalar transforms: `abs`, `ceil`, `floor`, `round`, `pow`, `ln`, `sqrt`, `coalesce`
+  - Time utility: `time_bucket(step, ts [, origin])`
+- **Declared in metadata but not part of the supported compiled subset yet**
+  - `percentile`, `rate`, `irate`, `delta`, `integral`, `moving_avg`, `ema`, `lag`, `lead`, `fill_forward`
 
-Each function entry should specify argument types, return type, and planner capabilities (e.g., `rate` requires sorted series).
+The source of truth for the registry is [`src/sydra/query/functions.zig`](/Users/rexliu/sydradb/src/sydra/query/functions.zig), but the supported compiled subset above is the public contract for this alpha.
 
 ## Execution Semantics
-- **Implicit ordering**: results are ordered by timestamp ascending unless `order by` given.
+- **Implicit ordering**: do not rely on implicit ordering as a stable contract; use `order by` when ordering matters.
 - **Time zone**: all timestamps normalised to UTC; `now()` uses server clock in UTC.
 - **Bucket exclusivity**: `time_bucket(step, ts)` aligns to `[start, start+step)` half-open intervals.
-- **Fill evaluation**: applied post-aggregation per `group by` bucket.
+- **Fill evaluation**: `fill(...)` parses today but is not part of the supported compiled subset.
 - **Null handling**: aggregates follow SQL semantics (`count` ignores nulls, `sum` returns null if all null).
 - **Limits**: apply after aggregation/order by; planner should push down `LIMIT` when possible.
 
@@ -165,7 +219,7 @@ Each function entry should specify argument types, return type, and planner capa
 - These fields are intended for dashboards and tracing; clients should treat them as part of the public API.
 
 ## Open Questions
-- Do we allow multi-series expressions in the first release (e.g., `select a.value / b.value` with alignment)?
+- How far do we want to widen the compiled subset before `v0.4.0` versus leaving the rest as explicit fallback?
 - How do we expose rollup metadata (system tables vs. planner introspection) for users to inspect?
 - Should inserts accept structured fields beyond a single numeric value in v0?
 - What retention/TTL semantics should `DELETE` enforce when interacting with compaction?
