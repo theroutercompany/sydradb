@@ -181,6 +181,12 @@ Response JSON object:
 - `rows`: array of row arrays
 - `stats`: execution timings and operator stats
 
+When the query runs on the compiled path or falls back from it, `stats` also carries:
+
+- `execution_mode`
+- `legacy_fallback`
+- `fallback_reason` (when a fallback occurred)
+
 Error responses for `/api/*` are JSON:
 
 ```json
@@ -195,6 +201,22 @@ For sydraQL specifically, `code` now distinguishes:
 - `shadow_mismatch` – shadow-mode verification failures
 - `query_too_large` – query text exceeds the current `65536` byte execution ceiling
 - `execution_error` – other runtime failures that do not fit the categories above
+
+`stats.fallback_reason` uses a stable taxonomy for the current alpha subset:
+
+- `unsupported_statement`
+- `unsupported_fill`
+- `unsupported_tag_filter`
+- `unsupported_grouping`
+- `unsupported_aggregate`
+- `unsupported_projection`
+- `unsupported_ordering`
+- `unsupported_predicate`
+- `unsupported_expression`
+- `unsupported_function`
+- `series_not_found`
+- `ambiguous_selector`
+- `shadow_mismatch`
 
 Implementation:
 

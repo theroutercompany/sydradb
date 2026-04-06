@@ -208,7 +208,20 @@ Diagnostics:
   - `schema=[{name:\"...\",type:\"...\",nullable:true}, ...]` (for non-empty schemas)
   - `trace_id=...` (when `cursor.stats.trace_id` is present)
   - `execution_mode=... legacy_fallback=...`
-  - `fallback_reason=...` (when execution fell back)
+  - `fallback_reason=...` (when execution fell back). Current stable values mirror the compiler taxonomy:
+    - `unsupported_statement`
+    - `unsupported_fill`
+    - `unsupported_tag_filter`
+    - `unsupported_grouping`
+    - `unsupported_aggregate`
+    - `unsupported_projection`
+    - `unsupported_ordering`
+    - `unsupported_predicate`
+    - `unsupported_expression`
+    - `unsupported_function`
+    - `series_not_found`
+    - `ambiguous_selector`
+    - `shadow_mismatch`
   - `operator=... rows_out=... elapsed_ms=...` for each operator stat
 - Completes with:
   - `CommandComplete` tag `SELECT rows=… scanned=… stream_ms=… plan_ms=… [trace_id=…]`
