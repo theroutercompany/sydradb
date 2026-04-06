@@ -8,6 +8,7 @@ Current alpha focus:
 
 - HTTP ingest
 - HTTP range queries
+- Market-data truth engine alpha: market schema registration, `ts_ns` market ingest, derived rollups/signals, and revision-aware post-trade analysis
 - Compiled sydraQL as the default execution path for the supported subset
 - CAS-native snapshot, bundle, verify, clone, fetch/push, fsck, vacuum, and upgrade workflows
 - Snapshot/restore via CAS bundles
@@ -48,6 +49,30 @@ zig build                                # default: mimalloc global allocator
 zig build -Dallocator-mode=default       # supported Zig allocator path
 zig build -Dallocator-mode=small_pool    # experimental allocator path
 ```
+
+### Market-data truth engine alpha
+
+The current trading-facing alpha is definition-driven and keeps the existing single-value storage path underneath:
+
+- Register market families with `POST /api/v1/market/schema/register`
+- Ingest market rows with `POST /api/v1/market/ingest`
+- Register bar policies, rollups, and signals with:
+  - `POST /api/v1/bar-policies/register`
+  - `POST /api/v1/rollups/register`
+  - `POST /api/v1/signals/register`
+- Inspect derived-runtime health with `GET /api/v1/rollups` and `GET /api/v1/signals`
+- Subscribe to signal SSE output with `GET /api/v1/signals/subscribe?name=<signal-id>`
+- Run revision-aware analysis with:
+  - `POST /api/v1/analysis/markout`
+  - `POST /api/v1/analysis/slippage`
+  - `POST /api/v1/analysis/quote-quality`
+
+Current contract notes:
+
+- Market APIs require `ts_ns` and treat it as nanosecond epoch time end-to-end.
+- Market ingest is schema-validated and fans out each row into sibling exact-series metrics such as `market.trade.price` and `market.bar.close`.
+- Derived outputs carry provenance labels including `data_revision`, `definition_id`, and `definition_version`.
+- Native multi-column storage is not implemented yet; that remains a later internal foundation project.
 
 ## Nix
 
@@ -133,7 +158,7 @@ Apache-2.0
 ## CLI
 
 ```bash
-./zig-out/bin/sydradb             # serve (HTTP): /api/v1/ingest, /api/v1/query/range, /api/v1/query/compare, /api/v1/metrics/find, /api/v1/metrics/health, /api/v1/series/find, /api/v1/labels/values, /api/v1/annotations/write, /api/v1/annotations/query, /api/v1/sydraql, /metrics
+./zig-out/bin/sydradb             # serve (HTTP): /api/v1/ingest, /api/v1/query/range, /api/v1/query/compare, /api/v1/metrics/find, /api/v1/metrics/health, /api/v1/series/find, /api/v1/labels/values, /api/v1/annotations/write, /api/v1/annotations/query, /api/v1/sydraql, /api/v1/market/schema/register, /api/v1/market/ingest, /api/v1/bar-policies/register, /api/v1/rollups, /api/v1/signals, /api/v1/signals/subscribe, /api/v1/analysis/markout, /api/v1/analysis/slippage, /api/v1/analysis/quote-quality, /api/v1/cas/refs, /api/v1/cas/commits, /api/v1/cas/log, /api/v1/cas/diff, /metrics
 ./zig-out/bin/sydradb pgwire      # PostgreSQL wire protocol preview (simple query + preview prepared flow)
 ./zig-out/bin/sydradb ingest      # read NDJSON from stdin, flush, and exit only after points are queryable
 ./zig-out/bin/sydradb query <series_id> <start_ts> <end_ts>

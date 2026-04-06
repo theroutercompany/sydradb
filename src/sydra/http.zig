@@ -5,6 +5,8 @@ const config = @import("config.zig");
 const compat = @import("compat.zig");
 const cas_mod = @import("storage/cas.zig");
 const annotations_mod = @import("storage/annotations.zig");
+const market_catalog_mod = @import("storage/market_catalog.zig");
+const market_runtime_mod = @import("storage/market_runtime.zig");
 const metric_catalog_mod = @import("storage/metric_catalog.zig");
 const query_exec = @import("query/exec.zig");
 const compiler_diagnostics = @import("query/compiler/diagnostics.zig");
@@ -106,6 +108,66 @@ fn handleRequest(handle: *alloc_mod.AllocatorHandle, alloc: std.mem.Allocator, e
     }
     if (std.mem.eql(u8, path, "/api/v1/ingest") and method == .POST) {
         return try handleIngest(alloc, eng, req);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/market/schema/register") and method == .POST) {
+        return try handleMarketSchemaRegister(alloc, eng, req);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/market/schemas") and method == .GET) {
+        return try handleMarketSchemaList(alloc, eng, req);
+    }
+    if (std.mem.startsWith(u8, path, "/api/v1/market/schema/") and method == .GET) {
+        return try handleMarketSchemaGet(alloc, eng, req, path["/api/v1/market/schema/".len..]);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/market/ingest") and method == .POST) {
+        return try handleMarketIngest(alloc, eng, req);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/bar-policies/register") and method == .POST) {
+        return try handleBarPolicyRegister(alloc, eng, req);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/bar-policies") and method == .GET) {
+        return try handleBarPolicyList(alloc, eng, req);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/rollups/register") and method == .POST) {
+        return try handleRollupRegister(alloc, eng, req);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/rollups") and method == .GET) {
+        return try handleRollupList(alloc, eng, req);
+    }
+    if (std.mem.startsWith(u8, path, "/api/v1/rollups/")) {
+        return try handleRollupAction(alloc, eng, req, method, path["/api/v1/rollups/".len..]);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/signals/register") and method == .POST) {
+        return try handleSignalRegister(alloc, eng, req);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/signals") and method == .GET) {
+        return try handleSignalList(alloc, eng, req);
+    }
+    if (std.mem.startsWith(u8, path, "/api/v1/signals/") and !std.mem.eql(u8, path, "/api/v1/signals/subscribe")) {
+        return try handleSignalAction(alloc, eng, req, method, path["/api/v1/signals/".len..]);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/signals/subscribe") and method == .GET) {
+        return try handleSignalSubscribe(alloc, eng, req, query);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/cas/refs") and method == .GET) {
+        return try handleCasRefs(alloc, eng, req);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/cas/commits") and method == .GET) {
+        return try handleCasCommits(alloc, eng, req, query);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/cas/log") and method == .GET) {
+        return try handleCasLog(alloc, eng, req, query);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/cas/diff") and method == .GET) {
+        return try handleCasDiff(alloc, eng, req, query);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/analysis/markout") and method == .POST) {
+        return try handleAnalysisMarkout(alloc, eng, req);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/analysis/slippage") and method == .POST) {
+        return try handleAnalysisSlippage(alloc, eng, req);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/analysis/quote-quality") and method == .POST) {
+        return try handleAnalysisQuoteQuality(alloc, eng, req);
     }
     if (std.mem.eql(u8, path, "/api/v1/query/range") and method == .POST) {
         return try handleQuery(alloc, eng, req);
@@ -1697,6 +1759,1115 @@ fn respondPoints(req: *std.http.Server.Request, points: []const types.Point) !vo
         try resp_writer.print("{{\"ts\":{d},\"value\":{d}}}", .{ pnt.ts, pnt.value });
     }
     try resp_writer.writeAll("]");
+    try response.end();
+}
+
+fn handleMarketSchemaRegister(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    var parsed = readJsonBody(alloc, req, 64 * 1024) catch |err| switch (err) {
+        error.LengthRequired => return respondJsonError(alloc, req, .length_required, "length_required", "length required"),
+        error.PayloadTooLarge => return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large"),
+        else => return respondJsonError(alloc, req, .bad_request, "invalid_json", "invalid json"),
+    };
+    defer parsed.deinit(alloc);
+    const obj = parsed.parsed.value.object;
+
+    const metric_value = obj.get("metric") orelse return respondJsonError(alloc, req, .bad_request, "missing_metric", "missing metric");
+    const columns_value = obj.get("ordered_columns") orelse return respondJsonError(alloc, req, .bad_request, "missing_ordered_columns", "missing ordered_columns");
+    const labels_value = obj.get("required_labels") orelse return respondJsonError(alloc, req, .bad_request, "missing_required_labels", "missing required_labels");
+    if (metric_value != .string or columns_value != .array or labels_value != .array) {
+        return respondJsonError(alloc, req, .bad_request, "invalid_market_schema", "invalid market schema");
+    }
+
+    const ordered_columns = try jsonStringArrayConst(alloc, columns_value);
+    defer alloc.free(ordered_columns);
+    const required_labels = try jsonStringArrayConst(alloc, labels_value);
+    defer alloc.free(required_labels);
+    const storage_mapping = if (obj.get("storage_mapping")) |value|
+        if (value == .string)
+            market_catalog_mod.StorageMapping.parse(value.string) orelse return respondJsonError(alloc, req, .bad_request, "invalid_storage_mapping", "invalid storage_mapping")
+        else
+            return respondJsonError(alloc, req, .bad_request, "invalid_storage_mapping", "invalid storage_mapping")
+    else
+        market_catalog_mod.StorageMapping.fanout_v1;
+
+    var stored = eng.registerMarketSchema(.{
+        .metric = metric_value.string,
+        .ordered_columns = ordered_columns,
+        .required_labels = required_labels,
+        .storage_mapping = storage_mapping,
+    }) catch |err| switch (err) {
+        error.MarketSchemaConflict => return respondJsonError(alloc, req, .conflict, "market_schema_conflict", "market schema conflict"),
+        else => return respondJsonError(alloc, req, .internal_server_error, "market_schema_register_failed", @errorName(err)),
+    };
+    defer stored.deinit(alloc);
+
+    var send_buffer: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{
+            .status = .created,
+            .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try market_catalog_mod.writeSchema(&jw, stored);
+    try response.end();
+}
+
+fn handleMarketSchemaList(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    const schemas = try eng.listMarketSchemas();
+    defer {
+        for (schemas) |*entry| entry.deinit(alloc);
+        alloc.free(schemas);
+    }
+
+    var send_buffer: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{
+            .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try jw.beginArray();
+    for (schemas) |entry| try market_catalog_mod.writeSchema(&jw, entry);
+    try jw.endArray();
+    try response.end();
+}
+
+fn handleMarketSchemaGet(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request, metric: []const u8) !void {
+    var stored = eng.marketSchema(metric) orelse return respondJsonError(alloc, req, .not_found, "market_schema_not_found", "market schema not found");
+    defer stored.deinit(alloc);
+
+    var send_buffer: [512]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{
+            .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try market_catalog_mod.writeSchema(&jw, stored);
+    try response.end();
+}
+
+fn handleBarPolicyRegister(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    var parsed = readJsonBody(alloc, req, 64 * 1024) catch |err| switch (err) {
+        error.LengthRequired => return respondJsonError(alloc, req, .length_required, "length_required", "length required"),
+        error.PayloadTooLarge => return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large"),
+        else => return respondJsonError(alloc, req, .bad_request, "invalid_json", "invalid json"),
+    };
+    defer parsed.deinit(alloc);
+    const obj = parsed.parsed.value.object;
+
+    const id_value = obj.get("id") orelse return respondJsonError(alloc, req, .bad_request, "missing_id", "missing id");
+    const source_value = obj.get("source_metric") orelse return respondJsonError(alloc, req, .bad_request, "missing_source_metric", "missing source_metric");
+    const interval_value = obj.get("interval_ns") orelse return respondJsonError(alloc, req, .bad_request, "missing_interval_ns", "missing interval_ns");
+    const session_value = obj.get("session_rule") orelse return respondJsonError(alloc, req, .bad_request, "missing_session_rule", "missing session_rule");
+    const no_trade_value = obj.get("no_trade_rule") orelse return respondJsonError(alloc, req, .bad_request, "missing_no_trade_rule", "missing no_trade_rule");
+    const halt_value = obj.get("halt_rule") orelse return respondJsonError(alloc, req, .bad_request, "missing_halt_rule", "missing halt_rule");
+    const correction_value = obj.get("correction_policy") orelse return respondJsonError(alloc, req, .bad_request, "missing_correction_policy", "missing correction_policy");
+    if (id_value != .string or source_value != .string or interval_value != .integer or session_value != .string or no_trade_value != .string or halt_value != .string or correction_value != .string) {
+        return respondJsonError(alloc, req, .bad_request, "invalid_bar_policy", "invalid bar policy");
+    }
+
+    var stored = try eng.registerBarPolicy(.{
+        .id = id_value.string,
+        .source_metric = source_value.string,
+        .interval_ns = interval_value.integer,
+        .session_rule = session_value.string,
+        .no_trade_rule = no_trade_value.string,
+        .halt_rule = halt_value.string,
+        .correction_policy = correction_value.string,
+        .trade_filter = if (obj.get("trade_filter")) |value| if (value == .string) value.string else null else null,
+    });
+    defer stored.deinit(alloc);
+
+    var send_buffer: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{
+            .status = .created,
+            .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try market_catalog_mod.writeBarPolicy(&jw, stored);
+    try response.end();
+}
+
+fn handleBarPolicyList(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    const entries = try eng.listBarPolicies();
+    defer {
+        for (entries) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+    var send_buffer: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try jw.beginArray();
+    for (entries) |entry| try market_catalog_mod.writeBarPolicy(&jw, entry);
+    try jw.endArray();
+    try response.end();
+}
+
+fn handleRollupRegister(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    var parsed = readJsonBody(alloc, req, 64 * 1024) catch |err| switch (err) {
+        error.LengthRequired => return respondJsonError(alloc, req, .length_required, "length_required", "length required"),
+        error.PayloadTooLarge => return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large"),
+        else => return respondJsonError(alloc, req, .bad_request, "invalid_json", "invalid json"),
+    };
+    defer parsed.deinit(alloc);
+    const obj = parsed.parsed.value.object;
+    const id_value = obj.get("id") orelse return respondJsonError(alloc, req, .bad_request, "missing_id", "missing id");
+    const source_value = obj.get("source_metric") orelse return respondJsonError(alloc, req, .bad_request, "missing_source_metric", "missing source_metric");
+    const target_value = obj.get("target_metric") orelse return respondJsonError(alloc, req, .bad_request, "missing_target_metric", "missing target_metric");
+    const policy_value = obj.get("policy_id") orelse return respondJsonError(alloc, req, .bad_request, "missing_policy_id", "missing policy_id");
+    const kind_value = obj.get("transform_kind") orelse return respondJsonError(alloc, req, .bad_request, "missing_transform_kind", "missing transform_kind");
+    if (id_value != .string or source_value != .string or target_value != .string or policy_value != .string or kind_value != .string) {
+        return respondJsonError(alloc, req, .bad_request, "invalid_rollup_definition", "invalid rollup definition");
+    }
+    const transform_kind = market_catalog_mod.RollupTransformKind.parse(kind_value.string) orelse return respondJsonError(alloc, req, .bad_request, "invalid_transform_kind", "invalid transform_kind");
+    var stored = try eng.registerRollup(.{
+        .id = id_value.string,
+        .source_metric = source_value.string,
+        .target_metric = target_value.string,
+        .policy_id = policy_value.string,
+        .transform_kind = transform_kind,
+    });
+    defer stored.deinit(alloc);
+
+    var send_buffer: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{
+            .status = .created,
+            .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try market_catalog_mod.writeRollup(&jw, stored);
+    try response.end();
+}
+
+fn handleRollupList(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    const entries = try eng.listRollups();
+    defer {
+        for (entries) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+    var send_buffer: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try jw.beginArray();
+    for (entries) |entry| {
+        var runtime = eng.rollupRuntime(entry.id, entry.version);
+        defer if (runtime) |*value| value.deinit(alloc);
+        try writeRollupWithRuntime(&jw, entry, runtime);
+    }
+    try jw.endArray();
+    try response.end();
+}
+
+fn handleSignalRegister(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    var parsed = readJsonBody(alloc, req, 64 * 1024) catch |err| switch (err) {
+        error.LengthRequired => return respondJsonError(alloc, req, .length_required, "length_required", "length required"),
+        error.PayloadTooLarge => return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large"),
+        else => return respondJsonError(alloc, req, .bad_request, "invalid_json", "invalid json"),
+    };
+    defer parsed.deinit(alloc);
+    const obj = parsed.parsed.value.object;
+    const id_value = obj.get("id") orelse return respondJsonError(alloc, req, .bad_request, "missing_id", "missing id");
+    const input_value = obj.get("input_metric") orelse return respondJsonError(alloc, req, .bad_request, "missing_input_metric", "missing input_metric");
+    const expression_value = obj.get("expression_kind") orelse return respondJsonError(alloc, req, .bad_request, "missing_expression_kind", "missing expression_kind");
+    const params_value = obj.get("params") orelse return respondJsonError(alloc, req, .bad_request, "missing_params", "missing params");
+    const emit_value = obj.get("emit_rule") orelse return respondJsonError(alloc, req, .bad_request, "missing_emit_rule", "missing emit_rule");
+    if (id_value != .string or input_value != .string or expression_value != .string or emit_value != .string) {
+        return respondJsonError(alloc, req, .bad_request, "invalid_signal_definition", "invalid signal definition");
+    }
+    const expression_kind = market_catalog_mod.SignalExpressionKind.parse(expression_value.string) orelse return respondJsonError(alloc, req, .bad_request, "invalid_expression_kind", "invalid expression_kind");
+    const params_json = try stringifyJsonValue(alloc, params_value);
+    defer alloc.free(params_json);
+    var stored = try eng.registerSignal(.{
+        .id = id_value.string,
+        .input_metric = input_value.string,
+        .policy_id = if (obj.get("policy_id")) |value| if (value == .string) value.string else null else null,
+        .expression_kind = expression_kind,
+        .params_json = params_json,
+        .emit_rule = emit_value.string,
+    });
+    defer stored.deinit(alloc);
+
+    var send_buffer: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{
+            .status = .created,
+            .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }},
+        },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try market_catalog_mod.writeSignal(&jw, stored);
+    try response.end();
+}
+
+fn handleSignalList(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    const entries = try eng.listSignals();
+    defer {
+        for (entries) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+    var send_buffer: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try jw.beginArray();
+    for (entries) |entry| {
+        var runtime = eng.signalRuntime(entry.id, entry.version);
+        defer if (runtime) |*value| value.deinit(alloc);
+        try writeSignalWithRuntime(&jw, entry, runtime);
+    }
+    try jw.endArray();
+    try response.end();
+}
+
+fn handleRollupAction(
+    alloc: std.mem.Allocator,
+    eng: *Engine,
+    req: *std.http.Server.Request,
+    method: std.http.Method,
+    remainder: []const u8,
+) !void {
+    if (std.mem.endsWith(u8, remainder, "/pause") and method == .POST) {
+        const id = remainder[0 .. remainder.len - "/pause".len];
+        try eng.pauseRollup(id);
+        return try respondActionOk(req, "paused");
+    }
+    if (std.mem.endsWith(u8, remainder, "/resume") and method == .POST) {
+        const id = remainder[0 .. remainder.len - "/resume".len];
+        try eng.resumeRollup(id);
+        return try respondActionOk(req, "active");
+    }
+    if (method == .DELETE) {
+        const deleted = try eng.deleteRollup(remainder);
+        if (!deleted) return respondJsonError(alloc, req, .not_found, "rollup_not_found", "rollup not found");
+        return try respondActionOk(req, "deleted");
+    }
+    return respondJsonError(alloc, req, .not_found, "not_found", "not found");
+}
+
+fn handleSignalAction(
+    alloc: std.mem.Allocator,
+    eng: *Engine,
+    req: *std.http.Server.Request,
+    method: std.http.Method,
+    remainder: []const u8,
+) !void {
+    if (std.mem.endsWith(u8, remainder, "/pause") and method == .POST) {
+        const id = remainder[0 .. remainder.len - "/pause".len];
+        try eng.pauseSignal(id);
+        return try respondActionOk(req, "paused");
+    }
+    if (std.mem.endsWith(u8, remainder, "/resume") and method == .POST) {
+        const id = remainder[0 .. remainder.len - "/resume".len];
+        try eng.resumeSignal(id);
+        return try respondActionOk(req, "active");
+    }
+    if (method == .DELETE) {
+        const deleted = try eng.deleteSignal(remainder);
+        if (!deleted) return respondJsonError(alloc, req, .not_found, "signal_not_found", "signal not found");
+        return try respondActionOk(req, "deleted");
+    }
+    return respondJsonError(alloc, req, .not_found, "not_found", "not found");
+}
+
+fn respondActionOk(req: *std.http.Server.Request, status_text: []const u8) !void {
+    var send_buffer: [256]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try jw.beginObject();
+    try jw.objectField("status");
+    try jw.write(status_text);
+    try jw.endObject();
+    try response.end();
+}
+
+fn writeRollupWithRuntime(
+    jw: *std.json.Stringify,
+    entry: market_catalog_mod.RollupDefinition,
+    runtime: ?market_runtime_mod.DefinitionRuntime,
+) !void {
+    try jw.beginObject();
+    try jw.objectField("id");
+    try jw.write(entry.id);
+    try jw.objectField("version");
+    try jw.write(entry.version);
+    try jw.objectField("source_metric");
+    try jw.write(entry.source_metric);
+    try jw.objectField("target_metric");
+    try jw.write(entry.target_metric);
+    try jw.objectField("policy_id");
+    try jw.write(entry.policy_id);
+    try jw.objectField("transform_kind");
+    try jw.write(entry.transform_kind.text());
+    try jw.objectField("runtime");
+    try writeRuntimeState(jw, runtime);
+    try jw.endObject();
+}
+
+fn writeSignalWithRuntime(
+    jw: *std.json.Stringify,
+    entry: market_catalog_mod.SignalDefinition,
+    runtime: ?market_runtime_mod.DefinitionRuntime,
+) !void {
+    try jw.beginObject();
+    try jw.objectField("id");
+    try jw.write(entry.id);
+    try jw.objectField("version");
+    try jw.write(entry.version);
+    try jw.objectField("input_metric");
+    try jw.write(entry.input_metric);
+    if (entry.policy_id) |value| {
+        try jw.objectField("policy_id");
+        try jw.write(value);
+    }
+    try jw.objectField("expression_kind");
+    try jw.write(entry.expression_kind.text());
+    try jw.objectField("params_json");
+    try jw.write(entry.params_json);
+    try jw.objectField("emit_rule");
+    try jw.write(entry.emit_rule);
+    try jw.objectField("runtime");
+    try writeRuntimeState(jw, runtime);
+    try jw.endObject();
+}
+
+fn writeRuntimeState(
+    jw: *std.json.Stringify,
+    runtime: ?market_runtime_mod.DefinitionRuntime,
+) !void {
+    try jw.beginObject();
+    if (runtime) |value| {
+        try jw.objectField("status");
+        try jw.write(value.status.text());
+        try jw.objectField("last_run_ts");
+        if (value.last_run_ts) |ts| try jw.write(ts) else try jw.write(null);
+        try jw.objectField("last_success_ts");
+        if (value.last_success_ts) |ts| try jw.write(ts) else try jw.write(null);
+        try jw.objectField("last_error");
+        if (value.last_error) |err_text| try jw.write(err_text) else try jw.write(null);
+        try jw.objectField("rows_processed");
+        try jw.write(value.rows_processed);
+        try jw.objectField("emissions_total");
+        try jw.write(value.emissions_total);
+        try jw.objectField("last_event_id");
+        if (value.last_event_id) |event_id| try jw.write(event_id) else try jw.write(null);
+    } else {
+        try jw.objectField("status");
+        try jw.write("active");
+        try jw.objectField("last_run_ts");
+        try jw.write(null);
+        try jw.objectField("last_success_ts");
+        try jw.write(null);
+        try jw.objectField("last_error");
+        try jw.write(null);
+        try jw.objectField("rows_processed");
+        try jw.write(@as(u64, 0));
+        try jw.objectField("emissions_total");
+        try jw.write(@as(u64, 0));
+        try jw.objectField("last_event_id");
+        try jw.write(null);
+    }
+    try jw.endObject();
+}
+
+fn handleMarketIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    var body_buf: [4096]u8 = undefined;
+    const body_reader = req.readerExpectNone(&body_buf);
+    var rows: usize = 0;
+    var writes: usize = 0;
+
+    while (true) {
+        const slice = body_reader.*.takeDelimiterExclusive('\n') catch |err| switch (err) {
+            error.StreamTooLong => return respondJsonError(alloc, req, .payload_too_large, "line_too_long", "line too long"),
+            error.EndOfStream => break,
+            else => return err,
+        };
+        const trimmed = std.mem.trim(u8, slice, " \t\r\n");
+        if (trimmed.len == 0) continue;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, trimmed, .{}) catch {
+            return respondJsonError(alloc, req, .bad_request, "invalid_market_record", "invalid market record");
+        };
+        defer parsed.deinit();
+        if (parsed.value != .object) return respondJsonError(alloc, req, .bad_request, "invalid_market_record", "invalid market record");
+        const obj = parsed.value.object;
+
+        const metric_value = obj.get("metric") orelse return respondJsonError(alloc, req, .bad_request, "missing_metric", "missing metric");
+        const ts_value = obj.get("ts_ns") orelse return respondJsonError(alloc, req, .bad_request, "missing_ts_ns", "missing ts_ns");
+        const columns_value = obj.get("columns") orelse return respondJsonError(alloc, req, .bad_request, "missing_columns", "missing columns");
+        const labels_value = obj.get("labels") orelse return respondJsonError(alloc, req, .bad_request, "missing_labels", "missing labels");
+        if (metric_value != .string or ts_value != .integer or columns_value != .object or labels_value != .object) {
+            return respondJsonError(alloc, req, .bad_request, "invalid_market_record", "invalid market record");
+        }
+
+        var schema = eng.marketSchema(metric_value.string) orelse return respondJsonError(alloc, req, .not_found, "market_schema_not_found", "market schema not found");
+        defer schema.deinit(alloc);
+        if (!marketLabelsSatisfySchema(labels_value, schema)) {
+            return respondJsonError(alloc, req, .bad_request, "invalid_market_labels", "invalid market labels");
+        }
+        if (!marketColumnsMatchSchema(columns_value, schema)) {
+            return respondJsonError(alloc, req, .bad_request, "invalid_market_columns", "invalid market columns");
+        }
+
+        const labels_json = try extractTagsJson(alloc, labels_value);
+        defer if (labels_json.owned) |owned| alloc.free(owned);
+        const batch = try alloc.alloc(Engine.IngestItem, schema.ordered_columns.len);
+        defer alloc.free(batch);
+        var batch_len: usize = 0;
+        for (schema.ordered_columns) |column| {
+            const value = numericValue(columns_value.object.get(column).?) catch return respondJsonError(alloc, req, .bad_request, "invalid_market_columns", "invalid market columns");
+            const derived_metric = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ metric_value.string, column });
+            defer alloc.free(derived_metric);
+            _ = try eng.registerMetricDescriptor(.{
+                .metric = derived_metric,
+                .kind = .gauge,
+                .source_metric = metric_value.string,
+                .source_field = column,
+            });
+            const sid = types.seriesIdFrom(derived_metric, labels_json.value);
+            try eng.registerSeries(derived_metric, labels_json.value, sid);
+            batch[batch_len] = .{
+                .series_id = sid,
+                .ts = ts_value.integer,
+                .value = value,
+                .tags_json = labels_json.value,
+            };
+            batch_len += 1;
+            writes += 1;
+        }
+        try eng.ingestBatch(batch[0..batch_len]);
+        for (batch[0..batch_len]) |item| eng.noteTags(item.series_id, labels_json.value);
+        rows += 1;
+    }
+
+    var send_buffer: [256]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try jw.beginObject();
+    try jw.objectField("rows");
+    try jw.write(rows);
+    try jw.objectField("writes");
+    try jw.write(writes);
+    try jw.endObject();
+    try response.end();
+}
+
+fn handleCasRefs(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    var cas = eng.cas orelse return respondJsonError(alloc, req, .not_found, "cas_disabled", "cas disabled");
+    const refs = try cas.listRefs();
+    defer {
+        for (refs) |*entry| entry.deinit(alloc);
+        alloc.free(refs);
+    }
+    var send_buffer: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try jw.beginArray();
+    for (refs) |entry| {
+        try jw.beginObject();
+        try jw.objectField("name");
+        try jw.write(entry.name);
+        try jw.objectField("id");
+        const hex = entry.id.toHex();
+        try jw.write(hex[0..]);
+        try jw.endObject();
+    }
+    try jw.endArray();
+    try response.end();
+}
+
+fn handleCasCommits(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request, query: []const u8) !void {
+    return try handleCasLog(alloc, eng, req, query);
+}
+
+fn handleCasLog(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request, query: []const u8) !void {
+    var cas = eng.cas orelse return respondJsonError(alloc, req, .not_found, "cas_disabled", "cas disabled");
+    const spec = queryParam(query, "spec") orelse cas_mod.main_ref;
+    const limit = if (queryParam(query, "limit")) |value| std.fmt.parseInt(usize, value, 10) catch 32 else 32;
+    const entries = try cas.loadLog(spec, limit);
+    defer {
+        for (entries) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+
+    var send_buffer: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try jw.beginArray();
+    for (entries) |entry| {
+        try jw.beginObject();
+        try jw.objectField("commit_id");
+        const hex = entry.commit_id.toHex();
+        try jw.write(hex[0..]);
+        try jw.objectField("created_at_ms");
+        try jw.write(entry.created_at_ms);
+        try jw.objectField("reason");
+        try jw.write(entry.reason);
+        try jw.objectField("parent_count");
+        try jw.write(entry.parent_count);
+        try jw.endObject();
+    }
+    try jw.endArray();
+    try response.end();
+}
+
+fn handleCasDiff(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request, query: []const u8) !void {
+    var cas = eng.cas orelse return respondJsonError(alloc, req, .not_found, "cas_disabled", "cas disabled");
+    const lhs = queryParam(query, "lhs") orelse return respondJsonError(alloc, req, .bad_request, "missing_lhs", "missing lhs");
+    const rhs = queryParam(query, "rhs") orelse return respondJsonError(alloc, req, .bad_request, "missing_rhs", "missing rhs");
+    const diff = try cas.diffSnapshots(lhs, rhs);
+
+    var send_buffer: [512]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try jw.beginObject();
+    try jw.objectField("lhs");
+    try jw.write(lhs);
+    try jw.objectField("rhs");
+    try jw.write(rhs);
+    try jw.objectField("segments_added");
+    try jw.write(diff.segments_added);
+    try jw.objectField("segments_removed");
+    try jw.write(diff.segments_removed);
+    try jw.objectField("tags_changed");
+    try jw.write(diff.tags_changed);
+    try jw.objectField("series_entries_changed");
+    try jw.write(diff.series_entries_changed);
+    try jw.objectField("wal_chunks_added");
+    try jw.write(diff.wal_chunks_added);
+    try jw.objectField("wal_chunks_removed");
+    try jw.write(diff.wal_chunks_removed);
+    try jw.endObject();
+    try response.end();
+}
+
+fn handleSignalSubscribe(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request, query: []const u8) !void {
+    const name = queryParam(query, "name") orelse return respondJsonError(alloc, req, .bad_request, "missing_name", "missing name");
+    const from_ts = if (findHeader(req, "last-event-id")) |value|
+        eventIdTimestamp(value) orelse 0
+    else if (queryParam(query, "from_ts")) |value|
+        std.fmt.parseInt(i64, value, 10) catch 0
+    else
+        0;
+    const metric = try std.fmt.allocPrint(alloc, "_signal.{s}", .{name});
+    defer alloc.free(metric);
+
+    var send_buffer: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{
+            .extra_headers = &.{
+                .{ .name = "Content-Type", .value = "text/event-stream" },
+                .{ .name = "Cache-Control", .value = "no-cache" },
+            },
+        },
+    });
+    errdefer response.end() catch {};
+
+    var last_seen_ts = from_ts;
+    while (true) {
+        const series = eng.seriesDescriptorsForMetric(alloc, metric, null, true, null) catch |err| switch (err) {
+            else => {
+                std.log.warn("signal subscribe series lookup failed: {s}", .{@errorName(err)});
+                break;
+            },
+        };
+        defer alloc.free(series);
+
+        var emitted = false;
+        for (series) |descriptor| {
+            var points = std.array_list.Managed(types.Point).init(alloc);
+            defer points.deinit();
+            eng.queryRange(descriptor.series_id, last_seen_ts + 1, std.math.maxInt(i64), &points) catch continue;
+            for (points.items) |point| {
+                const event_id = try std.fmt.allocPrint(alloc, "{d}:{d}", .{ descriptor.series_id, point.ts });
+                defer alloc.free(event_id);
+                const payload = try std.fmt.allocPrint(alloc, "{{\"metric\":\"{s}\",\"ts\":{d},\"value\":{d},\"labels\":{s}}}", .{
+                    metric,
+                    point.ts,
+                    point.value,
+                    descriptor.labels_json,
+                });
+                defer alloc.free(payload);
+                try response.writer.writeAll("id: ");
+                try response.writer.writeAll(event_id);
+                try response.writer.writeAll("\n");
+                try response.writer.writeAll("event: signal\n");
+                try response.writer.writeAll("data: ");
+                try response.writer.writeAll(payload);
+                try response.writer.writeAll("\n\n");
+                if (point.ts > last_seen_ts) last_seen_ts = point.ts;
+                emitted = true;
+            }
+        }
+        if (!emitted) {
+            try response.writer.writeAll(": keep-alive\n\n");
+        }
+        std.Thread.sleep(std.time.ns_per_s);
+    }
+    try response.end();
+}
+
+fn eventIdTimestamp(event_id: []const u8) ?i64 {
+    const colon = std.mem.lastIndexOfScalar(u8, event_id, ':') orelse return null;
+    return std.fmt.parseInt(i64, event_id[colon + 1 ..], 10) catch null;
+}
+
+fn handleAnalysisMarkout(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    var parsed = readJsonBody(alloc, req, 64 * 1024) catch |err| switch (err) {
+        error.LengthRequired => return respondJsonError(alloc, req, .length_required, "length_required", "length required"),
+        error.PayloadTooLarge => return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large"),
+        else => return respondJsonError(alloc, req, .bad_request, "invalid_json", "invalid json"),
+    };
+    defer parsed.deinit(alloc);
+    const obj = parsed.parsed.value.object;
+    const symbol = jsonRequiredString(obj, "symbol") orelse return respondJsonError(alloc, req, .bad_request, "missing_symbol", "missing symbol");
+    const venue = jsonRequiredString(obj, "venue") orelse return respondJsonError(alloc, req, .bad_request, "missing_venue", "missing venue");
+    const start_ts = jsonRequiredInt(obj, "start") orelse return respondJsonError(alloc, req, .bad_request, "missing_start", "missing start");
+    const end_ts = jsonRequiredInt(obj, "end") orelse return respondJsonError(alloc, req, .bad_request, "missing_end", "missing end");
+    const single_horizon_ns = if (obj.get("horizon_ns")) |value| if (value == .integer) value.integer else return respondJsonError(alloc, req, .bad_request, "invalid_horizon_ns", "invalid horizon_ns") else null;
+    const horizons_ns = if (obj.get("horizons_ns")) |value|
+        try jsonIntArray(alloc, value)
+    else if (single_horizon_ns) |value|
+        try alloc.dupe(i64, &.{value})
+    else
+        return respondJsonError(alloc, req, .bad_request, "missing_horizon_ns", "missing horizon_ns");
+    defer alloc.free(horizons_ns);
+    const revision = if (obj.get("revision")) |value| if (value == .string) value.string else null else null;
+    const signal_name = if (obj.get("signal_name")) |value| if (value == .string) value.string else null else null;
+    const bar_policy_id = if (obj.get("bar_policy_id")) |value| if (value == .string) value.string else null else null;
+    const labels_json = try canonicalLabelsForMarket(alloc, symbol, venue, null, null);
+    defer alloc.free(labels_json);
+
+    var max_horizon: i64 = 0;
+    for (horizons_ns) |horizon| {
+        if (horizon > max_horizon) max_horizon = horizon;
+    }
+    const prices = try queryMetricPoints(alloc, eng, "market.trade.price", labels_json, start_ts, end_ts + max_horizon, revision);
+    defer alloc.free(prices);
+    const entry_points = if (signal_name) |signal_id| blk: {
+        const signal_metric = try std.fmt.allocPrint(alloc, "_signal.{s}", .{signal_id});
+        defer alloc.free(signal_metric);
+        break :blk try queryMetricPoints(alloc, eng, signal_metric, labels_json, start_ts, end_ts, revision);
+    } else try alloc.dupe(types.Point, prices);
+    defer alloc.free(entry_points);
+
+    var send_buffer: [1024]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try jw.beginObject();
+    try jw.objectField("analysis");
+    try jw.write("markout");
+    try jw.objectField("data_revision");
+    const revision_label = try resolvedRevisionLabel(alloc, eng, revision);
+    defer alloc.free(revision_label);
+    try jw.write(revision_label);
+    if (signal_name) |value| {
+        try jw.objectField("signal_name");
+        try jw.write(value);
+    }
+    if (bar_policy_id) |value| {
+        try jw.objectField("bar_policy_id");
+        try jw.write(value);
+    }
+    try jw.objectField("horizons");
+    try jw.beginArray();
+    for (horizons_ns) |horizon_ns| {
+        var count: usize = 0;
+        var total: f64 = 0;
+        var dropped: usize = 0;
+        var future_idx: usize = 0;
+        for (entry_points) |point| {
+            if (point.ts < start_ts or point.ts > end_ts) continue;
+            while (future_idx < prices.len and prices[future_idx].ts < point.ts + horizon_ns) : (future_idx += 1) {}
+            if (future_idx >= prices.len) {
+                dropped += 1;
+                break;
+            }
+            total += prices[future_idx].value - point.value;
+            count += 1;
+        }
+        try jw.beginObject();
+        try jw.objectField("horizon_ns");
+        try jw.write(horizon_ns);
+        try jw.objectField("samples");
+        try jw.write(count);
+        try jw.objectField("dropped_samples");
+        try jw.write(dropped);
+        try jw.objectField("value");
+        if (count != 0) try jw.write(total / @as(f64, @floatFromInt(count))) else try jw.write(null);
+        try jw.endObject();
+    }
+    try jw.endArray();
+    try jw.endObject();
+    try response.end();
+}
+
+fn handleAnalysisSlippage(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    var parsed = readJsonBody(alloc, req, 64 * 1024) catch |err| switch (err) {
+        error.LengthRequired => return respondJsonError(alloc, req, .length_required, "length_required", "length required"),
+        error.PayloadTooLarge => return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large"),
+        else => return respondJsonError(alloc, req, .bad_request, "invalid_json", "invalid json"),
+    };
+    defer parsed.deinit(alloc);
+    const obj = parsed.parsed.value.object;
+    const symbol = jsonRequiredString(obj, "symbol") orelse return respondJsonError(alloc, req, .bad_request, "missing_symbol", "missing symbol");
+    const venue = jsonRequiredString(obj, "venue") orelse return respondJsonError(alloc, req, .bad_request, "missing_venue", "missing venue");
+    const start_ts = jsonRequiredInt(obj, "start") orelse return respondJsonError(alloc, req, .bad_request, "missing_start", "missing start");
+    const end_ts = jsonRequiredInt(obj, "end") orelse return respondJsonError(alloc, req, .bad_request, "missing_end", "missing end");
+    const revision = if (obj.get("revision")) |value| if (value == .string) value.string else null else null;
+    const execution_side = if (obj.get("execution_side")) |value| if (value == .string) value.string else "auto" else "auto";
+    const entry_price_source = if (obj.get("entry_price_source")) |value| if (value == .string) value.string else "trade" else "trade";
+    const benchmark_source = if (obj.get("benchmark_source")) |value| if (value == .string) value.string else "mid" else "mid";
+    const labels_json = try canonicalLabelsForMarket(alloc, symbol, venue, null, null);
+    defer alloc.free(labels_json);
+
+    const trades = try queryMetricPoints(alloc, eng, "market.trade.price", labels_json, start_ts, end_ts, revision);
+    defer alloc.free(trades);
+    const bids = try queryMetricPoints(alloc, eng, "market.quote.bid", labels_json, start_ts, end_ts, revision);
+    defer alloc.free(bids);
+    const asks = try queryMetricPoints(alloc, eng, "market.quote.ask", labels_json, start_ts, end_ts, revision);
+    defer alloc.free(asks);
+
+    var bid_idx: usize = 0;
+    var ask_idx: usize = 0;
+    var signed_total: f64 = 0;
+    var abs_total: f64 = 0;
+    var count: usize = 0;
+    var dropped_samples: usize = 0;
+    for (trades) |trade| {
+        while (bid_idx + 1 < bids.len and bids[bid_idx + 1].ts <= trade.ts) : (bid_idx += 1) {}
+        while (ask_idx + 1 < asks.len and asks[ask_idx + 1].ts <= trade.ts) : (ask_idx += 1) {}
+        if (bids.len == 0 or asks.len == 0) {
+            dropped_samples += 1;
+            break;
+        }
+        const mid = (bids[bid_idx].value + asks[ask_idx].value) / 2.0;
+        const entry_price = if (std.mem.eql(u8, entry_price_source, "trade")) trade.value else mid;
+        const benchmark_price = if (std.mem.eql(u8, benchmark_source, "mid")) mid else trade.value;
+        var slip = entry_price - benchmark_price;
+        if (std.mem.eql(u8, execution_side, "sell")) slip = -slip;
+        signed_total += slip;
+        abs_total += @abs(slip);
+        count += 1;
+    }
+
+    var send_buffer: [512]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try jw.beginObject();
+    try jw.objectField("analysis");
+    try jw.write("slippage");
+    try jw.objectField("data_revision");
+    const revision_label = try resolvedRevisionLabel(alloc, eng, revision);
+    defer alloc.free(revision_label);
+    try jw.write(revision_label);
+    try jw.objectField("samples");
+    try jw.write(count);
+    try jw.objectField("dropped_samples");
+    try jw.write(dropped_samples);
+    try jw.objectField("execution_side");
+    try jw.write(execution_side);
+    try jw.objectField("entry_price_source");
+    try jw.write(entry_price_source);
+    try jw.objectField("benchmark_source");
+    try jw.write(benchmark_source);
+    try jw.objectField("signed_avg");
+    if (count != 0) try jw.write(signed_total / @as(f64, @floatFromInt(count))) else try jw.write(null);
+    try jw.objectField("abs_avg");
+    if (count != 0) try jw.write(abs_total / @as(f64, @floatFromInt(count))) else try jw.write(null);
+    try jw.endObject();
+    try response.end();
+}
+
+fn handleAnalysisQuoteQuality(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    var parsed = readJsonBody(alloc, req, 64 * 1024) catch |err| switch (err) {
+        error.LengthRequired => return respondJsonError(alloc, req, .length_required, "length_required", "length required"),
+        error.PayloadTooLarge => return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large"),
+        else => return respondJsonError(alloc, req, .bad_request, "invalid_json", "invalid json"),
+    };
+    defer parsed.deinit(alloc);
+    const obj = parsed.parsed.value.object;
+    const symbol = jsonRequiredString(obj, "symbol") orelse return respondJsonError(alloc, req, .bad_request, "missing_symbol", "missing symbol");
+    const venue = jsonRequiredString(obj, "venue") orelse return respondJsonError(alloc, req, .bad_request, "missing_venue", "missing venue");
+    const start_ts = jsonRequiredInt(obj, "start") orelse return respondJsonError(alloc, req, .bad_request, "missing_start", "missing start");
+    const end_ts = jsonRequiredInt(obj, "end") orelse return respondJsonError(alloc, req, .bad_request, "missing_end", "missing end");
+    const stale_after_ns = if (obj.get("stale_after_ns")) |value| if (value == .integer) value.integer else 5 * std.time.ns_per_s else 5 * std.time.ns_per_s;
+    const revision = if (obj.get("revision")) |value| if (value == .string) value.string else null else null;
+    const labels_json = try canonicalLabelsForMarket(alloc, symbol, venue, null, null);
+    defer alloc.free(labels_json);
+
+    const bids = try queryMetricPoints(alloc, eng, "market.quote.bid", labels_json, start_ts, end_ts, revision);
+    defer alloc.free(bids);
+    const asks = try queryMetricPoints(alloc, eng, "market.quote.ask", labels_json, start_ts, end_ts, revision);
+    defer alloc.free(asks);
+    const paired = @min(bids.len, asks.len);
+    var avg_spread_total: f64 = 0;
+    var stale_count: usize = 0;
+    var crossed_count: usize = 0;
+    var locked_count: usize = 0;
+    var dropped_samples: usize = 0;
+    for (0..paired) |idx| {
+        if (bids[idx].ts != asks[idx].ts) {
+            dropped_samples += 1;
+            continue;
+        }
+        const spread = asks[idx].value - bids[idx].value;
+        avg_spread_total += spread;
+        if (spread < 0) crossed_count += 1;
+        if (spread == 0) locked_count += 1;
+        if (idx > 0 and bids[idx].value == bids[idx - 1].value and asks[idx].value == asks[idx - 1].value and (bids[idx].ts - bids[idx - 1].ts) > stale_after_ns) {
+            stale_count += 1;
+        }
+    }
+    try respondQuoteQualityResult(alloc, eng, req, revision, paired, avg_spread_total, stale_count, crossed_count, locked_count, dropped_samples);
+}
+
+fn jsonStringArrayConst(alloc: std.mem.Allocator, value: std.json.Value) ![][]const u8 {
+    if (value != .array) return error.InvalidCharacter;
+    const out = try alloc.alloc([]const u8, value.array.items.len);
+    errdefer alloc.free(out);
+    for (value.array.items, 0..) |item, idx| {
+        if (item != .string) return error.InvalidCharacter;
+        out[idx] = item.string;
+    }
+    return out;
+}
+
+fn stringifyJsonValue(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
+    var buffer = std.array_list.Managed(u8).init(alloc);
+    errdefer buffer.deinit();
+    var writer = buffer.writer();
+    var tmp: [512]u8 = undefined;
+    var adapter = writer.adaptToNewApi(&tmp);
+    var iface = &adapter.new_interface;
+    var jw = std.json.Stringify{ .writer = iface };
+    try jw.write(value);
+    try iface.flush();
+    if (adapter.err) |err| return err;
+    return try buffer.toOwnedSlice();
+}
+
+fn marketLabelsSatisfySchema(labels_value: std.json.Value, schema: market_catalog_mod.MarketSchema) bool {
+    if (labels_value != .object) return false;
+    for (schema.required_labels) |label| {
+        const value = labels_value.object.get(label) orelse return false;
+        if (value != .string) return false;
+    }
+    return true;
+}
+
+fn marketColumnsMatchSchema(columns_value: std.json.Value, schema: market_catalog_mod.MarketSchema) bool {
+    if (columns_value != .object) return false;
+    if (columns_value.object.count() != schema.ordered_columns.len) return false;
+    for (schema.ordered_columns) |column| {
+        const value = columns_value.object.get(column) orelse return false;
+        if (value != .integer and value != .float) return false;
+    }
+    return true;
+}
+
+fn queryParam(query: []const u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
+    }
+    return null;
+}
+
+fn jsonRequiredString(obj: std.json.ObjectMap, key: []const u8) ?[]const u8 {
+    if (obj.get(key)) |value| if (value == .string) return value.string;
+    return null;
+}
+
+fn jsonRequiredInt(obj: std.json.ObjectMap, key: []const u8) ?i64 {
+    if (obj.get(key)) |value| if (value == .integer) return value.integer;
+    return null;
+}
+
+fn jsonIntArray(alloc: std.mem.Allocator, value: std.json.Value) ![]i64 {
+    if (value != .array) return error.InvalidCharacter;
+    const out = try alloc.alloc(i64, value.array.items.len);
+    errdefer alloc.free(out);
+    for (value.array.items, 0..) |item, idx| {
+        if (item != .integer) return error.InvalidCharacter;
+        out[idx] = item.integer;
+    }
+    return out;
+}
+
+fn canonicalLabelsForMarket(
+    alloc: std.mem.Allocator,
+    symbol: []const u8,
+    venue: []const u8,
+    interval: ?[]const u8,
+    bar_policy_id: ?[]const u8,
+) ![]u8 {
+    var buffer = std.array_list.Managed(u8).init(alloc);
+    defer buffer.deinit();
+    var writer = buffer.writer();
+    try writer.writeAll("{");
+    try writer.print("\"symbol\":\"{s}\",\"venue\":\"{s}\"", .{ symbol, venue });
+    if (interval) |value| try writer.print(",\"interval\":\"{s}\"", .{value});
+    if (bar_policy_id) |value| try writer.print(",\"bar_policy_id\":\"{s}\"", .{value});
+    try writer.writeAll("}");
+    return try @import("storage/series_catalog.zig").canonicalizeTagsJson(alloc, buffer.items);
+}
+
+fn queryMetricPoints(
+    alloc: std.mem.Allocator,
+    eng: *Engine,
+    metric: []const u8,
+    labels_json: []const u8,
+    start_ts: i64,
+    end_ts: i64,
+    revision: ?[]const u8,
+) ![]types.Point {
+    if (revision) |spec| {
+        var cas = eng.cas orelse return error.CasDisabled;
+        const snapshot = try cas.loadSnapshotForSpec(spec);
+        var index = cas_mod.SnapshotIndex.init(alloc, &cas.store, snapshot);
+        defer index.deinit();
+        const resolution = try index.resolveExactSeriesDetailed(metric, labels_json);
+        if (resolution.status == .not_found or resolution.series_id == null) return try alloc.alloc(types.Point, 0);
+        var points = std.array_list.Managed(types.Point).init(alloc);
+        defer points.deinit();
+        try index.queryRange(alloc, eng.data_dir, resolution.series_id.?, start_ts, end_ts, &points);
+        return try alloc.dupe(types.Point, points.items);
+    }
+    const sid = try resolveExactSeriesId(eng, metric, labels_json) orelse return try alloc.alloc(types.Point, 0);
+    if (sid == null_series_id) return try alloc.alloc(types.Point, 0);
+    var points = std.array_list.Managed(types.Point).init(alloc);
+    defer points.deinit();
+    try eng.queryRange(sid, start_ts, end_ts, &points);
+    return try alloc.dupe(types.Point, points.items);
+}
+
+fn resolvedRevisionLabel(alloc: std.mem.Allocator, eng: *Engine, revision: ?[]const u8) ![]u8 {
+    if (revision) |spec| {
+        if (eng.cas) |*cas| {
+            const id = try cas.resolveCommitSpec(spec);
+            const hex = id.toHex();
+            return try alloc.dupe(u8, hex[0..]);
+        }
+    }
+    if (eng.cas) |*cas| {
+        if (try cas.refs.readHead(cas_mod.main_ref)) |head| {
+            const hex = head.toHex();
+            return try alloc.dupe(u8, hex[0..]);
+        }
+    }
+    return try alloc.dupe(u8, "legacy-live");
+}
+
+fn respondAnalysisResult(
+    alloc: std.mem.Allocator,
+    eng: *Engine,
+    req: *std.http.Server.Request,
+    name: []const u8,
+    revision: ?[]const u8,
+    samples: usize,
+    value: ?f64,
+) !void {
+    var send_buffer: [512]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try jw.beginObject();
+    try jw.objectField("analysis");
+    try jw.write(name);
+    try jw.objectField("data_revision");
+    const revision_label = try resolvedRevisionLabel(alloc, eng, revision);
+    defer alloc.free(revision_label);
+    try jw.write(revision_label);
+    try jw.objectField("samples");
+    try jw.write(samples);
+    try jw.objectField("value");
+    if (value) |numeric| try jw.write(numeric) else try jw.write(null);
+    try jw.endObject();
+    try response.end();
+}
+
+fn respondQuoteQualityResult(
+    alloc: std.mem.Allocator,
+    eng: *Engine,
+    req: *std.http.Server.Request,
+    revision: ?[]const u8,
+    samples: usize,
+    spread_total: f64,
+    stale_count: usize,
+    crossed_count: usize,
+    locked_count: usize,
+    dropped_samples: usize,
+) !void {
+    var send_buffer: [768]u8 = undefined;
+    var response = try req.respondStreaming(&send_buffer, .{
+        .respond_options = .{ .extra_headers = &.{.{ .name = "Content-Type", .value = "application/json" }} },
+    });
+    errdefer response.end() catch {};
+    var jw = std.json.Stringify{ .writer = &response.writer };
+    try jw.beginObject();
+    try jw.objectField("analysis");
+    try jw.write("quote-quality");
+    try jw.objectField("data_revision");
+    const revision_label = try resolvedRevisionLabel(alloc, eng, revision);
+    defer alloc.free(revision_label);
+    try jw.write(revision_label);
+    try jw.objectField("samples");
+    try jw.write(samples);
+    try jw.objectField("dropped_samples");
+    try jw.write(dropped_samples);
+    try jw.objectField("avg_spread");
+    if (samples != 0) try jw.write(spread_total / @as(f64, @floatFromInt(samples))) else try jw.write(null);
+    try jw.objectField("stale_count");
+    try jw.write(stale_count);
+    try jw.objectField("crossed_count");
+    try jw.write(crossed_count);
+    try jw.objectField("locked_count");
+    try jw.write(locked_count);
+    try jw.endObject();
     try response.end();
 }
 

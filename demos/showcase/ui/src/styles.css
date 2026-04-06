@@ -874,11 +874,14 @@ pre, code {
 
 .launch-notes {
   width: min(420px, calc(100vw - 32px));
+  max-height: min(720px, calc(100vh - 104px));
   border: 1px solid var(--border-strong);
   border-radius: var(--radius-lg);
   background: var(--bg-raised);
   box-shadow: 0 18px 36px rgba(0, 0, 0, 0.28);
   overflow: hidden;
+  display: flex;
+  flex-direction: column;
 }
 
 .launch-notes__header {
@@ -930,6 +933,10 @@ pre, code {
 .launch-notes__stack {
   display: flex;
   flex-direction: column;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
 }
 
 .launch-card {
