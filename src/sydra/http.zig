@@ -5,6 +5,7 @@ const config = @import("config.zig");
 const compat = @import("compat.zig");
 const cas_mod = @import("storage/cas.zig");
 const query_exec = @import("query/exec.zig");
+const query_common = @import("query/common.zig");
 const plan = @import("query/plan.zig");
 const query_executor = @import("query/executor.zig");
 const query_value = @import("query/value.zig");
@@ -239,6 +240,9 @@ fn handleSydraql(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     if (sydraql.len == 0) {
         return respondJsonError(alloc, req, .bad_request, "query_required", "query required");
     }
+    query_common.validateQueryTextLimit(sydraql) catch {
+        return respondJsonError(alloc, req, .payload_too_large, "query_too_large", query_common.query_text_too_large_message);
+    };
 
     const start_time = std.time.microTimestamp();
     var cursor = query_exec.execute(alloc, eng, sydraql) catch |err| {
@@ -737,6 +741,20 @@ test "executionErrorContract distinguishes parse validation and unsupported fail
     const unsupported_contract = executionErrorContract(error.UnsupportedFunction);
     try std.testing.expectEqual(std.http.Status.bad_request, unsupported_contract.status);
     try std.testing.expectEqualStrings("unsupported_query_shape", unsupported_contract.code);
+}
+
+test "sydraql query text limit uses stable error payload" {
+    const alloc = std.testing.allocator;
+    const payload = try buildJsonErrorPayload(alloc, .payload_too_large, "query_too_large", query_common.query_text_too_large_message);
+    defer alloc.free(payload);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+    defer parsed.deinit();
+
+    const obj = parsed.value.object;
+    try std.testing.expectEqualStrings("query_too_large", obj.get("code").?.string);
+    try std.testing.expectEqualStrings(query_common.query_text_too_large_message, obj.get("error").?.string);
+    try std.testing.expectEqual(@as(i64, 413), obj.get("status").?.integer);
 }
 
 test "buildStatusPayload emits extended runtime counters" {

@@ -153,6 +153,7 @@ switch (translation) {
 ### `fn handleParseMessage(...) !void`
 
 - Parses the frontend `Parse` message fields (`statement_name`, SQL text, parameter slots/OIDs).
+- Rejects SQL text longer than `65536` bytes with stable `54000` program-limit errors before prepare.
 - Attempts `prepared_query.prepareSqlCore` against the current engine.
 - Stores prepared statement state in `ExtendedQueryState`.
 - On unsupported shapes, returns preview errors such as `0A000` and leaves the session usable.
@@ -199,6 +200,8 @@ Diagnostics:
 - Emits `NoticeResponse` messages:
   - `schema=[{name:\"...\",type:\"...\",nullable:true}, ...]` (for non-empty schemas)
   - `trace_id=...` (when `cursor.stats.trace_id` is present)
+  - `execution_mode=... legacy_fallback=...`
+  - `fallback_reason=...` (when execution fell back)
   - `operator=... rows_out=... elapsed_ms=...` for each operator stat
 - Completes with:
   - `CommandComplete` tag `SELECT rows=… scanned=… stream_ms=… plan_ms=… [trace_id=…]`

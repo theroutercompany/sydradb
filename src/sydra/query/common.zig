@@ -1,5 +1,10 @@
 const std = @import("std");
 
+pub const max_query_text_bytes: usize = 64 * 1024;
+pub const query_text_too_large_message = "query text exceeds 65536 bytes";
+
+pub const QueryTextLimitError = error{QueryTooLarge};
+
 /// Span records a half-open byte range inside the original query text.
 /// It is intentionally simple so we can extend with line/column metadata later.
 pub const Span = struct {
@@ -22,3 +27,25 @@ pub const Span = struct {
         return .{ .start = clamped_start, .end = clamped_end };
     }
 };
+
+pub fn validateQueryTextLimit(query: []const u8) QueryTextLimitError!void {
+    if (query.len > max_query_text_bytes) return error.QueryTooLarge;
+}
+
+test "validateQueryTextLimit accepts text at the configured ceiling" {
+    const alloc = std.testing.allocator;
+    const query = try alloc.alloc(u8, max_query_text_bytes);
+    defer alloc.free(query);
+    @memset(query, 'x');
+
+    try validateQueryTextLimit(query);
+}
+
+test "validateQueryTextLimit rejects oversized text" {
+    const alloc = std.testing.allocator;
+    const query = try alloc.alloc(u8, max_query_text_bytes + 1);
+    defer alloc.free(query);
+    @memset(query, 'x');
+
+    try std.testing.expectError(error.QueryTooLarge, validateQueryTextLimit(query));
+}

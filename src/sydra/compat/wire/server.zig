@@ -5,6 +5,7 @@ const prepared_query = @import("../../query/prepared.zig");
 const translator = @import("../../query/translator.zig");
 const query_exec = @import("../../query/exec.zig");
 const frontend = @import("../../query/frontend.zig");
+const query_common = @import("../../query/common.zig");
 const plan = @import("../../query/plan.zig");
 const value_mod = @import("../../query/value.zig");
 const engine_mod = @import("../../engine.zig");
@@ -431,6 +432,11 @@ fn handleSimpleQuery(
         try protocol.writeReadyForQuery(writer, 'I');
         return;
     }
+    query_common.validateQueryTextLimit(trimmed) catch {
+        try protocol.writeErrorResponse(writer, "ERROR", "54000", query_common.query_text_too_large_message);
+        try protocol.writeReadyForQuery(writer, 'I');
+        return;
+    };
 
     log.debug("simple query received: {s}", .{trimmed});
 
@@ -506,6 +512,10 @@ fn handleParseMessage(
     }
 
     const trimmed = std.mem.trim(u8, query_bytes, " \t\r\n");
+    query_common.validateQueryTextLimit(trimmed) catch {
+        try protocol.writeErrorResponse(writer, "ERROR", "54000", query_common.query_text_too_large_message);
+        return;
+    };
     log.debug(
         "parse message for statement '{s}' sql='{s}'",
         .{ statement_name, trimmed },
@@ -1767,6 +1777,76 @@ test "extended protocol rejects unsupported direct prepare with stable feature-n
     try std.testing.expectEqualSlices(u8, &.{ 'E', 'Z' }, message_types);
     try std.testing.expect(std.mem.indexOf(u8, written, "0A000") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "SQL parse unsupported by direct prepare") != null);
+}
+
+test "simple query rejects oversized query text with stable program limit error" {
+    const alloc = std.testing.allocator;
+    const payload_len = query_common.max_query_text_bytes + 32;
+    const payload = try alloc.alloc(u8, payload_len + 1);
+    defer alloc.free(payload);
+    @memset(payload[0..payload_len], 'x');
+    payload[payload_len] = 0;
+
+    var allocating_writer: std.Io.Writer.Allocating = .init(alloc);
+    defer allocating_writer.deinit();
+
+    const engine = undefined;
+    try handleSimpleQuery(alloc, anyWriter(&allocating_writer.writer), payload, engine);
+
+    const written = allocating_writer.written();
+    try std.testing.expect(std.mem.indexOf(u8, written, "54000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, query_common.query_text_too_large_message) != null);
+}
+
+test "extended protocol rejects oversized parse text with stable program limit error" {
+    const alloc = std.testing.allocator;
+    const sql = try alloc.alloc(u8, query_common.max_query_text_bytes + 32);
+    defer alloc.free(sql);
+    @memset(sql, 'x');
+
+    var input = std.array_list.Managed(u8).init(alloc);
+    defer input.deinit();
+    try appendParseMessage(&input, "stmt1", sql, 0);
+    try appendFrontendMessage(&input, 'S', &.{});
+
+    var read_stream = std.io.fixedBufferStream(input.items);
+    var read_state = read_stream.reader();
+    const reader = read_state.any();
+
+    var allocating_writer: std.Io.Writer.Allocating = .init(alloc);
+    defer allocating_writer.deinit();
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/pgwire-oversized-parse", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .compiled,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    try messageLoop(alloc, reader, anyWriter(&allocating_writer.writer), &allocating_writer.writer, engine);
+
+    const written = allocating_writer.written();
+    const message_types = try collectBackendMessageTypes(alloc, written);
+    defer alloc.free(message_types);
+    try std.testing.expectEqualSlices(u8, &.{ 'E', 'Z' }, message_types);
+    try std.testing.expect(std.mem.indexOf(u8, written, "54000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, query_common.query_text_too_large_message) != null);
 }
 
 fn appendFrontendMessage(buffer: *std.array_list.Managed(u8), msg_type: u8, payload: []const u8) !void {
