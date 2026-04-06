@@ -1,0 +1,25 @@
+{
+  "suite": "bench-ingest-transport",
+  "scenarios": [
+    {
+      "name": "one_hot_one_writer",
+      "description": "1 series, 1 writer, warm socket cache",
+      "command": "zig build bench-ingest-transport -- --scenario one_hot_one_writer"
+    },
+    {
+      "name": "fanout_four_writers",
+      "description": "100 series, 4 writers, warm socket cache",
+      "command": "zig build bench-ingest-transport -- --scenario fanout_four_writers"
+    },
+    {
+      "name": "warm_declared_10k",
+      "description": "10k predeclared series, steady-state socket append",
+      "command": "zig build bench-ingest-transport -- --scenario warm_declared_10k"
+    },
+    {
+      "name": "cold_declare_10k",
+      "description": "10k series cold declaration burst followed by append",
+      "command": "zig build bench-ingest-transport -- --scenario cold_declare_10k"
+    }
+  ]
+}

@@ -13,6 +13,9 @@ node_modules
 demos/showcase/node_modules
 demos/showcase/dist
 demos/showcase/ui/dist
+demos/trading-showcase/node_modules
+demos/trading-showcase/dist
+demos/trading-showcase/ui/dist
 
 output
 

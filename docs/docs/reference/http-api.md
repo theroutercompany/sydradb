@@ -36,7 +36,12 @@ Returns a lightweight JSON health snapshot with:
 - `compatibility_debt.legacy_segment_descriptors`
 - `compatibility_debt.legacy_wal_descriptors`
 - `compatibility_debt.loose_refs_present`
+- `runtime.local_ingest_enabled`
+- `runtime.local_ingest_connections_current`
+- `runtime.local_ingest_append_points_total`
+- `runtime.local_ingest_rejected_total`
 - `runtime.queue_depth`
+- `runtime.queue_pending_bytes_max`
 - `runtime.memtable_bytes`
 - `runtime.flush_total`
 - `runtime.flush_points_total`
@@ -77,7 +82,12 @@ Example:
     "loose_refs_present": 0
   },
   "runtime": {
+    "local_ingest_enabled": true,
+    "local_ingest_connections_current": 1,
+    "local_ingest_append_points_total": 42,
+    "local_ingest_rejected_total": 0,
     "queue_depth": 0,
+    "queue_pending_bytes_max": 16384,
     "memtable_bytes": 0,
     "flush_total": 3,
     "flush_points_total": 17,
@@ -140,6 +150,8 @@ Error cases:
 - If ingest backpressure is hit, the request fails with a JSON error and `503 Service Unavailable`.
 - Telemetry lines with non-numeric `fields` fail with a JSON `400` error.
 - Conflicting metric descriptor metadata fails with a JSON `409` error.
+
+For same-host writers that want lower overhead than HTTP NDJSON, use the [local ingest socket](./local-ingest.md) instead of widening the HTTP contract.
 
 ## `POST /api/v1/query/range`
 

@@ -9,6 +9,10 @@ Current entrypoints:
 - `zig build bench-alloc -- --ops 10000 --concurrency 4 --series 10000`
 - `zig build bench-sydraql -- --points-per-series 32 --iterations 5`
 - `zig build bench-cas`
+- `zig build bench-ingest-transport -- --scenario one_hot_one_writer`
+- `zig build bench-ingest-transport -- --scenario fanout_four_writers`
+- `zig build bench-ingest-transport -- --scenario warm_declared_10k`
+- `zig build bench-ingest-transport -- --scenario cold_declare_10k`
 
 The scenario files under `benchmarks/*/scenarios.json` are the checked-in contract for what we intend to measure and publish.
 

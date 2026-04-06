@@ -40,6 +40,8 @@ The checked-in `sydradb.toml` and `sydradb.toml.example` include inline comments
 ```toml
 data_dir = "./data"
 http_port = 8080
+ingest_socket_path = ""
+ingest_socket_max_frame_bytes = 8388608
 fsync = "interval"
 flush_interval_ms = 2000
 memtable_max_bytes = 8388608
@@ -63,6 +65,27 @@ Default: `./data`
 HTTP listen port.
 
 Default: `8080`
+
+Set `http_port = 0` to disable HTTP entirely. This is mainly useful for socket-only local ingest setups.
+
+### `ingest_socket_path` (string)
+
+Unix-domain socket path for the local binary ingest listener.
+
+Default: empty string (`""`, disabled)
+
+Notes:
+
+- Empty string disables the listener.
+- If `http_port != 0` and `ingest_socket_path != ""`, Sydra starts both listeners.
+- If `http_port = 0` and `ingest_socket_path != ""`, Sydra runs in socket-only mode.
+- The listener startup validates the path up front and fails fast for non-socket collisions, live listeners, and oversized paths.
+
+### `ingest_socket_max_frame_bytes` (integer)
+
+Maximum allowed local-ingest protocol frame size.
+
+Default: `8388608` (8 MiB)
 
 ### `fsync` (string enum)
 

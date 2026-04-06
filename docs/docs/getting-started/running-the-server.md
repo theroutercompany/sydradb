@@ -13,11 +13,19 @@ zig build
 ./zig-out/bin/sydradb         # same as: ./zig-out/bin/sydradb serve
 ```
 
-The server binds to `0.0.0.0:<http_port>` as configured in `sydradb.toml`.
+Listener modes:
+
+- HTTP-only: binds `0.0.0.0:<http_port>`
+- socket-only: binds `ingest_socket_path`
+- combined: starts both
+
+In combined mode, Sydra keeps HTTP as the operator surface and adds the local socket for same-host producers.
 
 See:
 
 - [Configuration – `http_port`](../reference/configuration.md#http_port-integer)
+- [Configuration – `ingest_socket_path`](../reference/configuration.md#ingest_socket_path-string)
+- [Local Ingest Socket](../reference/local-ingest.md)
 - [HTTP server implementation](../reference/source/sydra/http.md)
 
 ## Config file lookup
@@ -41,6 +49,7 @@ Non-`/api/` routes (for example `/metrics` and `/debug/*`) are not gated by this
 ## Endpoints
 
 - [`/metrics`](../reference/http-api.md#get-metrics) (GET) – Prometheus-style text metrics
+- [`/status`](../reference/http-api.md#get-status) (GET) – runtime and local-ingest health snapshot
 - [`/api/v1/ingest`](../reference/http-api.md#post-apiv1ingest) (POST) – NDJSON ingest
 - [`/api/v1/query/range`](../reference/http-api.md#post-apiv1queryrange) (GET/POST) – time range query by `series` or `series_id`
 - [`/api/v1/query/find`](../reference/http-api.md#post-apiv1queryfind) (POST) – tag-based series lookup

@@ -22,7 +22,13 @@ Implementation reference:
 ./zig-out/bin/sydradb serve
 ```
 
-Loads `sydradb.toml` from the current working directory and starts the HTTP server.
+Loads `sydradb.toml` from the current working directory and starts the configured listeners.
+
+Listener modes:
+
+- HTTP-only: `http_port != 0`, `ingest_socket_path = ""`
+- socket-only: `http_port = 0`, `ingest_socket_path != ""`
+- combined: both configured
 
 Implementation: [`server.run` dispatch](./source/sydra/server.md#pub-fn-runhandle-alloc_modallocatorhandle-void).
 
@@ -52,6 +58,7 @@ Reads NDJSON from stdin and ingests into the local engine.
 
 ```sh
 cat points.ndjson | ./zig-out/bin/sydradb ingest
+cat points.ndjson | ./zig-out/bin/sydradb ingest --socket ./ingest.sock
 ```
 
 Each line uses the same parser as `POST /api/v1/ingest`:
@@ -62,6 +69,8 @@ Each line uses the same parser as `POST /api/v1/ingest`:
 - `tags` participate in canonical series-id derivation
 
 The command flushes before exit, so a successful return means the ingested points are queryable from the local repository state.
+
+With `--socket <path>`, the CLI speaks the local binary ingest protocol instead of opening the repository directly. The current socket client batches declarations and append frames, then issues a queryable barrier before exit.
 
 The human-readable success summary is only printed when stderr is attached to a TTY, which keeps noninteractive smoke runs and scripts quieter.
 

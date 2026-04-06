@@ -280,4 +280,41 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| bench_cas_run.addArgs(args);
     b.step("bench-cas", "Run CAS bundle maintenance and local transfer benchmarks").dependOn(&bench_cas_run.step);
     bench_smoke.dependOn(&bench_cas_run.step);
+
+    const bench_transport_exe = if (is015) blk7: {
+        const root_mod = b.createModule(.{ .root_source_file = b.path("tools/bench_ingest_transport.zig"), .target = target, .optimize = optimize });
+        root_mod.addImport("build_options", build_options_module);
+        root_mod.addImport("sydra_tooling", tooling_module);
+        if (use_mimalloc) {
+            root_mod.addIncludePath(mimalloc_include);
+            root_mod.addIncludePath(mimalloc_src_dir);
+        }
+        break :blk7 b.addExecutable(.{ .name = "bench_ingest_transport", .root_module = root_mod });
+    } else blk7: {
+        const exe_inner = b.addExecutable(.{ .name = "bench_ingest_transport", .root_source_file = b.path("tools/bench_ingest_transport.zig"), .target = target, .optimize = optimize });
+        exe_inner.root_module.addImport("build_options", build_options_module);
+        exe_inner.root_module.addImport("sydra_tooling", tooling_module);
+        if (use_mimalloc) {
+            exe_inner.addIncludePath(mimalloc_include);
+            exe_inner.addIncludePath(mimalloc_src_dir);
+            exe_inner.addCSourceFile(.{ .file = mimalloc_c_file, .flags = mimalloc_flags });
+            exe_inner.linkLibC();
+            exe_inner.linkSystemLibrary("pthread");
+        }
+        break :blk7 exe_inner;
+    };
+
+    if (use_mimalloc and is015) {
+        bench_transport_exe.addCSourceFile(.{ .file = mimalloc_c_file, .flags = mimalloc_flags });
+        bench_transport_exe.linkLibC();
+        bench_transport_exe.linkSystemLibrary("pthread");
+    } else if (!use_mimalloc) {
+        bench_transport_exe.linkLibC();
+        if (os_tag == .linux) bench_transport_exe.linkSystemLibrary("pthread");
+    }
+
+    const bench_transport_run = b.addRunArtifact(bench_transport_exe);
+    bench_transport_run.step.dependOn(b.getInstallStep());
+    if (b.args) |args| bench_transport_run.addArgs(args);
+    b.step("bench-ingest-transport", "Run same-host ingest transport benchmark scenarios").dependOn(&bench_transport_run.step);
 }

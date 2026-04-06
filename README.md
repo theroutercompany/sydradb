@@ -136,27 +136,30 @@ Alpha. The current cycle is a stabilization-and-truthfulness push: make the CAS-
 
 ## Benchmarks
 
-The repo now carries three benchmark entrypoints for the `v0.4.0` alpha cycle:
+The repo now carries four benchmark entrypoints for the `v0.4.0` alpha cycle:
 
 ```bash
 zig build bench-alloc -- --ops 10000 --concurrency 4 --series 1
 zig build bench-sydraql -- --points-per-series 32 --iterations 5
 zig build bench-cas
+zig build bench-ingest-transport -- --scenario one_hot_one_writer
 ```
 
-Scenario definitions live under [`benchmarks/README.md`](/Users/rexliu/sydradb/benchmarks/README.md), [`benchmarks/alloc/scenarios.json`](/Users/rexliu/sydradb/benchmarks/alloc/scenarios.json), [`benchmarks/sydraql/scenarios.json`](/Users/rexliu/sydradb/benchmarks/sydraql/scenarios.json), and [`benchmarks/cas/scenarios.json`](/Users/rexliu/sydradb/benchmarks/cas/scenarios.json).
+Scenario definitions live under [`benchmarks/README.md`](/Users/rexliu/sydradb/benchmarks/README.md), [`benchmarks/alloc/scenarios.json`](/Users/rexliu/sydradb/benchmarks/alloc/scenarios.json), [`benchmarks/sydraql/scenarios.json`](/Users/rexliu/sydradb/benchmarks/sydraql/scenarios.json), [`benchmarks/cas/scenarios.json`](/Users/rexliu/sydradb/benchmarks/cas/scenarios.json), and [`benchmarks/ingest_transport/scenarios.json`](/Users/rexliu/sydradb/benchmarks/ingest_transport/scenarios.json).
 
 One checked-in sample run is published in [`benchmarks/v0.4.0-summary.md`](/Users/rexliu/sydradb/benchmarks/v0.4.0-summary.md).
 
 ## Demos
 
-The repo also carries four reproducible demo scripts:
+The repo also carries six reproducible demo scripts:
 
 ```bash
 bash demos/demo-quickstart.sh
 bash demos/demo-sydraql-compiled.sh
 bash demos/demo-cas-lifecycle.sh
 bash demos/demo-pgwire-preview.sh
+bash demos/demo-local-ingest-socket.sh
+bash demos/demo-combined-http-socket.sh
 zig build demo-smoke
 ```
 
