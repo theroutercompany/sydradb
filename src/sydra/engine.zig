@@ -11,6 +11,9 @@ const tags_mod = @import("storage/tags.zig");
 const retention = @import("storage/retention.zig");
 const cas_mod = @import("storage/cas.zig");
 const extents = @import("storage/extents.zig");
+const query_ast = @import("query/ast.zig");
+const query_expression = @import("query/expression.zig");
+const query_plan = @import("query/plan.zig");
 
 fn sleepMs(ms: u64) void {
     if (@hasDecl(std.time, "sleep")) {
@@ -377,6 +380,11 @@ pub const Engine = struct {
             self.closed = true;
             self.mu.unlock();
             self.cv.broadcast();
+        }
+        pub fn reopen(self: *Queue) void {
+            self.mu.lock();
+            self.closed = false;
+            self.mu.unlock();
         }
         pub fn len(self: *Queue) usize {
             self.mu.lock();
@@ -777,6 +785,45 @@ pub const Engine = struct {
 
     pub fn resolveExactSeries(self: *Engine, series: []const u8, tags_json: []const u8) !series_catalog_mod.Match {
         return (try self.resolveSelector(.{ .exact = .{ .series = series, .tags_json = tags_json } })).toMatch();
+    }
+
+    pub fn deleteWhere(self: *Engine, series_id: types.SeriesId, predicate: ?*const query_ast.Expr) !usize {
+        try pauseWriterForMaintenance(self);
+        defer resumeWriterAfterMaintenance(self) catch |err| {
+            std.log.err("failed to resume writer after delete maintenance: {s}", .{@errorName(err)});
+        };
+
+        _ = try flushMemtable(self);
+
+        var existing = std.array_list.Managed(types.Point).init(self.alloc);
+        defer existing.deinit();
+        try self.queryRange(series_id, std.math.minInt(i64), std.math.maxInt(i64), &existing);
+        if (existing.items.len == 0) return 0;
+
+        var survivors = std.array_list.Managed(types.Point).init(self.alloc);
+        defer survivors.deinit();
+
+        var deleted_count: usize = 0;
+        for (existing.items) |point| {
+            if (predicate) |expr| {
+                if (try deletePredicateMatches(expr, point)) {
+                    deleted_count += 1;
+                } else {
+                    try survivors.append(point);
+                }
+            } else {
+                deleted_count += 1;
+            }
+        }
+
+        if (deleted_count == 0) return 0;
+
+        try rewriteSeriesPoints(self, series_id, survivors.items);
+        try self.wal.reset();
+        if (self.cas != null) {
+            try self.syncCasSnapshot("delete");
+        }
+        return deleted_count;
     }
 
     pub fn collectMatchingSeriesIds(self: *Engine, alloc: std.mem.Allocator, tags_value: std.json.Value, op_and: bool) !std.array_list.Managed(types.SeriesId) {
@@ -1619,6 +1666,121 @@ fn waitForQueueEmpty(engine: *Engine, timeout_ms: u64) waitError!void {
     return waitError.Timeout;
 }
 
+fn pauseWriterForMaintenance(self: *Engine) !void {
+    try waitForQueueEmpty(self, 5_000);
+    self.stop_flag = true;
+    self.queue.close();
+    if (self.writer_thread) |thread| {
+        thread.join();
+        self.writer_thread = null;
+    }
+}
+
+fn resumeWriterAfterMaintenance(self: *Engine) !void {
+    self.stop_flag = false;
+    self.queue.reopen();
+    if (self.writer_thread == null) {
+        self.writer_thread = try std.Thread.spawn(.{}, Engine.writerLoop, .{self});
+    }
+}
+
+fn deletePredicateMatches(expr: *const query_ast.Expr, point: types.Point) !bool {
+    const time_expr = query_ast.Expr{
+        .identifier = .{ .value = "time", .quoted = false, .span = .{ .start = 0, .end = 0 } },
+    };
+    const value_expr = query_ast.Expr{
+        .identifier = .{ .value = "value", .quoted = false, .span = .{ .start = 0, .end = 0 } },
+    };
+    const schema = [_]query_plan.ColumnInfo{
+        .{ .name = "time", .expr = &time_expr },
+        .{ .name = "value", .expr = &value_expr },
+    };
+    const values = [_]query_expression.Value{
+        .{ .integer = point.ts },
+        .{ .float = point.value },
+    };
+    const ctx = query_expression.RowContext{
+        .schema = &schema,
+        .values = &values,
+    };
+    return try query_expression.evaluateRowBoolean(expr, &ctx);
+}
+
+fn rewriteSeriesPoints(self: *Engine, series_id: types.SeriesId, points: []types.Point) !void {
+    std.sort.block(types.Point, points, {}, struct {
+        fn lessThan(_: void, lhs: types.Point, rhs: types.Point) bool {
+            return lhs.ts < rhs.ts;
+        }
+    }.lessThan);
+
+    const selector_resolution = self.metadata.series_catalog.resolveBySeriesId(series_id);
+    const selector_metadata = switch (selector_resolution.status) {
+        .resolved, .exact_match => segment_mod.SelectorMetadataView{
+            .series = selector_resolution.series.?,
+            .canonical_tags = selector_resolution.canonical_tags.?,
+        },
+        .not_found, .ambiguous => null,
+    };
+
+    var rebuilt = std.ArrayListUnmanaged(manifest_mod.Entry){};
+    errdefer {
+        for (rebuilt.items) |entry| self.alloc.free(entry.path);
+        rebuilt.deinit(self.alloc);
+    }
+
+    for (self.metadata.manifest.entries.items) |entry| {
+        if (entry.series_id == series_id) {
+            self.data_dir.deleteFile(entry.path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+        } else {
+            try rebuilt.append(self.alloc, .{
+                .series_id = entry.series_id,
+                .hour_bucket = entry.hour_bucket,
+                .start_ts = entry.start_ts,
+                .end_ts = entry.end_ts,
+                .count = entry.count,
+                .path = try self.alloc.dupe(u8, entry.path),
+            });
+        }
+    }
+
+    for (self.metadata.manifest.entries.items) |entry| {
+        self.alloc.free(entry.path);
+    }
+    self.metadata.manifest.entries.deinit(self.alloc);
+
+    var start_idx: usize = 0;
+    while (start_idx < points.len) {
+        const hour = Engine.hourBucket(points[start_idx].ts);
+        var end_idx = start_idx + 1;
+        while (end_idx < points.len and Engine.hourBucket(points[end_idx].ts) == hour) : (end_idx += 1) {}
+        const slice = points[start_idx..end_idx];
+        const seg_path = try segment_mod.writeSegmentWithMetadata(
+            self.alloc,
+            self.data_dir,
+            series_id,
+            hour,
+            slice,
+            selector_metadata,
+        );
+        defer self.alloc.free(seg_path);
+        try rebuilt.append(self.alloc, .{
+            .series_id = series_id,
+            .hour_bucket = hour,
+            .start_ts = slice[0].ts,
+            .end_ts = slice[slice.len - 1].ts,
+            .count = @intCast(slice.len),
+            .path = try self.alloc.dupe(u8, seg_path),
+        });
+        start_idx = end_idx;
+    }
+
+    self.metadata.manifest.entries = rebuilt;
+    try self.metadata.manifest.rewriteCheckpoint(self.data_dir);
+}
+
 test "engine ingests, flushes, and queries range" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -1663,6 +1825,79 @@ test "engine ingests, flushes, and queries range" {
     const matches = engine.metadata.tags.get("host=a");
     try std.testing.expectEqual(@as(usize, 1), matches.len);
     try std.testing.expectEqual(sid, matches[0]);
+}
+
+test "engine deleteWhere rewrites series data and resets wal" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/delete-where", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const sid = types.hash64("delete.range");
+    try engine.registerSeries("delete.range", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.0, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 20, .value = 2.0, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 30, .value = 3.0, .tags_json = "{}" });
+    try waitForFlush(engine, 1, 1_000);
+
+    const time_expr = query_ast.Expr{
+        .identifier = .{ .value = "time", .quoted = false, .span = .{ .start = 0, .end = 0 } },
+    };
+    const cutoff_expr = query_ast.Expr{
+        .literal = .{ .value = .{ .integer = 20 }, .span = .{ .start = 0, .end = 0 } },
+    };
+    const predicate = query_ast.Expr{
+        .binary = .{
+            .op = .greater_equal,
+            .left = &time_expr,
+            .right = &cutoff_expr,
+            .span = .{ .start = 0, .end = 0 },
+        },
+    };
+
+    try std.testing.expectEqual(@as(usize, 2), try engine.deleteWhere(sid, &predicate));
+
+    var results = std.array_list.Managed(types.Point).init(talloc);
+    defer results.deinit();
+    try engine.queryRange(sid, 0, 10_000, &results);
+    try std.testing.expectEqual(@as(usize, 1), results.items.len);
+    try std.testing.expectEqual(@as(i64, 10), results.items[0].ts);
+
+    const wal_files = try wal_mod.listWalFiles(talloc, engine.data_dir);
+    defer wal_mod.freeWalFiles(talloc, wal_files);
+    try std.testing.expectEqual(@as(usize, 1), wal_files.len);
+    try std.testing.expectEqualStrings("current.wal", wal_files[0]);
+    const wal_stat = try engine.data_dir.statFile("wal/current.wal");
+    try std.testing.expectEqual(@as(u64, 0), wal_stat.size);
+
+    try engine.ingest(.{ .series_id = sid, .ts = 40, .value = 4.0, .tags_json = "{}" });
+    try waitForFlush(engine, 2, 1_000);
+
+    var resumed = std.array_list.Managed(types.Point).init(talloc);
+    defer resumed.deinit();
+    try engine.queryRange(sid, 0, 10_000, &resumed);
+    try std.testing.expectEqual(@as(usize, 2), resumed.items.len);
+    try std.testing.expectEqual(@as(i64, 40), resumed.items[1].ts);
 }
 
 test "engine replays wal on startup" {

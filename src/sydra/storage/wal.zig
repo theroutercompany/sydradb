@@ -116,6 +116,26 @@ pub const WAL = struct {
         self.bytes_written = 0;
     }
 
+    pub fn reset(self: *WAL) !void {
+        self.file.close();
+        self.dir.makePath("wal") catch {};
+
+        const files = try listWalFiles(self.alloc, self.dir);
+        defer freeWalFiles(self.alloc, files);
+
+        for (files) |name| {
+            const path = try std.fmt.allocPrint(self.alloc, "wal/{s}", .{name});
+            defer self.alloc.free(path);
+            self.dir.deleteFile(path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+        }
+
+        self.file = try self.dir.createFile("wal/current.wal", .{ .truncate = true, .read = true });
+        self.bytes_written = 0;
+    }
+
     pub fn replay(self: *WAL, alloc: std.mem.Allocator, ctx: anytype) !void {
         const files = try listWalFiles(alloc, self.dir);
         defer freeWalFiles(alloc, files);
