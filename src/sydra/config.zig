@@ -4,6 +4,7 @@ pub const FsyncPolicy = enum { always, interval, none };
 pub const CasMode = enum { off, dual_write };
 pub const QueryCompilerMode = enum { legacy, shadow, compiled };
 pub const MetadataReadMode = enum { legacy, shadow, primary };
+pub const MarketStorageMode = enum { fanout_v1, dual_write_v1, native_v1 };
 
 pub const Config = struct {
     data_dir: []const u8,
@@ -19,6 +20,7 @@ pub const Config = struct {
     cas_mode: CasMode,
     metadata_read_mode: MetadataReadMode = .legacy,
     query_compiler_mode: QueryCompilerMode = .compiled,
+    market_storage_mode: MarketStorageMode = .fanout_v1,
     retention_ns: std.StringHashMap(u32),
 
     pub fn deinit(self: *Config, alloc: std.mem.Allocator) void {
@@ -53,6 +55,7 @@ fn parseToml(alloc: std.mem.Allocator, text: []const u8) !Config {
         .cas_mode = .off,
         .metadata_read_mode = .legacy,
         .query_compiler_mode = .compiled,
+        .market_storage_mode = .fanout_v1,
         .retention_ns = std.StringHashMap(u32).init(alloc),
     };
     var it = std.mem.tokenizeAny(u8, text, "\n\r");
@@ -126,6 +129,18 @@ fn parseToml(alloc: std.mem.Allocator, text: []const u8) !Config {
                 cfg.query_compiler_mode = .compiled;
             } else {
                 return error.InvalidQueryCompilerMode;
+            }
+        } else if (std.mem.eql(u8, key_raw, "market_storage_mode")) {
+            var v2 = val_raw;
+            if (v2.len >= 2 and v2[0] == '"' and v2[v2.len - 1] == '"') v2 = v2[1 .. v2.len - 1];
+            if (std.mem.eql(u8, v2, "fanout_v1")) {
+                cfg.market_storage_mode = .fanout_v1;
+            } else if (std.mem.eql(u8, v2, "dual_write_v1")) {
+                cfg.market_storage_mode = .dual_write_v1;
+            } else if (std.mem.eql(u8, v2, "native_v1")) {
+                cfg.market_storage_mode = .native_v1;
+            } else {
+                return error.InvalidMarketStorageMode;
             }
         } else if (std.mem.startsWith(u8, key_raw, "retention.")) {
             const ns = key_raw["retention.".len..];

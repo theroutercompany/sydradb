@@ -56,20 +56,23 @@ The current trading-facing alpha is definition-driven and keeps the existing sin
 
 - Register market families with `POST /api/v1/market/schema/register`
 - Ingest market rows with `POST /api/v1/market/ingest`
+- Query market rows with `POST /api/v1/market/query`
 - Register bar policies, rollups, and signals with:
   - `POST /api/v1/bar-policies/register`
   - `POST /api/v1/rollups/register`
   - `POST /api/v1/signals/register`
 - Inspect derived-runtime health with `GET /api/v1/rollups` and `GET /api/v1/signals`
+- Inspect signal history with `GET /api/v1/signals/history?name=<signal-id>&start_ts_ns=<...>&end_ts_ns=<...>`
 - Subscribe to signal SSE output with `GET /api/v1/signals/subscribe?name=<signal-id>`
 - Run revision-aware analysis with:
   - `POST /api/v1/analysis/markout`
   - `POST /api/v1/analysis/slippage`
   - `POST /api/v1/analysis/quote-quality`
+  - `GET /api/v1/analysis/catalog`
 
 Current contract notes:
 
-- Market APIs require `ts_ns` and treat it as nanosecond epoch time end-to-end.
+- Market APIs require `ts_ns` / `*_ts_ns` fields and treat them as nanosecond epoch time end-to-end.
 - Market ingest is schema-validated and fans out each row into sibling exact-series metrics such as `market.trade.price` and `market.bar.close`.
 - Derived outputs carry provenance labels including `data_revision`, `definition_id`, and `definition_version`.
 - Native multi-column storage is not implemented yet; that remains a later internal foundation project.
@@ -158,7 +161,7 @@ Apache-2.0
 ## CLI
 
 ```bash
-./zig-out/bin/sydradb             # serve (HTTP): /api/v1/ingest, /api/v1/query/range, /api/v1/query/compare, /api/v1/metrics/find, /api/v1/metrics/health, /api/v1/series/find, /api/v1/labels/values, /api/v1/annotations/write, /api/v1/annotations/query, /api/v1/sydraql, /api/v1/market/schema/register, /api/v1/market/ingest, /api/v1/bar-policies/register, /api/v1/rollups, /api/v1/signals, /api/v1/signals/subscribe, /api/v1/analysis/markout, /api/v1/analysis/slippage, /api/v1/analysis/quote-quality, /api/v1/cas/refs, /api/v1/cas/commits, /api/v1/cas/log, /api/v1/cas/diff, /metrics
+./zig-out/bin/sydradb             # serve (HTTP): /api/v1/ingest, /api/v1/query/range, /api/v1/query/compare, /api/v1/metrics/find, /api/v1/metrics/health, /api/v1/series/find, /api/v1/labels/values, /api/v1/annotations/write, /api/v1/annotations/query, /api/v1/sydraql, /api/v1/market/schema/register, /api/v1/market/ingest, /api/v1/market/query, /api/v1/bar-policies/register, /api/v1/rollups, /api/v1/signals, /api/v1/signals/history, /api/v1/signals/subscribe, /api/v1/analysis/markout, /api/v1/analysis/slippage, /api/v1/analysis/quote-quality, /api/v1/analysis/catalog, /api/v1/cas/refs, /api/v1/cas/commits, /api/v1/cas/log, /api/v1/cas/diff, /metrics
 ./zig-out/bin/sydradb pgwire      # PostgreSQL wire protocol preview (simple query + preview prepared flow)
 ./zig-out/bin/sydradb ingest      # read NDJSON from stdin, flush, and exit only after points are queryable
 ./zig-out/bin/sydradb query <series_id> <start_ts> <end_ts>
@@ -213,6 +216,7 @@ enable_prom = true
 cas_mode = "off"  # off|dual_write
 metadata_read_mode = "legacy"  # legacy|shadow|primary
 query_compiler_mode = "compiled"  # legacy|shadow|compiled
+market_storage_mode = "fanout_v1" # fanout_v1|dual_write_v1|native_v1
 # Per-namespace TTL
 retention.weather = 30
 ```
@@ -233,6 +237,7 @@ Config notes:
 - `metadata_read_mode = "shadow"` serves from legacy metadata and cross-checks answers against the CAS snapshot.
 - `metadata_read_mode = "primary"` serves metadata from CAS and can boot even if `MANIFEST`, `tags.json`, or `series_catalog.jsonl` are missing.
 - `query_compiler_mode = "compiled"` is the default execution mode. Unsupported query shapes fall back to the legacy pipeline and emit visible fallback metrics.
+- `market_storage_mode` currently defaults to `fanout_v1`. `dual_write_v1` and `native_v1` are forward-looking internal modes and should still be treated as preview plumbing rather than a broad compatibility guarantee.
 - Without `sydradb.toml`, fresh repositories default to `cas_mode = "dual_write"` plus `metadata_read_mode = "primary"`. Existing repositories without a migrated `objects/info/store-format` marker stay on `off` plus `legacy` until `cas migrate-reftable` or `cas upgrade` is run.
 - CAS repositories persist `objects/info/store-format` to version repository-wide storage behavior separately from per-object codecs. Fresh repositories initialize format v3 with a reftable ref backend plus canonical `segment_root` / `journal_root` metadata for active history. Legacy repositories stay in the older compatibility format until explicitly migrated and normalized.
 - WAL recovery order is sourced from the CAS commit graph when CAS is enabled, with any uncaptured live WAL files appended as tail replay.
