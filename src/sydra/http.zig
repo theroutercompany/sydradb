@@ -327,18 +327,15 @@ fn handleAllocStats(handle: *alloc_mod.AllocatorHandle, req: *std.http.Server.Re
     try response.end();
 }
 fn handleSydraql(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
-    var body_buf: [1024]u8 = undefined;
-    const body_reader = req.readerExpectNone(&body_buf);
-    const content_len = req.head.content_length orelse {
-        return respondJsonError(alloc, req, .length_required, "length_required", "length required");
+    const body = readRequestBodyAlloc(alloc, req, 256 * 1024) catch |err| switch (err) {
+        error.LengthRequired => {
+            return respondJsonError(alloc, req, .length_required, "length_required", "length required");
+        },
+        error.PayloadTooLarge => {
+            return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large");
+        },
+        else => return err,
     };
-    if (content_len > 256 * 1024) {
-        return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large");
-    }
-
-    const len: usize = @intCast(content_len);
-    const body_slice = try body_reader.*.take(len);
-    const body = try alloc.dupe(u8, body_slice);
     defer alloc.free(body);
 
     const sydraql = std.mem.trim(u8, body, " \t\r\n");
@@ -1521,30 +1518,7 @@ fn handleStatus(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Re
 }
 
 const default_tags_json = "{}";
-
-const ParsedIngestMetric = struct {
-    series: []u8,
-    value: f64,
-    descriptor: ?metric_catalog_mod.Descriptor = null,
-
-    fn deinit(self: *ParsedIngestMetric, alloc: std.mem.Allocator) void {
-        alloc.free(self.series);
-        if (self.descriptor) |*descriptor| descriptor.deinit(alloc);
-        self.* = undefined;
-    }
-};
-
-pub const ParsedIngestLine = struct {
-    ts: i64,
-    tags_json: []u8,
-    writes: []ParsedIngestMetric,
-
-    pub fn deinit(self: ParsedIngestLine, alloc: std.mem.Allocator) void {
-        alloc.free(self.tags_json);
-        for (self.writes) |*write| write.deinit(alloc);
-        alloc.free(self.writes);
-    }
-};
+pub const ParsedIngestLine = ingest_service.ParsedIngestLine;
 
 const TagsJson = struct {
     value: []const u8,
@@ -1552,176 +1526,11 @@ const TagsJson = struct {
 };
 
 pub fn parseIngestLine(alloc: std.mem.Allocator, raw_line: []const u8) !ParsedIngestLine {
-    const trimmed = std.mem.trim(u8, raw_line, " \t\r\n");
-    if (trimmed.len == 0) return error.EmptyLine;
-
-    const line = try alloc.dupe(u8, trimmed);
-    defer alloc.free(line);
-
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{}) catch return error.InvalidRecord;
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.InvalidRecord;
-
-    const obj = parsed.value.object;
-    const ts_value = obj.get("ts") orelse return error.MissingTimestamp;
-    if (ts_value != .integer) return error.InvalidTimestamp;
-
-    if (obj.get("metric")) |metric_value| {
-        if (metric_value != .string) return error.InvalidMetric;
-        const labels = try extractTagsJson(alloc, obj.get("labels"));
-        errdefer if (labels.owned) |owned| alloc.free(owned);
-
-        var writes = std.array_list.Managed(ParsedIngestMetric).init(alloc);
-        errdefer {
-            for (writes.items) |*write| write.deinit(alloc);
-            writes.deinit();
-        }
-
-        const kind = try parseMetricKind(obj.get("kind"));
-        const unit = try dupOptionalJsonString(alloc, obj.get("unit"));
-        defer if (unit) |value| alloc.free(value);
-        const description = try dupOptionalJsonString(alloc, obj.get("description"));
-        defer if (description) |value| alloc.free(value);
-
-        if (obj.get("value")) |value_node| {
-            try writes.append(try buildParsedIngestMetric(
-                alloc,
-                metric_value.string,
-                try numericValue(value_node),
-                .{
-                    .metric = metric_value.string,
-                    .kind = kind,
-                    .unit = unit,
-                    .description = description,
-                },
-            ));
-        }
-
-        if (obj.get("fields")) |fields_value| {
-            if (fields_value != .object) return error.InvalidTelemetryFields;
-            var it = fields_value.object.iterator();
-            while (it.next()) |entry| {
-                const field_value = switch (entry.value_ptr.*) {
-                    .float => entry.value_ptr.float,
-                    .integer => @as(f64, @floatFromInt(entry.value_ptr.integer)),
-                    else => return error.TelemetryFieldsMustBeNumeric,
-                };
-                const derived_metric = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ metric_value.string, entry.key_ptr.* });
-                defer alloc.free(derived_metric);
-                try writes.append(try buildParsedIngestMetric(
-                    alloc,
-                    derived_metric,
-                    field_value,
-                    .{
-                        .metric = derived_metric,
-                        .kind = kind,
-                        .unit = unit,
-                        .description = description,
-                        .source_metric = metric_value.string,
-                        .source_field = entry.key_ptr.*,
-                    },
-                ));
-            }
-        }
-
-        if (writes.items.len == 0) return error.MissingMetricValue;
-
-        return .{
-            .ts = @intCast(ts_value.integer),
-            .tags_json = if (labels.owned) |owned| owned else try alloc.dupe(u8, default_tags_json),
-            .writes = try writes.toOwnedSlice(),
-        };
-    }
-
-    const series_value = obj.get("series") orelse return error.MissingSeries;
-    if (series_value != .string) return error.InvalidSeries;
-
-    const tags = try extractTagsJson(alloc, obj.get("tags"));
-    var writes = std.array_list.Managed(ParsedIngestMetric).init(alloc);
-    errdefer {
-        for (writes.items) |*write| write.deinit(alloc);
-        writes.deinit();
-    }
-    try writes.append(.{
-        .series = try alloc.dupe(u8, series_value.string),
-        .value = firstNumericValue(obj),
-        .descriptor = null,
-    });
-    return .{
-        .ts = @intCast(ts_value.integer),
-        .tags_json = if (tags.owned) |owned| owned else try alloc.dupe(u8, default_tags_json),
-        .writes = try writes.toOwnedSlice(),
-    };
+    return try ingest_service.parseIngestLine(alloc, raw_line);
 }
 
 pub fn applyIngestLine(eng: *Engine, parsed: ParsedIngestLine) !types.SeriesId {
-    var first_sid: ?types.SeriesId = null;
-    for (parsed.writes) |write| {
-        if (write.descriptor) |descriptor| {
-            _ = try eng.registerMetricDescriptor(.{
-                .metric = descriptor.metric,
-                .kind = descriptor.kind,
-                .unit = descriptor.unit,
-                .description = descriptor.description,
-                .source_metric = descriptor.source_metric,
-                .source_field = descriptor.source_field,
-            });
-        }
-
-        const sid = types.seriesIdFrom(write.series, parsed.tags_json);
-        try eng.registerSeries(write.series, parsed.tags_json, sid);
-        try eng.ingest(.{
-            .series_id = sid,
-            .ts = parsed.ts,
-            .value = write.value,
-            .tags_json = parsed.tags_json,
-        });
-        eng.noteTags(sid, parsed.tags_json);
-        if (first_sid == null) first_sid = sid;
-    }
-    return first_sid orelse 0;
-}
-
-fn buildParsedIngestMetric(
-    alloc: std.mem.Allocator,
-    metric: []const u8,
-    value: f64,
-    descriptor_input: metric_catalog_mod.DescriptorInput,
-) !ParsedIngestMetric {
-    return .{
-        .series = try alloc.dupe(u8, metric),
-        .value = value,
-        .descriptor = .{
-            .metric = try alloc.dupe(u8, descriptor_input.metric),
-            .kind = descriptor_input.kind,
-            .unit = try dupOptionalBytes(alloc, descriptor_input.unit),
-            .description = try dupOptionalBytes(alloc, descriptor_input.description),
-            .source_metric = try dupOptionalBytes(alloc, descriptor_input.source_metric),
-            .source_field = try dupOptionalBytes(alloc, descriptor_input.source_field),
-        },
-    };
-}
-
-fn parseMetricKind(maybe_value: ?std.json.Value) !?metric_catalog_mod.MetricKind {
-    if (maybe_value) |value| {
-        if (value != .string) return error.InvalidMetricKind;
-        return metric_catalog_mod.MetricKind.parse(value.string) orelse return error.InvalidMetricKind;
-    }
-    return null;
-}
-
-fn dupOptionalJsonString(alloc: std.mem.Allocator, maybe_value: ?std.json.Value) !?[]const u8 {
-    if (maybe_value) |value| {
-        if (value != .string) return error.InvalidMetricMetadata;
-        if (value.string.len == 0) return null;
-        return try alloc.dupe(u8, value.string);
-    }
-    return null;
-}
-
-fn dupOptionalBytes(alloc: std.mem.Allocator, maybe_value: ?[]const u8) !?[]const u8 {
-    if (maybe_value) |value| return try alloc.dupe(u8, value);
-    return null;
+    return try ingest_service.applyParsedIngestLine(eng, parsed);
 }
 
 fn numericValue(value: std.json.Value) !f64 {
@@ -1786,6 +1595,19 @@ fn collectMatchingSeriesIds(
     return try eng.collectMatchingSeriesIds(alloc, tags_value, op_and);
 }
 
+fn readRequestBodyAlloc(alloc: std.mem.Allocator, req: *std.http.Server.Request, max_len: usize) ![]u8 {
+    var body_buf: [256]u8 = undefined;
+    const body_reader = try req.readerExpectContinue(&body_buf);
+    const content_len = req.head.content_length orelse return error.LengthRequired;
+    if (content_len > max_len) return error.PayloadTooLarge;
+    var body: std.ArrayList(u8) = .empty;
+    defer body.deinit(alloc);
+    try body.ensureTotalCapacity(alloc, @intCast(content_len));
+    try body_reader.*.appendRemainingUnlimited(alloc, &body);
+    if (body.items.len > max_len) return error.PayloadTooLarge;
+    return try body.toOwnedSlice(alloc);
+}
+
 pub fn ingestRequestBody(alloc: std.mem.Allocator, eng: *Engine, body_slice: []const u8) !usize {
     var count: usize = 0;
     var lines = std.mem.splitScalar(u8, body_slice, '\n');
@@ -1822,17 +1644,18 @@ pub fn ingestRequestBody(alloc: std.mem.Allocator, eng: *Engine, body_slice: []c
 }
 
 fn handleIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
-    var body_buf: [4096]u8 = undefined;
-    const body_reader = req.readerExpectNone(&body_buf);
-    const content_len = req.head.content_length orelse {
-        return respondJsonError(alloc, req, .length_required, "length_required", "length required");
+    const body = readRequestBodyAlloc(alloc, req, 64 * 1024 * 1024) catch |err| switch (err) {
+        error.LengthRequired => {
+            return respondJsonError(alloc, req, .length_required, "length_required", "length required");
+        },
+        error.PayloadTooLarge => {
+            return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large");
+        },
+        else => return err,
     };
-    if (content_len > 64 * 1024 * 1024) {
-        return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large");
-    }
+    defer alloc.free(body);
 
-    const body_slice = try body_reader.*.take(@intCast(content_len));
-    const count = ingestRequestBody(alloc, eng, body_slice) catch |err| switch (err) {
+    const count = ingestRequestBody(alloc, eng, body) catch |err| switch (err) {
         error.InvalidTelemetryRecord => {
             return respondJsonError(alloc, req, .bad_request, "invalid_telemetry_record", "invalid telemetry record");
         },
@@ -1846,9 +1669,9 @@ fn handleIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Re
     };
 
     var buf: [64]u8 = undefined;
-    const body = try std.fmt.bufPrint(&buf, "{{\"ingested\":{d}}}", .{count});
+    const response_body = try std.fmt.bufPrint(&buf, "{{\"ingested\":{d}}}", .{count});
     const headers = [_]std.http.Header{.{ .name = "Content-Type", .value = "application/json" }};
-    try req.respond(body, .{ .extra_headers = &headers });
+    try req.respond(response_body, .{ .extra_headers = &headers });
 }
 
 fn testConfig(alloc: std.mem.Allocator, data_path: []const u8) !config.Config {
@@ -1866,6 +1689,155 @@ fn testConfig(alloc: std.mem.Allocator, data_path: []const u8) !config.Config {
         .cas_mode = .off,
         .retention_ns = std.StringHashMap(u32).init(alloc),
     };
+}
+
+const OneShotHttpServer = struct {
+    handle: *alloc_mod.AllocatorHandle,
+    eng: *Engine,
+    server: std.net.Server,
+};
+
+const HttpTestResponse = struct {
+    status_code: u16,
+    body: []u8,
+
+    fn deinit(self: *HttpTestResponse, alloc: std.mem.Allocator) void {
+        alloc.free(self.body);
+        self.* = undefined;
+    }
+};
+
+fn serveSingleHttpConnection(ctx: *OneShotHttpServer) void {
+    defer ctx.server.deinit();
+    const connection = ctx.server.accept() catch return;
+    handleConnection(ctx.handle, std.heap.c_allocator, ctx.eng, connection) catch |err| switch (err) {
+        error.HttpConnectionClosing, error.HttpRequestTruncated => {},
+        else => std.log.warn("http one-shot test server error: {s}", .{@errorName(err)}),
+    };
+}
+
+fn sendHttpRequestToPort(
+    alloc: std.mem.Allocator,
+    port: u16,
+    method: []const u8,
+    path: []const u8,
+    body: []const u8,
+) !HttpTestResponse {
+    return try sendHttpRequestToPortWithHeaders(alloc, port, method, path, body, &.{});
+}
+
+fn sendHttpRequestToPortWithHeaders(
+    alloc: std.mem.Allocator,
+    port: u16,
+    method: []const u8,
+    path: []const u8,
+    body: []const u8,
+    extra_headers: []const std.http.Header,
+) !HttpTestResponse {
+    const address = try std.net.Address.parseIp4("127.0.0.1", port);
+    var stream = try std.net.tcpConnectToAddress(address);
+    defer stream.close();
+
+    var out_buf: [4096]u8 = undefined;
+    var writer_state = stream.writer(&out_buf);
+    const writer = &writer_state.interface;
+    try writer.print(
+        "{s} {s} HTTP/1.1\r\nHost: 127.0.0.1:{d}\r\nContent-Length: {d}\r\nConnection: close\r\n",
+        .{ method, path, port, body.len },
+    );
+    for (extra_headers) |header| {
+        try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
+    }
+    try writer.writeAll("\r\n");
+    if (body.len != 0) try writer.writeAll(body);
+    try writer.flush();
+
+    var in_buf: [4096]u8 = undefined;
+    var reader_state = stream.reader(&in_buf);
+    const reader = std.Io.Reader.adaptToOldInterface(reader_state.interface());
+    var response = std.array_list.Managed(u8).init(alloc);
+    defer response.deinit();
+    var chunk: [4096]u8 = undefined;
+    var target_total: ?usize = null;
+    while (true) {
+        const n = reader.read(chunk[0..]) catch |err| switch (err) {
+            error.EndOfStream => 0,
+            else => return err,
+        };
+        if (n == 0) break;
+        try response.appendSlice(chunk[0..n]);
+
+        if (target_total == null) {
+            if (std.mem.indexOf(u8, response.items, "\r\n\r\n")) |header_end| {
+                const header_bytes = response.items[0..header_end];
+                if (parseContentLengthHeader(header_bytes)) |content_length| {
+                    target_total = header_end + 4 + content_length;
+                }
+            }
+        }
+        if (target_total) |target| {
+            if (response.items.len >= target) break;
+        }
+    }
+
+    const header_end = std.mem.indexOf(u8, response.items, "\r\n\r\n") orelse return error.InvalidHttpResponse;
+    const header_bytes = response.items[0..header_end];
+    const status_end = std.mem.indexOf(u8, header_bytes, "\r\n") orelse return error.InvalidHttpResponse;
+    const status_line = header_bytes[0..status_end];
+    if (!std.mem.startsWith(u8, status_line, "HTTP/1.1 ")) return error.InvalidHttpResponse;
+    const status_code = try std.fmt.parseInt(u16, status_line["HTTP/1.1 ".len .. "HTTP/1.1 ".len + 3], 10);
+    if (target_total) |target| {
+        if (response.items.len < target) return error.InvalidHttpResponse;
+    }
+    return .{
+        .status_code = status_code,
+        .body = try alloc.dupe(u8, response.items[header_end + 4 ..]),
+    };
+}
+
+fn parseContentLengthHeader(header_bytes: []const u8) ?usize {
+    var lines = std.mem.splitSequence(u8, header_bytes, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        if (!std.ascii.eqlIgnoreCase(name, "Content-Length")) continue;
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        return std.fmt.parseInt(usize, value, 10) catch null;
+    }
+    return null;
+}
+
+fn runSingleRequestServer(
+    alloc: std.mem.Allocator,
+    eng: *Engine,
+    method: []const u8,
+    path: []const u8,
+    body: []const u8,
+) !HttpTestResponse {
+    return try runSingleRequestServerWithHeaders(alloc, eng, method, path, body, &.{});
+}
+
+fn runSingleRequestServerWithHeaders(
+    alloc: std.mem.Allocator,
+    eng: *Engine,
+    method: []const u8,
+    path: []const u8,
+    body: []const u8,
+    extra_headers: []const std.http.Header,
+) !HttpTestResponse {
+    var address = try std.net.Address.parseIp4("127.0.0.1", 0);
+    const server = try address.listen(.{ .reuse_address = true });
+    var handle = alloc_mod.AllocatorHandle.init();
+    var ctx = OneShotHttpServer{
+        .handle = &handle,
+        .eng = eng,
+        .server = server,
+    };
+    const port = ctx.server.listen_address.getPort();
+    const thread = try std.Thread.spawn(.{}, serveSingleHttpConnection, .{&ctx});
+    defer thread.join();
+    return try sendHttpRequestToPortWithHeaders(alloc, port, method, path, body, extra_headers);
 }
 
 test "parseIngestLine mirrors HTTP numeric and tags behavior" {
@@ -1961,18 +1933,174 @@ test "ingestRequestBody rejects invalid telemetry rows" {
     ));
 }
 
-fn handleQuery(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
-    var body_buf: [1024]u8 = undefined;
-    const body_reader = req.readerExpectNone(&body_buf);
-    const content_len = req.head.content_length orelse {
-        return respondJsonError(alloc, req, .length_required, "length_required", "length required");
-    };
-    if (content_len > 1024 * 64) {
-        return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large");
+test "handleIngest accepts large multiline NDJSON over a live HTTP connection" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/http-live-ingest", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var eng = try Engine.init(talloc, try testConfig(talloc, data_path));
+    defer eng.deinit();
+
+    var body = std.array_list.Managed(u8).init(talloc);
+    defer body.deinit();
+    for (0..400) |idx| {
+        try body.writer().print(
+            "{{\"series\":\"http.live.large\",\"ts\":{d},\"value\":{d}}}\n",
+            .{ idx, idx },
+        );
     }
-    const alloc_len: usize = @intCast(content_len);
-    const body_slice = try body_reader.*.take(alloc_len);
-    const body = try alloc.dupe(u8, body_slice);
+
+    var response = try runSingleRequestServer(talloc, eng, "POST", "/api/v1/ingest", body.items);
+    defer response.deinit(talloc);
+
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqualStrings("{\"ingested\":400}", response.body);
+
+    const sid = types.seriesIdFrom("http.live.large", "{}");
+    try eng.waitForQueryablePoints(talloc, sid, 400, 1_000);
+
+    var points = std.array_list.Managed(types.Point).init(talloc);
+    defer points.deinit();
+    try eng.queryRange(sid, 0, 1_000, &points);
+    try std.testing.expectEqual(@as(usize, 400), points.items.len);
+}
+
+test "handleIngest returns deterministic 400 for invalid telemetry over live HTTP" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/http-live-invalid", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var eng = try Engine.init(talloc, try testConfig(talloc, data_path));
+    defer eng.deinit();
+
+    var response = try runSingleRequestServer(
+        talloc,
+        eng,
+        "POST",
+        "/api/v1/ingest",
+        "{\"metric\":\"system.cpu\",\"ts\":20,\"fields\":{\"user\":\"oops\"},\"labels\":{\"host\":\"web-1\"}}\n",
+    );
+    defer response.deinit(talloc);
+
+    try std.testing.expectEqual(@as(u16, 400), response.status_code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"code\":\"invalid_telemetry_record\"") != null);
+}
+
+test "handleIngest accepts live HTTP uploads with Expect: 100-continue" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/http-live-expect-continue", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var eng = try Engine.init(talloc, try testConfig(talloc, data_path));
+    defer eng.deinit();
+
+    var body = std.array_list.Managed(u8).init(talloc);
+    defer body.deinit();
+    for (0..1_000) |idx| {
+        try body.writer().print(
+            "{{\"series\":\"http.live.expect\",\"ts\":{d},\"value\":{d}}}\n",
+            .{ idx, idx },
+        );
+    }
+
+    var response = try runSingleRequestServerWithHeaders(
+        talloc,
+        eng,
+        "POST",
+        "/api/v1/ingest",
+        body.items,
+        &.{
+            .{ .name = "Expect", .value = "100-continue" },
+        },
+    );
+    defer response.deinit(talloc);
+
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    try std.testing.expectEqualStrings("{\"ingested\":1000}", response.body);
+
+    const sid = types.seriesIdFrom("http.live.expect", "{}");
+    try eng.waitForQueryablePoints(talloc, sid, 1_000, 1_000);
+}
+
+test "handleIngest returns deterministic 409 for descriptor conflicts over live HTTP" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/http-live-descriptor-conflict", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var eng = try Engine.init(talloc, try testConfig(talloc, data_path));
+    defer eng.deinit();
+
+    var first = try runSingleRequestServer(
+        talloc,
+        eng,
+        "POST",
+        "/api/v1/ingest",
+        "{\"metric\":\"system.req\",\"ts\":10,\"value\":1,\"kind\":\"counter\",\"labels\":{\"host\":\"edge-1\"}}\n",
+    );
+    defer first.deinit(talloc);
+    try std.testing.expectEqual(@as(u16, 200), first.status_code);
+
+    var conflict = try runSingleRequestServer(
+        talloc,
+        eng,
+        "POST",
+        "/api/v1/ingest",
+        "{\"metric\":\"system.req\",\"ts\":20,\"value\":2,\"kind\":\"gauge\",\"labels\":{\"host\":\"edge-1\"}}\n",
+    );
+    defer conflict.deinit(talloc);
+
+    try std.testing.expectEqual(@as(u16, 409), conflict.status_code);
+    try std.testing.expect(std.mem.indexOf(u8, conflict.body, "\"code\":\"metric_descriptor_conflict\"") != null);
+}
+
+test "handleIngest returns deterministic 503 for ingest backpressure over live HTTP" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/http-live-backpressure", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var conf = try testConfig(talloc, data_path);
+    conf.mem_limit_bytes = @sizeOf(Engine.ResolvedIngestPoint) - 1;
+    var eng = try Engine.init(talloc, conf);
+    defer eng.deinit();
+
+    var response = try runSingleRequestServer(
+        talloc,
+        eng,
+        "POST",
+        "/api/v1/ingest",
+        "{\"series\":\"svc.pressure\",\"ts\":1,\"value\":1}\n",
+    );
+    defer response.deinit(talloc);
+
+    try std.testing.expectEqual(@as(u16, 503), response.status_code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"code\":\"ingest_backpressure\"") != null);
+}
+
+fn handleQuery(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
+    const body = readRequestBodyAlloc(alloc, req, 64 * 1024) catch |err| switch (err) {
+        error.LengthRequired => {
+            return respondJsonError(alloc, req, .length_required, "length_required", "length required");
+        },
+        error.PayloadTooLarge => {
+            return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large");
+        },
+        else => return err,
+    };
     defer alloc.free(body);
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch {
@@ -4818,17 +4946,15 @@ fn respondQuoteQualityResult(
 }
 
 fn handleFind(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
-    var body_buf: [1024]u8 = undefined;
-    const body_reader = req.readerExpectNone(&body_buf);
-    const content_len = req.head.content_length orelse {
-        return respondJsonError(alloc, req, .length_required, "length_required", "length required");
+    const body = readRequestBodyAlloc(alloc, req, 64 * 1024) catch |err| switch (err) {
+        error.LengthRequired => {
+            return respondJsonError(alloc, req, .length_required, "length_required", "length required");
+        },
+        error.PayloadTooLarge => {
+            return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large");
+        },
+        else => return err,
     };
-    if (content_len > 64 * 1024) {
-        return respondJsonError(alloc, req, .payload_too_large, "payload_too_large", "payload too large");
-    }
-    const alloc_len: usize = @intCast(content_len);
-    const body_slice = try body_reader.*.take(alloc_len);
-    const body = try alloc.dupe(u8, body_slice);
     defer alloc.free(body);
 
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch {
@@ -5543,13 +5669,7 @@ const OwnedJsonBody = struct {
 };
 
 fn readJsonBody(alloc: std.mem.Allocator, req: *std.http.Server.Request, max_len: usize) !OwnedJsonBody {
-    var body_buf: [2048]u8 = undefined;
-    const body_reader = req.readerExpectNone(&body_buf);
-    const content_len = req.head.content_length orelse return error.LengthRequired;
-    if (content_len > max_len) return error.PayloadTooLarge;
-    const alloc_len: usize = @intCast(content_len);
-    const body_slice = try body_reader.*.take(alloc_len);
-    const body = try alloc.dupe(u8, body_slice);
+    const body = try readRequestBodyAlloc(alloc, req, max_len);
     errdefer alloc.free(body);
     return .{
         .body = body,
