@@ -309,7 +309,12 @@ fn ensureConstantOnlySupported(expr: *const ast.Expr) errors.CompileError!void {
             try ensureConstantOnlySupported(binary.left);
             try ensureConstantOnlySupported(binary.right);
         },
-        .call => return error.UnsupportedFunction,
+        .call => |call| {
+            if (!isSupportedConstantScalarFunction(call.callee.value, call.args.len)) return error.UnsupportedFunction;
+            for (call.args) |arg| {
+                try ensureConstantOnlySupported(arg);
+            }
+        },
     }
 }
 
@@ -389,6 +394,14 @@ fn isSupportedUnaryRawRowFunction(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(name, "round") or
         std.ascii.eqlIgnoreCase(name, "sqrt") or
         std.ascii.eqlIgnoreCase(name, "ln");
+}
+
+fn isSupportedConstantScalarFunction(name: []const u8, arg_count: usize) bool {
+    if (std.ascii.eqlIgnoreCase(name, "now")) return arg_count == 0;
+    if (std.ascii.eqlIgnoreCase(name, "time_bucket")) return arg_count == 2 or arg_count == 3;
+    if (isSupportedUnaryRawRowFunction(name)) return arg_count == 1;
+    if (std.ascii.eqlIgnoreCase(name, "pow")) return arg_count == 2;
+    return false;
 }
 
 fn ensureOrderIdentifier(

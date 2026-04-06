@@ -788,7 +788,7 @@ test "executeWithMode shadow falls back for ambiguous series names" {
     try std.testing.expectError(error.UnsupportedPlan, executeWithMode(talloc, engine, "select value from weather.room1 where time >= 0", .shadow));
 }
 
-test "executeWithMode shadow falls back to legacy for unsupported compiler projections" {
+test "executeWithMode shadow compiles constant scalar functions" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -819,8 +819,8 @@ test "executeWithMode shadow falls back to legacy for unsupported compiler proje
     defer cursor.deinit();
 
     try std.testing.expectEqualStrings("shadow", cursor.stats.execution_mode);
-    try std.testing.expect(cursor.stats.legacy_fallback);
-    try std.testing.expectEqualStrings(@tagName(compiler_diagnostics.FallbackReason.unsupported_function), cursor.stats.fallback_reason);
+    try std.testing.expect(!cursor.stats.legacy_fallback);
+    try std.testing.expectEqualStrings("", cursor.stats.fallback_reason);
 
     const first = try cursor.next();
     try std.testing.expect(first != null);
@@ -828,7 +828,7 @@ test "executeWithMode shadow falls back to legacy for unsupported compiler proje
     try std.testing.expect((try cursor.next()) == null);
 }
 
-test "executeWithMode compiled falls back to legacy and records metrics" {
+test "executeWithMode compiled compiles constant scalar functions and records success metrics" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -859,16 +859,74 @@ test "executeWithMode compiled falls back to legacy and records metrics" {
     defer cursor.deinit();
 
     try std.testing.expectEqualStrings("compiled", cursor.stats.execution_mode);
+    try std.testing.expect(!cursor.stats.legacy_fallback);
+    try std.testing.expectEqualStrings("", cursor.stats.fallback_reason);
+    try std.testing.expectEqual(@as(u64, 1), engine.metrics.query_compile_attempts_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), engine.metrics.query_compile_success_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), engine.metrics.query_compile_fallback_total.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 0), engine.metrics.query_compile_unsupported_total.load(.monotonic));
+
+    const first = try cursor.next();
+    try std.testing.expect(first != null);
+    try std.testing.expect(executor.Value.equals(first.?.values[0], executor.Value{ .float = 1.0 }));
+    try std.testing.expect((try cursor.next()) == null);
+}
+
+test "executeWithMode compiled falls back to legacy for fill clauses and records metrics" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/compiled-fill-fallback", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .compiled,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try engine_mod.Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const sid: u64 = 7444;
+    try engine.registerSeries("fill.room1", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.5, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 70, .value = 2.0, .tags_json = "{}" });
+    try waitForFlushForTest(engine, 1, 1_000);
+
+    var cursor = try executeWithMode(
+        talloc,
+        engine,
+        "select time_bucket(60, time) as bucket, avg(value) as avg_value from fill.room1 where time >= 0 group by time_bucket(60, time) fill(previous) order by bucket desc",
+        .compiled,
+    );
+    defer cursor.deinit();
+
+    try std.testing.expectEqualStrings("compiled", cursor.stats.execution_mode);
     try std.testing.expect(cursor.stats.legacy_fallback);
-    try std.testing.expectEqualStrings(@tagName(compiler_diagnostics.FallbackReason.unsupported_function), cursor.stats.fallback_reason);
+    try std.testing.expectEqualStrings(@tagName(compiler_diagnostics.FallbackReason.unsupported_fill), cursor.stats.fallback_reason);
     try std.testing.expectEqual(@as(u64, 1), engine.metrics.query_compile_attempts_total.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 0), engine.metrics.query_compile_success_total.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), engine.metrics.query_compile_fallback_total.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), engine.metrics.query_compile_unsupported_total.load(.monotonic));
 
-    const first = try cursor.next();
-    try std.testing.expect(first != null);
-    try std.testing.expect(executor.Value.equals(first.?.values[0], executor.Value{ .float = 1.0 }));
+    const first = (try cursor.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 60), first.values[0].integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), try first.values[1].asFloat(), 1e-9);
+    const second = (try cursor.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 0), second.values[0].integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), try second.values[1].asFloat(), 1e-9);
     try std.testing.expect((try cursor.next()) == null);
 }
 
@@ -1120,14 +1178,20 @@ test "execution snapshots stay stable for supported and fallback query classes" 
         \\
     , selector_snapshot);
 
-    var fallback_cursor = try executeWithMode(talloc, &engine, "select abs(-1)", .compiled);
+    var fallback_cursor = try executeWithMode(
+        talloc,
+        &engine,
+        "select time_bucket(60, time) as bucket, avg(value) as avg_value from parity.room1 where time >= 0 group by time_bucket(60, time) fill(previous) order by bucket desc",
+        .compiled,
+    );
     defer fallback_cursor.deinit();
     const fallback_snapshot = try collectCursorContractSnapshot(talloc, &fallback_cursor);
     defer talloc.free(fallback_snapshot);
     try std.testing.expectEqualStrings(
-        \\mode=compiled|legacy_fallback=true|fallback_reason=unsupported_function
-        \\_col0
-        \\1
+        \\mode=compiled|legacy_fallback=true|fallback_reason=unsupported_fill
+        \\bucket|avg_value
+        \\60|3.5
+        \\0|1.75
         \\
     , fallback_snapshot);
 }

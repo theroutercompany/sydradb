@@ -35,33 +35,49 @@ fn buildConstantProgram(allocator: std.mem.Allocator, compiled: compiler.Compile
     const columns = try buildColumns(allocator, compiled.typed_query.projections);
     errdefer allocator.free(columns);
 
-    const constants = try allocator.alloc(value_mod.Value, compiled.typed_query.projections.len);
-    errdefer allocator.free(constants);
-    const instructions = try allocator.alloc(bytecode.Instruction, compiled.typed_query.projections.len + 2);
-    errdefer allocator.free(instructions);
+    var instructions = std.array_list.Managed(bytecode.Instruction).init(allocator);
+    errdefer instructions.deinit();
+    var constants = std.array_list.Managed(value_mod.Value).init(allocator);
+    errdefer constants.deinit();
+    var exprs = std.array_list.Managed(*const ast.Expr).init(allocator);
+    errdefer exprs.deinit();
 
     for (compiled.typed_query.projections, 0..) |projection, idx| {
-        constants[idx] = try literalValue(projection.expr.expr);
-        instructions[idx] = .{
-            .opcode = .load_const,
-            .p1 = @intCast(idx),
-            .p4 = .{ .constant = @intCast(idx) },
-            .comment = projection.name,
-        };
+        switch (projection.expr.expr.*) {
+            .literal => {
+                try constants.append(try literalValue(projection.expr.expr));
+                try instructions.append(.{
+                    .opcode = .load_const,
+                    .p1 = @intCast(idx),
+                    .p4 = .{ .constant = @intCast(constants.items.len - 1) },
+                    .comment = projection.name,
+                });
+            },
+            else => {
+                try exprs.append(projection.expr.expr);
+                try instructions.append(.{
+                    .opcode = .function,
+                    .p1 = @intCast(idx),
+                    .p4 = .{ .expr = @intCast(exprs.items.len - 1) },
+                    .comment = projection.name,
+                });
+            },
+        }
     }
-    instructions[compiled.typed_query.projections.len] = .{
+    try instructions.append(.{
         .opcode = .result_row,
         .p1 = 0,
         .p2 = @intCast(compiled.typed_query.projections.len),
         .p4 = .{ .schema = 0 },
-    };
-    instructions[compiled.typed_query.projections.len + 1] = .{ .opcode = .halt };
+    });
+    try instructions.append(.{ .opcode = .halt });
 
     return .{
         .program = .{
             .allocator = allocator,
-            .instructions = instructions,
-            .constants = constants,
+            .instructions = try instructions.toOwnedSlice(),
+            .constants = try constants.toOwnedSlice(),
+            .exprs = try exprs.toOwnedSlice(),
             .schemas = try allocator.dupe([]const plan.ColumnInfo, &.{columns}),
             .register_count = compiled.typed_query.projections.len,
             .source_name = "prepared_constant_select",
