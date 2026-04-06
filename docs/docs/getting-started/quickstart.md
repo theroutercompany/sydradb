@@ -85,4 +85,4 @@ See also:
 
 - [Running the server](./running-the-server.md)
 - [Ingest and query](./ingest-and-query.md)
-- [`demos/demo-quickstart.sh`](/Users/rexliu/sydradb/demos/demo-quickstart.sh)
+- `demos/demo-quickstart.sh`
