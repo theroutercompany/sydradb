@@ -117,9 +117,11 @@ Apache-2.0
 ./zig-out/bin/sydradb cas rollback <spec>
 ./zig-out/bin/sydradb cas migrate-reftable
 ./zig-out/bin/sydradb cas upgrade
-./zig-out/bin/sydradb cas vacuum
+./zig-out/bin/sydradb cas expire [--materialize-borrowed] [--reflog-expiry-ms <n>] [--checkpoint-expiry-ms <n>]
+./zig-out/bin/sydradb cas vacuum [--repair] [--materialize-borrowed] [--reflog-expiry-ms <n>] [--checkpoint-expiry-ms <n>] [--prune-grace-ms <n>]
+./zig-out/bin/sydradb cas prune [--dry-run] [--grace-ms <n>]
 ./zig-out/bin/sydradb cas gc [--apply] [--no-reflogs] [--grace-ms <n>]
-./zig-out/bin/sydradb cas fsck [--connectivity-only] [--no-reflogs] [--lost-found]
+./zig-out/bin/sydradb cas fsck [--connectivity-only] [--no-reflogs] [--lost-found] [--repair]
 ./zig-out/bin/sydradb cas pack
 ./zig-out/bin/sydradb cas checkout <spec>
 ./zig-out/bin/sydradb cas export-legacy [spec]
@@ -164,8 +166,10 @@ Config notes:
 - Active pack files now carry adjacent `.manifest` files with per-type counts and checksums, and unreachable loose objects are quarantined into cruft packs instead of loose cruft directories.
 - Reftable repositories now persist `reftable/state` and write update-indexed `<min>-<max>.table` files. Transactions append narrow spans, while compaction rewrites suffixes geometrically into wider tables without losing tombstones.
 - `cas gc` is reflog-aware by default. `--apply` first quarantines unreachable content under `objects/cruft/<timestamp>/` and only prunes older cruft after the configured grace window; use `--no-reflogs` when you want rollback history to stop protecting old commits.
-- `cas fsck` defaults to full content and mirror validation. `--connectivity-only` limits it to graph/reflog/reachability checks, and `--lost-found` writes dangling commit/blob/tree ids under `lost-found/`.
+- `cas fsck` defaults to full content and mirror validation. `--connectivity-only` limits it to graph/reflog/reachability checks, `--lost-found` writes dangling commit/blob/tree ids under `lost-found/`, and `--repair` safely rebuilds derivable side indexes, pack sidecars, and reftable metadata before re-validating the store.
 - `cas upgrade` verifies the repository, migrates loose refs to reftable when needed, refreshes indexes, and rewrites the repository-format marker only after the migration path succeeds.
-- `cas vacuum` is the one-shot maintenance path: it runs `fsck`, repacks reachable loose objects, and then applies GC with the current grace-period policy.
+- `cas expire` applies the non-destructive maintenance policy: reflog expiry, checkpoint expiry, and optional borrowed-object materialization.
+- `cas prune` is the destructive end of maintenance. It only deletes previously quarantined cruft that has aged past the grace window and cleans up stale mirror files; it does not quarantine new unreachable content.
+- `cas vacuum` is the one-shot maintenance path: it runs `fsck`, optionally repairs derivable metadata, applies expiry/materialization policy, repacks reachable loose objects, and then applies GC with the current prune-grace policy.
 - `enable_influx` and `enable_prom` remain parseable config flags, but they should be treated as placeholder or experimental toggles until real adapter surfaces land.
 - `auth_token` is the only built-in API auth mechanism today; if it is empty, `/api/*` is unauthenticated.

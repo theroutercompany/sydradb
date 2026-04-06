@@ -436,16 +436,106 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         );
         return;
     }
-    if (std.mem.eql(u8, sub, "vacuum")) {
-        const result = try cas.vacuum(data_dir);
+    if (std.mem.eql(u8, sub, "expire")) {
+        var policy = cas_mod.MaintenancePolicy{};
+        var idx: usize = 3;
+        while (idx < args.len) : (idx += 1) {
+            const arg = std.mem.sliceTo(args[idx], 0);
+            if (std.mem.eql(u8, arg, "--materialize-borrowed")) {
+                policy.materialize_borrowed_packs = true;
+            } else if (std.mem.eql(u8, arg, "--reflog-expiry-ms")) {
+                idx += 1;
+                if (idx >= args.len) return error.Invalid;
+                policy.reflog_expiry_ms = try std.fmt.parseInt(i64, std.mem.sliceTo(args[idx], 0), 10);
+            } else if (std.mem.eql(u8, arg, "--checkpoint-expiry-ms")) {
+                idx += 1;
+                if (idx >= args.len) return error.Invalid;
+                policy.checkpoint_expiry_ms = try std.fmt.parseInt(i64, std.mem.sliceTo(args[idx], 0), 10);
+            } else {
+                return error.Invalid;
+            }
+        }
+        const result = try cas.expire(data_dir, policy);
         std.debug.print(
-            "cas vacuum reachable={d} rewritten={d} unreachable={d} pruned={d} deleted={d}\n",
+            "cas expire reflog_entries_expired={d} checkpoint_refs_expired={d} borrowed_packs_materialized={d}\n",
+            .{
+                result.reflog_entries_expired,
+                result.checkpoint_refs_expired,
+                result.borrowed_packs_materialized,
+            },
+        );
+        return;
+    }
+    if (std.mem.eql(u8, sub, "prune")) {
+        var options = cas_mod.PruneOptions{};
+        var idx: usize = 3;
+        while (idx < args.len) : (idx += 1) {
+            const arg = std.mem.sliceTo(args[idx], 0);
+            if (std.mem.eql(u8, arg, "--dry-run")) {
+                options.dry_run = true;
+            } else if (std.mem.eql(u8, arg, "--grace-ms")) {
+                idx += 1;
+                if (idx >= args.len) return error.Invalid;
+                options.grace_period_ms = try std.fmt.parseInt(i64, std.mem.sliceTo(args[idx], 0), 10);
+            } else {
+                return error.Invalid;
+            }
+        }
+        const result = try cas.prune(options);
+        std.debug.print(
+            "cas prune dry_run={} pruned={d} pruned_bytes={d} stale_segment_files={d} stale_segment_bytes={d} stale_wal_files={d} stale_wal_bytes={d} mirror_deleted={d}\n",
+            .{
+                options.dry_run,
+                result.pruned_count,
+                result.pruned_bytes,
+                result.stale_segment_files,
+                result.stale_segment_bytes,
+                result.stale_wal_files,
+                result.stale_wal_bytes,
+                result.mirror_deleted,
+            },
+        );
+        return;
+    }
+    if (std.mem.eql(u8, sub, "vacuum")) {
+        var policy = cas_mod.MaintenancePolicy{};
+        var idx: usize = 3;
+        while (idx < args.len) : (idx += 1) {
+            const arg = std.mem.sliceTo(args[idx], 0);
+            if (std.mem.eql(u8, arg, "--repair")) {
+                policy.repair_side_indexes = true;
+            } else if (std.mem.eql(u8, arg, "--materialize-borrowed")) {
+                policy.materialize_borrowed_packs = true;
+            } else if (std.mem.eql(u8, arg, "--reflog-expiry-ms")) {
+                idx += 1;
+                if (idx >= args.len) return error.Invalid;
+                policy.reflog_expiry_ms = try std.fmt.parseInt(i64, std.mem.sliceTo(args[idx], 0), 10);
+            } else if (std.mem.eql(u8, arg, "--checkpoint-expiry-ms")) {
+                idx += 1;
+                if (idx >= args.len) return error.Invalid;
+                policy.checkpoint_expiry_ms = try std.fmt.parseInt(i64, std.mem.sliceTo(args[idx], 0), 10);
+            } else if (std.mem.eql(u8, arg, "--prune-grace-ms")) {
+                idx += 1;
+                if (idx >= args.len) return error.Invalid;
+                policy.prune_grace_ms = try std.fmt.parseInt(i64, std.mem.sliceTo(args[idx], 0), 10);
+            } else {
+                return error.Invalid;
+            }
+        }
+        const result = try cas.vacuumWithPolicy(data_dir, policy);
+        std.debug.print(
+            "cas vacuum reachable={d} rewritten={d} unreachable={d} pruned={d} deleted={d} repaired_side_indexes={} pack_sidecars_rebuilt={d} reflog_entries_expired={d} checkpoint_refs_expired={d} borrowed_packs_materialized={d}\n",
             .{
                 result.pack.reachable_objects,
                 result.pack.rewritten_objects,
                 result.gc.unreachable_count,
                 result.gc.pruned_count,
                 result.gc.deleted,
+                result.repair.side_indexes_rebuilt,
+                result.repair.pack_sidecars_rebuilt,
+                result.expiry.reflog_entries_expired,
+                result.expiry.checkpoint_refs_expired,
+                result.expiry.borrowed_packs_materialized,
             },
         );
         return;
@@ -492,6 +582,7 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     }
     if (std.mem.eql(u8, sub, "fsck")) {
         var options = cas_mod.FsckOptions{};
+        var repair = false;
         for (args[3..]) |raw| {
             const arg = std.mem.sliceTo(raw, 0);
             if (std.mem.eql(u8, arg, "--connectivity-only")) {
@@ -500,15 +591,22 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
                 options.include_reflogs = false;
             } else if (std.mem.eql(u8, arg, "--lost-found")) {
                 options.write_lost_found = true;
+            } else if (std.mem.eql(u8, arg, "--repair")) {
+                repair = true;
             } else {
                 return error.Invalid;
             }
         }
+        const repair_report = if (repair)
+            try cas.repairRepository(data_dir, .{})
+        else
+            cas_mod.RepairReport{};
         const report = try cas.fsck(data_dir, options);
         std.debug.print(
-            "cas fsck mode={s} refs={d} reachable={d} reflog_heads={d} reflog_protected={d} commits={d} trees={d} blobs={d} dangling={d} lost_found={d} commit_graph_entries_checked={d} segment_contents_checked={d} wal_contents_checked={d} missing_segment_mirrors={d} missing_wal_mirrors={d} reflog_files_checked={d} stale_reflog_files={d}\n",
+            "cas fsck mode={s} repair={} refs={d} reachable={d} reflog_heads={d} reflog_protected={d} commits={d} trees={d} blobs={d} dangling={d} lost_found={d} commit_graph_entries_checked={d} segment_contents_checked={d} wal_contents_checked={d} missing_segment_mirrors={d} missing_wal_mirrors={d} reflog_files_checked={d} stale_reflog_files={d} repaired_side_indexes={} pack_sidecars_rebuilt={d} reftable_state_rebuilt={} reftable_tables_list_rebuilt={}\n",
             .{
                 if (options.mode == .connectivity_only) "connectivity-only" else "full",
+                repair,
                 report.refs,
                 report.reachable_objects,
                 report.reflog_heads,
@@ -525,6 +623,10 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
                 report.missing_wal_mirrors,
                 report.reflog_files_checked,
                 report.stale_reflog_files,
+                repair_report.side_indexes_rebuilt,
+                repair_report.pack_sidecars_rebuilt,
+                repair_report.reftable_state_rebuilt,
+                repair_report.reftable_tables_list_rebuilt,
             },
         );
         return;

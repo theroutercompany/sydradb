@@ -178,9 +178,13 @@ Operational notes:
 - `objects/info/commit-graph` version 2 stores fixed-width Bloom filters for logical metadata paths such as `metadata/segments`, `metadata/tags`, `metadata/series_catalog`, and `wal/*`.
 - Active packs now carry adjacent `.manifest` files with per-type object counts and pack checksums; `cas fsck` validates those manifests before trusting mixed-pack reachability.
 - Reftable writes now use update-indexed table names, a persisted `reftable/state` counter, and block-indexed v3 tables with separate ref and reflog block indexes plus a footer checksum. Readers remain compatible with older flat v1/v2 tables and rewrite them into the current format during compaction or upgrade.
+- `cas fsck --repair` only rebuilds derivable metadata: active-pack reverse indexes and manifests, `objects/info/*` side indexes, and `reftable/state` plus `reftable/tables.list`. It never rewrites commit, tree, or blob payloads.
 - `cas fsck --connectivity-only` limits validation to refs, reflogs, reachable objects, commit-graph consistency, and dangling detection.
 - `cas fsck --lost-found` writes dangling commit/blob/tree ids into `lost-found/`.
 - `cas gc --no-reflogs` ignores reflog protection when deciding what is unreachable.
+- `cas expire` applies the policy-only maintenance phase: reflog trimming, checkpoint-ref expiry, and optional borrowed-object materialization from `objects/info/alternates` into local storage.
+- `cas prune` only deletes previously quarantined cruft directories after the grace window and removes stale mirror files; it does not create new cruft packs.
+- `cas vacuum` runs `fsck`, optional repair, policy expiry/materialization, reachable-object repack, and then `cas gc` with the configured prune grace period.
 
 See also:
 
