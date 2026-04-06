@@ -20,3 +20,17 @@ sqlcore-debug-*.zig
 demos/showcase/node_modules/
 demos/showcase/ui/dist/
 demos/showcase/dist/
+demos/showcase/ui/node_modules/
+demos/showcase/ui/.vite/
+demos/showcase/.vite/
+demos/showcase/coverage/
+demos/showcase/**/*.tsbuildinfo
+
+# Docs web app artifacts
+docs/node_modules/
+docs/.docusaurus/
+docs/.cache/
+docs/build/
+docs/coverage/
+docs/.vite/
+docs/**/*.tsbuildinfo
