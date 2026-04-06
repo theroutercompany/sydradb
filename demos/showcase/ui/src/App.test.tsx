@@ -106,10 +106,10 @@ describe("ShowcaseDashboard", () => {
 
     render(<App />);
 
-    await waitFor(() => expect(screen.getAllByRole("button", { name: "Run scenario" }).length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Run" })).toBeInTheDocument());
     await waitFor(() => expect(document.documentElement.dataset.theme).toBe("dark"));
 
-    fireEvent.click(screen.getByRole("button", { name: "Light" }));
+    fireEvent.click(screen.getByRole("button", { name: "Dark" }));
 
     expect(document.documentElement.dataset.theme).toBe("light");
     expect(document.documentElement.style.colorScheme).toBe("light");
@@ -122,7 +122,7 @@ describe("ShowcaseDashboard", () => {
 
     render(<App />);
 
-    await waitFor(() => expect(screen.getAllByRole("button", { name: "Run scenario" }).length).toBeGreaterThan(0));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Run" })).toBeInTheDocument());
     await waitFor(() => expect(document.documentElement.dataset.theme).toBe("light"));
   });
 });

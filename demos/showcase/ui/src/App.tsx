@@ -4,10 +4,82 @@ import type { DemoStateResponse, ScenarioRunResult, ScenarioStepResult } from ".
 import { fetchState, resetSession, runScenario } from "./api.js";
 
 type ThemeMode = "dark" | "light";
+type TabId = "evidence" | "context";
 
 const THEME_STORAGE_KEY = "sydra-showcase-theme";
 
-interface ShowcaseDashboardProps {
+function readInitialTheme(): ThemeMode {
+  if (typeof window === "undefined") return "dark";
+  try {
+    const stored = window.localStorage.getItem(THEME_STORAGE_KEY);
+    return stored === "light" || stored === "dark" ? stored : "dark";
+  } catch {
+    return "dark";
+  }
+}
+
+function formatValue(value: unknown): string {
+  if (typeof value === "string") return value;
+  return JSON.stringify(value, null, 2);
+}
+
+function formatTimestamp(value: string): string {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function StepCard({ step, index }: { step: ScenarioStepResult; index: number }) {
+  const [open, setOpen] = useState(step.status === "failed");
+
+  return (
+    <div className="step">
+      <div className="step__header" onClick={() => setOpen(!open)}>
+        <div className="step__header-left">
+          <span className="step__index">{String(index + 1).padStart(2, "0")}</span>
+          <span className="step__title">{step.title}</span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          <span className="step__kind">{step.kind.replaceAll("_", " ")}</span>
+          <span className={`tag tag--${step.status}`}>{step.status}</span>
+        </div>
+      </div>
+      {open && (
+        <div className="step__body">
+          <p className="step__summary">{step.summary}</p>
+          {step.command && <pre className="step__command">{step.command}</pre>}
+          {step.assertions.length > 0 && (
+            <div className="assertions">
+              {step.assertions.map((a) => (
+                <div key={`${a.path}-${a.operator}`} className={`assertion assertion--${a.passed ? "pass" : "fail"}`}>
+                  <span className="assertion__icon" />
+                  <span>
+                    <strong>{a.operator}</strong> {a.path || "(root)"}
+                  </span>
+                  {a.message && <span className="assertion__text">{a.message}</span>}
+                </div>
+              ))}
+            </div>
+          )}
+          {step.output != null && (
+            <div className="step__output">
+              <div className="step__output-label">Output</div>
+              <pre className="step__output-pre">{formatValue(step.output)}</pre>
+            </div>
+          )}
+          {step.textOutput && (
+            <div className="step__output">
+              <div className="step__output-label">Command output</div>
+              <pre className="step__output-pre">{step.textOutput}</pre>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+interface DashboardProps {
   state: DemoStateResponse | null;
   selectedScenarioId: string | null;
   releaseMode: boolean;
@@ -16,82 +88,11 @@ interface ShowcaseDashboardProps {
   error: string | null;
   loading: boolean;
   running: boolean;
-  onSelectScenario: (scenarioId: string) => void;
+  onSelectScenario: (id: string) => void;
   onThemeChange: (theme: ThemeMode) => void;
   onToggleReleaseMode: (value: boolean) => void;
   onResetSession: () => void;
   onRunScenario: () => void;
-}
-
-function readInitialTheme(): ThemeMode {
-  if (typeof window === "undefined") {
-    return "dark";
-  }
-  try {
-    const storedTheme = window.localStorage.getItem(THEME_STORAGE_KEY);
-    return storedTheme === "light" || storedTheme === "dark" ? storedTheme : "dark";
-  } catch {
-    return "dark";
-  }
-}
-
-function formatValue(value: unknown): string {
-  if (typeof value === "string") {
-    return value;
-  }
-  return JSON.stringify(value, null, 2);
-}
-
-function formatTimestamp(value: string): string {
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return value;
-  }
-  return date.toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
-}
-
-function ScenarioStepCard({ step }: { step: ScenarioStepResult }) {
-  const tone = step.status;
-  return (
-    <section className={`step-card step-card--${tone}`}>
-      <header className="step-card__header">
-        <div>
-          <p className="eyebrow">{step.kind.replaceAll("_", " ")}</p>
-          <h3>{step.title}</h3>
-        </div>
-        <span className={`status-pill status-pill--${tone}`}>{tone}</span>
-      </header>
-      <p className="step-card__summary">{step.summary}</p>
-      {step.command ? <pre className="step-card__command">{step.command}</pre> : null}
-      {step.assertions.length > 0 ? (
-        <ul className="assertion-list">
-          {step.assertions.map((assertion) => (
-            <li key={`${assertion.path}-${assertion.operator}`} className={assertion.passed ? "assertion-pass" : "assertion-fail"}>
-              <strong>{assertion.operator}</strong> {assertion.path || "(root)"} {assertion.passed ? "passed" : "failed"}
-            </li>
-          ))}
-        </ul>
-      ) : null}
-      {step.output ? (
-        <div className="evidence-grid">
-          <article className="evidence-panel">
-            <h4>Raw output</h4>
-            <pre>{formatValue(step.output)}</pre>
-          </article>
-        </div>
-      ) : null}
-      {step.textOutput ? (
-        <article className="evidence-panel">
-          <h4>Command output</h4>
-          <pre>{step.textOutput}</pre>
-        </article>
-      ) : null}
-    </section>
-  );
 }
 
 export function ShowcaseDashboard({
@@ -108,246 +109,235 @@ export function ShowcaseDashboard({
   onToggleReleaseMode,
   onResetSession,
   onRunScenario,
-}: ShowcaseDashboardProps) {
+}: DashboardProps) {
+  const [activeTab, setActiveTab] = useState<TabId>("evidence");
   const deferredReleaseMode = useDeferredValue(releaseMode);
+
   const visibleScenarios = deferredReleaseMode
-    ? (state?.scenarios ?? []).filter((entry) => entry.manifest.maturity !== "experimental")
+    ? (state?.scenarios ?? []).filter((s) => s.manifest.maturity !== "experimental")
     : (state?.scenarios ?? []);
 
-  const selectedScenario =
-    visibleScenarios.find((entry) => entry.manifest.id === selectedScenarioId) ?? visibleScenarios[0] ?? null;
-
-  const plannedSteps = selectedScenario?.manifest.steps ?? [];
-  const enabledCapabilityCount = Object.entries(state?.capabilities ?? {}).filter(([, enabled]) => enabled).length;
-  const selectedRunVisible =
-    runResult && selectedScenario && runResult.scenarioId === selectedScenario.manifest.id ? runResult : null;
+  const selected = visibleScenarios.find((s) => s.manifest.id === selectedScenarioId) ?? visibleScenarios[0] ?? null;
+  const selectedRun = runResult && selected && runResult.scenarioId === selected.manifest.id ? runResult : null;
+  const enabledCaps = Object.values(state?.capabilities ?? {}).filter(Boolean).length;
 
   return (
-    <div className="showcase-shell">
-      <div className="showcase-backdrop" aria-hidden="true" />
-      <header className="showcase-header">
-        <div className="showcase-header__intro">
-          <p className="eyebrow">SydraDB living showcase</p>
-          <h1>Operational evidence for CAS, sydraQL, compiler work, and the core engine</h1>
-          <p className="showcase-header__lede">
-            Dark-first scenario packs for validating fast-moving trunk work with real repos, live binaries, and
-            operator-grade evidence.
-          </p>
+    <div>
+      {/* ── Top bar ────────────────────────────────────── */}
+      <header className="topbar">
+        <div className="topbar__brand">
+          <span className="topbar__logo">sydradb</span>
+          <span className="topbar__separator">/</span>
+          <span className="topbar__subtitle">showcase</span>
         </div>
-        <div className="showcase-header__actions">
-          <div className="theme-toggle" role="group" aria-label="Theme mode">
-            <span className="theme-toggle__label">Theme</span>
-            {(["dark", "light"] as const).map((option) => (
-              <button
-                key={option}
-                type="button"
-                className={`theme-toggle__button ${theme === option ? "theme-toggle__button--active" : ""}`}
-                aria-pressed={theme === option}
-                onClick={() => onThemeChange(option)}
-              >
-                {option === "dark" ? "Midnight" : "Light"}
-              </button>
-            ))}
-          </div>
-          <label className="toggle">
-            <input
-              type="checkbox"
-              checked={releaseMode}
-              onChange={(event) => onToggleReleaseMode(event.target.checked)}
-            />
-            <span>Release mode</span>
+        <div className="topbar__actions">
+          <label className="toggle-label">
+            <input type="checkbox" checked={releaseMode} onChange={(e) => onToggleReleaseMode(e.target.checked)} />
+            <span>Release</span>
           </label>
-          <button type="button" className="secondary-button" onClick={onResetSession} disabled={loading || running}>
-            Reset session
+          <button
+            type="button"
+            className={`btn btn--small ${theme === "dark" ? "btn--active" : ""}`}
+            onClick={() => onThemeChange(theme === "dark" ? "light" : "dark")}
+          >
+            {theme === "dark" ? "Dark" : "Light"}
+          </button>
+          <button type="button" className="btn btn--small" onClick={onResetSession} disabled={loading || running}>
+            Reset
           </button>
           <button
             type="button"
-            className="primary-button"
+            className="btn btn--primary btn--small"
             onClick={onRunScenario}
-            disabled={!selectedScenario || running || loading || !selectedScenario.availability.available}
+            disabled={!selected || running || loading || !selected.availability.available}
           >
-            {running ? "Running…" : "Run scenario"}
+            {running ? "Running..." : "Run"}
           </button>
         </div>
       </header>
 
-      <div className="meta-strip">
-        <article className="meta-pill">
-          <span className="meta-pill__label">Session</span>
-          <strong>{state?.sessionId ?? "initializing"}</strong>
-        </article>
-        <article className="meta-pill">
-          <span className="meta-pill__label">Binary</span>
-          <strong>{state?.binaryPath ?? "not found"}</strong>
-        </article>
-        <article className="meta-pill">
-          <span className="meta-pill__label">Capabilities online</span>
-          <strong>{enabledCapabilityCount}</strong>
-        </article>
-        <article className="meta-pill">
-          <span className="meta-pill__label">Scenario packs</span>
-          <strong>{visibleScenarios.length}</strong>
-        </article>
+      {/* ── Meta bar ───────────────────────────────────── */}
+      <div className="meta-bar">
+        <div className="meta-bar__item">
+          session <span className="meta-bar__value">{state?.sessionId?.slice(0, 8) ?? "—"}</span>
+        </div>
+        <div className="meta-bar__item">
+          capabilities <span className="meta-bar__value">{enabledCaps}</span>
+        </div>
+        <div className="meta-bar__item">
+          scenarios <span className="meta-bar__value">{visibleScenarios.length}</span>
+        </div>
+        <div className="meta-bar__item">
+          binary <span className="meta-bar__value">{state?.binaryPath?.split("/").pop() ?? "—"}</span>
+        </div>
       </div>
 
-      {error ? (
-        <section className="error-banner" role="alert">
-          <p className="eyebrow">Attention</p>
-          <strong>{error}</strong>
-        </section>
-      ) : null}
+      {error && <div className="error-banner" role="alert">{error}</div>}
 
-      <main className="showcase-grid">
-        <aside className="scenario-pane">
-          <div className="pane-heading">
-            <p className="eyebrow">Scenario registry</p>
-            <h2>Subsystem packs</h2>
-            <p className="pane-heading__body">Track stable and experimental proof points without rewriting the shell.</p>
+      {/* ── Layout ─────────────────────────────────────── */}
+      <div className="layout">
+        {/* ── Sidebar ────────────────────────────────── */}
+        <aside className="sidebar">
+          <div className="sidebar__header">
+            <span className="sidebar__title">Scenarios</span>
+            <span className="sidebar__count">{visibleScenarios.length}</span>
           </div>
-          <div className="scenario-list">
-            {visibleScenarios.map((entry) => {
-              const selected = entry.manifest.id === selectedScenario?.manifest.id;
-              return (
-                <button
-                  key={entry.manifest.id}
-                  type="button"
-                  className={`scenario-list__item ${selected ? "scenario-list__item--selected" : ""} ${
-                    entry.availability.available ? "scenario-list__item--available" : "scenario-list__item--blocked"
-                  }`}
-                  onClick={() => onSelectScenario(entry.manifest.id)}
-                >
-                  <div className="scenario-list__row">
-                    <h3>{entry.manifest.title}</h3>
-                    <span className={`maturity-pill maturity-pill--${entry.manifest.maturity}`}>
-                      {entry.manifest.maturity}
-                    </span>
-                  </div>
-                  <div className="scenario-list__availability">
-                    <span
-                      className={`availability-pill ${
-                        entry.availability.available ? "availability-pill--ready" : "availability-pill--blocked"
-                      }`}
-                    >
-                      {entry.availability.available ? "Ready" : "Capability gated"}
-                    </span>
-                  </div>
-                  <p>{entry.manifest.summary}</p>
-                  <div className="scenario-tags">
-                    {entry.manifest.subsystems.map((tag) => (
-                      <span key={tag}>{tag}</span>
-                    ))}
-                  </div>
-                  {!entry.availability.available ? (
-                    <p className="scenario-list__missing">
-                      Missing: {entry.availability.missingCapabilities.join(", ")}
-                    </p>
-                  ) : null}
-                </button>
-              );
-            })}
-          </div>
-        </aside>
-
-        <section className="evidence-pane">
-          <div className="pane-heading">
-            <p className="eyebrow">Execution evidence</p>
-            <h2>{selectedScenario?.manifest.title ?? "No scenario selected"}</h2>
-            <p className="pane-heading__body">
-              Run packs against the current binary and inspect the exact output the scenario contracts assert on.
-            </p>
-          </div>
-          <section className="run-status">
-            <div>
-              <p className="eyebrow">Execution state</p>
-              <h3>{selectedRunVisible ? "Latest run loaded" : "Waiting for first execution"}</h3>
-            </div>
-            <div className="run-status__chips">
-              <span className={`status-pill ${selectedRunVisible ? `status-pill--${selectedRunVisible.status}` : "status-pill--skipped"}`}>
-                {selectedRunVisible?.status ?? "not run"}
-              </span>
-              {selectedRunVisible ? <span className="run-status__timestamp">Started {formatTimestamp(selectedRunVisible.startedAt)}</span> : null}
-              {selectedRunVisible ? <span className="run-status__timestamp">Finished {formatTimestamp(selectedRunVisible.finishedAt)}</span> : null}
-            </div>
-          </section>
-          {selectedRunVisible ? (
-            <>
-              {selectedRunVisible.summaryEvidence ? (
-                <article className="summary-evidence">
-                  <h3>Stable summary evidence</h3>
-                  <pre>{formatValue(selectedRunVisible.summaryEvidence)}</pre>
-                </article>
-              ) : null}
-              <div className="step-stack">
-                {selectedRunVisible.steps.map((step) => (
-                  <ScenarioStepCard key={step.id} step={step} />
-                ))}
-              </div>
-            </>
-          ) : (
-            <div className="planned-steps">
-              <article className="planned-intro">
-                <p className="eyebrow">Ready state</p>
-                <h3>Execution panels will fill in after a live run.</h3>
-                <p>
-                  The sequence below is the current contract for this scenario. Each step maps to machine-checked
-                  evidence once you execute the pack.
-                </p>
-              </article>
-              {plannedSteps.map((step, index) => (
-                <article key={step.id} className="planned-step">
-                  <span className="planned-step__index">{String(index + 1).padStart(2, "0")}</span>
-                  <div>
-                    <h3>{step.title}</h3>
-                    <p>{step.summary}</p>
-                  </div>
-                </article>
-              ))}
-            </div>
-          )}
-        </section>
-
-        <aside className="context-pane">
-          <div className="pane-heading">
-            <p className="eyebrow">Decision context</p>
-            <h2>Why not standard SQLite here?</h2>
-            <p className="pane-heading__body">
-              This rail keeps the product argument attached to the exact scenario you are inspecting.
-            </p>
-          </div>
-          {selectedScenario ? (
-            <>
-              <p className="context-pane__summary">{selectedScenario.manifest.summary}</p>
-              <ul className="reason-list">
-                {selectedScenario.manifest.whySQLiteFallsShort.map((reason) => (
-                  <li key={reason}>{reason}</li>
-                ))}
-              </ul>
-              <section className="context-pane__details">
-                <h3>Minimum outputs</h3>
-                <ul>
-                  {selectedScenario.manifest.minimumOutputs.map((output) => (
-                    <li key={output}>{output}</li>
+          {visibleScenarios.map((entry) => {
+            const isSelected = entry.manifest.id === selected?.manifest.id;
+            return (
+              <button
+                key={entry.manifest.id}
+                type="button"
+                className={[
+                  "scenario-item",
+                  isSelected && "scenario-item--selected",
+                  !entry.availability.available && "scenario-item--blocked",
+                ]
+                  .filter(Boolean)
+                  .join(" ")}
+                onClick={() => onSelectScenario(entry.manifest.id)}
+              >
+                <div className="scenario-item__top">
+                  <span className="scenario-item__title">{entry.manifest.title}</span>
+                  <span className={`tag tag--${entry.manifest.maturity}`}>{entry.manifest.maturity}</span>
+                </div>
+                <p className="scenario-item__summary">{entry.manifest.summary}</p>
+                <div className="scenario-item__meta">
+                  <span className={`tag ${entry.availability.available ? "tag--ready" : "tag--blocked"}`}>
+                    {entry.availability.available ? "ready" : "blocked"}
+                  </span>
+                  {entry.manifest.subsystems.map((tag) => (
+                    <span key={tag} className="tag tag--subsystem">{tag}</span>
                   ))}
-                </ul>
-              </section>
-              <section className="context-pane__details">
-                <h3>Scenario evidence panels</h3>
-                <ul>
-                  {plannedSteps.flatMap((step) =>
-                    step.evidencePanels.map((panel) => (
-                      <li key={`${step.id}-${panel.id}`}>
-                        {step.title}: {panel.title}
-                      </li>
-                    )),
-                  )}
-                </ul>
-              </section>
+                </div>
+                {!entry.availability.available && (
+                  <p className="scenario-item__missing">
+                    missing: {entry.availability.missingCapabilities.join(", ")}
+                  </p>
+                )}
+              </button>
+            );
+          })}
+        </aside>
+
+        {/* ── Main ───────────────────────────────────── */}
+        <main className="main">
+          {selected ? (
+            <>
+              <div className="main__header">
+                <h1 className="main__title">{selected.manifest.title}</h1>
+                <p className="main__description">{selected.manifest.summary}</p>
+              </div>
+
+              <div className="tabs">
+                <button
+                  type="button"
+                  className={`tab ${activeTab === "evidence" ? "tab--active" : ""}`}
+                  onClick={() => setActiveTab("evidence")}
+                >
+                  Evidence
+                </button>
+                <button
+                  type="button"
+                  className={`tab ${activeTab === "context" ? "tab--active" : ""}`}
+                  onClick={() => setActiveTab("context")}
+                >
+                  Context
+                </button>
+              </div>
+
+              {activeTab === "evidence" && (
+                <>
+                  <div className="run-bar">
+                    <div className="run-bar__left">
+                      <span className={`tag ${selectedRun ? `tag--${selectedRun.status}` : "tag--skipped"}`}>
+                        {selectedRun?.status ?? "not run"}
+                      </span>
+                      <span>{selectedRun ? "Latest run" : "Awaiting execution"}</span>
+                    </div>
+                    {selectedRun && (
+                      <div className="run-bar__right">
+                        <span>{formatTimestamp(selectedRun.startedAt)}</span>
+                        <span>→</span>
+                        <span>{formatTimestamp(selectedRun.finishedAt)}</span>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="content">
+                    {selectedRun ? (
+                      <>
+                        {selectedRun.summaryEvidence && (
+                          <div className="summary-block">
+                            <div className="summary-block__header">Summary Evidence</div>
+                            <div className="summary-block__body">
+                              <pre>{formatValue(selectedRun.summaryEvidence)}</pre>
+                            </div>
+                          </div>
+                        )}
+                        <div className="step-list">
+                          {selectedRun.steps.map((step, i) => (
+                            <StepCard key={step.id} step={step} index={i} />
+                          ))}
+                        </div>
+                      </>
+                    ) : (
+                      <div className="planned-list">
+                        {selected.manifest.steps.map((step, i) => (
+                          <div key={step.id} className="planned-item">
+                            <span className="planned-item__index">{String(i + 1).padStart(2, "0")}</span>
+                            <div className="planned-item__content">
+                              <div className="planned-item__title">{step.title}</div>
+                              <p className="planned-item__summary">{step.summary}</p>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+
+              {activeTab === "context" && (
+                <div className="content">
+                  <div className="context-section">
+                    <h3 className="context-section__title">Why not standard SQLite?</h3>
+                    <ul>
+                      {selected.manifest.whySQLiteFallsShort.map((reason) => (
+                        <li key={reason}>{reason}</li>
+                      ))}
+                    </ul>
+                  </div>
+
+                  <div className="context-section">
+                    <h3 className="context-section__title">Minimum outputs</h3>
+                    <ul>
+                      {selected.manifest.minimumOutputs.map((output) => (
+                        <li key={output}>{output}</li>
+                      ))}
+                    </ul>
+                  </div>
+
+                  <div className="context-section">
+                    <h3 className="context-section__title">Evidence panels</h3>
+                    <ul>
+                      {selected.manifest.steps.flatMap((step) =>
+                        step.evidencePanels.map((panel) => (
+                          <li key={`${step.id}-${panel.id}`}>
+                            {step.title}: {panel.title}
+                          </li>
+                        )),
+                      )}
+                    </ul>
+                  </div>
+                </div>
+              )}
             </>
           ) : (
-            <p>Select a scenario to inspect the tradeoffs it highlights.</p>
+            <div className="empty-state">No scenarios available</div>
           )}
-        </aside>
-      </main>
+        </main>
+      </div>
     </div>
   );
 }
@@ -379,36 +369,25 @@ export default function App() {
         }
       })
       .finally(() => {
-        if (!cancelled) {
-          setLoading(false);
-        }
+        if (!cancelled) setLoading(false);
       });
-    return () => {
-      cancelled = true;
-    };
+    return () => { cancelled = true; };
   }, []);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
     document.documentElement.style.colorScheme = theme;
-    try {
-      window.localStorage.setItem(THEME_STORAGE_KEY, theme);
-    } catch {
-      // Keep the UI usable even if storage is unavailable.
-    }
+    try { window.localStorage.setItem(THEME_STORAGE_KEY, theme); } catch {}
   }, [theme]);
 
   useEffect(() => {
-    const visibleScenarios = releaseMode
-      ? (state?.scenarios ?? []).filter((entry) => entry.manifest.maturity !== "experimental")
+    const visible = releaseMode
+      ? (state?.scenarios ?? []).filter((s) => s.manifest.maturity !== "experimental")
       : (state?.scenarios ?? []);
-    if (visibleScenarios.length === 0) {
-      return;
-    }
-    const selectionVisible = visibleScenarios.some((entry) => entry.manifest.id === selectedScenarioId);
-    if (!selectionVisible) {
+    if (visible.length === 0) return;
+    if (!visible.some((s) => s.manifest.id === selectedScenarioId)) {
       startTransition(() => {
-        setSelectedScenarioId(visibleScenarios[0]?.manifest.id ?? null);
+        setSelectedScenarioId(visible[0]?.manifest.id ?? null);
         setRunResult(null);
       });
     }
@@ -432,23 +411,18 @@ export default function App() {
   }
 
   async function handleRunScenario() {
-    const visibleScenarios = releaseMode
-      ? (state?.scenarios ?? []).filter((entry) => entry.manifest.maturity !== "experimental")
+    const visible = releaseMode
+      ? (state?.scenarios ?? []).filter((s) => s.manifest.maturity !== "experimental")
       : (state?.scenarios ?? []);
-    const selectedScenario =
-      visibleScenarios.find((entry) => entry.manifest.id === selectedScenarioId) ?? visibleScenarios[0] ?? null;
-    if (!selectedScenario) {
-      return;
-    }
+    const target = visible.find((s) => s.manifest.id === selectedScenarioId) ?? visible[0] ?? null;
+    if (!target) return;
     setRunning(true);
     setError(null);
     try {
-      const nextResult = await runScenario(selectedScenario.manifest.id);
-      setRunResult(nextResult);
-      if (selectedScenario.manifest.id !== selectedScenarioId) {
-        startTransition(() => {
-          setSelectedScenarioId(selectedScenario.manifest.id);
-        });
+      const result = await runScenario(target.manifest.id);
+      setRunResult(result);
+      if (target.manifest.id !== selectedScenarioId) {
+        startTransition(() => setSelectedScenarioId(target.manifest.id));
       }
     } catch (nextError) {
       setError(nextError instanceof Error ? nextError.message : "Unable to execute the selected scenario.");
@@ -467,9 +441,9 @@ export default function App() {
       error={error}
       loading={loading}
       running={running}
-      onSelectScenario={(scenarioId) => {
+      onSelectScenario={(id) => {
         startTransition(() => {
-          setSelectedScenarioId(scenarioId);
+          setSelectedScenarioId(id);
           setRunResult(null);
           setError(null);
         });

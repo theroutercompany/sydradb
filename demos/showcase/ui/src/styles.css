@@ -2,12 +2,12 @@
 
 :root {
   color-scheme: dark;
-  --bg: #201d1d;
-  --bg-raised: #2a2626;
-  --bg-inset: #1a1717;
+  --bg: #171717;
+  --bg-raised: #222222;
+  --bg-inset: #111111;
   --text: #fdfcfc;
-  --text-secondary: #9a9898;
-  --text-tertiary: #6e6b6b;
+  --text-secondary: #b0aeae;
+  --text-tertiary: #858282;
   --border: rgba(253, 252, 252, 0.1);
   --border-strong: rgba(253, 252, 252, 0.18);
   --blue: #007aff;
@@ -46,7 +46,7 @@ body {
   background: var(--bg);
   color: var(--text);
   font-family: var(--font);
-  font-size: 14px;
+  font-size: 15px;
   line-height: 1.5;
   -webkit-font-smoothing: antialiased;
 }
