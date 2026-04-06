@@ -1007,6 +1007,55 @@ test "shadowCompareSelect matches compiled and legacy rows for supported query" 
     try std.testing.expect(result.rows_compared > 0);
 }
 
+test "compiled and legacy parity holds across metadata modes for public query classes" {
+    const talloc = std.testing.allocator;
+    const modes = [_]cfg.MetadataReadMode{ .legacy, .shadow, .primary };
+    const queries = [_][]const u8{
+        "select time, value from parity.room1 where time >= 0 order by time asc",
+        "select max(value) as max_value from parity.room1 where time >= 0",
+        "select time_bucket(60, time) as bucket, max(value) as max_value from parity.room1 where time >= 0 group by time_bucket(60, time) order by bucket asc",
+        "select tag.host as host, avg(value) as avg_value from tagged.room1 where tag.host = 'web' group by tag.host",
+    };
+
+    for (modes) |mode| {
+        var tmp = std.testing.tmpDir(.{ .iterate = true });
+        defer tmp.cleanup();
+
+        const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/parity-{s}", .{ tmp.sub_path, @tagName(mode) });
+        defer talloc.free(data_path);
+
+        const config = cfg.Config{
+            .data_dir = try talloc.dupe(u8, data_path),
+            .http_port = 0,
+            .fsync = .none,
+            .flush_interval_ms = 5,
+            .memtable_max_bytes = 512,
+            .retention_days = 0,
+            .auth_token = try talloc.dupe(u8, ""),
+            .enable_influx = false,
+            .enable_prom = false,
+            .mem_limit_bytes = 1024 * 1024,
+            .cas_mode = .dual_write,
+            .metadata_read_mode = mode,
+            .query_compiler_mode = .compiled,
+            .retention_ns = std.StringHashMap(u32).init(talloc),
+        };
+
+        var engine = try engine_mod.Engine.init(talloc, config);
+        defer engine.deinit();
+
+        try seedParityDataset(&engine);
+
+        for (queries) |query| {
+            const result = try shadowCompareSelect(talloc, &engine, query);
+            try std.testing.expect(result.matched);
+            try std.testing.expect(result.rows_compared > 0);
+        }
+
+        try std.testing.expectEqual(@as(u64, 0), engine.metrics.cas_shadow_mismatch_total.load(.monotonic));
+    }
+}
+
 fn waitForFlushForTest(engine: *engine_mod.Engine, min_flushes: u64, timeout_ms: u64) !void {
     const start = std.time.milliTimestamp();
     while (std.time.milliTimestamp() - start < timeout_ms) {
@@ -1018,6 +1067,25 @@ fn waitForFlushForTest(engine: *engine_mod.Engine, min_flushes: u64, timeout_ms:
         }
     }
     return error.Timeout;
+}
+
+fn seedParityDataset(engine: *engine_mod.Engine) !void {
+    const types = @import("../types.zig");
+
+    const raw_sid = types.seriesIdFrom("parity.room1", "{}");
+    try engine.registerSeries("parity.room1", "{}", raw_sid);
+    try engine.ingest(.{ .series_id = raw_sid, .ts = 10, .value = 1.5, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = raw_sid, .ts = 20, .value = 2.0, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = raw_sid, .ts = 70, .value = 3.5, .tags_json = "{}" });
+
+    const tagged_tags = "{\"host\":\"web\",\"rack\":\"r1\"}";
+    const tagged_sid = types.seriesIdFrom("tagged.room1", tagged_tags);
+    try engine.registerSeries("tagged.room1", tagged_tags, tagged_sid);
+    engine.noteTags(tagged_sid, tagged_tags);
+    try engine.ingest(.{ .series_id = tagged_sid, .ts = 10, .value = 1.0, .tags_json = tagged_tags });
+    try engine.ingest(.{ .series_id = tagged_sid, .ts = 20, .value = 3.0, .tags_json = tagged_tags });
+
+    try waitForFlushForTest(engine, 1, 1_000);
 }
 
 fn collectCursorSnapshot(alloc: std.mem.Allocator, cursor: *executor.ExecutionCursor) ![]u8 {
