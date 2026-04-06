@@ -336,25 +336,22 @@ fn executeExplainTablesUsed(
         const detailed = compiler.compileSelectDetailed(prepared.arena_ptr.allocator(), prepared.engine, explain.target) catch |err| {
             if (compiler_diagnostics.fromCompileError(err)) |reason| {
                 recordCompileFallback(prepared.engine, reason);
-                return null;
             }
             return err;
         };
         const compile_end = std.time.microTimestamp();
-        if (detailed) |result| {
-            bind_us = result.bind_us;
-            if (result.compiled) |compiled| {
-                recordCompileSuccess(prepared.engine);
-                typed_query = compiled.typed_query;
-                logical_us = compiled.backend.logical_us;
-                optimize_us = compiled.backend.optimize_us;
-                physical_us = compiled.backend.physical_us;
-                const backend_us = logical_us + optimize_us + physical_us;
-                compile_us = durationMicros(compile_end - compile_start) -| backend_us;
-            } else if (result.fallback_reason) |reason| {
-                recordCompileFallback(prepared.engine, reason);
-                compile_us = durationMicros(compile_end - compile_start) -| bind_us;
-            }
+        bind_us = detailed.bind_us;
+        if (detailed.compiled) |compiled| {
+            recordCompileSuccess(prepared.engine);
+            typed_query = compiled.typed_query;
+            logical_us = compiled.backend.logical_us;
+            optimize_us = compiled.backend.optimize_us;
+            physical_us = compiled.backend.physical_us;
+            const backend_us = logical_us + optimize_us + physical_us;
+            compile_us = durationMicros(compile_end - compile_start) -| backend_us;
+        } else if (detailed.fallback_reason) |reason| {
+            recordCompileFallback(prepared.engine, reason);
+            compile_us = durationMicros(compile_end - compile_start) -| bind_us;
         }
     }
 

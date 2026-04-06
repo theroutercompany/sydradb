@@ -459,8 +459,8 @@ fn timeRangeFromExpr(expr: *const ast.Expr) ir.TimeRange {
             if (binary.op == .logical_and) {
                 return mergeTimeRanges(timeRangeFromExpr(binary.left), timeRangeFromExpr(binary.right));
             }
-            const lhs_time = infer.expressionHasTime(binary.left) and binary.left.* == .identifier and identifierAllowedInRawRow(binary.left.identifier.value);
-            const rhs_time = infer.expressionHasTime(binary.right) and binary.right.* == .identifier and identifierAllowedInRawRow(binary.right.identifier.value);
+            const lhs_time = infer.expressionHasTime(binary.left) and binary.left.* == .identifier and identifierAllowedInRawRow(binary.left.identifier.value, false);
+            const rhs_time = infer.expressionHasTime(binary.right) and binary.right.* == .identifier and identifierAllowedInRawRow(binary.right.identifier.value, false);
             if (lhs_time == rhs_time) return .{};
 
             const literal = if (lhs_time) literalToTimestamp(binary.right) else literalToTimestamp(binary.left);

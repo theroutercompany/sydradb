@@ -131,8 +131,7 @@ fn handleAllocStats(handle: *alloc_mod.AllocatorHandle, req: *std.http.Server.Re
     });
     errdefer response.end() catch {};
 
-    var writer = response.writer;
-    var jw = std.json.Stringify{ .writer = &writer };
+    var jw = std.json.Stringify{ .writer = &response.writer };
     try jw.beginObject();
     try jw.objectField("allocator_mode");
     try jw.write(alloc_mod.mode);
@@ -249,8 +248,7 @@ fn handleSydraql(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     });
     errdefer response.end() catch {};
 
-    var writer = response.writer;
-    var jw = std.json.Stringify{ .writer = &writer };
+    var jw = std.json.Stringify{ .writer = &response.writer };
 
     try jw.beginObject();
     try jw.objectField("columns");
@@ -293,7 +291,6 @@ fn handleSydraql(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     const elapsed_us = @as(u64, @intCast(elapsed_us_signed));
     try writeStatsObject(&jw, row_count, elapsed_us, &cursor.stats, op_stats, cursor.columns);
     try jw.endObject();
-
     try response.end();
 }
 

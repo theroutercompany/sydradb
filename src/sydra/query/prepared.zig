@@ -1209,11 +1209,12 @@ test "prepared statement disassembles bytecode programs" {
         .{ .opcode = .result_row, .p1 = 0, .p2 = 1 },
         .{ .opcode = .halt },
     });
+    const source_text = try alloc.dupe(u8, "select 1");
     var stmt = PreparedStmt{
         .allocator = alloc,
         .engine = engine,
         .language = .sydraql,
-        .source_text = "select 1",
+        .source_text = source_text,
         .flags = .{},
         .program = .{
             .allocator = alloc,
@@ -1223,7 +1224,7 @@ test "prepared statement disassembles bytecode programs" {
         },
         .binding = .{
             .language = .sydraql,
-            .source_text = "select 1",
+            .source_text = source_text,
             .statement_kind = .select,
             .statement_span = .{ .start = 0, .end = 8 },
         },
