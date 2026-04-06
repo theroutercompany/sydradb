@@ -173,7 +173,7 @@ Operational notes:
 - `cas fsck` is reflog-aware by default, so commits only referenced by reflogs are still considered reachable.
 - `objects/info/commit-graph` version 2 stores fixed-width Bloom filters for logical metadata paths such as `metadata/segments`, `metadata/tags`, `metadata/series_catalog`, and `wal/*`.
 - Active packs now carry adjacent `.manifest` files with per-type object counts and pack checksums; `cas fsck` validates those manifests before trusting mixed-pack reachability.
-- Reftable writes now use update-indexed table names and a persisted `reftable/state` counter. Compaction rewrites suffixes geometrically into wider `<min>-<max>.table` spans while preserving tombstones.
+- Reftable writes now use update-indexed table names, a persisted `reftable/state` counter, and block-indexed v3 tables with separate ref and reflog block indexes plus a footer checksum. Readers remain compatible with older flat v1/v2 tables and rewrite them into the current format during compaction or upgrade.
 - `cas fsck --connectivity-only` limits validation to refs, reflogs, reachable objects, commit-graph consistency, and dangling detection.
 - `cas fsck --lost-found` writes dangling commit/blob/tree ids into `lost-found/`.
 - `cas gc --no-reflogs` ignores reflog protection when deciding what is unreachable.
