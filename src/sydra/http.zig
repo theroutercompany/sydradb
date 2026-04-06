@@ -413,7 +413,9 @@ const StatusSnapshot = struct {
     query_compiler_mode: []const u8,
     compatibility_debt: cas_mod.CompatibilityDebtReport,
     queue_depth: usize,
+    maintenance_pause_active: bool,
     memtable_bytes: usize,
+    drain_timeout_total: u64,
     flush_total: u64,
     flush_points_total: u64,
     flush_seconds_total: f64,
@@ -448,7 +450,9 @@ fn buildStatusSnapshot(eng: *Engine) StatusSnapshot {
         .query_compiler_mode = @tagName(eng.config.query_compiler_mode),
         .compatibility_debt = compatibility_debt,
         .queue_depth = eng.queue.len(),
+        .maintenance_pause_active = eng.metrics.maintenance_pause_active.load(.monotonic),
         .memtable_bytes = eng.mem.bytes.load(.monotonic),
+        .drain_timeout_total = eng.metrics.drain_timeout_total.load(.monotonic),
         .flush_total = eng.metrics.flush_total.load(.monotonic),
         .flush_points_total = eng.metrics.flush_points_total.load(.monotonic),
         .flush_seconds_total = @as(f64, @floatFromInt(eng.metrics.flush_ns_total.load(.monotonic))) / 1_000_000_000.0,
@@ -526,8 +530,12 @@ fn writeStatusPayload(jw: *std.json.Stringify, snapshot: StatusSnapshot) !void {
     try jw.beginObject();
     try jw.objectField("queue_depth");
     try jw.write(snapshot.queue_depth);
+    try jw.objectField("maintenance_pause_active");
+    try jw.write(snapshot.maintenance_pause_active);
     try jw.objectField("memtable_bytes");
     try jw.write(snapshot.memtable_bytes);
+    try jw.objectField("drain_timeout_total");
+    try jw.write(snapshot.drain_timeout_total);
     try jw.objectField("flush_total");
     try jw.write(snapshot.flush_total);
     try jw.objectField("flush_points_total");
@@ -827,7 +835,9 @@ test "buildStatusPayload emits extended runtime counters" {
             .loose_refs_present = 3,
         },
         .queue_depth = 2,
+        .maintenance_pause_active = true,
         .memtable_bytes = 4096,
+        .drain_timeout_total = 6,
         .flush_total = 3,
         .flush_points_total = 17,
         .flush_seconds_total = 0.125,
@@ -870,7 +880,9 @@ test "buildStatusPayload emits extended runtime counters" {
 
     const runtime = root.get("runtime").?.object;
     try std.testing.expectEqual(@as(i64, 2), runtime.get("queue_depth").?.integer);
+    try std.testing.expectEqual(true, runtime.get("maintenance_pause_active").?.bool);
     try std.testing.expectEqual(@as(i64, 4096), runtime.get("memtable_bytes").?.integer);
+    try std.testing.expectEqual(@as(i64, 6), runtime.get("drain_timeout_total").?.integer);
     try std.testing.expectEqual(@as(i64, 17), runtime.get("flush_points_total").?.integer);
     try std.testing.expectApproxEqAbs(@as(f64, 0.125), runtime.get("flush_seconds_total").?.float, 0.0001);
     try std.testing.expectEqual(@as(i64, 11), runtime.get("wal_append_total").?.integer);
@@ -900,6 +912,7 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     const wal_append_seconds_total = @as(f64, @floatFromInt(eng.metrics.wal_append_ns_total.load(.monotonic))) / 1_000_000_000.0;
     const wal_bytes_total = eng.metrics.wal_bytes_total.load(.monotonic);
     const wal_append_failed_total = eng.metrics.wal_append_failed_total.load(.monotonic);
+    const drain_timeout_total = eng.metrics.drain_timeout_total.load(.monotonic);
     const memtable_append_failed_total = eng.metrics.memtable_append_failed_total.load(.monotonic);
     const ingest_quarantined_total = eng.metrics.ingest_quarantined_total.load(.monotonic);
     const ingest_quarantine_write_failed_total = eng.metrics.ingest_quarantine_write_failed_total.load(.monotonic);
@@ -915,6 +928,7 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     const query_compile_shadow_mismatch_total = eng.metrics.query_compile_shadow_mismatch_total.load(.monotonic);
     const cas_shadow_mismatch_total = eng.metrics.cas_shadow_mismatch_total.load(.monotonic);
     const queue_depth = eng.queue.len();
+    const maintenance_pause_active = eng.metrics.maintenance_pause_active.load(.monotonic);
     const memtable_bytes = eng.mem.bytes.load(.monotonic);
     const flush_seconds_total = @as(f64, @floatFromInt(flush_ns_total)) / 1_000_000_000.0;
 
@@ -933,6 +947,7 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     try writer.print("# HELP sydradb_wal_append_seconds_total Aggregate WAL append duration in seconds\n# TYPE sydradb_wal_append_seconds_total counter\nsydradb_wal_append_seconds_total {d:.6}\n", .{wal_append_seconds_total});
     try writer.print("# HELP sydradb_wal_bytes_total Total bytes written to WAL\n# TYPE sydradb_wal_bytes_total counter\nsydradb_wal_bytes_total {d}\n", .{wal_bytes_total});
     try writer.print("# HELP sydradb_wal_append_failed_total Total WAL append failures observed by the writer loop\n# TYPE sydradb_wal_append_failed_total counter\nsydradb_wal_append_failed_total {d}\n", .{wal_append_failed_total});
+    try writer.print("# HELP sydradb_drain_timeout_total Total waitForDrained calls that timed out before the engine became queryable\n# TYPE sydradb_drain_timeout_total counter\nsydradb_drain_timeout_total {d}\n", .{drain_timeout_total});
     try writer.print("# HELP sydradb_memtable_append_failed_total Total memtable append failures observed by the writer loop\n# TYPE sydradb_memtable_append_failed_total counter\nsydradb_memtable_append_failed_total {d}\n", .{memtable_append_failed_total});
     try writer.print("# HELP sydradb_ingest_quarantined_total Total ingest records written to quarantine after writer-loop failures\n# TYPE sydradb_ingest_quarantined_total counter\nsydradb_ingest_quarantined_total {d}\n", .{ingest_quarantined_total});
     try writer.print("# HELP sydradb_ingest_quarantine_write_failed_total Total failures while writing ingest quarantine records\n# TYPE sydradb_ingest_quarantine_write_failed_total counter\nsydradb_ingest_quarantine_write_failed_total {d}\n", .{ingest_quarantine_write_failed_total});
@@ -951,6 +966,7 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     try writer.print("# HELP sydradb_query_compile_shadow_mismatch_total Total query compiler fallbacks caused by shadow mismatches\n# TYPE sydradb_query_compile_shadow_mismatch_total counter\nsydradb_query_compile_shadow_mismatch_total {d}\n", .{query_compile_shadow_mismatch_total});
     try writer.print("# HELP sydradb_cas_shadow_mismatch_total Total CAS shadow mismatches observed in runtime verification paths\n# TYPE sydradb_cas_shadow_mismatch_total counter\nsydradb_cas_shadow_mismatch_total {d}\n", .{cas_shadow_mismatch_total});
     try writer.print("# HELP sydradb_queue_depth Current ingest queue depth\n# TYPE sydradb_queue_depth gauge\nsydradb_queue_depth {d}\n", .{queue_depth});
+    try writer.print("# HELP sydradb_maintenance_pause_active 1 when the writer loop is paused for maintenance, 0 otherwise\n# TYPE sydradb_maintenance_pause_active gauge\nsydradb_maintenance_pause_active {d}\n", .{@intFromBool(maintenance_pause_active)});
     try writer.print("# HELP sydradb_memtable_bytes Current memtable size in bytes\n# TYPE sydradb_memtable_bytes gauge\nsydradb_memtable_bytes {d}\n", .{memtable_bytes});
 
     const headers = [_]std.http.Header{.{ .name = "Content-Type", .value = "text/plain; version=0.0.4" }};

@@ -431,11 +431,13 @@ pub const Engine = struct {
         wal_append_total: AtomicU64,
         wal_append_ns_total: AtomicU64,
         wal_bytes_total: AtomicU64,
+        drain_timeout_total: AtomicU64,
         queue_pop_total: AtomicU64,
         queue_wait_ns_total: AtomicU64,
         queue_max_len: std.atomic.Value(usize),
         queue_len_sum: AtomicU64,
         queue_len_samples: AtomicU64,
+        maintenance_pause_active: std.atomic.Value(bool),
         queue_push_lock_wait_ns_total: AtomicU64,
         queue_push_lock_hold_ns_total: AtomicU64,
         queue_push_lock_acquisitions: AtomicU64,
@@ -471,11 +473,13 @@ pub const Engine = struct {
                 .wal_append_total = AtomicU64.init(0),
                 .wal_append_ns_total = AtomicU64.init(0),
                 .wal_bytes_total = AtomicU64.init(0),
+                .drain_timeout_total = AtomicU64.init(0),
                 .queue_pop_total = AtomicU64.init(0),
                 .queue_wait_ns_total = AtomicU64.init(0),
                 .queue_max_len = std.atomic.Value(usize).init(0),
                 .queue_len_sum = AtomicU64.init(0),
                 .queue_len_samples = AtomicU64.init(0),
+                .maintenance_pause_active = std.atomic.Value(bool).init(false),
                 .queue_push_lock_wait_ns_total = AtomicU64.init(0),
                 .queue_push_lock_hold_ns_total = AtomicU64.init(0),
                 .queue_push_lock_acquisitions = AtomicU64.init(0),
@@ -1230,6 +1234,7 @@ pub const Engine = struct {
             }
             sleepMs(10);
         }
+        _ = self.metrics.drain_timeout_total.fetchAdd(1, .monotonic);
         return WaitError.Timeout;
     }
 
@@ -2061,6 +2066,7 @@ fn pauseWriterForMaintenance(self: *Engine) !void {
         thread.join();
         self.writer_thread = null;
     }
+    self.metrics.maintenance_pause_active.store(true, .monotonic);
 }
 
 fn resumeWriterAfterMaintenance(self: *Engine) !void {
@@ -2069,6 +2075,7 @@ fn resumeWriterAfterMaintenance(self: *Engine) !void {
     if (self.writer_thread == null) {
         self.writer_thread = try std.Thread.spawn(.{}, Engine.writerLoop, .{self});
     }
+    self.metrics.maintenance_pause_active.store(false, .monotonic);
 }
 
 fn deletePredicateMatches(expr: *const query_ast.Expr, point: types.Point) !bool {
@@ -2656,6 +2663,50 @@ test "engine writer loop drains queued ingests during shutdown" {
     try std.testing.expectEqual(@as(usize, 2), results.items.len);
     try std.testing.expectEqual(@as(i64, 10), results.items[0].ts);
     try std.testing.expectEqual(@as(i64, 20), results.items[1].ts);
+}
+
+test "engine surfaces drain timeouts and maintenance pause state" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/drain-timeout", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 60_000,
+        .memtable_max_bytes = 1024 * 1024,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    try pauseWriterForMaintenance(engine);
+    try std.testing.expectEqual(true, engine.metrics.maintenance_pause_active.load(.monotonic));
+
+    engine.queue.mu.lock();
+    try engine.queue.buf.append(.{
+        .series_id = types.hash64("drain.timeout.series"),
+        .ts = 10,
+        .value = 1.0,
+        .tags_json = try talloc.dupe(u8, "{}"),
+    });
+    engine.queue.mu.unlock();
+
+    try std.testing.expectError(WaitError.Timeout, engine.waitForDrained(1));
+    try std.testing.expectEqual(@as(u64, 1), engine.metrics.drain_timeout_total.load(.monotonic));
+    try resumeWriterAfterMaintenance(engine);
+    try std.testing.expectEqual(false, engine.metrics.maintenance_pause_active.load(.monotonic));
 }
 
 test "engine snapshotTo captures a restorable CAS bundle" {
