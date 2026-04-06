@@ -3056,7 +3056,8 @@ pub const CasManager = struct {
             if (!normalized_parents[idx].eql(parent)) parents_changed = true;
         }
 
-        var snapshot = try self.loadSnapshotForSpec((commit_id.toHex())[0..]);
+        var reader = CommitReader{ .alloc = self.alloc, .store = &self.store, .refs = &self.refs };
+        var snapshot = try reader.loadSnapshot(commit_id);
         defer snapshot.deinit(self.alloc);
 
         const canonical = try self.canonicalizeSnapshot(data_dir, snapshot);
@@ -8556,6 +8557,91 @@ test "upgrade repository migrates legacy refs to reftable and refreshes format" 
     try std.testing.expect(upgraded_head.eql(head));
     const state = try loadReftableState(talloc, cas_manager.refs.root);
     try std.testing.expect(state.next_update_index >= 2);
+}
+
+test "upgrade normalizes active commits to canonical roots and clears compatibility debt" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/upgrade-normalize", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    try std.fs.cwd().makePath(data_path);
+
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
+    defer series_catalog.deinit();
+
+    const sid = types.hash64("upgrade.normalize.series");
+    _ = try series_catalog.register("upgrade.normalize.series", "{}", sid);
+    const points = [_]types.Point{.{ .ts = 1_000, .value = 9.5 }};
+    const seg_path = try segment_mod.writeSegment(talloc, data_dir, sid, 0, points[0..]);
+    defer talloc.free(seg_path);
+    try manifest.add(data_dir, sid, 0, 1_000, 1_000, 1, seg_path);
+
+    var cas_manager = try CasManager.init(talloc, data_path, .none);
+    defer cas_manager.deinit();
+    const current_head = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+
+    var reader = CommitReader{ .alloc = talloc, .store = &cas_manager.store, .refs = &cas_manager.refs };
+    var snapshot = try reader.loadHeadSnapshot();
+    defer snapshot.deinit(talloc);
+
+    const legacy_descriptors = try talloc.alloc(SegmentDescriptor, snapshot.segment_descriptors.len);
+    errdefer {
+        for (legacy_descriptors) |*descriptor| {
+            if (descriptor.path.len != 0) descriptor.deinit(talloc);
+        }
+        talloc.free(legacy_descriptors);
+    }
+    for (snapshot.segment_descriptors, 0..) |descriptor, idx| {
+        legacy_descriptors[idx] = try cloneSegmentDescriptor(talloc, descriptor);
+        legacy_descriptors[idx].segment_root = null;
+    }
+
+    const legacy_wal_entries = try talloc.alloc(WalChunkDescriptor, snapshot.wal_index.entries.len);
+    errdefer {
+        for (legacy_wal_entries) |*entry| {
+            if (entry.name.len != 0) entry.deinit(talloc);
+        }
+        talloc.free(legacy_wal_entries);
+    }
+    for (snapshot.wal_index.entries, 0..) |entry, idx| {
+        legacy_wal_entries[idx] = try cloneWalChunkDescriptor(talloc, entry);
+        legacy_wal_entries[idx].journal_root = null;
+    }
+
+    var legacy_snapshot = LegacySnapshot{
+        .segment_descriptors = legacy_descriptors,
+        .tag_snapshot = try cloneTagSnapshot(talloc, snapshot.tag_snapshot),
+        .series_catalog_snapshot = try cloneSeriesCatalogSnapshot(talloc, snapshot.series_catalog_snapshot),
+        .wal_index = .{ .entries = legacy_wal_entries },
+        .checkpoint_state = try buildCheckpointState(talloc, legacy_descriptors, legacy_wal_entries),
+    };
+    defer legacy_snapshot.deinit(talloc);
+
+    var writer = CommitWriter{ .alloc = talloc, .store = &cas_manager.store, .extent_chunk_bytes = cas_manager.format.extent_chunk_bytes };
+    const legacy_like_head = try writer.writeCanonicalSnapshot(&legacy_snapshot, snapshot.commit.parents, snapshot.commit.created_at_ms, "legacy-like");
+    try cas_manager.refs.compareAndSwapRef(main_ref, current_head, legacy_like_head, "legacy-like");
+    try cas_manager.refreshCommitGraph();
+
+    const before = try cas_manager.fsck(data_dir, .{});
+    try std.testing.expect(before.compatibility_debt.legacy_segment_descriptors > 0);
+    try std.testing.expect(before.compatibility_debt.legacy_wal_descriptors > 0);
+
+    const upgraded = try cas_manager.upgradeRepository(data_dir);
+    try std.testing.expect(upgraded.normalized_commits > 0);
+    try std.testing.expectEqual(current_repository_format_version, upgraded.format_version);
+
+    const after = try cas_manager.fsck(data_dir, .{});
+    try std.testing.expectEqual(@as(usize, 0), after.compatibility_debt.legacy_segment_descriptors);
+    try std.testing.expectEqual(@as(usize, 0), after.compatibility_debt.legacy_wal_descriptors);
 }
 
 test "repair rebuilds pack sidecars side indexes and reftable metadata" {
