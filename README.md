@@ -99,6 +99,8 @@ Apache-2.0
 ./zig-out/bin/sydradb restore  <src_dir>   # apply a CAS bundle into data_dir
 ./zig-out/bin/sydradb stats       # print simple counters
 ./zig-out/bin/sydradb cas clone <src_dir> <dst_dir>
+./zig-out/bin/sydradb cas fetch-local <src_dir>
+./zig-out/bin/sydradb cas push-local <dst_dir>
 ./zig-out/bin/sydradb cas verify-bundle <bundle_dir>
 ./zig-out/bin/sydradb cas bundle create <dst_dir> [--since <spec>]
 ./zig-out/bin/sydradb cas bundle verify <bundle_dir>
@@ -152,6 +154,8 @@ Config notes:
 - WAL recovery order is sourced from the CAS commit graph when CAS is enabled, with any uncaptured live WAL files appended as tail replay.
 - `snapshot`/`restore` now operate on CAS bundles. A restored bundle only materializes `objects/` and `refs/`; use `metadata_read_mode = "primary"` for mirrorless startup, or run `cas checkout` / `cas export-legacy` if you need compatibility files regenerated.
 - `cas clone` now uses the same pack-preserving bundle path as `snapshot`/`restore`, so local repository clones keep active packs, reftable state, and side indexes instead of re-inserting everything through loose objects.
+- `cas fetch-local` records source refs under `remotes/<repository-id>/...` and borrows source object storage through alternates instead of eagerly copying every object into the destination.
+- `cas push-local` enforces a fast-forward update of the destination `heads/main` and configures the destination to borrow the source repository’s object storage when needed.
 - Sealed segment and WAL payloads are chunked into CAS extent trees; `cas checkout` / `cas export-legacy` materialize mirror files by walking those trees rather than depending on legacy blobs.
 - Segment descriptors now carry a canonical native `segment_root` tree for sealed segment data. Each root stores a `meta` blob plus per-block `stats`, `ts`, and `values` objects so later read paths can skip blocks without materializing a full `.seg` file.
 - WAL descriptors now carry a canonical native `journal_root` tree plus checkpoint-state metadata, so commits record replay high-water and the exact captured WAL frame set instead of treating sealed WAL content as one opaque file blob.

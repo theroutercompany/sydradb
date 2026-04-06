@@ -239,6 +239,26 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         );
         return;
     }
+    if (std.mem.eql(u8, sub, "fetch-local")) {
+        if (args.len < 4) return error.Invalid;
+        const result = try cas_mod.fetchLocalRepository(alloc, std.mem.sliceTo(args[3], 0), cfg.data_dir, cfg.fsync);
+        const repo_hex = result.repository_id.toHex();
+        std.debug.print(
+            "cas fetch-local repository={s} refs={d} borrowed_repositories={d}\n",
+            .{ repo_hex, result.ref_count, result.borrowed_repositories },
+        );
+        return;
+    }
+    if (std.mem.eql(u8, sub, "push-local")) {
+        if (args.len < 4) return error.Invalid;
+        const result = try cas_mod.pushLocalRepository(alloc, cfg.data_dir, std.mem.sliceTo(args[3], 0), cfg.fsync);
+        const repo_hex = result.repository_id.toHex();
+        std.debug.print(
+            "cas push-local repository={s} refs={d} borrowed_repositories={d}\n",
+            .{ repo_hex, result.ref_count, result.borrowed_repositories },
+        );
+        return;
+    }
     if (std.mem.eql(u8, sub, "verify-bundle")) {
         if (args.len < 4) return error.Invalid;
         const result = try cas_mod.verifyBundle(alloc, std.mem.sliceTo(args[3], 0));
