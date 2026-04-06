@@ -297,6 +297,7 @@ fn toFrontendExplainMode(mode: ast.ExplainMode) stmt_mod.ExplainMode {
     return switch (mode) {
         .standard => .standard,
         .bytecode => .bytecode,
+        .tables_used => .tables_used,
     };
 }
 
@@ -318,6 +319,7 @@ fn terminalNameForToken(token: lexer.Token) []const u8 {
             .delete => "delete",
             .explain => "explain",
             .bytecode => "bytecode",
+            .tables_used => "tables_used",
             .from => "from",
             .where => "where",
             .group => "group",
@@ -384,6 +386,19 @@ test "shadow sydraql parser tracks insert and delete statement kinds" {
 test "shadow sydraql parser covers explain bytecode" {
     const alloc = std.testing.allocator;
     const result = try parseSydraqlShadow(alloc, "explain bytecode select 1");
+    defer {
+        var owned = result;
+        owned.deinit();
+    }
+
+    try std.testing.expect(result.statement == .explain);
+    try std.testing.expect(!result.hasMismatch());
+    try std.testing.expect(result.generated_stmt != null);
+}
+
+test "shadow sydraql parser covers explain tables-used" {
+    const alloc = std.testing.allocator;
+    const result = try parseSydraqlShadow(alloc, "explain tables_used select 1");
     defer {
         var owned = result;
         owned.deinit();

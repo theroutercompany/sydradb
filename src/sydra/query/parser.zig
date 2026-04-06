@@ -83,6 +83,8 @@ pub const Parser = struct {
                 var mode: ast.ExplainMode = .standard;
                 if (try self.matchKeyword(.bytecode)) {
                     mode = .bytecode;
+                } else if (try self.matchKeyword(.tables_used)) {
+                    mode = .tables_used;
                 }
                 const inner = try self.parseStatement();
                 const explain_ptr = try self.allocExplain(.{
@@ -902,6 +904,17 @@ test "parse explain bytecode statement" {
     const statement = try parser_inst.parse();
     try std.testing.expect(statement == .explain);
     try std.testing.expectEqual(ast.ExplainMode.bytecode, statement.explain.mode);
+    try std.testing.expect(statement.explain.target.* == .select);
+}
+
+test "parse explain tables-used statement" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    var parser_inst = Parser.init(arena.allocator(), "explain tables_used select 1");
+    const statement = try parser_inst.parse();
+    try std.testing.expect(statement == .explain);
+    try std.testing.expectEqual(ast.ExplainMode.tables_used, statement.explain.mode);
     try std.testing.expect(statement.explain.target.* == .select);
 }
 

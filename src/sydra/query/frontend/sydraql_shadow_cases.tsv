@@ -6,3 +6,4 @@ select|false|select time_bucket(5m, time, 2022-03-27T00:00:00Z) from weather.roo
 insert|false|insert into metrics(time, value) values(1, 2)
 delete|false|delete from metrics where time >= 1
 explain|false|explain bytecode select 1
+explain|false|explain tables_used select 1

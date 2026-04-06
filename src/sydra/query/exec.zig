@@ -5,7 +5,9 @@ const bytecode = @import("bytecode.zig");
 const codegen = @import("codegen.zig");
 const compiler = @import("compiler.zig");
 const compiler_diagnostics = @import("compiler/diagnostics.zig");
+const frontend = @import("frontend.zig");
 const parser = @import("parser.zig");
+const table_use = @import("table_use.zig");
 const validator = @import("validator.zig");
 const plan_builder = @import("plan.zig");
 const optimizer = @import("optimizer.zig");
@@ -15,7 +17,7 @@ const vm = @import("vm.zig");
 const cfg = @import("../config.zig");
 const engine_mod = @import("../engine.zig");
 
-pub const ExecuteError = parser.ParseError || validator.AnalyzeError || plan_builder.BuildError || optimizer.OptimizeError || physical.BuildError || executor.ExecuteError || compiler.CompileError || codegen.CodegenError || vm.VmError || std.mem.Allocator.Error || error{ValidationFailed};
+pub const ExecuteError = parser.ParseError || validator.AnalyzeError || frontend.normalize.NormalizeError || plan_builder.BuildError || optimizer.OptimizeError || physical.BuildError || executor.ExecuteError || compiler.CompileError || codegen.CodegenError || vm.VmError || std.mem.Allocator.Error || error{ValidationFailed};
 
 pub const ExecutionMode = compiler.ExecutionMode;
 
@@ -64,6 +66,11 @@ pub fn executeWithMode(
 
     if (statement == .explain and statement.explain.mode == .bytecode) {
         const result = try executeExplainBytecode(prepared, mode, statement.explain);
+        arena_cleanup = false;
+        return result;
+    }
+    if (statement == .explain and statement.explain.mode == .tables_used) {
+        const result = try executeExplainTablesUsed(prepared, mode, statement.explain);
         arena_cleanup = false;
         return result;
     }
@@ -309,6 +316,69 @@ fn executeExplainBytecode(
     return cursor;
 }
 
+fn executeExplainTablesUsed(
+    prepared: Prepared,
+    mode: ExecutionMode,
+    explain: *const ast.Explain,
+) ExecuteError!executor.ExecutionCursor {
+    const normalized = try frontend.normalize.normalizeAstStatement(prepared.arena_ptr.allocator(), explain.target);
+
+    var typed_query: ?compiler.TypedQuery = null;
+    var bind_us: u64 = 0;
+    var compile_us: u64 = 0;
+    var logical_us: u64 = 0;
+    var optimize_us: u64 = 0;
+    var physical_us: u64 = 0;
+
+    if (explain.target.* == .select) {
+        const compile_start = std.time.microTimestamp();
+        recordCompileAttempt(prepared.engine);
+        const detailed = compiler.compileSelectDetailed(prepared.arena_ptr.allocator(), prepared.engine, explain.target) catch |err| {
+            if (compiler_diagnostics.fromCompileError(err)) |reason| {
+                recordCompileFallback(prepared.engine, reason);
+                return null;
+            }
+            return err;
+        };
+        const compile_end = std.time.microTimestamp();
+        if (detailed) |result| {
+            bind_us = result.bind_us;
+            if (result.compiled) |compiled| {
+                recordCompileSuccess(prepared.engine);
+                typed_query = compiled.typed_query;
+                logical_us = compiled.backend.logical_us;
+                optimize_us = compiled.backend.optimize_us;
+                physical_us = compiled.backend.physical_us;
+                const backend_us = logical_us + optimize_us + physical_us;
+                compile_us = durationMicros(compile_end - compile_start) -| backend_us;
+            } else if (result.fallback_reason) |reason| {
+                recordCompileFallback(prepared.engine, reason);
+                compile_us = durationMicros(compile_end - compile_start) -| bind_us;
+            }
+        }
+    }
+
+    const uses = try table_use.collectTableUses(prepared.arena_ptr.allocator(), typed_query, normalized.statement);
+    const columns = try buildExplainTablesUsedColumns(prepared.arena_ptr.allocator());
+    const rows = try buildExplainTablesUsedRows(prepared.arena_ptr.allocator(), uses);
+    var cursor = try executor.cursorFromRows(prepared.allocator, columns, rows);
+
+    try finalizeCursor(
+        prepared,
+        &cursor,
+        mode,
+        false,
+        "",
+        bind_us,
+        compile_us,
+        logical_us,
+        optimize_us,
+        physical_us,
+        0,
+    );
+    return cursor;
+}
+
 fn buildExplainBytecodeColumns(allocator: std.mem.Allocator) ![]const plan_builder.ColumnInfo {
     const names = [_][]const u8{
         "addr",
@@ -351,6 +421,46 @@ fn buildExplainBytecodeRows(
         values[5] = .{ .string = line.p4 };
         values[6] = .{ .integer = line.p5 };
         values[7] = .{ .string = line.comment };
+        rows[idx] = values;
+    }
+    return rows;
+}
+
+fn buildExplainTablesUsedColumns(allocator: std.mem.Allocator) ![]const plan_builder.ColumnInfo {
+    const names = [_][]const u8{
+        "kind",
+        "name",
+        "series_id",
+    };
+
+    const columns = try allocator.alloc(plan_builder.ColumnInfo, names.len);
+    for (names, 0..) |name, idx| {
+        const expr = try allocator.create(ast.Expr);
+        expr.* = .{
+            .identifier = .{
+                .value = name,
+                .quoted = false,
+                .span = .{ .start = 0, .end = 0 },
+            },
+        };
+        columns[idx] = .{ .name = name, .expr = expr };
+    }
+    return columns;
+}
+
+fn buildExplainTablesUsedRows(
+    allocator: std.mem.Allocator,
+    uses: []const table_use.TableUse,
+) ![]([]executor.Value) {
+    const rows = try allocator.alloc([]executor.Value, uses.len);
+    for (uses, 0..) |use, idx| {
+        const values = try allocator.alloc(executor.Value, 3);
+        values[0] = .{ .string = @tagName(use.kind) };
+        values[1] = .{ .string = use.name };
+        values[2] = if (use.series_id) |series_id|
+            .{ .integer = @intCast(series_id) }
+        else
+            .null;
         rows[idx] = values;
     }
     return rows;
@@ -567,6 +677,48 @@ test "execute supports explain bytecode" {
     const third = try cursor.next();
     try std.testing.expect(third != null);
     try std.testing.expectEqualStrings("halt", try third.?.values[1].asString());
+    try std.testing.expect((try cursor.next()) == null);
+}
+
+test "execute supports explain tables-used" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/explain-tables-used", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try engine_mod.Engine.init(talloc, config);
+    defer engine.deinit();
+
+    try engine.registerSeries("weather.room1", "{\"host\":\"a\"}", 41);
+
+    var cursor = try execute(talloc, engine, "explain tables_used select value from weather.room1 where time >= 0");
+    defer cursor.deinit();
+
+    try std.testing.expectEqualStrings("compiled", cursor.stats.execution_mode);
+    try std.testing.expectEqual(@as(usize, 3), cursor.columns.len);
+
+    const first = try cursor.next();
+    try std.testing.expect(first != null);
+    try std.testing.expectEqualStrings("series", try first.?.values[0].asString());
+    try std.testing.expectEqualStrings("weather.room1", try first.?.values[1].asString());
+    try std.testing.expect(executor.Value.equals(first.?.values[2], executor.Value{ .integer = 41 }));
     try std.testing.expect((try cursor.next()) == null);
 }
 

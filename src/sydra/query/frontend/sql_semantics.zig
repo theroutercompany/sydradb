@@ -75,6 +75,7 @@ const Dispatcher = struct {
         if (std.mem.eql(u8, action_name, "emitStatement()")) return rhs[0];
         if (std.mem.eql(u8, action_name, "emitExplain()")) return try self.emitExplain(rhs, .standard);
         if (std.mem.eql(u8, action_name, "emitExplainBytecode()")) return try self.emitExplain(rhs, .bytecode);
+        if (std.mem.eql(u8, action_name, "emitExplainTablesUsed()")) return try self.emitExplain(rhs, .tables_used);
         if (std.mem.eql(u8, action_name, "emitSelectConstant()")) return try self.emitSelectConstant(rhs);
         if (std.mem.eql(u8, action_name, "emitSelect()")) return try self.emitSelect(rhs);
         if (std.mem.eql(u8, action_name, "emitInsert()")) return try self.emitInsert(rhs);

@@ -40,6 +40,7 @@ pub const Delete = struct {
 pub const ExplainMode = enum {
     standard,
     bytecode,
+    tables_used,
 };
 
 pub const Explain = struct {

@@ -504,6 +504,7 @@ fn fromAstExplain(allocator: std.mem.Allocator, explain: *const ast.Explain) Nor
         .mode = switch (explain.mode) {
             .standard => .standard,
             .bytecode => .bytecode,
+            .tables_used => .tables_used,
         },
         .target = target,
         .span = explain.span,
@@ -1019,6 +1020,7 @@ fn lowerExplain(
         .mode = switch (explain.mode) {
             .standard => .standard,
             .bytecode => .bytecode,
+            .tables_used => .tables_used,
         },
         .target = target_stmt,
         .span = explain.span,

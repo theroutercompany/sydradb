@@ -35,6 +35,7 @@ pub const FrontendStmt = union(enum) {
 pub const ExplainMode = enum {
     standard,
     bytecode,
+    tables_used,
 };
 
 pub const Explain = struct {

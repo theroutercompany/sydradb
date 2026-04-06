@@ -225,6 +225,7 @@ fn terminalNameForToken(token: lexer.Token) []const u8 {
             .delete => "delete",
             .explain => "explain",
             .bytecode => "bytecode",
+            .tables_used => "tables_used",
             .into => "into",
             .from => "from",
             .where => "where",
@@ -315,6 +316,18 @@ test "sql core parser skeleton preserves by_id sources and projection aliases" {
     try std.testing.expectEqual(@as(usize, 1), select.ordering.len);
     try std.testing.expect(select.ordering[0].expr.* == .identifier);
     try std.testing.expectEqualStrings("reading", select.ordering[0].expr.identifier.value);
+}
+
+test "sql core parser skeleton covers explain tables-used" {
+    const alloc = std.testing.allocator;
+    var result = try parseSqlCoreSkeleton(alloc, "explain tables_used select 1");
+    defer result.deinit();
+
+    try std.testing.expectEqual(StatementKind.explain, result.kind);
+    try std.testing.expectEqual(@as(usize, 0), result.diagnostics.len);
+    try std.testing.expect(result.used_generated_runtime);
+    try std.testing.expect(result.stmt != null);
+    try std.testing.expectEqual(stmt_mod.ExplainMode.tables_used, result.stmt.?.explain.mode);
 }
 
 test "sql core parser skeleton preserves dotted series sources" {
