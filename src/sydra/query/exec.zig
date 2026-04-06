@@ -487,6 +487,7 @@ fn finalizeCursor(
     pipeline_us: u64,
 ) !void {
     const trace_id = try randomTraceId(prepared.arena_ptr.allocator());
+    const has_selector = prepared.statement.* == .select and prepared.statement.select.selector != null;
     cursor.stats = .{
         .parse_us = prepared.parse_us,
         .validate_us = prepared.validate_us,
@@ -500,6 +501,8 @@ fn finalizeCursor(
         .execution_mode = modeName(mode),
         .legacy_fallback = legacy_fallback,
         .fallback_reason = try dupeOptionalString(prepared.arena_ptr.allocator(), fallback_reason),
+        .selector_mode = if (has_selector) "exact" else "",
+        .selected_series_count = if (has_selector) 1 else 0,
     };
     cursor.arena = prepared.arena_ptr;
 }
@@ -963,6 +966,47 @@ test "executeWithMode compiled supports ordering by hidden scan identifiers" {
     try std.testing.expect((try value_cursor.next()) == null);
 }
 
+test "executeWithMode compiled supports visible selector tag projections" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/compiled-tag-projection", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .compiled,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try engine_mod.Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const sid: u64 = 7777;
+    const tags_json = "{\"host\":\"a\"}";
+    try engine.registerSeries("tagged.room1", tags_json, sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 4.5, .tags_json = tags_json });
+    try waitForFlushForTest(engine, 1, 1_000);
+
+    var cursor = try executeWithMode(talloc, engine, "select tag.host as host, value from tagged.room1 where time >= 0 order by time asc limit 1", .compiled);
+    defer cursor.deinit();
+    const row = (try cursor.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("a", row.values[0].string);
+    try std.testing.expectApproxEqAbs(@as(f64, 4.5), try row.values[1].asFloat(), 1e-9);
+    try std.testing.expect((try cursor.next()) == null);
+}
+
 test "executeWithMode compiled falls back to legacy for fill clauses and records metrics" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -1249,10 +1293,10 @@ test "compiled and legacy parity holds across metadata modes for public query cl
         var engine = try engine_mod.Engine.init(talloc, config);
         defer engine.deinit();
 
-        try seedParityDataset(&engine);
+        try seedParityDataset(engine);
 
         for (queries) |query| {
-            const result = try shadowCompareSelect(talloc, &engine, query);
+            const result = try shadowCompareSelect(talloc, engine, query);
             try std.testing.expect(result.matched);
             try std.testing.expect(result.rows_compared > 0);
         }
@@ -1287,9 +1331,9 @@ test "execution snapshots stay stable for supported and fallback query classes" 
 
     var engine = try engine_mod.Engine.init(talloc, config);
     defer engine.deinit();
-    try seedParityDataset(&engine);
+    try seedParityDataset(engine);
 
-    var read_cursor = try executeWithMode(talloc, &engine, "select time, value from parity.room1 where time >= 0 order by time asc", .compiled);
+    var read_cursor = try executeWithMode(talloc, engine, "select time, value from parity.room1 where time >= 0 order by time asc", .compiled);
     defer read_cursor.deinit();
     const read_snapshot = try collectCursorContractSnapshot(talloc, &read_cursor);
     defer talloc.free(read_snapshot);
@@ -1302,7 +1346,7 @@ test "execution snapshots stay stable for supported and fallback query classes" 
         \\
     , read_snapshot);
 
-    var aggregate_cursor = try executeWithMode(talloc, &engine, "select time_bucket(60, time) as bucket, max(value) as max_value from parity.room1 where time >= 0 group by time_bucket(60, time) order by bucket asc", .compiled);
+    var aggregate_cursor = try executeWithMode(talloc, engine, "select time_bucket(60, time) as bucket, max(value) as max_value from parity.room1 where time >= 0 group by time_bucket(60, time) order by bucket asc", .compiled);
     defer aggregate_cursor.deinit();
     const aggregate_snapshot = try collectCursorContractSnapshot(talloc, &aggregate_cursor);
     defer talloc.free(aggregate_snapshot);
@@ -1314,7 +1358,7 @@ test "execution snapshots stay stable for supported and fallback query classes" 
         \\
     , aggregate_snapshot);
 
-    var selector_cursor = try executeWithMode(talloc, &engine, "select tag.host as host, avg(value) as avg_value from tagged.room1 where tag.host = 'web' group by tag.host", .compiled);
+    var selector_cursor = try executeWithMode(talloc, engine, "select tag.host as host, avg(value) as avg_value from tagged.room1 where tag.host = 'web' group by tag.host", .compiled);
     defer selector_cursor.deinit();
     const selector_snapshot = try collectCursorContractSnapshot(talloc, &selector_cursor);
     defer talloc.free(selector_snapshot);
@@ -1327,7 +1371,7 @@ test "execution snapshots stay stable for supported and fallback query classes" 
 
     var fallback_cursor = try executeWithMode(
         talloc,
-        &engine,
+        engine,
         "select time_bucket(60, time) as bucket, avg(value) as avg_value from parity.room1 where time >= 0 group by time_bucket(60, time) fill(previous) order by bucket desc",
         .compiled,
     );
