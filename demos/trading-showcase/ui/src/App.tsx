@@ -23,7 +23,7 @@ const SCENARIO_GUIDES: Record<string, { whatItProves: string; whereSydraDbSits: 
     whereSydraDbSits:
       "Here SydraDB is not just storing raw rows. It is also acting as the local engine that materializes derived trading state and exposes whether those definitions are active, stalled, or emitting.",
     whyItMatters:
-      "For trading engineers and platform teams, this is the difference between a passive time-series store and an operational runtime that can host market definitions close to the data.",
+      "For traders, researchers, and platform teams, this is the difference between a passive time-series store and an operational runtime that can host market definitions close to the data.",
   },
   "analysis-and-replay": {
     whatItProves:
@@ -192,7 +192,7 @@ export default function App() {
           <p className="eyebrow">SydraDB trading showcase</p>
           <h1>Market data in, runtime state out, revisions still explainable</h1>
           <p className="lead">
-            This walkthrough is for market-data and trading-platform engineers evaluating SydraDB as a local trading engine,
+            This walkthrough is for traders and researchers evaluating SydraDB as a local trading engine,
             not just a place to park rows.
           </p>
         </div>

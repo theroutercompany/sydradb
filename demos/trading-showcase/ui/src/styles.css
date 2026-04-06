@@ -78,7 +78,7 @@ code {
 
 .trading-app-header {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(0, 1.45fr) auto;
   gap: 16px;
   align-items: start;
   padding: 24px 32px 20px;
@@ -90,7 +90,7 @@ code {
   font-size: 21px;
   line-height: 1.35;
   letter-spacing: -0.02em;
-  max-width: 18ch;
+  max-width: 44ch;
 }
 
 .eyebrow {

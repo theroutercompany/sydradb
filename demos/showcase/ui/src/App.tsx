@@ -1062,7 +1062,7 @@ function ShowcaseCategoryHome({
         <h1>Choose the story you want to walk through first</h1>
         <p>
           The core showcase stays focused on CAS, sydraQL, compiler rollout, and engine lifecycle. The trading showcase
-          starts from market rows, grouped analysis, and correction-aware revision work for trading engineers.
+          starts from market rows, grouped analysis, and correction-aware revision work for traders and researchers.
         </p>
       </div>
       <div className="showcase-home-grid">
