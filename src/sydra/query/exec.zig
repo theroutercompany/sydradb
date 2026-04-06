@@ -1065,6 +1065,63 @@ test "executeWithMode compiled keeps fill clauses on the native physical path" {
     try std.testing.expect((try cursor.next()) == null);
 }
 
+test "executeWithMode compiled supports null fill on the native physical path" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/compiled-null-fill", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .compiled,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try engine_mod.Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const sid: u64 = 7445;
+    try engine.registerSeries("fill.room2", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.5, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 130, .value = 4.0, .tags_json = "{}" });
+    try waitForFlushForTest(engine, 1, 1_000);
+
+    var cursor = try executeWithMode(
+        talloc,
+        engine,
+        "select time_bucket(60, time) as bucket, avg(value) as avg_value from fill.room2 where time >= 0 group by time_bucket(60, time) fill(null) order by bucket asc",
+        .compiled,
+    );
+    defer cursor.deinit();
+
+    try std.testing.expectEqualStrings("compiled", cursor.stats.execution_mode);
+    try std.testing.expect(!cursor.stats.legacy_fallback);
+    try std.testing.expectEqualStrings("", cursor.stats.fallback_reason);
+
+    const first = (try cursor.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 0), first.values[0].integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.5), try first.values[1].asFloat(), 1e-9);
+    const second = (try cursor.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 60), second.values[0].integer);
+    try std.testing.expect(second.values[1] == .null);
+    const third = (try cursor.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, 120), third.values[0].integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 4.0), try third.values[1].asFloat(), 1e-9);
+    try std.testing.expect((try cursor.next()) == null);
+}
+
 test "executeWithMode compiled supports scalar alias ordering and first/last aggregates" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -1372,7 +1429,7 @@ test "execution snapshots stay stable for supported and fallback query classes" 
     var fallback_cursor = try executeWithMode(
         talloc,
         engine,
-        "select time_bucket(60, time) as bucket, avg(value) as avg_value from parity.room1 where time >= 0 group by time_bucket(60, time) fill(previous) order by bucket desc",
+        "select time_bucket(60, time) as bucket, avg(value) as avg_value from parity.room1 where time >= 0 group by time_bucket(60, time) fill(linear) order by bucket desc",
         .compiled,
     );
     defer fallback_cursor.deinit();

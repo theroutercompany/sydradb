@@ -210,6 +210,7 @@ Diagnostics:
   - `execution_mode=... legacy_fallback=...`
   - `fallback_reason=...` (when execution fell back). Current stable values mirror the compiler taxonomy:
     - `unsupported_statement`
+    - `unsupported_fill`
     - `unsupported_tag_filter`
     - `unsupported_grouping`
     - `unsupported_aggregate`

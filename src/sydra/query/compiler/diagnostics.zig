@@ -38,7 +38,7 @@ pub const ShadowCompareResult = struct {
 pub fn diagnosticMessage(code: FallbackReason) []const u8 {
     return switch (code) {
         .unsupported_statement => "statement is not supported by the native compiler",
-        .unsupported_fill => "fill clauses stay on the legacy path",
+        .unsupported_fill => "only fill(previous), fill(null), and constant fill values stay on the native path",
         .unsupported_tag_filter => "tag filters stay on the legacy path",
         .unsupported_grouping => "grouping shape is not supported by the native compiler",
         .unsupported_aggregate => "aggregate shape is not supported by the native compiler",

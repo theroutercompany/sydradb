@@ -1171,51 +1171,52 @@ fn finalizeState(state: Operator.AggregateState, kind: Operator.AggregateKind) V
     return switch (state) {
         .filled => |value| value,
         else => switch (kind) {
-        .avg => switch (state) {
-            .avg => |avg_state| if (avg_state.count == 0) Value.null else Value{ .float = avg_state.total / @as(f64, @floatFromInt(avg_state.count)) },
-            else => unreachable,
+            .avg => switch (state) {
+                .avg => |avg_state| if (avg_state.count == 0) Value.null else Value{ .float = avg_state.total / @as(f64, @floatFromInt(avg_state.count)) },
+                else => unreachable,
+            },
+            .sum => switch (state) {
+                .sum => |sum_state| Value{ .float = sum_state },
+                else => unreachable,
+            },
+            .count => switch (state) {
+                .count => |count_state| Value{ .integer = @as(i64, @intCast(count_state)) },
+                else => unreachable,
+            },
+            .min => switch (state) {
+                .min => |min_state| if (min_state.seen) min_state.value else Value.null,
+                else => unreachable,
+            },
+            .max => switch (state) {
+                .max => |max_state| if (max_state.seen) max_state.value else Value.null,
+                else => unreachable,
+            },
+            .first => switch (state) {
+                .first => |first_state| if (first_state.seen) first_state.value else Value.null,
+                else => unreachable,
+            },
+            .last => switch (state) {
+                .last => |last_state| if (last_state.seen) last_state.value else Value.null,
+                else => unreachable,
+            },
+            .percentile => switch (state) {
+                .percentile => |percentile_state| percentileValue(percentile_state.values.items, percentile_state.quantile),
+                else => unreachable,
+            },
+            .delta => switch (state) {
+                .delta => |payload| derivativeAggregateValue(payload.series.items, .delta, payload.metric_kind),
+                else => unreachable,
+            },
+            .rate => switch (state) {
+                .rate => |payload| derivativeAggregateValue(payload.series.items, .rate, payload.metric_kind),
+                else => unreachable,
+            },
+            .irate => switch (state) {
+                .irate => |payload| derivativeAggregateValue(payload.series.items, .irate, payload.metric_kind),
+                else => unreachable,
+            },
         },
-        .sum => switch (state) {
-            .sum => |sum_state| Value{ .float = sum_state },
-            else => unreachable,
-        },
-        .count => switch (state) {
-            .count => |count_state| Value{ .integer = @as(i64, @intCast(count_state)) },
-            else => unreachable,
-        },
-        .min => switch (state) {
-            .min => |min_state| if (min_state.seen) min_state.value else Value.null,
-            else => unreachable,
-        },
-        .max => switch (state) {
-            .max => |max_state| if (max_state.seen) max_state.value else Value.null,
-            else => unreachable,
-        },
-        .first => switch (state) {
-            .first => |first_state| if (first_state.seen) first_state.value else Value.null,
-            else => unreachable,
-        },
-        .last => switch (state) {
-            .last => |last_state| if (last_state.seen) last_state.value else Value.null,
-            else => unreachable,
-        },
-        .percentile => switch (state) {
-            .percentile => |percentile_state| percentileValue(percentile_state.values.items, percentile_state.quantile),
-            else => unreachable,
-        },
-        .delta => switch (state) {
-            .delta => |payload| derivativeAggregateValue(payload.series.items, .delta, payload.metric_kind),
-            else => unreachable,
-        },
-        .rate => switch (state) {
-            .rate => |payload| derivativeAggregateValue(payload.series.items, .rate, payload.metric_kind),
-            else => unreachable,
-        },
-        .irate => switch (state) {
-            .irate => |payload| derivativeAggregateValue(payload.series.items, .irate, payload.metric_kind),
-            else => unreachable,
-        },
-    } };
+    };
 }
 
 fn updateDerivativeSeries(
@@ -1354,6 +1355,7 @@ fn applyFill(allocator: std.mem.Allocator, payload: *Operator.Aggregate) Execute
             while (missing_bucket < next_bucket) : (missing_bucket += bucket_step) {
                 const fill_value = switch (fill.strategy) {
                     .previous => try filledValuesFromGroup(allocator, payload, previous),
+                    .null_value => try filledValuesConstant(allocator, payload, Value.null),
                     .constant => |expr| blk: {
                         const value = try expression.evaluateConstant(expr);
                         break :blk try filledValuesConstant(allocator, payload, value);

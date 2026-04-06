@@ -14,6 +14,7 @@ pub fn buildTypedSelect(
 ) errors.CompileError!ir.TypedQuery {
     if (statement.* != .select) return error.UnsupportedStatement;
     const select = statement.select;
+    if (select.fill) |fill| try ensureSupportedFillClause(fill);
 
     const deferred_features = &[_]ir.DeferredFeature{};
     const allow_tag_identifiers = bound_selector != null;
@@ -310,6 +311,14 @@ fn expressionContainsIdentifier(expr: *const ast.Expr, name: []const u8) bool {
 
 fn ensurePredicateSupported(expr: *const ast.Expr, allow_tag_identifiers: bool) errors.CompileError!void {
     try ensureRawRowScalarSupported(expr, allow_tag_identifiers);
+}
+
+fn ensureSupportedFillClause(fill: ast.FillClause) errors.CompileError!void {
+    switch (fill.strategy) {
+        .previous, .null_value => {},
+        .constant => |expr| try ensureConstantOnlySupported(expr),
+        .linear => return error.UnsupportedFill,
+    }
 }
 
 fn ensureConstantOnlySupported(expr: *const ast.Expr) errors.CompileError!void {
