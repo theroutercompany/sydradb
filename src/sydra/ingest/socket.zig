@@ -109,12 +109,34 @@ pub const BatchOptions = struct {
     connect_retry_delay_ms: u64 = 20,
 };
 
+pub const ClientStats = struct {
+    cache_hits_total: u64 = 0,
+    cache_misses_total: u64 = 0,
+    reconnect_total: u64 = 0,
+    declare_frames_sent_total: u64 = 0,
+    declare_entries_sent_total: u64 = 0,
+    append_frames_sent_total: u64 = 0,
+    append_points_sent_total: u64 = 0,
+
+    pub fn averageAppendPointsPerFrame(self: @This()) f64 {
+        if (self.append_frames_sent_total == 0) return 0;
+        return @as(f64, @floatFromInt(self.append_points_sent_total)) /
+            @as(f64, @floatFromInt(self.append_frames_sent_total));
+    }
+};
+
 pub const Client = struct {
     alloc: std.mem.Allocator,
+    path: []u8,
     stream: std.net.Stream,
     max_frame_bytes: usize = default_max_frame_bytes,
+    capabilities: u32 = 0,
     cache: std.StringHashMap(ClientCacheEntry),
+    encode_buf: std.array_list.Managed(u8),
+    read_buf: [4096]u8 = undefined,
+    write_buf: [4096]u8 = undefined,
     next_client_decl_id: u32 = 1,
+    stats: ClientStats = .{},
 
     pub fn connect(alloc: std.mem.Allocator, path: []const u8) !Client {
         var stream = try std.net.connectUnixSocket(path);
@@ -122,8 +144,10 @@ pub const Client = struct {
 
         var client = Client{
             .alloc = alloc,
+            .path = try alloc.dupe(u8, path),
             .stream = stream,
             .cache = std.StringHashMap(ClientCacheEntry).init(alloc),
+            .encode_buf = std.array_list.Managed(u8).init(alloc),
         };
         errdefer client.deinit();
         try client.hello();
@@ -148,11 +172,60 @@ pub const Client = struct {
     }
 
     pub fn deinit(self: *Client) void {
-        var it = self.cache.iterator();
-        while (it.next()) |entry| self.alloc.free(entry.key_ptr.*);
+        self.clearDeclarationCache();
         self.cache.deinit();
+        self.encode_buf.deinit();
+        self.alloc.free(self.path);
         self.stream.close();
         self.* = undefined;
+    }
+
+    pub fn reconnect(self: *Client) !void {
+        self.stream.close();
+        self.clearDeclarationCache();
+        self.max_frame_bytes = default_max_frame_bytes;
+        self.capabilities = 0;
+        self.next_client_decl_id = 1;
+        self.stream = try std.net.connectUnixSocket(self.path);
+        self.stats.reconnect_total += 1;
+        try self.hello();
+    }
+
+    pub fn reconnectWithRetry(self: *Client, attempts: usize, retry_delay_ms: u64) !void {
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            self.reconnect() catch |err| switch (err) {
+                error.FileNotFound,
+                error.ConnectionRefused,
+                error.ConnectionResetByPeer,
+                error.EndOfStream,
+                => {
+                    if (attempt + 1 >= attempts) return err;
+                    std.Thread.sleep(retry_delay_ms * std.time.ns_per_ms);
+                    continue;
+                },
+                else => return err,
+            };
+            return;
+        }
+    }
+
+    pub fn statsSnapshot(self: *const Client) ClientStats {
+        return self.stats;
+    }
+
+    pub fn maxAppendPointsPerFrame(self: *const Client, requested_max: usize) usize {
+        const payload_overhead = @sizeOf(u32);
+        const entry_bytes = @sizeOf(u32) + @sizeOf(i64) + @sizeOf(u64);
+        if (self.max_frame_bytes <= payload_overhead + entry_bytes) return 1;
+        const negotiated = (self.max_frame_bytes - payload_overhead) / entry_bytes;
+        return @max(@as(usize, 1), @min(requested_max, negotiated));
+    }
+
+    fn clearDeclarationCache(self: *Client) void {
+        var it = self.cache.iterator();
+        while (it.next()) |entry| self.alloc.free(entry.key_ptr.*);
+        self.cache.clearRetainingCapacity();
     }
 
     pub fn declareCachedBatch(self: *Client, inputs: []const ClientDeclareInput) ![]ClientDeclaration {
@@ -176,6 +249,7 @@ pub const Client = struct {
             errdefer self.alloc.free(signature);
 
             if (self.cache.get(signature)) |entry| {
+                self.stats.cache_hits_total += 1;
                 results[idx] = .{
                     .client_decl_id = entry.client_decl_id,
                     .series_id = entry.series_id,
@@ -184,6 +258,7 @@ pub const Client = struct {
                 self.alloc.free(signature);
                 continue;
             }
+            self.stats.cache_misses_total += 1;
 
             if (pending_by_signature.get(signature)) |pending_index| {
                 try pending_aliases.append(.{
@@ -209,67 +284,84 @@ pub const Client = struct {
 
         if (pending.items.len == 0) return results;
 
-        var payload = std.array_list.Managed(u8).init(self.alloc);
-        defer payload.deinit();
-        try appendInt(&payload, u32, @intCast(pending.items.len));
-        for (pending.items) |item| {
-            try encodeDeclareEntry(&payload, item.client_decl_id, item.input.decl_kind, item.input.name, item.canonical_tags, item.input.descriptor);
-        }
+        var pending_start: usize = 0;
+        while (pending_start < pending.items.len) {
+            self.encode_buf.clearRetainingCapacity();
+            try appendInt(&self.encode_buf, u32, @as(u32, 0));
 
-        try self.sendFrame(.declare_batch, 0, payload.items);
-        const frame = try self.receiveFrame();
-        defer frame.deinit(self.alloc);
+            var pending_end = pending_start;
+            var chunk_count: usize = 0;
+            while (pending_end < pending.items.len) : (pending_end += 1) {
+                const item = pending.items[pending_end];
+                const entry_len = declareEntryPayloadLen(item.input.name, item.canonical_tags, item.input.descriptor);
+                if (self.encode_buf.items.len + entry_len > self.max_frame_bytes) {
+                    if (chunk_count == 0) return error.FrameTooLarge;
+                    break;
+                }
+                try encodeDeclareEntry(&self.encode_buf, item.client_decl_id, item.input.decl_kind, item.input.name, item.canonical_tags, item.input.descriptor);
+                chunk_count += 1;
+            }
+            std.mem.writeInt(u32, self.encode_buf.items[0..4], @intCast(chunk_count), .little);
 
-        switch (frame.kind) {
-            .declare_ack => {},
-            .error_message => return errorFromErrorFrame(frame.payload),
-            else => return error.InvalidResponse,
-        }
+            self.stats.declare_frames_sent_total += 1;
+            self.stats.declare_entries_sent_total += chunk_count;
+            try self.sendFrame(.declare_batch, 0, self.encode_buf.items);
+            const frame = try self.receiveFrame();
+            defer frame.deinit(self.alloc);
 
-        var offset: usize = 0;
-        const ack_count = try takeInt(u32, frame.payload, &offset);
-        if (ack_count != pending.items.len) return error.InvalidResponse;
-        for (pending.items, 0..) |item, idx| {
-            const ack_decl_id = try takeInt(u32, frame.payload, &offset);
-            const ack_status = try takeEnum(DeclareStatus, u16, frame.payload, &offset);
-            const ack_code = try takeEnum(ErrorCode, u16, frame.payload, &offset);
-            _ = try takeInt(u32, frame.payload, &offset); // reserved
-            const series_id = try takeInt(u64, frame.payload, &offset);
-            if (ack_decl_id != item.client_decl_id) return error.InvalidResponse;
-            if (ack_status != .ok) return errorForCode(ack_code);
+            switch (frame.kind) {
+                .declare_ack => {},
+                .error_message => return errorFromErrorFrame(frame.payload),
+                else => return error.InvalidResponse,
+            }
 
-            const entry = ClientCacheEntry{
-                .client_decl_id = item.client_decl_id,
-                .series_id = series_id,
-            };
-            try self.cache.put(try self.alloc.dupe(u8, item.signature), entry);
-            results[item.result_index] = .{
-                .client_decl_id = item.client_decl_id,
-                .series_id = series_id,
-            };
-            for (pending_aliases.items) |alias| {
-                if (alias.pending_index != idx) continue;
-                results[alias.result_index] = .{
+            var offset: usize = 0;
+            const ack_count = try takeInt(u32, frame.payload, &offset);
+            if (ack_count != chunk_count) return error.InvalidResponse;
+            for (pending.items[pending_start..pending_end], pending_start..) |item, idx| {
+                const ack_decl_id = try takeInt(u32, frame.payload, &offset);
+                const ack_status = try takeEnum(DeclareStatus, u16, frame.payload, &offset);
+                const ack_code = try takeEnum(ErrorCode, u16, frame.payload, &offset);
+                _ = try takeInt(u32, frame.payload, &offset); // reserved
+                const series_id = try takeInt(u64, frame.payload, &offset);
+                if (ack_decl_id != item.client_decl_id) return error.InvalidResponse;
+                if (ack_status != .ok) return errorForCode(ack_code);
+
+                const entry = ClientCacheEntry{
                     .client_decl_id = item.client_decl_id,
                     .series_id = series_id,
                 };
+                try self.cache.put(try self.alloc.dupe(u8, item.signature), entry);
+                results[item.result_index] = .{
+                    .client_decl_id = item.client_decl_id,
+                    .series_id = series_id,
+                };
+                for (pending_aliases.items) |alias| {
+                    if (alias.pending_index != idx) continue;
+                    results[alias.result_index] = .{
+                        .client_decl_id = item.client_decl_id,
+                        .series_id = series_id,
+                    };
+                }
             }
+            pending_start = pending_end;
         }
 
         return results;
     }
 
     pub fn appendBatch(self: *Client, entries: []const AppendEntry) !Engine.AppendBatchReceipt {
-        var payload = std.array_list.Managed(u8).init(self.alloc);
-        defer payload.deinit();
-        try appendInt(&payload, u32, @intCast(entries.len));
+        self.encode_buf.clearRetainingCapacity();
+        try appendInt(&self.encode_buf, u32, @intCast(entries.len));
         for (entries) |entry| {
-            try appendInt(&payload, u32, entry.client_decl_id);
-            try appendInt(&payload, i64, entry.ts);
-            try appendInt(&payload, u64, @bitCast(entry.value));
+            try appendInt(&self.encode_buf, u32, entry.client_decl_id);
+            try appendInt(&self.encode_buf, i64, entry.ts);
+            try appendInt(&self.encode_buf, u64, @bitCast(entry.value));
         }
 
-        try self.sendFrame(.append_batch, 0, payload.items);
+        self.stats.append_frames_sent_total += 1;
+        self.stats.append_points_sent_total += entries.len;
+        try self.sendFrame(.append_batch, 0, self.encode_buf.items);
         const frame = try self.receiveFrame();
         defer frame.deinit(self.alloc);
         switch (frame.kind) {
@@ -287,12 +379,11 @@ pub const Client = struct {
     }
 
     pub fn flushAndDrain(self: *Client, timeout_ms: u32) !FlushDrainAck {
-        var payload = std.array_list.Managed(u8).init(self.alloc);
-        defer payload.deinit();
-        try appendInt(&payload, u32, timeout_ms);
-        try appendInt(&payload, u32, flush_drain_force_flush_flag);
+        self.encode_buf.clearRetainingCapacity();
+        try appendInt(&self.encode_buf, u32, timeout_ms);
+        try appendInt(&self.encode_buf, u32, flush_drain_force_flush_flag);
 
-        try self.sendFrame(.flush_drain, 0, payload.items);
+        try self.sendFrame(.flush_drain, 0, self.encode_buf.items);
         const frame = try self.receiveFrame();
         defer frame.deinit(self.alloc);
         switch (frame.kind) {
@@ -325,21 +416,20 @@ pub const Client = struct {
         const server_version = try takeInt(u16, frame.payload, &offset);
         _ = try takeInt(u16, frame.payload, &offset);
         const max_frame_bytes = try takeInt(u32, frame.payload, &offset);
-        _ = try takeInt(u32, frame.payload, &offset);
+        const capabilities = try takeInt(u32, frame.payload, &offset);
         if (server_version != protocol_version) return error.ProtocolVersionMismatch;
         self.max_frame_bytes = max_frame_bytes;
+        self.capabilities = capabilities;
     }
 
     fn sendFrame(self: *Client, kind: MessageKind, flags: u16, payload: []const u8) !void {
-        var out_buf: [4096]u8 = undefined;
-        var writer_state = self.stream.writer(&out_buf);
+        var writer_state = self.stream.writer(&self.write_buf);
         try writeFrame(&writer_state.interface, kind, flags, payload);
         try writer_state.interface.flush();
     }
 
     fn receiveFrame(self: *Client) !Frame {
-        var in_buf: [4096]u8 = undefined;
-        var reader_state = self.stream.reader(&in_buf);
+        var reader_state = self.stream.reader(&self.read_buf);
         const reader = std.Io.Reader.adaptToOldInterface(reader_state.interface());
         return try readFrameAlloc(self.alloc, reader, self.max_frame_bytes);
     }
@@ -415,7 +505,7 @@ pub fn appendParsedLines(
     const declared = try client.declareCachedBatch(declarations);
     defer alloc.free(declared);
 
-    const frame_cap = @max(@as(usize, 1), max_points_per_frame);
+    const frame_cap = client.maxAppendPointsPerFrame(@max(@as(usize, 1), max_points_per_frame));
     const append_entries = try alloc.alloc(AppendEntry, @min(frame_cap, total_points));
     defer alloc.free(append_entries);
 
@@ -934,6 +1024,28 @@ fn encodeDeclareEntry(
         try appendOptionalBytes(payload, desc.source_metric);
         try appendOptionalBytes(payload, desc.source_field);
     }
+}
+
+fn declareEntryPayloadLen(
+    name: []const u8,
+    canonical_tags: []const u8,
+    descriptor: ?metric_catalog_mod.DescriptorInput,
+) usize {
+    var len: usize = @sizeOf(u32) + 4; // decl id + kind/presence/reserved
+    len += @sizeOf(u32) + name.len;
+    len += @sizeOf(u32) + canonical_tags.len;
+    if (descriptor) |desc| {
+        len += 4; // kind + reserved
+        len += optionalBytesPayloadLen(desc.unit);
+        len += optionalBytesPayloadLen(desc.description);
+        len += optionalBytesPayloadLen(desc.source_metric);
+        len += optionalBytesPayloadLen(desc.source_field);
+    }
+    return len;
+}
+
+fn optionalBytesPayloadLen(maybe_bytes: ?[]const u8) usize {
+    return @sizeOf(u32) + if (maybe_bytes) |bytes| bytes.len else 0;
 }
 
 fn parseDeclareEntry(payload: []const u8, offset: *usize) !BorrowedDeclareEntry {

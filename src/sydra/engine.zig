@@ -45,6 +45,7 @@ pub const Engine = struct {
     cas: ?cas_mod.CasManager = null,
     market_runtime: market_runtime_mod.State,
     signal_events: signal_events_mod.Store,
+    exact_series_declare_mu: std.Thread.Mutex = .{},
     derived_mu: std.Thread.Mutex = .{},
     derived_cv: std.Thread.Condition = .{},
     derived_pending: bool = false,
@@ -53,6 +54,7 @@ pub const Engine = struct {
     signal_event_mu: std.Thread.Mutex = .{},
     signal_event_cv: std.Thread.Condition = .{},
     signal_event_epoch: u64 = 0,
+    tag_index_dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub const SelectorLookup = union(enum) {
         by_id: types.SeriesId,
@@ -374,20 +376,43 @@ pub const Engine = struct {
         }
     };
 
+    const MemSeriesBuffer = struct {
+        points: std.array_list.Managed(types.Point),
+        sorted: bool = true,
+        last_ts: ?i64 = null,
+
+        fn init(alloc: std.mem.Allocator) MemSeriesBuffer {
+            return .{
+                .points = std.array_list.Managed(types.Point).init(alloc),
+            };
+        }
+
+        fn deinit(self: *MemSeriesBuffer) void {
+            self.points.deinit();
+            self.* = undefined;
+        }
+
+        fn clearRetainingCapacity(self: *MemSeriesBuffer) void {
+            self.points.clearRetainingCapacity();
+            self.sorted = true;
+            self.last_ts = null;
+        }
+    };
+
     pub const MemTable = struct {
         alloc: std.mem.Allocator,
-        series: std.AutoHashMap(types.SeriesId, std.array_list.Managed(types.Point)),
+        series: std.AutoHashMap(types.SeriesId, MemSeriesBuffer),
         bytes: std.atomic.Value(usize),
         pub fn init(alloc: std.mem.Allocator) MemTable {
             return .{
                 .alloc = alloc,
-                .series = std.AutoHashMap(types.SeriesId, std.array_list.Managed(types.Point)).init(alloc),
+                .series = std.AutoHashMap(types.SeriesId, MemSeriesBuffer).init(alloc),
                 .bytes = std.atomic.Value(usize).init(0),
             };
         }
         pub fn deinit(self: *MemTable) void {
             var it = self.series.valueIterator();
-            while (it.next()) |lst| lst.deinit();
+            while (it.next()) |buffer| buffer.deinit();
             self.series.deinit();
         }
     };
@@ -630,6 +655,7 @@ pub const Engine = struct {
         ingest_rejected_total: AtomicU64,
         ingest_rejected_mem_limit_total: AtomicU64,
         wal_append_failed_total: AtomicU64,
+        memtable_append_ns_total: AtomicU64,
         memtable_append_failed_total: AtomicU64,
         ingest_quarantined_total: AtomicU64,
         ingest_quarantine_write_failed_total: AtomicU64,
@@ -637,6 +663,9 @@ pub const Engine = struct {
         cas_sync_failed_total: AtomicU64,
         cas_sync_ns_total: AtomicU64,
         cas_shadow_mismatch_total: AtomicU64,
+        tag_index_save_total: AtomicU64,
+        tag_index_save_skipped_total: AtomicU64,
+        tag_index_save_ns_total: AtomicU64,
         local_ingest_connections_total: AtomicU64,
         local_ingest_connections_current: AtomicU64,
         local_ingest_frames_total: AtomicU64,
@@ -688,6 +717,7 @@ pub const Engine = struct {
                 .ingest_rejected_total = AtomicU64.init(0),
                 .ingest_rejected_mem_limit_total = AtomicU64.init(0),
                 .wal_append_failed_total = AtomicU64.init(0),
+                .memtable_append_ns_total = AtomicU64.init(0),
                 .memtable_append_failed_total = AtomicU64.init(0),
                 .ingest_quarantined_total = AtomicU64.init(0),
                 .ingest_quarantine_write_failed_total = AtomicU64.init(0),
@@ -695,6 +725,9 @@ pub const Engine = struct {
                 .cas_sync_failed_total = AtomicU64.init(0),
                 .cas_sync_ns_total = AtomicU64.init(0),
                 .cas_shadow_mismatch_total = AtomicU64.init(0),
+                .tag_index_save_total = AtomicU64.init(0),
+                .tag_index_save_skipped_total = AtomicU64.init(0),
+                .tag_index_save_ns_total = AtomicU64.init(0),
                 .local_ingest_connections_total = AtomicU64.init(0),
                 .local_ingest_connections_current = AtomicU64.init(0),
                 .local_ingest_frames_total = AtomicU64.init(0),
@@ -918,29 +951,32 @@ pub const Engine = struct {
                     _ = self.metrics.queue_wait_ns_total.fetchAdd(@as(u64, @intCast(wait_delta)), .monotonic);
                 }
                 last_pop_ns = now_ns;
-                for (batch.points) |point| {
-                    const wal_start_ns = std.time.nanoTimestamp();
-                    const wal_bytes = self.wal.append(point.series_id, point.ts, point.value) catch |err| blk: {
-                        _ = self.metrics.wal_append_failed_total.fetchAdd(1, .monotonic);
-                        self.quarantineFailedIngest(point, "wal_append", @errorName(err));
-                        std.log.warn("wal append failed: {s}", .{@errorName(err)});
-                        break :blk 0;
-                    };
-                    const wal_elapsed_ns_i128 = std.time.nanoTimestamp() - wal_start_ns;
-                    const wal_elapsed_ns: u64 = @intCast(wal_elapsed_ns_i128);
-                    _ = self.metrics.wal_append_total.fetchAdd(1, .monotonic);
-                    _ = self.metrics.wal_append_ns_total.fetchAdd(wal_elapsed_ns, .monotonic);
-                    if (wal_bytes != 0) {
-                        const wal_bytes_u64: u64 = @intCast(wal_bytes);
-                        _ = self.metrics.wal_bytes_total.fetchAdd(wal_bytes_u64, .monotonic);
+                const wal_start_ns = std.time.nanoTimestamp();
+                const wal_bytes = self.wal.appendBatch(batch.points) catch |err| blk: {
+                    _ = self.metrics.wal_append_failed_total.fetchAdd(@intCast(batch.points.len), .monotonic);
+                    for (batch.points) |point| {
+                        self.quarantineFailedIngest(point, "wal_append_batch", @errorName(err));
                     }
-                    if (self.appendMemtablePoint(point.series_id, point.ts, point.value)) |_| {
-                        _ = self.metrics.ingest_total.fetchAdd(1, .monotonic);
+                    std.log.warn("wal batch append failed: {s}", .{@errorName(err)});
+                    break :blk 0;
+                };
+                const wal_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - wal_start_ns);
+                if (wal_bytes != 0) {
+                    _ = self.metrics.wal_append_total.fetchAdd(@intCast(batch.points.len), .monotonic);
+                    _ = self.metrics.wal_append_ns_total.fetchAdd(wal_elapsed_ns, .monotonic);
+                    _ = self.metrics.wal_bytes_total.fetchAdd(wal_bytes, .monotonic);
+
+                    const memtable_start_ns = std.time.nanoTimestamp();
+                    if (self.appendMemtableBatchGrouped(batch.points)) |_| {
+                        const memtable_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - memtable_start_ns);
+                        _ = self.metrics.memtable_append_ns_total.fetchAdd(memtable_elapsed_ns, .monotonic);
+                        _ = self.metrics.ingest_total.fetchAdd(@intCast(batch.points.len), .monotonic);
                     } else |err| {
-                        _ = self.metrics.memtable_append_failed_total.fetchAdd(1, .monotonic);
-                        self.quarantineFailedIngest(point, "memtable_append", @errorName(err));
-                        std.log.warn("failed to append to memtable: {s}", .{@errorName(err)});
-                        continue;
+                        _ = self.metrics.memtable_append_failed_total.fetchAdd(@intCast(batch.points.len), .monotonic);
+                        for (batch.points) |point| {
+                            self.quarantineFailedIngest(point, "memtable_append_batch", @errorName(err));
+                        }
+                        std.log.warn("failed to append batch to memtable: {s}", .{@errorName(err)});
                     }
                 }
             } else {
@@ -950,7 +986,8 @@ pub const Engine = struct {
 
             const now = std.time.milliTimestamp();
             const mem_usage = self.mem.bytes.load(.monotonic);
-            if (mem_usage >= self.config.memtable_max_bytes or (now - last_flush) >= self.flush_timer_ms) {
+            const queue_idle = self.queue.len() == 0;
+            if (mem_usage >= self.config.memtable_max_bytes or (mem_usage != 0 and queue_idle and (now - last_flush) >= self.flush_timer_ms)) {
                 const flushed = flushMemtable(self) catch |err| blk: {
                     std.log.warn("memtable flush failed: {s}", .{@errorName(err)});
                     break :blk false;
@@ -1884,20 +1921,22 @@ pub const Engine = struct {
         var it = self.mem.series.iterator();
         while (it.next()) |entry| {
             const sid = entry.key_ptr.*;
-            const arr_ptr = entry.value_ptr;
-            if (arr_ptr.*.items.len == 0) continue;
-            std.sort.block(types.Point, arr_ptr.*.items, {}, struct {
-                fn lessThan(_: void, a: types.Point, b: types.Point) bool {
-                    return a.ts < b.ts;
-                }
-            }.lessThan);
+            const buffer = entry.value_ptr;
+            if (buffer.points.items.len == 0) continue;
+            if (!buffer.sorted and buffer.points.items.len > 1) {
+                std.sort.block(types.Point, buffer.points.items, {}, struct {
+                    fn lessThan(_: void, a: types.Point, b: types.Point) bool {
+                        return a.ts < b.ts;
+                    }
+                }.lessThan);
+            }
             // Partition by hour (UTC)
             var start_idx: usize = 0;
-            while (start_idx < arr_ptr.*.items.len) {
-                const hour = self.hourBucketForSeries(sid, arr_ptr.*.items[start_idx].ts);
+            while (start_idx < buffer.points.items.len) {
+                const hour = self.hourBucketForSeries(sid, buffer.points.items[start_idx].ts);
                 var end_idx = start_idx + 1;
-                while (end_idx < arr_ptr.*.items.len and self.hourBucketForSeries(sid, arr_ptr.*.items[end_idx].ts) == hour) : (end_idx += 1) {}
-                const slice = arr_ptr.*.items[start_idx..end_idx];
+                while (end_idx < buffer.points.items.len and self.hourBucketForSeries(sid, buffer.points.items[end_idx].ts) == hour) : (end_idx += 1) {}
+                const slice = buffer.points.items[start_idx..end_idx];
                 // write segment
                 const selector_resolution = self.metadata.series_catalog.resolveBySeriesId(sid);
                 const selector_metadata = switch (selector_resolution.status) {
@@ -1915,7 +1954,7 @@ pub const Engine = struct {
                 segments_written += 1;
                 start_idx = end_idx;
             }
-            arr_ptr.*.clearRetainingCapacity();
+            buffer.clearRetainingCapacity();
         }
         self.mem.bytes.store(0, .monotonic);
         if (segments_written > 0) {
@@ -1932,10 +1971,19 @@ pub const Engine = struct {
         self.wal.rotateIfNeeded() catch |err| {
             std.log.warn("wal rotation failed: {s}", .{@errorName(err)});
         };
-        // persist tag index snapshot (best-effort)
-        self.metadata.tags.save(self.data_dir) catch |err| {
-            std.log.warn("tag index save failed: {s}", .{@errorName(err)});
-        };
+        if (self.tag_index_dirty.swap(false, .monotonic)) {
+            const tag_save_start_ns = std.time.nanoTimestamp();
+            self.metadata.tags.save(self.data_dir) catch |err| {
+                self.tag_index_dirty.store(true, .monotonic);
+                std.log.warn("tag index save failed: {s}", .{@errorName(err)});
+                return segments_written > 0;
+            };
+            const tag_save_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - tag_save_start_ns);
+            _ = self.metrics.tag_index_save_total.fetchAdd(1, .monotonic);
+            _ = self.metrics.tag_index_save_ns_total.fetchAdd(tag_save_elapsed_ns, .monotonic);
+        } else {
+            _ = self.metrics.tag_index_save_skipped_total.fetchAdd(1, .monotonic);
+        }
         return segments_written > 0;
     }
 
@@ -2505,8 +2553,8 @@ pub const Engine = struct {
             if (last_ts == null or entry.end_ts > last_ts.?) last_ts = entry.end_ts;
         }
 
-        if (self.mem.series.get(series_id)) |points| {
-            for (points.items) |point| {
+        if (self.mem.series.get(series_id)) |buffer| {
+            for (buffer.points.items) |point| {
                 if (first_ts == null or point.ts < first_ts.?) first_ts = point.ts;
                 if (last_ts == null or point.ts > last_ts.?) last_ts = point.ts;
             }
@@ -2599,25 +2647,81 @@ pub const Engine = struct {
         var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, tags, .{}) catch return;
         defer parsed.deinit();
         if (parsed.value != .object) return;
+        var dirty = false;
         var it = parsed.value.object.iterator();
         while (it.next()) |e| {
             if (e.value_ptr.* == .string) {
                 const key = std.fmt.allocPrint(self.alloc, "{s}={s}", .{ e.key_ptr.*, e.value_ptr.string }) catch continue;
                 defer self.alloc.free(key);
-                self.metadata.tags.add(key, series_id) catch |err| {
+                const inserted = self.metadata.tags.add(key, series_id) catch |err| {
                     std.log.warn("tag index add failed: {s}", .{@errorName(err)});
+                    continue;
                 };
+                dirty = dirty or inserted;
             }
         }
+        if (dirty) self.tag_index_dirty.store(true, .monotonic);
     }
 
     fn appendMemtablePoint(self: *Engine, sid: types.SeriesId, ts: i64, value: f64) !void {
         const gop = try self.mem.series.getOrPut(sid);
         if (!gop.found_existing) {
-            gop.value_ptr.* = std.array_list.Managed(types.Point).init(self.alloc);
+            gop.value_ptr.* = MemSeriesBuffer.init(self.alloc);
         }
-        try gop.value_ptr.*.append(.{ .ts = ts, .value = value });
+        if (gop.value_ptr.last_ts) |last_ts| {
+            if (ts < last_ts) gop.value_ptr.sorted = false;
+        }
+        try gop.value_ptr.points.append(.{ .ts = ts, .value = value });
+        if (gop.value_ptr.last_ts == null or ts > gop.value_ptr.last_ts.?) {
+            gop.value_ptr.last_ts = ts;
+        }
         _ = self.mem.bytes.fetchAdd(@sizeOf(types.Point), .monotonic);
+    }
+
+    fn appendMemtableBatchGrouped(self: *Engine, points: []ResolvedIngestPoint) !void {
+        if (points.len == 0) return;
+
+        std.sort.block(ResolvedIngestPoint, points, {}, struct {
+            fn lessThan(_: void, a: ResolvedIngestPoint, b: ResolvedIngestPoint) bool {
+                if (a.series_id != b.series_id) return a.series_id < b.series_id;
+                return a.ts < b.ts;
+            }
+        }.lessThan);
+
+        var start: usize = 0;
+        while (start < points.len) {
+            const sid = points[start].series_id;
+            var end = start + 1;
+            while (end < points.len and points[end].series_id == sid) : (end += 1) {}
+
+            const gop = try self.mem.series.getOrPut(sid);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = MemSeriesBuffer.init(self.alloc);
+            }
+            try gop.value_ptr.points.ensureUnusedCapacity(end - start);
+            start = end;
+        }
+
+        start = 0;
+        while (start < points.len) {
+            const sid = points[start].series_id;
+            var end = start + 1;
+            while (end < points.len and points[end].series_id == sid) : (end += 1) {}
+
+            const buffer = self.mem.series.getPtr(sid).?;
+            if (buffer.last_ts) |last_ts| {
+                if (points[start].ts < last_ts) buffer.sorted = false;
+            }
+            var last_ts = buffer.last_ts;
+            for (points[start..end]) |point| {
+                buffer.points.appendAssumeCapacity(.{ .ts = point.ts, .value = point.value });
+                if (last_ts == null or point.ts > last_ts.?) last_ts = point.ts;
+            }
+            buffer.last_ts = last_ts;
+            start = end;
+        }
+
+        _ = self.mem.bytes.fetchAdd(points.len * @sizeOf(types.Point), .monotonic);
     }
 
     pub fn verifyCasState(self: *Engine) !void {
@@ -2862,6 +2966,8 @@ pub const Engine = struct {
         canonical_tags: []const u8,
         descriptor: ?metric_catalog_mod.DescriptorInput,
     ) !types.SeriesId {
+        self.exact_series_declare_mu.lock();
+        defer self.exact_series_declare_mu.unlock();
         if (descriptor) |descriptor_input| {
             _ = try self.registerMetricDescriptor(descriptor_input);
         }
@@ -3220,7 +3326,7 @@ fn tagIndexFromSnapshot(alloc: std.mem.Allocator, snapshot: cas_mod.TagSnapshot)
 
     for (snapshot.entries) |entry| {
         for (entry.series_ids) |series_id| {
-            try tags.add(entry.key, series_id);
+            _ = try tags.add(entry.key, series_id);
         }
     }
     return tags;

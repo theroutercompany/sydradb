@@ -9713,7 +9713,7 @@ test "cas bootstrap imports legacy metadata into a genesis commit" {
     defer talloc.free(seg_path);
     try manifest.add(data_dir, sid, 0, points[0].ts, points[points.len - 1].ts, @intCast(points.len), seg_path);
     try manifest.rewriteCheckpoint(data_dir);
-    try tags.add("host=bootstrap", sid);
+    _ = try tags.add("host=bootstrap", sid);
     try tags.save(data_dir);
     _ = try series_catalog.register("bootstrap.series", "{}", sid);
 
@@ -10633,7 +10633,7 @@ test "bundle create, verify, and apply round-trip the CAS head" {
 
     const sid = types.hash64("bundle.series");
     _ = try series_catalog.register("bundle.series", "{}", sid);
-    try tags.add("host=bundle", sid);
+    _ = try tags.add("host=bundle", sid);
     const points = [_]types.Point{.{ .ts = 1_000, .value = 7.0 }};
     const seg_path = try segment_mod.writeSegment(talloc, data_dir, sid, 0, points[0..]);
     defer talloc.free(seg_path);
@@ -11312,7 +11312,7 @@ test "exportSpecToLegacy materializes segment and wal mirrors from content refs"
     const seg_path = try segment_mod.writeSegment(alloc, data_dir, sid, 0, points[0..]);
     defer alloc.free(seg_path);
     try manifest.add(data_dir, sid, 0, points[0].ts, points[points.len - 1].ts, @intCast(points.len), seg_path);
-    try tags.add("host=checkout", sid);
+    _ = try tags.add("host=checkout", sid);
     _ = try series_catalog.register("checkout.series", "{}", sid);
 
     var wal = try wal_mod.WAL.open(alloc, data_dir, .none);

@@ -45,11 +45,11 @@ pub const TagIndex = struct {
         self.map.deinit();
     }
 
-    pub fn add(self: *TagIndex, key: []const u8, series_id: types.SeriesId) !void {
+    pub fn add(self: *TagIndex, key: []const u8, series_id: types.SeriesId) !bool {
         if (self.map.getPtr(key)) |existing| {
-            for (existing.items) |sid| if (sid == series_id) return;
+            for (existing.items) |sid| if (sid == series_id) return false;
             try existing.append(self.alloc, series_id);
-            return;
+            return true;
         }
 
         const owned_key = try self.alloc.dupe(u8, key);
@@ -57,6 +57,7 @@ pub const TagIndex = struct {
         try self.map.put(owned_key, .{});
         const inserted = self.map.getPtr(owned_key).?;
         try inserted.append(self.alloc, series_id);
+        return true;
     }
 
     pub fn get(self: *TagIndex, key: []const u8) []const types.SeriesId {

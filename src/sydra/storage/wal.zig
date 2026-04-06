@@ -330,6 +330,52 @@ pub const WAL = struct {
         return @intCast(total_bytes);
     }
 
+    pub fn appendBatch(self: *WAL, points: anytype) !u64 {
+        const points_type = @TypeOf(points);
+        const points_info = @typeInfo(points_type);
+        comptime {
+            if (points_info != .pointer or points_info.pointer.size != .slice) {
+                @compileError("appendBatch expects a slice of point-like structs");
+            }
+            const Point = points_info.pointer.child;
+            if (!@hasField(Point, "series_id") or !@hasField(Point, "ts") or !@hasField(Point, "value")) {
+                @compileError("appendBatch points must expose series_id, ts, and value");
+            }
+        }
+
+        if (points.len == 0) return 0;
+
+        const point_frame_bytes = 4 + (1 + 8 + 8 + 8) + 4;
+        const payload_len: u32 = 1 + 8 + 8 + 8;
+        const total_bytes = points.len * point_frame_bytes;
+        const encoded = try self.alloc.alloc(u8, total_bytes);
+        defer self.alloc.free(encoded);
+
+        var offset: usize = 0;
+        for (points) |point| {
+            writeIntBytes(u32, encoded, &offset, payload_len);
+            const payload = encoded[offset .. offset + payload_len];
+            payload[0] = 1;
+            writeIntSlice(u64, payload[1..9], point.series_id);
+            writeIntSlice(i64, payload[9..17], point.ts);
+            writeIntSlice(u64, payload[17..25], @as(u64, @bitCast(point.value)));
+            offset += payload_len;
+
+            var crc = std.hash.Crc32.init();
+            crc.update(payload);
+            writeIntBytes(u32, encoded, &offset, crc.final());
+        }
+
+        try self.file.writeAll(encoded);
+        self.bytes_written += total_bytes;
+        switch (self.fsync) {
+            .always => try self.file.sync(),
+            .interval => {},
+            .none => {},
+        }
+        return total_bytes;
+    }
+
     pub fn appendSeriesRegistration(self: *WAL, series_id: u64, series: []const u8, canonical_tags: []const u8) !u32 {
         var payload = std.array_list.Managed(u8).init(self.alloc);
         defer payload.deinit();
@@ -442,6 +488,19 @@ pub fn listWalFiles(alloc: std.mem.Allocator, data_dir: std.fs.Dir) ![][]u8 {
 
     sortWalFiles(files.items);
     return try files.toOwnedSlice();
+}
+
+fn writeIntBytes(comptime T: type, bytes: []u8, offset: *usize, value: T) void {
+    var raw: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &raw, value, .little);
+    @memcpy(bytes[offset.* .. offset.* + raw.len], raw[0..]);
+    offset.* += raw.len;
+}
+
+fn writeIntSlice(comptime T: type, bytes: []u8, value: T) void {
+    var raw: [@sizeOf(T)]u8 = undefined;
+    std.mem.writeInt(T, &raw, value, .little);
+    @memcpy(bytes[0..raw.len], raw[0..]);
 }
 
 pub fn freeWalFiles(alloc: std.mem.Allocator, files: [][]u8) void {
