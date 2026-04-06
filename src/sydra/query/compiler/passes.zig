@@ -62,21 +62,33 @@ pub fn buildTypedGroupings(
     allow_tag_identifiers: bool,
 ) errors.CompileError![]const ir.TypedGrouping {
     if (groupings.len == 0) return &[_]ir.TypedGrouping{};
-    if (groupings.len != 1) return error.UnsupportedGrouping;
+    if (groupings.len > 2) return error.UnsupportedGrouping;
 
-    const typed = try typeCheckedExpr(allocator, groupings[0].expr);
-    const is_time_bucket = isTimeBucketExpr(groupings[0].expr);
-    if (is_time_bucket) {
-        try ensureTimeBucketSupported(groupings[0].expr);
-    } else if (!groupingSupportsSingleSelectorTag(groupings[0].expr, allow_tag_identifiers)) {
-        return error.UnsupportedGrouping;
+    const list = try allocator.alloc(ir.TypedGrouping, groupings.len);
+    var time_bucket_count: usize = 0;
+    var tag_grouping_count: usize = 0;
+
+    for (groupings, 0..) |grouping, idx| {
+        const typed = try typeCheckedExpr(allocator, grouping.expr);
+        const is_time_bucket = isTimeBucketExpr(grouping.expr);
+        if (is_time_bucket) {
+            try ensureTimeBucketSupported(grouping.expr);
+            time_bucket_count += 1;
+        } else if (groupingSupportsSingleSelectorTag(grouping.expr, allow_tag_identifiers)) {
+            tag_grouping_count += 1;
+        } else {
+            return error.UnsupportedGrouping;
+        }
+
+        list[idx] = .{
+            .expr = typed,
+            .is_time_bucket = is_time_bucket,
+        };
     }
 
-    const list = try allocator.alloc(ir.TypedGrouping, 1);
-    list[0] = .{
-        .expr = typed,
-        .is_time_bucket = is_time_bucket,
-    };
+    if (time_bucket_count > 1 or tag_grouping_count > 1) return error.UnsupportedGrouping;
+    if (groupings.len == 2 and !(time_bucket_count == 1 and tag_grouping_count == 1)) return error.UnsupportedGrouping;
+
     return list;
 }
 
