@@ -143,11 +143,12 @@ zig build bench-alloc -- --ops 10000 --concurrency 4 --series 1
 zig build bench-sydraql -- --points-per-series 32 --iterations 5
 zig build bench-cas
 zig build bench-ingest-transport -- --scenario one_hot_one_writer
+zig build bench-ingest-transport -- --scenario steady_state_100k
 ```
 
 Scenario definitions live under [`benchmarks/README.md`](/Users/rexliu/sydradb/benchmarks/README.md), [`benchmarks/alloc/scenarios.json`](/Users/rexliu/sydradb/benchmarks/alloc/scenarios.json), [`benchmarks/sydraql/scenarios.json`](/Users/rexliu/sydradb/benchmarks/sydraql/scenarios.json), [`benchmarks/cas/scenarios.json`](/Users/rexliu/sydradb/benchmarks/cas/scenarios.json), and [`benchmarks/ingest_transport/scenarios.json`](/Users/rexliu/sydradb/benchmarks/ingest_transport/scenarios.json).
 
-One checked-in sample run is published in [`benchmarks/v0.4.0-summary.md`](/Users/rexliu/sydradb/benchmarks/v0.4.0-summary.md).
+Checked-in sample runs are published in [`benchmarks/v0.4.0-summary.md`](/Users/rexliu/sydradb/benchmarks/v0.4.0-summary.md) and [`benchmarks/v0.4.0-ingest-transport-summary.md`](/Users/rexliu/sydradb/benchmarks/v0.4.0-ingest-transport-summary.md).
 
 ## Demos
 

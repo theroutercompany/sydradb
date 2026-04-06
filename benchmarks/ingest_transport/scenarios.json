@@ -20,6 +20,11 @@
       "name": "cold_declare_10k",
       "description": "10k series cold declaration burst followed by append",
       "command": "zig build bench-ingest-transport -- --scenario cold_declare_10k"
+    },
+    {
+      "name": "steady_state_100k",
+      "description": "100k warm-declared points to measure sustained same-host append",
+      "command": "zig build bench-ingest-transport -- --scenario steady_state_100k"
     }
   ]
 }

@@ -13,7 +13,8 @@ Current entrypoints:
 - `zig build bench-ingest-transport -- --scenario fanout_four_writers`
 - `zig build bench-ingest-transport -- --scenario warm_declared_10k`
 - `zig build bench-ingest-transport -- --scenario cold_declare_10k`
+- `zig build bench-ingest-transport -- --scenario steady_state_100k`
 
 The scenario files under `benchmarks/*/scenarios.json` are the checked-in contract for what we intend to measure and publish.
 
-The summary file `benchmarks/v0.4.0-summary.md` captures one concrete run on a reference machine, including the commands used and the observed outputs.
+The summary files [`benchmarks/v0.4.0-summary.md`](/Users/rexliu/sydradb/benchmarks/v0.4.0-summary.md) and [`benchmarks/v0.4.0-ingest-transport-summary.md`](/Users/rexliu/sydradb/benchmarks/v0.4.0-ingest-transport-summary.md) capture checked-in reference runs, including the commands used and the observed outputs.
