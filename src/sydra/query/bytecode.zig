@@ -44,6 +44,7 @@ pub const Opcode = enum {
     sorter_insert,
     sorter_next,
     insert_point,
+    delete_points,
     result_row,
     halt,
 };

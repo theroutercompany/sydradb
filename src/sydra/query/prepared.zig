@@ -116,6 +116,11 @@ pub const TableUse = struct {
     series_id: ?types.SeriesId = null,
 };
 
+pub const StatementCapability = struct {
+    kind: frontend.stmt.StatementKind,
+    produces_rows: bool,
+};
+
 pub const PreparedStmt = struct {
     allocator: std.mem.Allocator,
     engine: *engine_mod.Engine,
@@ -259,6 +264,17 @@ pub const PreparedStmt = struct {
         return self.binding.statement_kind;
     }
 
+    pub fn capability(self: *const PreparedStmt) StatementCapability {
+        return .{
+            .kind = self.binding.statement_kind,
+            .produces_rows = statementKindProducesRows(self.binding.statement_kind),
+        };
+    }
+
+    pub fn producesRows(self: *const PreparedStmt) bool {
+        return statementKindProducesRows(self.binding.statement_kind);
+    }
+
     pub fn rowsAffected(self: *const PreparedStmt) usize {
         if (self.machine) |machine| return machine.rowsAffected();
         return 0;
@@ -398,6 +414,13 @@ pub fn freeTableUses(allocator: std.mem.Allocator, uses: []TableUse) void {
         if (use.name.len != 0) allocator.free(use.name);
     }
     allocator.free(uses);
+}
+
+fn statementKindProducesRows(kind: frontend.stmt.StatementKind) bool {
+    return switch (kind) {
+        .select, .explain => true,
+        .insert, .delete => false,
+    };
 }
 
 pub fn prepareSydraQL(
@@ -602,6 +625,7 @@ fn compilePreparedExecutable(
             };
         },
         .insert => |insert_stmt| return try buildInsertPreparedExecutable(allocator, compile_arena_ptr, insert_stmt),
+        .delete => |delete_stmt| return try buildDeletePreparedExecutable(allocator, engine, compile_arena_ptr, delete_stmt),
         else => return error.NotImplemented,
     }
 }
@@ -651,6 +675,57 @@ fn buildInsertPreparedExecutable(
     };
 }
 
+fn buildDeletePreparedExecutable(
+    allocator: std.mem.Allocator,
+    engine: *engine_mod.Engine,
+    compile_arena_ptr: *std.heap.ArenaAllocator,
+    delete_stmt: *const ast.Delete,
+) PrepareError!CompiledPreparedExecutable {
+    if (delete_stmt.selector.tag_filter != null) return error.NotImplemented;
+    if (delete_stmt.predicate) |predicate| {
+        try ensureDeletePredicateSupported(predicate);
+    }
+
+    const target = try resolveDeleteWriteTarget(compile_arena_ptr.allocator(), engine, delete_stmt.selector);
+
+    const predicate_exprs = if (delete_stmt.predicate) |predicate|
+        try allocator.dupe(*const ast.Expr, &.{predicate})
+    else
+        &.{};
+    errdefer if (predicate_exprs.len != 0) allocator.free(predicate_exprs);
+
+    const instructions = try allocator.dupe(bytecode.Instruction, &.{
+        .{
+            .opcode = .delete_points,
+            .p1 = if (delete_stmt.predicate != null) 0 else -1,
+            .p4 = .{ .write_target = 0 },
+            .comment = switch (delete_stmt.selector.series) {
+                .name => |name| name.value,
+                .by_id => "by_id",
+            },
+        },
+        .{ .opcode = .halt },
+    });
+    errdefer allocator.free(instructions);
+
+    const write_targets = try allocator.dupe(bytecode.WriteTarget, &.{target});
+    errdefer allocator.free(write_targets);
+
+    return .{
+        .program = .{
+            .allocator = allocator,
+            .instructions = instructions,
+            .exprs = predicate_exprs,
+            .write_targets = write_targets,
+            .register_count = 1,
+            .source_name = "prepared_delete",
+        },
+        .columns = &.{},
+        .typed_query = null,
+        .compile_arena_ptr = compile_arena_ptr,
+    };
+}
+
 const InsertExprMapping = struct {
     time_expr: *const ast.Expr,
     value_expr: *const ast.Expr,
@@ -682,6 +757,105 @@ fn resolveInsertColumnExprs(insert_stmt: *const ast.Insert) PrepareError!InsertE
         .time_expr = time_expr orelse return error.NotImplemented,
         .value_expr = value_expr orelse return error.NotImplemented,
     };
+}
+
+fn resolveDeleteWriteTarget(
+    allocator: std.mem.Allocator,
+    engine: *engine_mod.Engine,
+    selector: ast.Selector,
+) PrepareError!bytecode.WriteTarget {
+    const resolution = switch (selector.series) {
+        .name => |name| engine.resolveSelector(.{ .name = name.value }) catch return error.NotImplemented,
+        .by_id => |by_id| engine.resolveSelector(.{ .by_id = @intCast(by_id.value) }) catch return error.NotImplemented,
+    };
+    return switch (resolution.status) {
+        .resolved, .exact_match => .{
+            .series_id = resolution.series_id.?,
+            .series_name = try allocator.dupe(u8, resolution.series orelse switch (selector.series) {
+                .name => |name| name.value,
+                .by_id => "by_id",
+            }),
+            .tags_json = try allocator.dupe(u8, resolution.canonical_tags orelse "{}"),
+        },
+        .not_found, .ambiguous => error.NotImplemented,
+    };
+}
+
+fn ensureDeletePredicateSupported(expr: *const ast.Expr) PrepareError!void {
+    switch (expr.*) {
+        .identifier => |ident| {
+            const tail = trailingSegment(ident.value);
+            if (!std.ascii.eqlIgnoreCase(tail, "time") and !std.ascii.eqlIgnoreCase(tail, "value")) {
+                return error.NotImplemented;
+            }
+        },
+        .literal => {},
+        .unary => |unary| try ensureDeletePredicateSupported(unary.operand),
+        .binary => |binary| {
+            switch (binary.op) {
+                .add,
+                .subtract,
+                .multiply,
+                .divide,
+                .modulo,
+                .equal,
+                .not_equal,
+                .less,
+                .less_equal,
+                .greater,
+                .greater_equal,
+                .logical_and,
+                .logical_or,
+                => {},
+                else => return error.NotImplemented,
+            }
+            try ensureDeletePredicateSupported(binary.left);
+            try ensureDeletePredicateSupported(binary.right);
+        },
+        .call => |call| {
+            if (std.ascii.eqlIgnoreCase(call.callee.value, "time_bucket")) {
+                if (call.args.len != 2 and call.args.len != 3) return error.NotImplemented;
+                for (call.args, 0..) |arg, idx| {
+                    if (idx == 1) {
+                        try ensureDeletePredicateSupported(arg);
+                    } else {
+                        try ensureDeleteConstantExpr(arg);
+                    }
+                }
+                return;
+            }
+            if (std.ascii.eqlIgnoreCase(call.callee.value, "abs") or
+                std.ascii.eqlIgnoreCase(call.callee.value, "ceil") or
+                std.ascii.eqlIgnoreCase(call.callee.value, "floor") or
+                std.ascii.eqlIgnoreCase(call.callee.value, "round") or
+                std.ascii.eqlIgnoreCase(call.callee.value, "sqrt") or
+                std.ascii.eqlIgnoreCase(call.callee.value, "ln"))
+            {
+                if (call.args.len != 1) return error.NotImplemented;
+                try ensureDeletePredicateSupported(call.args[0]);
+                return;
+            }
+            if (std.ascii.eqlIgnoreCase(call.callee.value, "pow")) {
+                if (call.args.len != 2) return error.NotImplemented;
+                try ensureDeletePredicateSupported(call.args[0]);
+                try ensureDeletePredicateSupported(call.args[1]);
+                return;
+            }
+            return error.NotImplemented;
+        },
+    }
+}
+
+fn ensureDeleteConstantExpr(expr: *const ast.Expr) PrepareError!void {
+    switch (expr.*) {
+        .literal => {},
+        .unary => |unary| try ensureDeleteConstantExpr(unary.operand),
+        .binary => |binary| {
+            try ensureDeleteConstantExpr(binary.left);
+            try ensureDeleteConstantExpr(binary.right);
+        },
+        else => return error.NotImplemented,
+    }
 }
 
 fn emptyProgram(allocator: std.mem.Allocator) bytecode.Program {
@@ -1754,6 +1928,59 @@ test "prepared statement executes parameterized inserts through the VM" {
     try std.testing.expectEqual(@as(usize, 1), points.items.len);
     try std.testing.expectEqual(@as(i64, 10), points.items[0].ts);
     try std.testing.expectApproxEqAbs(@as(f64, 4.5), points.items[0].value, 1e-9);
+}
+
+test "prepared statement executes parameterized deletes through the VM" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-delete", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .legacy,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    const sid = @import("../types.zig").seriesIdFrom("writes.room1", "{}");
+    try engine.registerSeries("writes.room1", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.0, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 20, .value = 2.0, .tags_json = "{}" });
+    try engine.ingest(.{ .series_id = sid, .ts = 30, .value = 3.0, .tags_json = "{}" });
+
+    var stmt = try prepareSqlCore(alloc, engine, "DELETE FROM writes.room1 WHERE time >= $1", .{});
+    defer stmt.finalize();
+
+    try std.testing.expectEqual(frontend.stmt.StatementKind.delete, stmt.statementKind());
+    try std.testing.expect(!stmt.producesRows());
+    try std.testing.expectEqual(@as(usize, 0), (try stmt.describeColumns()).len);
+    try std.testing.expectEqual(@as(usize, 1), (try stmt.describeParameters()).len);
+    try std.testing.expectEqual(@as(usize, 0), stmt.rowsAffected());
+    try std.testing.expectError(error.UnboundParameter, stmt.step());
+
+    try stmt.bindPositional(1, .{ .integer = 20 });
+    try std.testing.expect((try stmt.step()) == .done);
+    try std.testing.expectEqual(@as(usize, 2), stmt.rowsAffected());
+
+    var points = std.array_list.Managed(@import("../types.zig").Point).init(alloc);
+    defer points.deinit();
+    try engine.queryRange(sid, std.math.minInt(i64), std.math.maxInt(i64), &points);
+    try std.testing.expectEqual(@as(usize, 1), points.items.len);
+    try std.testing.expectEqual(@as(i64, 10), points.items[0].ts);
 }
 
 test "binding context tracks named parameter slots" {

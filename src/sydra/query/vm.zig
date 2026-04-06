@@ -11,8 +11,9 @@ const vdbe = @import("vdbe.zig");
 const value_mod = @import("value.zig");
 
 const QueryRangeError = @typeInfo(@typeInfo(@TypeOf(engine_mod.Engine.queryRange)).@"fn".return_type.?).error_union.error_set;
+const DeleteWhereError = @typeInfo(@typeInfo(@TypeOf(engine_mod.Engine.deleteWhere)).@"fn".return_type.?).error_union.error_set;
 
-pub const VmError = value_mod.ConvertError || expression.EvalError || QueryRangeError || error{
+pub const VmError = value_mod.ConvertError || expression.EvalError || QueryRangeError || DeleteWhereError || error{
     InvalidOpcode,
     InvalidRegister,
     InvalidConstant,
@@ -121,6 +122,7 @@ pub const VirtualMachine = struct {
                 .sorter_insert => try self.executeSorterInsert(instruction),
                 .sorter_next => try self.executeSorterNext(instruction),
                 .insert_point => try self.executeInsertPoint(instruction),
+                .delete_points => try self.executeDeletePoints(instruction),
                 .result_row => return .{ .row = try self.executeResultRow(instruction) },
                 .halt => {
                     self.halted = true;
@@ -359,6 +361,25 @@ pub const VirtualMachine = struct {
             .tags_json = target.tags_json,
         });
         self.rows_affected += 1;
+    }
+
+    fn executeDeletePoints(self: *VirtualMachine, instruction: bytecode.Instruction) VmError!void {
+        const target_id = switch (instruction.p4) {
+            .write_target => |id| id,
+            else => return error.InvalidConstant,
+        };
+        if (target_id >= self.program.write_targets.len) return error.InvalidConstant;
+        const target = self.program.write_targets[target_id];
+
+        const predicate_expr = if (instruction.p1 < 0)
+            null
+        else blk: {
+            const expr_id: usize = @intCast(instruction.p1);
+            if (expr_id >= self.program.exprs.len) return error.InvalidConstant;
+            break :blk self.program.exprs[expr_id];
+        };
+
+        self.rows_affected += try self.engine.deleteWhere(target.series_id, predicate_expr);
     }
 
     fn registerPtr(self: *VirtualMachine, id: bytecode.RegisterId) VmError!*value_mod.Value {
