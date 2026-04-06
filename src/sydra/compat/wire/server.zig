@@ -444,6 +444,7 @@ fn handleSimpleQuery(
         .handled => return,
         .fallback => |reason| {
             defer alloc.free(reason);
+            try writeExecutionModeNotices(alloc, writer, "translator", true, reason);
             const notice = try std.fmt.allocPrint(alloc, "sql_prepare_fallback=translator reason={s}", .{reason});
             defer alloc.free(notice);
             try protocol.writeNoticeResponse(writer, notice);
@@ -929,7 +930,7 @@ fn handleSqlCorePreparedQuery(
         defer alloc.free(schema_notice);
         try protocol.writeNoticeResponse(writer, schema_notice);
     }
-    try protocol.writeNoticeResponse(writer, "execution_mode=sql_core_vm legacy_fallback=false");
+    try writeExecutionModeNotices(alloc, writer, "sql_core_vm", false, "");
 
     const tag = try formatCommandTag(
         alloc,
@@ -1011,14 +1012,7 @@ fn handleSydraqlQuery(
         defer alloc.free(trace_notice);
         try protocol.writeNoticeResponse(writer, trace_notice);
     }
-    const mode_notice = try std.fmt.allocPrint(alloc, "execution_mode={s} legacy_fallback={}", .{ cursor.stats.execution_mode, cursor.stats.legacy_fallback });
-    defer alloc.free(mode_notice);
-    try protocol.writeNoticeResponse(writer, mode_notice);
-    if (cursor.stats.fallback_reason.len != 0) {
-        const fallback_notice = try std.fmt.allocPrint(alloc, "fallback_reason={s}", .{cursor.stats.fallback_reason});
-        defer alloc.free(fallback_notice);
-        try protocol.writeNoticeResponse(writer, fallback_notice);
-    }
+    try writeExecutionModeNotices(alloc, writer, cursor.stats.execution_mode, cursor.stats.legacy_fallback, cursor.stats.fallback_reason);
     for (op_stats) |stat| {
         const elapsed_ms = @divTrunc(@as(i64, @intCast(stat.elapsed_us)), 1000);
         const notice = try std.fmt.allocPrint(alloc, "operator={s} rows_out={d} elapsed_ms={d}", .{ stat.name, stat.rows_out, elapsed_ms });
@@ -1146,6 +1140,24 @@ fn formatMetricsNotice(
         "metrics rows={d} scanned={d} stream_ms={d} plan_ms={d}",
         .{ rows_emitted, rows_scanned, stream_ms, plan_ms },
     );
+}
+
+fn writeExecutionModeNotices(
+    alloc: std.mem.Allocator,
+    writer: std.Io.AnyWriter,
+    execution_mode: []const u8,
+    legacy_fallback: bool,
+    fallback_reason: []const u8,
+) !void {
+    const mode_notice = try std.fmt.allocPrint(alloc, "execution_mode={s} legacy_fallback={}", .{ execution_mode, legacy_fallback });
+    defer alloc.free(mode_notice);
+    try protocol.writeNoticeResponse(writer, mode_notice);
+
+    if (fallback_reason.len != 0) {
+        const fallback_notice = try std.fmt.allocPrint(alloc, "fallback_reason={s}", .{fallback_reason});
+        defer alloc.free(fallback_notice);
+        try protocol.writeNoticeResponse(writer, fallback_notice);
+    }
 }
 
 fn writeDataRow(
@@ -1281,6 +1293,18 @@ test "formatTraceNotice renders id" {
     const notice = try formatTraceNotice(alloc, "xyz");
     defer alloc.free(notice);
     try std.testing.expectEqualStrings("trace_id=xyz", notice);
+}
+
+test "writeExecutionModeNotices emits normalized fallback telemetry" {
+    const alloc = std.testing.allocator;
+    var allocating_writer: std.Io.Writer.Allocating = .init(alloc);
+    defer allocating_writer.deinit();
+
+    try writeExecutionModeNotices(alloc, anyWriter(&allocating_writer.writer), "translator", true, "frontend_lexer_mismatch");
+
+    const written = allocating_writer.written();
+    try std.testing.expect(std.mem.indexOf(u8, written, "execution_mode=translator legacy_fallback=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "fallback_reason=frontend_lexer_mismatch") != null);
 }
 
 test "sql core prepared path handles simple select queries" {
@@ -1624,6 +1648,8 @@ test "simple query writes explicit translator fallback notice for uncovered SQL"
     try handleSimpleQuery(alloc, anyWriter(&allocating_writer.writer), payload.items, engine);
 
     const written = allocating_writer.written();
+    try std.testing.expect(std.mem.indexOf(u8, written, "execution_mode=translator legacy_fallback=true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "fallback_reason=frontend_lexer_mismatch") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "sql_prepare_fallback=translator reason=") != null);
 }
 

@@ -116,6 +116,13 @@ Behavior:
 - If empty:
   - writes `EmptyQueryResponse` then `ReadyForQuery('I')`
 - Otherwise:
+  - first attempts the SQL-core prepared path
+    - on direct-handle success: returns after emitting `execution_mode=sql_core_vm legacy_fallback=false`
+    - on fallback to translator:
+      - emits normalized notices:
+        - `execution_mode=translator legacy_fallback=true`
+        - `fallback_reason=...`
+      - also emits the preview-specific notice `sql_prepare_fallback=translator reason=...`
   - calls `translator.translate(alloc, sql)` (see [SQL → sydraQL translator](../query/translator.md))
     - on OOM: `ErrorResponse(FATAL, 53100, "out of memory during translation")`
   - on translation success:
