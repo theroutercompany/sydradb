@@ -5,6 +5,7 @@ const manifest_mod = @import("manifest.zig");
 const compact_mod = @import("compact.zig");
 const object_store = @import("object_store.zig");
 const extents = @import("extents.zig");
+const market_catalog_mod = @import("market_catalog.zig");
 const metric_catalog_mod = @import("metric_catalog.zig");
 const segment_mod = @import("segment.zig");
 const series_catalog_mod = @import("series_catalog.zig");
@@ -375,6 +376,7 @@ pub const LegacySnapshot = struct {
     tag_snapshot: TagSnapshot,
     series_catalog_snapshot: SeriesCatalogSnapshot,
     metric_catalog_snapshot: MetricCatalogSnapshot,
+    market_catalog_snapshot: ?market_catalog_mod.Snapshot = null,
     wal_index: WalIndex,
     checkpoint_state: CheckpointState,
 
@@ -384,6 +386,7 @@ pub const LegacySnapshot = struct {
         self.tag_snapshot.deinit(alloc);
         self.series_catalog_snapshot.deinit(alloc);
         self.metric_catalog_snapshot.deinit(alloc);
+        if (self.market_catalog_snapshot) |*snapshot| snapshot.deinit(alloc);
         self.wal_index.deinit(alloc);
         self.checkpoint_state.deinit(alloc);
     }
@@ -397,6 +400,7 @@ pub const Snapshot = struct {
     tag_snapshot: TagSnapshot,
     series_catalog_snapshot: SeriesCatalogSnapshot,
     metric_catalog_snapshot: MetricCatalogSnapshot,
+    market_catalog_snapshot: ?market_catalog_mod.Snapshot = null,
     wal_index: WalIndex,
     checkpoint_state: CheckpointState,
 
@@ -407,6 +411,7 @@ pub const Snapshot = struct {
         self.tag_snapshot.deinit(alloc);
         self.series_catalog_snapshot.deinit(alloc);
         self.metric_catalog_snapshot.deinit(alloc);
+        if (self.market_catalog_snapshot) |*snapshot| snapshot.deinit(alloc);
         self.wal_index.deinit(alloc);
         self.checkpoint_state.deinit(alloc);
     }
@@ -1498,7 +1503,21 @@ pub const CommitWriter = struct {
         parent: ?object_store.ObjectId,
         reason: []const u8,
     ) !object_store.ObjectId {
-        var snapshot = try buildLegacySnapshot(self.alloc, data_dir, manifest, tags, series_catalog, metric_catalog, self.store, self.extent_chunk_bytes);
+        return try self.writeSnapshotWithMarket(data_dir, manifest, tags, series_catalog, metric_catalog, null, parent, reason);
+    }
+
+    pub fn writeSnapshotWithMarket(
+        self: *CommitWriter,
+        data_dir: std.fs.Dir,
+        manifest: *const manifest_mod.Manifest,
+        tags: *const tags_mod.TagIndex,
+        series_catalog: *const series_catalog_mod.SeriesCatalog,
+        metric_catalog: *const metric_catalog_mod.MetricCatalog,
+        market_catalog: ?*market_catalog_mod.Catalog,
+        parent: ?object_store.ObjectId,
+        reason: []const u8,
+    ) !object_store.ObjectId {
+        var snapshot = try buildLegacySnapshotWithMarket(self.alloc, data_dir, manifest, tags, series_catalog, metric_catalog, market_catalog, self.store, self.extent_chunk_bytes);
         defer snapshot.deinit(self.alloc);
         return try self.writePreparedSnapshot(&snapshot, parent, reason);
     }
@@ -1543,6 +1562,12 @@ pub const CommitWriter = struct {
         defer self.alloc.free(metric_payload);
         const metric_blob_id = try self.store.put(.blob, metric_payload);
 
+        const market_blob_id = if (snapshot.market_catalog_snapshot) |market_snapshot| blk: {
+            const market_payload = try encodeMarketCatalogSnapshot(self.alloc, market_snapshot);
+            defer self.alloc.free(market_payload);
+            break :blk try self.store.put(.blob, market_payload);
+        } else null;
+
         const wal_payload = try encodeWalIndex(self.alloc, snapshot.wal_index);
         defer self.alloc.free(wal_payload);
         const wal_blob_id = try self.store.put(.blob, wal_payload);
@@ -1573,6 +1598,13 @@ pub const CommitWriter = struct {
             .object_type = .blob,
             .object_id = metric_blob_id,
         });
+        if (market_blob_id) |blob_id| {
+            try metadata_entries.append(.{
+                .name = try self.alloc.dupe(u8, "market_catalog"),
+                .object_type = .blob,
+                .object_id = blob_id,
+            });
+        }
         try metadata_entries.append(.{
             .name = try self.alloc.dupe(u8, "tags"),
             .object_type = .blob,
@@ -1827,6 +1859,8 @@ pub const CommitReader = struct {
         errdefer series_catalog_snapshot.deinit(self.alloc);
         var metric_catalog_snapshot = try MetricCatalogSnapshot.empty(self.alloc);
         errdefer metric_catalog_snapshot.deinit(self.alloc);
+        var market_catalog_snapshot: ?market_catalog_mod.Snapshot = null;
+        errdefer if (market_catalog_snapshot) |*snapshot| snapshot.deinit(self.alloc);
         var wal_index = try WalIndex.empty(self.alloc);
         errdefer wal_index.deinit(self.alloc);
         var checkpoint_state = try CheckpointState.empty(self.alloc);
@@ -1864,6 +1898,14 @@ pub const CommitReader = struct {
                 if (loaded.obj_type != .blob) return error.InvalidMetricCatalogSnapshotObject;
                 metric_catalog_snapshot.deinit(self.alloc);
                 metric_catalog_snapshot = try decodeMetricCatalogSnapshot(self.alloc, loaded.payload);
+            }
+
+            if (findBlobEntry(metadata_tree.entries, "market_catalog")) |market_blob_id| {
+                const loaded = try self.store.get(self.alloc, market_blob_id);
+                defer self.alloc.free(loaded.payload);
+                if (loaded.obj_type != .blob) return error.InvalidMetricCatalogSnapshotObject;
+                if (market_catalog_snapshot) |*snapshot| snapshot.deinit(self.alloc);
+                market_catalog_snapshot = try decodeMarketCatalogSnapshot(self.alloc, loaded.payload);
             }
 
             if (findTreeEntry(metadata_tree.entries, "segments")) |segments_tree_id| {
@@ -1906,6 +1948,7 @@ pub const CommitReader = struct {
             .tag_snapshot = tag_snapshot,
             .series_catalog_snapshot = series_catalog_snapshot,
             .metric_catalog_snapshot = metric_catalog_snapshot,
+            .market_catalog_snapshot = market_catalog_snapshot,
             .wal_index = wal_index,
             .checkpoint_state = checkpoint_state,
         };
@@ -1919,7 +1962,19 @@ pub const CommitReader = struct {
         series_catalog: *const series_catalog_mod.SeriesCatalog,
         metric_catalog: *const metric_catalog_mod.MetricCatalog,
     ) !void {
-        var live = try buildLegacySnapshot(self.alloc, data_dir, manifest, tags, series_catalog, metric_catalog, self.store, default_extent_chunk_bytes);
+        return try self.verifyHeadMatchesLegacyWithMarket(data_dir, manifest, tags, series_catalog, metric_catalog, null);
+    }
+
+    pub fn verifyHeadMatchesLegacyWithMarket(
+        self: *CommitReader,
+        data_dir: std.fs.Dir,
+        manifest: *const manifest_mod.Manifest,
+        tags: *const tags_mod.TagIndex,
+        series_catalog: *const series_catalog_mod.SeriesCatalog,
+        metric_catalog: *const metric_catalog_mod.MetricCatalog,
+        market_catalog: ?*market_catalog_mod.Catalog,
+    ) !void {
+        var live = try buildLegacySnapshotWithMarket(self.alloc, data_dir, manifest, tags, series_catalog, metric_catalog, market_catalog, self.store, default_extent_chunk_bytes);
         defer live.deinit(self.alloc);
 
         var stored = try self.loadHeadSnapshot();
@@ -2267,9 +2322,21 @@ pub const CasManager = struct {
         series_catalog: *const series_catalog_mod.SeriesCatalog,
         metric_catalog: *const metric_catalog_mod.MetricCatalog,
     ) !object_store.ObjectId {
+        return try self.bootstrapIfMissingWithMarket(data_dir, manifest, tags, series_catalog, metric_catalog, null);
+    }
+
+    pub fn bootstrapIfMissingWithMarket(
+        self: *CasManager,
+        data_dir: std.fs.Dir,
+        manifest: *const manifest_mod.Manifest,
+        tags: *const tags_mod.TagIndex,
+        series_catalog: *const series_catalog_mod.SeriesCatalog,
+        metric_catalog: *const metric_catalog_mod.MetricCatalog,
+        market_catalog: ?*market_catalog_mod.Catalog,
+    ) !object_store.ObjectId {
         if (try self.refs.readHead(main_ref)) |head| return head;
         var writer = CommitWriter{ .alloc = self.alloc, .store = &self.store, .extent_chunk_bytes = self.format.extent_chunk_bytes };
-        const commit_id = try writer.writeSnapshot(data_dir, manifest, tags, series_catalog, metric_catalog, null, "bootstrap");
+        const commit_id = try writer.writeSnapshotWithMarket(data_dir, manifest, tags, series_catalog, metric_catalog, market_catalog, null, "bootstrap");
         try self.refs.compareAndSwapRef(main_ref, null, commit_id, "bootstrap");
         try self.ensureHeadSymRef();
         try self.refreshCommitGraph();
@@ -2285,9 +2352,22 @@ pub const CasManager = struct {
         metric_catalog: *const metric_catalog_mod.MetricCatalog,
         reason: []const u8,
     ) !object_store.ObjectId {
+        return try self.syncLegacySnapshotWithMarket(data_dir, manifest, tags, series_catalog, metric_catalog, null, reason);
+    }
+
+    pub fn syncLegacySnapshotWithMarket(
+        self: *CasManager,
+        data_dir: std.fs.Dir,
+        manifest: *const manifest_mod.Manifest,
+        tags: *const tags_mod.TagIndex,
+        series_catalog: *const series_catalog_mod.SeriesCatalog,
+        metric_catalog: *const metric_catalog_mod.MetricCatalog,
+        market_catalog: ?*market_catalog_mod.Catalog,
+        reason: []const u8,
+    ) !object_store.ObjectId {
         const parent = try self.refs.readHead(main_ref);
         var writer = CommitWriter{ .alloc = self.alloc, .store = &self.store, .extent_chunk_bytes = self.format.extent_chunk_bytes };
-        const commit_id = try writer.writeSnapshot(data_dir, manifest, tags, series_catalog, metric_catalog, parent, reason);
+        const commit_id = try writer.writeSnapshotWithMarket(data_dir, manifest, tags, series_catalog, metric_catalog, market_catalog, parent, reason);
         try self.refs.compareAndSwapRef(main_ref, parent, commit_id, reason);
         try self.refreshCommitGraph();
         return commit_id;
@@ -2301,8 +2381,20 @@ pub const CasManager = struct {
         series_catalog: *const series_catalog_mod.SeriesCatalog,
         metric_catalog: *const metric_catalog_mod.MetricCatalog,
     ) !void {
+        return try self.verifyHeadMatchesLegacyWithMarket(data_dir, manifest, tags, series_catalog, metric_catalog, null);
+    }
+
+    pub fn verifyHeadMatchesLegacyWithMarket(
+        self: *CasManager,
+        data_dir: std.fs.Dir,
+        manifest: *const manifest_mod.Manifest,
+        tags: *const tags_mod.TagIndex,
+        series_catalog: *const series_catalog_mod.SeriesCatalog,
+        metric_catalog: *const metric_catalog_mod.MetricCatalog,
+        market_catalog: ?*market_catalog_mod.Catalog,
+    ) !void {
         var reader = CommitReader{ .alloc = self.alloc, .store = &self.store, .refs = &self.refs };
-        try reader.verifyHeadMatchesLegacy(data_dir, manifest, tags, series_catalog, metric_catalog);
+        try reader.verifyHeadMatchesLegacyWithMarket(data_dir, manifest, tags, series_catalog, metric_catalog, market_catalog);
     }
 
     pub fn loadHeadIndex(self: *CasManager) !SnapshotIndex {
@@ -2733,6 +2825,9 @@ pub const CasManager = struct {
         try writeTagsFile(self.alloc, data_dir, snapshot.tag_snapshot);
         try writeSeriesCatalogFile(self.alloc, data_dir, snapshot.series_catalog_snapshot);
         try writeMetricCatalogFile(self.alloc, data_dir, snapshot.metric_catalog_snapshot);
+        if (snapshot.market_catalog_snapshot) |market_snapshot| {
+            try writeMarketCatalogFile(self.alloc, data_dir, market_snapshot);
+        }
         _ = try cleanupStaleMirrors(self.alloc, data_dir, snapshot, false);
     }
 
@@ -3298,6 +3393,11 @@ pub const CasManager = struct {
         errdefer series_catalog_snapshot.deinit(self.alloc);
         var metric_catalog_snapshot = try cloneMetricCatalogSnapshot(self.alloc, snapshot.metric_catalog_snapshot);
         errdefer metric_catalog_snapshot.deinit(self.alloc);
+        var market_catalog_snapshot = if (snapshot.market_catalog_snapshot) |market_snapshot|
+            try market_snapshot.clone(self.alloc)
+        else
+            null;
+        errdefer if (market_catalog_snapshot) |*catalog_snapshot| catalog_snapshot.deinit(self.alloc);
 
         const wal_entries = try self.alloc.alloc(WalChunkDescriptor, snapshot.wal_index.entries.len);
         errdefer {
@@ -3327,6 +3427,7 @@ pub const CasManager = struct {
                 .tag_snapshot = tag_snapshot,
                 .series_catalog_snapshot = series_catalog_snapshot,
                 .metric_catalog_snapshot = metric_catalog_snapshot,
+                .market_catalog_snapshot = market_catalog_snapshot,
                 .wal_index = wal_index,
                 .checkpoint_state = checkpoint_state,
             },
@@ -5971,6 +6072,20 @@ pub fn buildLegacySnapshot(
     store: ?*object_store.ObjectStore,
     extent_chunk_bytes: u32,
 ) !LegacySnapshot {
+    return try buildLegacySnapshotWithMarket(alloc, data_dir, manifest, tags, series_catalog, metric_catalog, null, store, extent_chunk_bytes);
+}
+
+pub fn buildLegacySnapshotWithMarket(
+    alloc: std.mem.Allocator,
+    data_dir: std.fs.Dir,
+    manifest: *const manifest_mod.Manifest,
+    tags: *const tags_mod.TagIndex,
+    series_catalog: *const series_catalog_mod.SeriesCatalog,
+    metric_catalog: *const metric_catalog_mod.MetricCatalog,
+    market_catalog: ?*market_catalog_mod.Catalog,
+    store: ?*object_store.ObjectStore,
+    extent_chunk_bytes: u32,
+) !LegacySnapshot {
     var descriptors = std.array_list.Managed(SegmentDescriptor).init(alloc);
     errdefer {
         for (descriptors.items) |*descriptor| descriptor.deinit(alloc);
@@ -6026,6 +6141,12 @@ pub fn buildLegacySnapshot(
     var metric_catalog_snapshot = try buildMetricCatalogSnapshot(alloc, metric_catalog);
     errdefer metric_catalog_snapshot.deinit(alloc);
 
+    var market_catalog_snapshot = if (market_catalog) |catalog|
+        try catalog.snapshotClone()
+    else
+        null;
+    errdefer if (market_catalog_snapshot) |*snapshot| snapshot.deinit(alloc);
+
     var wal_index = try buildWalIndex(alloc, data_dir, store, extent_chunk_bytes);
     errdefer wal_index.deinit(alloc);
 
@@ -6037,6 +6158,7 @@ pub fn buildLegacySnapshot(
         .tag_snapshot = tag_snapshot,
         .series_catalog_snapshot = series_catalog_snapshot,
         .metric_catalog_snapshot = metric_catalog_snapshot,
+        .market_catalog_snapshot = market_catalog_snapshot,
         .wal_index = wal_index,
         .checkpoint_state = checkpoint_state,
     };
@@ -6061,6 +6183,27 @@ pub fn verifyLegacySnapshot(live: LegacySnapshot, stored: Snapshot) !void {
     if (live.metric_catalog_snapshot.entries.len != stored.metric_catalog_snapshot.entries.len) return error.CasVerificationFailed;
     for (live.metric_catalog_snapshot.entries, stored.metric_catalog_snapshot.entries) |lhs, rhs| {
         if (!lhs.eql(rhs)) return error.CasVerificationFailed;
+    }
+
+    if ((live.market_catalog_snapshot == null) != (stored.market_catalog_snapshot == null)) return error.CasVerificationFailed;
+    if (live.market_catalog_snapshot) |live_market| {
+        const stored_market = stored.market_catalog_snapshot.?;
+        if (live_market.schemas.len != stored_market.schemas.len) return error.CasVerificationFailed;
+        for (live_market.schemas, stored_market.schemas) |lhs, rhs| {
+            if (!lhs.eql(rhs)) return error.CasVerificationFailed;
+        }
+        if (live_market.bar_policies.len != stored_market.bar_policies.len) return error.CasVerificationFailed;
+        for (live_market.bar_policies, stored_market.bar_policies) |lhs, rhs| {
+            if (!std.mem.eql(u8, lhs.id, rhs.id) or lhs.version != rhs.version or !std.mem.eql(u8, lhs.source_metric, rhs.source_metric) or lhs.interval_ns != rhs.interval_ns or !std.mem.eql(u8, lhs.session_rule, rhs.session_rule) or !std.mem.eql(u8, lhs.no_trade_rule, rhs.no_trade_rule) or !std.mem.eql(u8, lhs.halt_rule, rhs.halt_rule) or !std.mem.eql(u8, lhs.correction_policy, rhs.correction_policy) or !optionalStringEql(lhs.trade_filter, rhs.trade_filter)) return error.CasVerificationFailed;
+        }
+        if (live_market.rollups.len != stored_market.rollups.len) return error.CasVerificationFailed;
+        for (live_market.rollups, stored_market.rollups) |lhs, rhs| {
+            if (!std.mem.eql(u8, lhs.id, rhs.id) or lhs.version != rhs.version or !std.mem.eql(u8, lhs.source_metric, rhs.source_metric) or !std.mem.eql(u8, lhs.target_metric, rhs.target_metric) or !std.mem.eql(u8, lhs.policy_id, rhs.policy_id) or lhs.transform_kind != rhs.transform_kind) return error.CasVerificationFailed;
+        }
+        if (live_market.signals.len != stored_market.signals.len) return error.CasVerificationFailed;
+        for (live_market.signals, stored_market.signals) |lhs, rhs| {
+            if (!std.mem.eql(u8, lhs.id, rhs.id) or lhs.version != rhs.version or !std.mem.eql(u8, lhs.input_metric, rhs.input_metric) or !optionalStringEql(lhs.policy_id, rhs.policy_id) or lhs.expression_kind != rhs.expression_kind or !std.mem.eql(u8, lhs.params_json, rhs.params_json) or !std.mem.eql(u8, lhs.emit_rule, rhs.emit_rule)) return error.CasVerificationFailed;
+        }
     }
 }
 
@@ -6546,6 +6689,73 @@ fn decodeMetricCatalogSnapshot(alloc: std.mem.Allocator, payload: []const u8) !M
     }
     try cursor.finish();
     return .{ .entries = entries };
+}
+
+fn encodeMarketCatalogSnapshot(alloc: std.mem.Allocator, snapshot: market_catalog_mod.Snapshot) ![]u8 {
+    var buffer = std.array_list.Managed(u8).init(alloc);
+    errdefer buffer.deinit();
+    var writer = buffer.writer();
+    var tmp: [1024]u8 = undefined;
+    var adapter = writer.adaptToNewApi(&tmp);
+    var iface = &adapter.new_interface;
+    var jw = std.json.Stringify{ .writer = iface };
+    try jw.beginObject();
+    try jw.objectField("schemas");
+    try jw.beginArray();
+    for (snapshot.schemas) |entry| try market_catalog_mod.writeSchema(&jw, entry);
+    try jw.endArray();
+    try jw.objectField("bar_policies");
+    try jw.beginArray();
+    for (snapshot.bar_policies) |entry| try market_catalog_mod.writeBarPolicy(&jw, entry);
+    try jw.endArray();
+    try jw.objectField("rollups");
+    try jw.beginArray();
+    for (snapshot.rollups) |entry| try market_catalog_mod.writeRollup(&jw, entry);
+    try jw.endArray();
+    try jw.objectField("signals");
+    try jw.beginArray();
+    for (snapshot.signals) |entry| try market_catalog_mod.writeSignal(&jw, entry);
+    try jw.endArray();
+    try jw.endObject();
+    try iface.flush();
+    if (adapter.err) |err| return err;
+    return try buffer.toOwnedSlice();
+}
+
+fn decodeMarketCatalogSnapshot(alloc: std.mem.Allocator, payload: []const u8) !market_catalog_mod.Snapshot {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, payload, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidMetricCatalogSnapshotObject;
+    const obj = parsed.value.object;
+
+    var snapshot = try market_catalog_mod.Snapshot.empty(alloc);
+    errdefer snapshot.deinit(alloc);
+
+    if (obj.get("schemas")) |value| {
+        if (value != .array) return error.InvalidMetricCatalogSnapshotObject;
+        alloc.free(snapshot.schemas);
+        snapshot.schemas = try alloc.alloc(market_catalog_mod.MarketSchema, value.array.items.len);
+        for (value.array.items, 0..) |item, idx| snapshot.schemas[idx] = try decodeMarketSchemaEntry(alloc, item);
+    }
+    if (obj.get("bar_policies")) |value| {
+        if (value != .array) return error.InvalidMetricCatalogSnapshotObject;
+        alloc.free(snapshot.bar_policies);
+        snapshot.bar_policies = try alloc.alloc(market_catalog_mod.BarPolicy, value.array.items.len);
+        for (value.array.items, 0..) |item, idx| snapshot.bar_policies[idx] = try decodeBarPolicyEntry(alloc, item);
+    }
+    if (obj.get("rollups")) |value| {
+        if (value != .array) return error.InvalidMetricCatalogSnapshotObject;
+        alloc.free(snapshot.rollups);
+        snapshot.rollups = try alloc.alloc(market_catalog_mod.RollupDefinition, value.array.items.len);
+        for (value.array.items, 0..) |item, idx| snapshot.rollups[idx] = try decodeRollupEntry(alloc, item);
+    }
+    if (obj.get("signals")) |value| {
+        if (value != .array) return error.InvalidMetricCatalogSnapshotObject;
+        alloc.free(snapshot.signals);
+        snapshot.signals = try alloc.alloc(market_catalog_mod.SignalDefinition, value.array.items.len);
+        for (value.array.items, 0..) |item, idx| snapshot.signals[idx] = try decodeSignalEntry(alloc, item);
+    }
+    return snapshot;
 }
 
 fn encodeCheckpointState(alloc: std.mem.Allocator, checkpoint: CheckpointState) ![]u8 {
@@ -7093,6 +7303,98 @@ fn cloneMetricCatalogSnapshot(alloc: std.mem.Allocator, snapshot: MetricCatalogS
         };
     }
     return .{ .entries = entries };
+}
+
+fn decodeMarketSchemaEntry(alloc: std.mem.Allocator, value: std.json.Value) !market_catalog_mod.MarketSchema {
+    if (value != .object) return error.InvalidMetricCatalogSnapshotObject;
+    const obj = value.object;
+    const metric_value = obj.get("metric") orelse return error.InvalidMetricCatalogSnapshotObject;
+    const columns_value = obj.get("ordered_columns") orelse return error.InvalidMetricCatalogSnapshotObject;
+    const labels_value = obj.get("required_labels") orelse return error.InvalidMetricCatalogSnapshotObject;
+    const mapping_value = obj.get("storage_mapping") orelse return error.InvalidMetricCatalogSnapshotObject;
+    if (metric_value != .string or mapping_value != .string or columns_value != .array or labels_value != .array) return error.InvalidMetricCatalogSnapshotObject;
+    return .{
+        .metric = try alloc.dupe(u8, metric_value.string),
+        .ordered_columns = try decodeStringArray(alloc, columns_value.array.items),
+        .required_labels = try decodeStringArray(alloc, labels_value.array.items),
+        .storage_mapping = market_catalog_mod.StorageMapping.parse(mapping_value.string) orelse return error.InvalidMetricCatalogSnapshotObject,
+    };
+}
+
+fn decodeBarPolicyEntry(alloc: std.mem.Allocator, value: std.json.Value) !market_catalog_mod.BarPolicy {
+    if (value != .object) return error.InvalidMetricCatalogSnapshotObject;
+    const obj = value.object;
+    const id_value = obj.get("id") orelse return error.InvalidMetricCatalogSnapshotObject;
+    const version_value = obj.get("version") orelse return error.InvalidMetricCatalogSnapshotObject;
+    const source_value = obj.get("source_metric") orelse return error.InvalidMetricCatalogSnapshotObject;
+    const interval_value = obj.get("interval_ns") orelse return error.InvalidMetricCatalogSnapshotObject;
+    const session_value = obj.get("session_rule") orelse return error.InvalidMetricCatalogSnapshotObject;
+    const no_trade_value = obj.get("no_trade_rule") orelse return error.InvalidMetricCatalogSnapshotObject;
+    const halt_value = obj.get("halt_rule") orelse return error.InvalidMetricCatalogSnapshotObject;
+    const correction_value = obj.get("correction_policy") orelse return error.InvalidMetricCatalogSnapshotObject;
+    if (id_value != .string or source_value != .string or session_value != .string or no_trade_value != .string or halt_value != .string or correction_value != .string) return error.InvalidMetricCatalogSnapshotObject;
+    return .{
+        .id = try alloc.dupe(u8, id_value.string),
+        .version = switch (version_value) { .integer => @intCast(version_value.integer), else => return error.InvalidMetricCatalogSnapshotObject },
+        .source_metric = try alloc.dupe(u8, source_value.string),
+        .interval_ns = switch (interval_value) { .integer => interval_value.integer, else => return error.InvalidMetricCatalogSnapshotObject },
+        .session_rule = try alloc.dupe(u8, session_value.string),
+        .no_trade_rule = try alloc.dupe(u8, no_trade_value.string),
+        .halt_rule = try alloc.dupe(u8, halt_value.string),
+        .correction_policy = try alloc.dupe(u8, correction_value.string),
+        .trade_filter = if (obj.get("trade_filter")) |trade_value| if (trade_value == .string) try alloc.dupe(u8, trade_value.string) else null else null,
+    };
+}
+
+fn decodeRollupEntry(alloc: std.mem.Allocator, value: std.json.Value) !market_catalog_mod.RollupDefinition {
+    if (value != .object) return error.InvalidMetricCatalogSnapshotObject;
+    const obj = value.object;
+    const id_value = obj.get("id") orelse return error.InvalidMetricCatalogSnapshotObject;
+    const version_value = obj.get("version") orelse return error.InvalidMetricCatalogSnapshotObject;
+    const source_value = obj.get("source_metric") orelse return error.InvalidMetricCatalogSnapshotObject;
+    const target_value = obj.get("target_metric") orelse return error.InvalidMetricCatalogSnapshotObject;
+    const policy_value = obj.get("policy_id") orelse return error.InvalidMetricCatalogSnapshotObject;
+    const kind_value = obj.get("transform_kind") orelse return error.InvalidMetricCatalogSnapshotObject;
+    if (id_value != .string or source_value != .string or target_value != .string or policy_value != .string or kind_value != .string) return error.InvalidMetricCatalogSnapshotObject;
+    return .{
+        .id = try alloc.dupe(u8, id_value.string),
+        .version = switch (version_value) { .integer => @intCast(version_value.integer), else => return error.InvalidMetricCatalogSnapshotObject },
+        .source_metric = try alloc.dupe(u8, source_value.string),
+        .target_metric = try alloc.dupe(u8, target_value.string),
+        .policy_id = try alloc.dupe(u8, policy_value.string),
+        .transform_kind = market_catalog_mod.RollupTransformKind.parse(kind_value.string) orelse return error.InvalidMetricCatalogSnapshotObject,
+    };
+}
+
+fn decodeSignalEntry(alloc: std.mem.Allocator, value: std.json.Value) !market_catalog_mod.SignalDefinition {
+    if (value != .object) return error.InvalidMetricCatalogSnapshotObject;
+    const obj = value.object;
+    const id_value = obj.get("id") orelse return error.InvalidMetricCatalogSnapshotObject;
+    const version_value = obj.get("version") orelse return error.InvalidMetricCatalogSnapshotObject;
+    const input_value = obj.get("input_metric") orelse return error.InvalidMetricCatalogSnapshotObject;
+    const expression_value = obj.get("expression_kind") orelse return error.InvalidMetricCatalogSnapshotObject;
+    const params_value = obj.get("params_json") orelse return error.InvalidMetricCatalogSnapshotObject;
+    const emit_value = obj.get("emit_rule") orelse return error.InvalidMetricCatalogSnapshotObject;
+    if (id_value != .string or input_value != .string or expression_value != .string or params_value != .string or emit_value != .string) return error.InvalidMetricCatalogSnapshotObject;
+    return .{
+        .id = try alloc.dupe(u8, id_value.string),
+        .version = switch (version_value) { .integer => @intCast(version_value.integer), else => return error.InvalidMetricCatalogSnapshotObject },
+        .input_metric = try alloc.dupe(u8, input_value.string),
+        .policy_id = if (obj.get("policy_id")) |policy_value| if (policy_value == .string) try alloc.dupe(u8, policy_value.string) else null else null,
+        .expression_kind = market_catalog_mod.SignalExpressionKind.parse(expression_value.string) orelse return error.InvalidMetricCatalogSnapshotObject,
+        .params_json = try alloc.dupe(u8, params_value.string),
+        .emit_rule = try alloc.dupe(u8, emit_value.string),
+    };
+}
+
+fn decodeStringArray(alloc: std.mem.Allocator, items: []const std.json.Value) ![][]u8 {
+    const out = try alloc.alloc([]u8, items.len);
+    errdefer alloc.free(out);
+    for (items, 0..) |item, idx| {
+        if (item != .string) return error.InvalidMetricCatalogSnapshotObject;
+        out[idx] = try alloc.dupe(u8, item.string);
+    }
+    return out;
 }
 
 fn sortDescriptors(descriptors: []SegmentDescriptor) void {
@@ -8694,6 +8996,19 @@ fn writeMetricCatalogFile(alloc: std.mem.Allocator, data_dir: std.fs.Dir, metric
     try writer_state.end();
     try file.sync();
     try data_dir.rename(temp_name, "metric_catalog.jsonl");
+}
+
+fn writeMarketCatalogFile(alloc: std.mem.Allocator, data_dir: std.fs.Dir, snapshot: market_catalog_mod.Snapshot) !void {
+    const temp_name = "market_catalog.json.tmp";
+    var file = try data_dir.createFile(temp_name, .{ .truncate = true, .read = true });
+    defer file.close();
+    errdefer data_dir.deleteFile(temp_name) catch {};
+
+    const payload = try encodeMarketCatalogSnapshot(alloc, snapshot);
+    defer alloc.free(payload);
+    try file.writeAll(payload);
+    try file.sync();
+    try data_dir.rename(temp_name, market_catalog_mod.path);
 }
 
 fn materializeSnapshotMirrors(
