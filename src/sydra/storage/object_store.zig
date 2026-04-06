@@ -72,6 +72,56 @@ pub const PackReverseIndex = struct {
     }
 };
 
+pub const PackedBlobReader = struct {
+    file: std.fs.File,
+    remaining: usize,
+    expected_id: ObjectId,
+    hasher: std.crypto.hash.Blake3,
+    finished: bool = false,
+
+    pub fn deinit(self: *PackedBlobReader) void {
+        self.file.close();
+    }
+
+    pub fn read(self: *PackedBlobReader, dest: []u8) !usize {
+        if (self.remaining == 0) {
+            try self.finish();
+            return 0;
+        }
+
+        const limit = @min(dest.len, self.remaining);
+        const read_len = try self.file.read(dest[0..limit]);
+        self.hasher.update(dest[0..read_len]);
+        self.remaining -= read_len;
+        if (self.remaining == 0) try self.finish();
+        return read_len;
+    }
+
+    pub fn readNoEof(self: *PackedBlobReader, dest: []u8) !void {
+        var offset: usize = 0;
+        while (offset < dest.len) {
+            const read_len = try self.read(dest[offset..]);
+            if (read_len == 0) return error.EndOfStream;
+            offset += read_len;
+        }
+    }
+
+    pub fn readByte(self: *PackedBlobReader) !u8 {
+        var buf: [1]u8 = undefined;
+        try self.readNoEof(buf[0..]);
+        return buf[0];
+    }
+
+    pub fn finish(self: *PackedBlobReader) !void {
+        if (self.finished) return;
+        if (self.remaining != 0) return error.UnconsumedBlobPayload;
+        var actual_id: [32]u8 = undefined;
+        self.hasher.final(actual_id[0..]);
+        if (!std.mem.eql(u8, actual_id[0..], self.expected_id.hash[0..])) return error.ObjectHashMismatch;
+        self.finished = true;
+    }
+};
+
 pub const ObjectStore = struct {
     allocator: std.mem.Allocator,
     root: std.fs.Dir,
@@ -469,6 +519,38 @@ pub const ObjectStore = struct {
             if (counts[@intFromEnum(ObjectType.commit) - 1] != manifest.manifest.commit_count) return error.CorruptPackManifest;
             if (counts[@intFromEnum(ObjectType.ref) - 1] != manifest.manifest.ref_count) return error.CorruptPackManifest;
         }
+    }
+
+    pub fn openPackedBlobReader(self: *ObjectStore, allocator: std.mem.Allocator, id: ObjectId) !?PackedBlobReader {
+        _ = allocator;
+        var location = try self.findPackedLocation(id) orelse return null;
+        defer location.deinit(self.allocator);
+
+        var pack_file = try self.root.openFile(location.pack_path, .{ .mode = .read_only });
+        errdefer pack_file.close();
+        try pack_file.seekTo(location.offset);
+
+        var id_buf: [32]u8 = undefined;
+        if (try pack_file.readAll(id_buf[0..]) != id_buf.len) return error.CorruptPack;
+        if (!std.mem.eql(u8, id_buf[0..], id.hash[0..])) return error.CorruptPack;
+
+        var type_buf: [1]u8 = undefined;
+        if (try pack_file.readAll(type_buf[0..]) != type_buf.len) return error.CorruptPack;
+        const obj_type = std.meta.intToEnum(ObjectType, type_buf[0]) catch return error.UnknownObjectType;
+        if (obj_type != .blob) return error.InvalidExtentChunkObject;
+
+        var len_buf: [8]u8 = undefined;
+        if (try pack_file.readAll(len_buf[0..]) != len_buf.len) return error.CorruptPack;
+        const payload_len = std.mem.readInt(u64, &len_buf, .little);
+
+        var hasher = std.crypto.hash.Blake3.init(.{});
+        hasher.update(&[_]u8{@intFromEnum(ObjectType.blob)});
+        return .{
+            .file = pack_file,
+            .remaining = @intCast(payload_len),
+            .expected_id = id,
+            .hasher = hasher,
+        };
     }
 
     fn containsId(self: *ObjectStore, id: ObjectId) !bool {

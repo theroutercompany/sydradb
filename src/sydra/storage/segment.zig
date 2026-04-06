@@ -850,27 +850,103 @@ test "segment root range queries skip unrelated blocks" {
     try std.testing.expectEqual(points[second_block_end_idx].ts, out.items[out.items.len - 1].ts);
 }
 
-fn decodeBlockPoints(
-    alloc: std.mem.Allocator,
-    ts_bytes: []const u8,
-    values_bytes: []const u8,
-    stats: SegmentBlockStats,
-) ![]types.Point {
-    var ts_stream = std.io.fixedBufferStream(ts_bytes);
-    const ts_reader = ts_stream.reader();
-    const ts_list = try @import("../codec/gorilla.zig").decodeTsDoD(alloc, ts_reader, stats.count, stats.first_ts);
-    defer alloc.free(ts_list);
+test "segment root range queries stream from packed extents" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
 
-    var values_stream = std.io.fixedBufferStream(values_bytes);
-    const values_reader = values_stream.reader();
-    const values = try @import("../codec/gorilla.zig").decodeF64(alloc, values_reader, stats.count);
-    defer alloc.free(values);
+    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/segment-root-packed-range-store", .{tmp.sub_path});
+    defer alloc.free(store_path);
+    var store = try object_store.ObjectStore.init(alloc, store_path, .none);
+    defer store.deinit();
 
-    const points = try alloc.alloc(types.Point, stats.count);
-    for (points, ts_list, values) |*point, ts, value| {
-        point.* = .{ .ts = ts, .value = value };
+    const point_count: usize = segment_root_block_point_count + 32;
+    const points = try alloc.alloc(types.Point, point_count);
+    defer alloc.free(points);
+    for (points, 0..) |*point, idx| {
+        point.* = .{
+            .ts = 200_000 + @as(i64, @intCast(idx)) * 2,
+            .value = @floatFromInt(idx),
+        };
     }
-    return points;
+
+    const root_id = try writeSegmentRoot(alloc, &store, .{
+        .series_id = 15,
+        .hour_bucket = 0,
+        .ts_codec = 1,
+        .val_codec = 1,
+    }, points, 0);
+
+    const ids = try store.listIds(alloc);
+    defer alloc.free(ids);
+    var pack_write = try store.writePack(alloc, ids);
+    defer pack_write.deinit(alloc);
+
+    const Descriptor = struct {
+        series_id: types.SeriesId,
+        start_ts: i64,
+        end_ts: i64,
+        segment_root: ?object_store.ObjectId,
+        path: []const u8 = "",
+    };
+    const descriptors = [_]Descriptor{.{
+        .series_id = 15,
+        .start_ts = points[0].ts,
+        .end_ts = points[points.len - 1].ts,
+        .segment_root = root_id,
+    }};
+
+    var out = std.array_list.Managed(types.Point).init(alloc);
+    defer out.deinit();
+    try queryRangeDescriptorEntries(
+        alloc,
+        tmp.dir,
+        &store,
+        descriptors[0..],
+        15,
+        points[segment_root_block_point_count - 3].ts,
+        points[segment_root_block_point_count + 3].ts,
+        &out,
+    );
+    try std.testing.expectEqual(@as(usize, 7), out.items.len);
+    try std.testing.expectEqual(points[segment_root_block_point_count - 3].ts, out.items[0].ts);
+    try std.testing.expectEqual(points[segment_root_block_point_count + 3].ts, out.items[out.items.len - 1].ts);
+}
+
+fn appendBlockPointsFromExtentTrees(
+    alloc: std.mem.Allocator,
+    store: *object_store.ObjectStore,
+    ts_tree: extents.WriteResult,
+    values_tree: extents.WriteResult,
+    stats: SegmentBlockStats,
+    maybe_start_ts: ?i64,
+    maybe_end_ts: ?i64,
+    out: *std.array_list.Managed(types.Point),
+) !usize {
+    var ts_reader = try extents.openReader(alloc, store, ts_tree);
+    defer ts_reader.deinit();
+    const ts_list = try @import("../codec/gorilla.zig").decodeTsDoD(alloc, &ts_reader, stats.count, stats.first_ts);
+    defer alloc.free(ts_list);
+    try ts_reader.finish();
+
+    var values_reader = try extents.openReader(alloc, store, values_tree);
+    defer values_reader.deinit();
+    const values = try @import("../codec/gorilla.zig").decodeF64(alloc, &values_reader, stats.count);
+    defer alloc.free(values);
+    try values_reader.finish();
+
+    var appended: usize = 0;
+    for (ts_list, values) |ts, value| {
+        if (maybe_start_ts) |start_ts| {
+            if (ts < start_ts) continue;
+        }
+        if (maybe_end_ts) |end_ts| {
+            if (ts > end_ts) continue;
+        }
+        try out.append(.{ .ts = ts, .value = value });
+        appended += 1;
+    }
+    return appended;
 }
 
 fn appendSegmentRootPoints(
@@ -920,38 +996,15 @@ fn appendSegmentRootPoints(
 
         const ts_root_id = findTreeEntry(block_tree.entries, "ts", .tree) orelse return error.MissingSegmentBlockTs;
         const values_root_id = findTreeEntry(block_tree.entries, "values", .tree) orelse return error.MissingSegmentBlockValues;
-        const ts_bytes = try extents.readAll(alloc, store, .{
+        appended_count += try appendBlockPointsFromExtentTrees(alloc, store, .{
             .root_id = ts_root_id,
             .size_bytes = stats.ts_size_bytes,
             .chunk_bytes = metadata.extent_chunk_bytes,
-        });
-        defer alloc.free(ts_bytes);
-
-        const values_bytes = try extents.readAll(alloc, store, .{
+        }, .{
             .root_id = values_root_id,
             .size_bytes = stats.values_size_bytes,
             .chunk_bytes = metadata.extent_chunk_bytes,
-        });
-        defer alloc.free(values_bytes);
-
-        const block_points = try decodeBlockPoints(alloc, ts_bytes, values_bytes, stats);
-        defer alloc.free(block_points);
-
-        if (maybe_start_ts == null and maybe_end_ts == null) {
-            try out.appendSlice(block_points);
-            appended_count += block_points.len;
-            continue;
-        }
-
-        for (block_points) |point| {
-            if (maybe_start_ts) |start_ts| {
-                if (point.ts < start_ts) continue;
-            }
-            if (maybe_end_ts) |end_ts| {
-                if (point.ts > end_ts) continue;
-            }
-            try out.append(point);
-        }
+        }, stats, maybe_start_ts, maybe_end_ts, out);
     }
 
     if (maybe_start_ts == null and maybe_end_ts == null and appended_count != metadata.count) {

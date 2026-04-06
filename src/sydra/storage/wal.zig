@@ -604,6 +604,53 @@ test "journal roots replay captured wal frames in order" {
     try std.testing.expectEqual(@as(usize, 1), ctx.point_count);
 }
 
+test "journal roots replay after packed storage prunes loose copies" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/wal-journal-packed-store", .{tmp.sub_path});
+    defer alloc.free(store_path);
+    var store = try object_store.ObjectStore.init(alloc, store_path, .none);
+    defer store.deinit();
+
+    var wal = try WAL.open(alloc, tmp.dir, .none);
+    defer wal.close();
+    const registration_bytes = try wal.appendSeriesRegistration(88, "metric.room8", "{\"host\":\"c\"}");
+    const first_bytes = try wal.append(88, 2_000, 6.5);
+    _ = try wal.append(88, 2_005, 7.5);
+
+    const root_id = try writeJournalRootForWalFile(alloc, tmp.dir, &store, "current.wal");
+    const ids = try store.listIds(alloc);
+    defer alloc.free(ids);
+    var pack_write = try store.writePack(alloc, ids);
+    defer pack_write.deinit(alloc);
+
+    var ctx = struct {
+        registered: bool = false,
+        point_count: usize = 0,
+
+        pub fn onSeriesRegistration(self: *@This(), series_id: u64, series: []const u8, canonical_tags: []const u8) !void {
+            try std.testing.expectEqual(@as(u64, 88), series_id);
+            try std.testing.expectEqualStrings("metric.room8", series);
+            try std.testing.expectEqualStrings("{\"host\":\"c\"}", canonical_tags);
+            self.registered = true;
+        }
+
+        pub fn onRecord(self: *@This(), series_id: u64, ts: i64, value: f64) !void {
+            try std.testing.expect(self.registered);
+            try std.testing.expectEqual(@as(u64, 88), series_id);
+            try std.testing.expect(ts == 2_000 or ts == 2_005);
+            _ = value;
+            self.point_count += 1;
+        }
+    }{};
+
+    try replayJournalRoot(alloc, &store, root_id, registration_bytes + first_bytes, &ctx);
+    try std.testing.expect(ctx.registered);
+    try std.testing.expectEqual(@as(usize, 1), ctx.point_count);
+}
+
 fn encodeJournalMeta(alloc: std.mem.Allocator, meta: JournalMeta) ![]u8 {
     var bytes = std.array_list.Managed(u8).init(alloc);
     errdefer bytes.deinit();
