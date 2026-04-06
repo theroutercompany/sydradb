@@ -53,16 +53,19 @@ For the current `v0.4.0` alpha cycle, the user-facing contract is intentionally 
 
 Supported and exercised today:
 
-- `SELECT` against one resolved series or `by_id(...)`
-- projections over `time`, `value`, and `tag.*`
+- `SELECT` against one resolved series, `by_id(...)`, or one metric family on the legacy path
+- projections over `time`, `value`, `tag.*`, and `label.*`
 - raw-row scalar functions currently exercised on the compiled path:
   - `abs`, `ceil`, `floor`, `round`, `sqrt`, `ln`, `pow`, `coalesce`
 - aggregate queries using:
-  - `min`, `max`, `avg`, `sum`, `count`, `first`, `last`
+  - `min`, `max`, `avg`, `sum`, `count`, `first`, `last`, `percentile`, `delta`, `rate`, `irate`
 - grouping by:
   - one `time_bucket(...)`
   - one selector tag such as `tag.host`
   - or the combination `time_bucket(...)` plus one selector tag
+- legacy fill on grouped time-bucket queries using:
+  - `fill(previous)`
+  - `fill(0)`
 - ordering by projection aliases or projected expressions on the supported raw-row path
 - `EXPLAIN BYTECODE` and `EXPLAIN TABLES_USED`
 
@@ -75,6 +78,12 @@ Explicitly out of the current compiled subset:
 - multi-series expressions / joins
 
 When a query falls outside the compiled subset, the current contract is to fall back visibly or fail explicitly rather than pretend broader support.
+
+Telemetry-first notes:
+
+- `label.<k>` is a preferred alias for `tag.<k>`.
+- Bare metric names may resolve to a metric family on the legacy path.
+- Raw row queries over a metric family must narrow to exactly one series after label filters; aggregate/grouped queries may scan multiple series.
 
 ### Selectors
 ```

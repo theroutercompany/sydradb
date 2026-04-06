@@ -81,7 +81,19 @@ const guidedState: DemoStateResponse = {
         seedRoutine: "seed",
         cleanupRoutine: "cleanup",
         whySQLiteFallsShort: ["History is first-class."],
-        steps: [],
+        steps: [
+          {
+            id: "log",
+            title: "Read commit history",
+            summary: "Show the CAS log for heads/main so the incident and rollback context are visible as commit history.",
+            kind: "cas_command",
+            workspace: "edge-east",
+            args: ["log"],
+            evidencePanels: [
+              { id: "log-entries", title: "Commit log", kind: "json", sourcePath: "entries" },
+            ],
+          },
+        ],
       },
     },
   ],
@@ -185,10 +197,10 @@ describe("ShowcaseDashboard", () => {
 
     render(<App />);
 
-    await waitFor(() => expect(screen.getByText("Edge fleet story")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("Local telemetry at the edge")).toBeInTheDocument());
     fireEvent.click(screen.getByRole("button", { name: "Dismiss launch notes" }));
 
-    await waitFor(() => expect(screen.queryByText("Edge fleet story")).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByText("Local telemetry at the edge")).not.toBeInTheDocument());
     expect(document.cookie).toContain("sydra_showcase_launch_cards=hidden");
     expect(screen.getByRole("button", { name: "Show launch notes" })).toBeInTheDocument();
   });
@@ -200,11 +212,11 @@ describe("ShowcaseDashboard", () => {
     render(<App />);
 
     await waitFor(() => expect(screen.getByRole("button", { name: "Show launch notes" })).toBeInTheDocument());
-    expect(screen.queryByText("Edge fleet story")).not.toBeInTheDocument();
+    expect(screen.queryByText("Local telemetry at the edge")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("button", { name: "Show launch notes" }));
 
-    await waitFor(() => expect(screen.getByText("Edge fleet story")).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText("Local telemetry at the edge")).toBeInTheDocument());
     expect(screen.getByRole("button", { name: "Hide launch notes" })).toBeInTheDocument();
   });
 
@@ -236,5 +248,38 @@ describe("ShowcaseDashboard", () => {
     expect(screen.getByText("If you are a manager")).toBeInTheDocument();
     expect(screen.getByText("What this step means")).toBeInTheDocument();
     expect(screen.getByText(/one site in the fleet takes on a bad state/i)).toBeInTheDocument();
+    expect(screen.getByText("Commit log")).toBeInTheDocument();
+  });
+
+  it("explains what SydraDB stores and how it is used in the model tab", () => {
+    render(
+      <ShowcaseDashboard
+        state={guidedState}
+        selectedScenarioId="cas-history"
+        releaseMode={false}
+        runResult={null}
+        theme="dark"
+        error={null}
+        launchCardsVisible={false}
+        dismissedLaunchCardIds={[]}
+        loading={false}
+        running={false}
+        onSelectScenario={vi.fn()}
+        onThemeChange={vi.fn()}
+        onToggleReleaseMode={vi.fn()}
+        onToggleLaunchCards={vi.fn()}
+        onDismissLaunchCard={vi.fn()}
+        onDismissAllLaunchCards={vi.fn()}
+        onResetSession={vi.fn()}
+        onRunScenario={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "How it works" }));
+
+    expect(screen.getByText("What SydraDB stores today")).toBeInTheDocument();
+    expect(screen.getByText(/tagged numeric time-series points/i)).toBeInTheDocument();
+    expect(screen.getByText("How applications fill it")).toBeInTheDocument();
+    expect(screen.getByText(/POST \/api\/v1\/ingest/i)).toBeInTheDocument();
   });
 });

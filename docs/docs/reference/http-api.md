@@ -111,6 +111,15 @@ Example:
 
 Consumes NDJSON (newline-delimited JSON). Each line is an object with:
 
+- Preferred telemetry envelope:
+  - `metric` (string, required)
+  - `ts` (integer, required)
+  - `value` (number, optional)
+  - `fields` (object, optional): numeric-only; each field fans out into a sibling metric named `<metric>.<field>`
+  - `labels` (object, optional)
+  - `kind` (`"gauge"` or `"counter"`, optional)
+  - `unit` (string, optional)
+  - `description` (string, optional)
 - `series` (string, required)
 - `ts` (integer, required)
 - `value` (number, optional)
@@ -129,6 +138,8 @@ Error cases:
 
 - A line that exceeds the internal buffer fails the request with `413 Payload Too Large`.
 - If ingest backpressure is hit, the request fails with a JSON error and `503 Service Unavailable`.
+- Telemetry lines with non-numeric `fields` fail with a JSON `400` error.
+- Conflicting metric descriptor metadata fails with a JSON `409` error.
 
 ## `POST /api/v1/query/range`
 
@@ -136,8 +147,9 @@ Requires `Content-Length` and a JSON body:
 
 - `start` (integer, required)
 - `end` (integer, required)
-- `series_id` (integer) **or** `series` (string)
-- `tags` (object, optional; used when hashing `series` → `series_id`)
+- `series_id` (integer) **or** `metric` (string) **or** `series` (string)
+- `labels` (object, optional; preferred exact selector for `metric`)
+- `tags` (object, optional; legacy exact selector for `series`)
 
 Returns a JSON array:
 
@@ -152,6 +164,8 @@ Implementation: [`handleQuery` (POST JSON)](./source/sydra/http.md#fn-handlequer
 Query parameters:
 
 - `series_id=<u64>` (preferred) or `series=<string>`
+- `metric=<string>` (preferred over `series` for telemetry workflows)
+- `labels=<string>` (optional canonical JSON object for exact telemetry selectors)
 - `tags=<string>` (optional, defaults to `{}`)
 - `start=<i64>` (required)
 - `end=<i64>` (required)
@@ -171,6 +185,57 @@ Response JSON: array of matching `series_id` values.
 
 Implementation: [`handleFind`](./source/sydra/http.md#fn-handlefind-void).
 
+## `POST /api/v1/metrics/find`
+
+Request JSON:
+
+- `prefix` (string, optional)
+- `labels` (object, optional)
+- `limit` (integer, optional)
+
+Response JSON: array of metric descriptors with:
+
+- `metric`
+- `kind`
+- `unit` (optional)
+- `description` (optional)
+- `series_count`
+- `label_keys`
+- `first_ts`
+- `last_ts`
+
+## `POST /api/v1/series/find`
+
+Request JSON:
+
+- `metric` (string, required)
+- `labels` (object, optional)
+- `op` (string, optional): `"and"` (default) or `"or"`
+- `limit` (integer, optional)
+
+Response JSON: array of series descriptors with:
+
+- `series_id`
+- `metric`
+- `labels`
+- `first_ts`
+- `last_ts`
+
+## `POST /api/v1/labels/values`
+
+Request JSON:
+
+- `key` (string, required)
+- `metric` (string, optional)
+- `prefix` (string, optional)
+- `limit` (integer, optional)
+
+Response JSON:
+
+```json
+{"values":["api","worker"]}
+```
+
 ## `POST /api/v1/sydraql`
 
 Request body is **plain text** sydraQL.
@@ -186,6 +251,8 @@ When the query runs on the compiled path or falls back from it, `stats` also car
 - `execution_mode`
 - `legacy_fallback`
 - `fallback_reason` (when a fallback occurred)
+- `selector_mode`
+- `selected_series_count`
 
 Error responses for `/api/*` are JSON:
 

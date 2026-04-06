@@ -41,7 +41,7 @@ This is intentionally not a broad PostgreSQL replacement. The current compatibil
 ```bash
 zig build -Doptimize=ReleaseSafe
 ./zig-out/bin/sydradb            # serve using sydradb.toml
-curl -XPOST localhost:8080/api/v1/ingest --data-binary $'{"series":"weather.room1","ts":1694300000,"value":24.2}\n'
+curl -XPOST localhost:8080/api/v1/ingest --data-binary $'{"metric":"requests_total","ts":1694300000,"value":42,"labels":{"service":"api","host":"edge-1"},"kind":"counter","unit":"requests"}\n'
 
 # Allocator modes
 zig build                                # default: mimalloc global allocator
@@ -120,7 +120,7 @@ Apache-2.0
 ## CLI
 
 ```bash
-./zig-out/bin/sydradb             # serve (HTTP): /api/v1/ingest, /api/v1/query/range, /api/v1/sydraql, /metrics
+./zig-out/bin/sydradb             # serve (HTTP): /api/v1/ingest, /api/v1/query/range, /api/v1/metrics/find, /api/v1/series/find, /api/v1/labels/values, /api/v1/sydraql, /metrics
 ./zig-out/bin/sydradb pgwire      # PostgreSQL wire protocol preview (simple query + preview prepared flow)
 ./zig-out/bin/sydradb ingest      # read NDJSON from stdin, flush, and exit only after points are queryable
 ./zig-out/bin/sydradb query <series_id> <start_ts> <end_ts>
@@ -182,8 +182,12 @@ retention.weather = 30
 Config notes:
 
 - `mem_limit_bytes` is enforced as a coarse ingest backpressure limit over queued + buffered in-memory points. When the limit is hit, ingest rejects new points and increments `/metrics` rejection counters.
-- `/api/*` error responses now include JSON fields `error`, `code`, and `status` so clients can distinguish missing input, unsupported query shapes, and overload conditions.
-- `sydradb ingest` now uses the same line parser and series-id derivation as HTTP ingest, including `tags` and fallback-to-first-numeric `fields` behavior.
+- `/api/*` error responses now include JSON fields `error`, `code`, and `status` so clients can distinguish missing input, unsupported query shapes, descriptor conflicts, and overload conditions.
+- `POST /api/v1/ingest` now accepts a telemetry-first envelope using `metric` + `labels` + optional descriptor metadata (`kind`, `unit`, `description`), while keeping the legacy `series` + `tags` envelope compatible.
+- Telemetry `fields` fan out into sibling metrics named `<metric>.<field>` without changing on-disk point storage.
+- `/api/v1/query/range` accepts `metric` + `labels` as the preferred exact selector surface; `series_id` and legacy `series` + `tags` remain supported.
+- Discovery endpoints `/api/v1/metrics/find`, `/api/v1/series/find`, and `/api/v1/labels/values` expose the catalog and label metadata needed for telemetry-style workflows.
+- `sydradb ingest` now uses the same line parser and series-id derivation as HTTP ingest, including telemetry envelopes, `tags`/`labels`, and legacy fallback-to-first-numeric `fields` behavior.
 - `cas_mode = "dual_write"` writes immutable metadata commits and `refs/heads/main` alongside the legacy storage path.
 - `metadata_read_mode = "shadow"` serves from legacy metadata and cross-checks answers against the CAS snapshot.
 - `metadata_read_mode = "primary"` serves metadata from CAS and can boot even if `MANIFEST`, `tags.json`, or `series_catalog.jsonl` are missing.
