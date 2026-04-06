@@ -90,6 +90,13 @@ fn buildScanProgram(allocator: std.mem.Allocator, compiled: compiler.CompiledSel
     const typed = compiled.typed_query;
     const columns = try buildColumns(allocator, typed.projections);
     errdefer allocator.free(columns);
+    const hidden_order_columns = try buildHiddenOrderingColumns(allocator, typed.ordering, columns);
+    errdefer if (hidden_order_columns.len != 0) allocator.free(hidden_order_columns);
+    const sorter_columns = if (hidden_order_columns.len != 0)
+        try concatColumns(allocator, columns, hidden_order_columns)
+    else
+        columns;
+    errdefer if (sorter_columns.ptr != columns.ptr) allocator.free(sorter_columns);
 
     var instructions = std.array_list.Managed(bytecode.Instruction).init(allocator);
     errdefer instructions.deinit();
@@ -104,6 +111,7 @@ fn buildScanProgram(allocator: std.mem.Allocator, compiled: compiler.CompiledSel
     const start_ts = if (typed.time_range.start) |bound| bound.value else std.math.minInt(i64);
     const end_ts = if (typed.time_range.end) |bound| bound.value else std.math.maxInt(i64);
     const uses_sorter = typed.ordering.len != 0 or typed.select.limit != null;
+    const sorter_value_count = sorter_columns.len;
 
     if (uses_sorter) {
         try instructions.append(.{
@@ -126,13 +134,16 @@ fn buildScanProgram(allocator: std.mem.Allocator, compiled: compiler.CompiledSel
     try instructions.append(.{ .opcode = .next_point, .p1 = 0, .p2 = 0 });
 
     try emitPredicate(allocator, &instructions, &constants, &exprs, typed.predicate, loop_pc);
-    try emitProjectionLoads(allocator, &instructions, &constants, &exprs, typed.projections);
+    try emitSchemaLoads(&instructions, &constants, &exprs, columns, 0);
+    if (hidden_order_columns.len != 0) {
+        try emitSchemaLoads(&instructions, &constants, &exprs, hidden_order_columns, columns.len);
+    }
     if (uses_sorter) {
         try instructions.append(.{
             .opcode = .sorter_insert,
             .p1 = 0,
             .p2 = 0,
-            .p3 = @intCast(typed.projections.len),
+            .p3 = @intCast(sorter_value_count),
         });
     } else {
         try instructions.append(.{
@@ -172,7 +183,7 @@ fn buildScanProgram(allocator: std.mem.Allocator, compiled: compiler.CompiledSel
             .constants = try constants.toOwnedSlice(),
             .exprs = try exprs.toOwnedSlice(),
             .selectors = try allocator.dupe(compiler.BoundSelector, &.{selector}),
-            .schemas = try allocator.dupe([]const plan.ColumnInfo, &.{columns}),
+            .schemas = try allocator.dupe([]const plan.ColumnInfo, &.{sorter_columns}),
             .orderings = if (typed.ordering.len != 0)
                 try allocator.dupe([]const ast.OrderExpr, &.{typed.select.ordering})
             else
@@ -182,7 +193,7 @@ fn buildScanProgram(allocator: std.mem.Allocator, compiled: compiler.CompiledSel
                 try allocator.dupe(bytecode.TempStoreDecl, &.{.{ .id = 0, .name = "sorter0" }})
             else
                 &.{},
-            .register_count = @max(typed.projections.len, 3),
+            .register_count = @max(sorter_value_count, 3),
             .source_name = "prepared_series_scan",
         },
         .columns = columns,
@@ -367,12 +378,89 @@ fn emitProjectionLoads(
     }
 }
 
+fn emitSchemaLoads(
+    instructions: *std.array_list.Managed(bytecode.Instruction),
+    constants: *std.array_list.Managed(value_mod.Value),
+    exprs: *std.array_list.Managed(*const ast.Expr),
+    columns: []const plan.ColumnInfo,
+    start_register: usize,
+) CodegenError!void {
+    for (columns, 0..) |column, idx| {
+        const register: i64 = @intCast(start_register + idx);
+        switch (column.expr.*) {
+            .identifier => |ident| {
+                const code = columnCode(ident.value) orelse return error.UnsupportedProjection;
+                try instructions.append(.{ .opcode = .column, .p1 = 0, .p2 = code, .p3 = register });
+            },
+            .literal => {
+                const const_id: u16 = @intCast(constants.items.len);
+                try constants.append(try literalValue(column.expr));
+                try instructions.append(.{ .opcode = .load_const, .p1 = register, .p4 = .{ .constant = const_id } });
+            },
+            else => {
+                const expr_id: u16 = @intCast(exprs.items.len);
+                try exprs.append(column.expr);
+                try instructions.append(.{
+                    .opcode = .function,
+                    .p1 = register,
+                    .p4 = .{ .expr = expr_id },
+                });
+            },
+        }
+    }
+}
+
 fn buildColumns(allocator: std.mem.Allocator, projections: []const compiler.TypedProjection) ![]plan.ColumnInfo {
     const columns = try allocator.alloc(plan.ColumnInfo, projections.len);
     for (projections, 0..) |projection, idx| {
         columns[idx] = .{ .name = projection.name, .expr = projection.expr.expr };
     }
     return columns;
+}
+
+fn buildHiddenOrderingColumns(
+    allocator: std.mem.Allocator,
+    ordering: []const compiler.TypedOrdering,
+    visible_columns: []const plan.ColumnInfo,
+) ![]plan.ColumnInfo {
+    var hidden = std.array_list.Managed(plan.ColumnInfo).init(allocator);
+    defer hidden.deinit();
+
+    for (ordering) |ordering_expr| {
+        if (ordering_expr.expr.expr.* != .identifier) continue;
+        const ident = ordering_expr.expr.expr.identifier;
+        if (schemaContainsIdentifier(visible_columns, ident.value)) continue;
+        if (schemaContainsIdentifier(hidden.items, ident.value)) continue;
+        try hidden.append(.{
+            .name = ident.value,
+            .expr = ordering_expr.expr.expr,
+        });
+    }
+
+    return try hidden.toOwnedSlice();
+}
+
+fn concatColumns(
+    allocator: std.mem.Allocator,
+    visible_columns: []const plan.ColumnInfo,
+    extra_columns: []const plan.ColumnInfo,
+) ![]plan.ColumnInfo {
+    const merged = try allocator.alloc(plan.ColumnInfo, visible_columns.len + extra_columns.len);
+    @memcpy(merged[0..visible_columns.len], visible_columns);
+    @memcpy(merged[visible_columns.len..], extra_columns);
+    return merged;
+}
+
+fn schemaContainsIdentifier(columns: []const plan.ColumnInfo, name: []const u8) bool {
+    const unqualified = trailingSegment(name);
+    for (columns) |column| {
+        if (namesEqual(column.name, name) or namesEqual(column.name, unqualified)) return true;
+        if (column.expr.* == .identifier) {
+            const ident = column.expr.identifier.value;
+            if (namesEqual(ident, name) or namesEqual(ident, unqualified)) return true;
+        }
+    }
+    return false;
 }
 
 fn literalValue(expr: *const ast.Expr) CodegenError!value_mod.Value {
@@ -423,4 +511,8 @@ fn trailingSegment(slice: []const u8) []const u8 {
         if (slice[index] == '.') return slice[index + 1 ..];
     }
     return slice;
+}
+
+fn namesEqual(a: []const u8, b: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(trailingSegment(a), trailingSegment(b));
 }
