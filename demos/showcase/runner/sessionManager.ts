@@ -8,7 +8,15 @@ import type { DemoStateResponse, ScenarioManifest, ScenarioRunResult } from "../
 import { buildScenarioAvailability, buildScenarioSummaries, loadScenarioManifests } from "./scenarioRegistry.js";
 import { cleanupRoutines, seedRoutines } from "./seeders.js";
 import { fixturesDir, findRepoRoot, resolveSydraBinary } from "./paths.js";
-import { cleanupSandbox, createWorkspace, runBinary, seedWorkspaceFromFixtures } from "./runtime.js";
+import {
+  cleanupSandbox,
+  createWorkspace,
+  postSydraqlQuery,
+  runBinary,
+  seedWorkspaceFromFixtures,
+  startWorkspaceServer,
+  stopWorkspaceServer,
+} from "./runtime.js";
 import { runScenarioManifest } from "./scenarioRunner.js";
 
 interface SessionSnapshot {
@@ -136,6 +144,81 @@ export class ShowcaseSessionManager {
         capabilities["cas.history"] = true;
       } catch {
         capabilities["cas.history"] = false;
+      }
+
+      const maintenanceWorkspace = await createWorkspace(path.join(sessionRoot, "capability-probe"), "maintenance");
+      try {
+        await seedWorkspaceFromFixtures(
+          maintenanceWorkspace,
+          binaryPath,
+          [path.join(fixturesDir, "edge-incident", "edge-east-baseline.ndjson")],
+        );
+        await runBinary(maintenanceWorkspace, binaryPath, ["cas", "--json", "pack"]);
+        await runBinary(maintenanceWorkspace, binaryPath, ["cas", "--json", "fsck", "--connectivity-only"]);
+        await runBinary(maintenanceWorkspace, binaryPath, ["cas", "--json", "gc"]);
+        await runBinary(maintenanceWorkspace, binaryPath, ["cas", "--json", "vacuum", "--repair"]);
+        capabilities["cas.maintenance"] = true;
+      } catch {
+        capabilities["cas.maintenance"] = false;
+      }
+
+      const bundleWorkspace = await createWorkspace(path.join(sessionRoot, "capability-probe"), "bundle");
+      try {
+        await seedWorkspaceFromFixtures(
+          bundleWorkspace,
+          binaryPath,
+          [path.join(fixturesDir, "edge-incident", "edge-east-baseline.ndjson")],
+        );
+        const bundleDir = path.join(bundleWorkspace.dir, "bundle-output");
+        await runBinary(bundleWorkspace, binaryPath, ["cas", "--json", "bundle", "create", bundleDir]);
+        await runBinary(bundleWorkspace, binaryPath, ["cas", "--json", "bundle", "verify", bundleDir]);
+        capabilities["cas.bundle"] = true;
+      } catch {
+        capabilities["cas.bundle"] = false;
+      }
+
+      const compilerWorkspace = await createWorkspace(path.join(sessionRoot, "capability-probe"), "compiler", "compiled");
+      const shadowWorkspace = await createWorkspace(path.join(sessionRoot, "capability-probe"), "shadow", "shadow");
+      try {
+        await seedWorkspaceFromFixtures(
+          compilerWorkspace,
+          binaryPath,
+          [path.join(fixturesDir, "edge-incident", "edge-east-baseline.ndjson")],
+        );
+        await seedWorkspaceFromFixtures(
+          shadowWorkspace,
+          binaryPath,
+          [path.join(fixturesDir, "edge-incident", "edge-east-baseline.ndjson")],
+        );
+
+        await startWorkspaceServer(compilerWorkspace, binaryPath);
+        const compiledResult = (await postSydraqlQuery(
+          compilerWorkspace,
+          "select tag.host as host, avg(value) as avg_value from edge.power_kw where tag.site = 'edge-east' group by tag.host",
+        )) as { stats?: { execution_mode?: string; trace_id?: string } };
+        capabilities["compiler.telemetry"] =
+          compiledResult.stats?.execution_mode === "compiled" &&
+          typeof compiledResult.stats?.trace_id === "string" &&
+          compiledResult.stats.trace_id.length > 0;
+      } catch {
+        capabilities["compiler.telemetry"] = false;
+      } finally {
+        await stopWorkspaceServer(compilerWorkspace).catch(() => {});
+      }
+
+      try {
+        await startWorkspaceServer(shadowWorkspace, binaryPath);
+        const shadowResult = (await postSydraqlQuery(shadowWorkspace, "select abs(-1)")) as {
+          stats?: { execution_mode?: string; legacy_fallback?: boolean; fallback_reason?: string };
+        };
+        capabilities["compiler.modes"] =
+          shadowResult.stats?.execution_mode === "shadow" &&
+          shadowResult.stats?.legacy_fallback === true &&
+          typeof shadowResult.stats?.fallback_reason === "string";
+      } catch {
+        capabilities["compiler.modes"] = false;
+      } finally {
+        await stopWorkspaceServer(shadowWorkspace).catch(() => {});
       }
     }
 
