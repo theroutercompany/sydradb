@@ -232,7 +232,18 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     const sub = std.mem.sliceTo(args[2], 0);
     if (std.mem.eql(u8, sub, "clone")) {
         if (args.len < 5) return error.Invalid;
-        const result = try cas_mod.cloneLocalRepository(alloc, std.mem.sliceTo(args[3], 0), std.mem.sliceTo(args[4], 0), cfg.fsync);
+        var options = cas_mod.LocalCloneOptions{};
+        if (args.len >= 6) {
+            if (!std.mem.eql(u8, std.mem.sliceTo(args[5], 0), "--borrow")) return error.Invalid;
+            options.borrow = true;
+        }
+        const result = try cas_mod.cloneLocalRepositoryWithOptions(
+            alloc,
+            std.mem.sliceTo(args[3], 0),
+            std.mem.sliceTo(args[4], 0),
+            cfg.fsync,
+            options,
+        );
         std.debug.print(
             "cas clone refs={d} prerequisites={d} objects={d} packs={d} reftable_files={d}\n",
             .{ result.ref_count, result.prerequisite_count, result.object_count, result.pack_count, result.reftable_file_count },
@@ -241,7 +252,12 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     }
     if (std.mem.eql(u8, sub, "fetch-local")) {
         if (args.len < 4) return error.Invalid;
-        const result = try cas_mod.fetchLocalRepository(alloc, std.mem.sliceTo(args[3], 0), cfg.data_dir, cfg.fsync);
+        var options = cas_mod.LocalFetchOptions{};
+        if (args.len >= 5) {
+            if (!std.mem.eql(u8, std.mem.sliceTo(args[4], 0), "--materialize")) return error.Invalid;
+            options.materialize = true;
+        }
+        const result = try cas_mod.fetchLocalRepositoryWithOptions(alloc, std.mem.sliceTo(args[3], 0), cfg.data_dir, cfg.fsync, options);
         const repo_hex = result.repository_id.toHex();
         std.debug.print(
             "cas fetch-local repository={s} refs={d} borrowed_repositories={d}\n",
@@ -251,7 +267,12 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     }
     if (std.mem.eql(u8, sub, "push-local")) {
         if (args.len < 4) return error.Invalid;
-        const result = try cas_mod.pushLocalRepository(alloc, cfg.data_dir, std.mem.sliceTo(args[3], 0), cfg.fsync);
+        var options = cas_mod.LocalPushOptions{};
+        if (args.len >= 5) {
+            if (!std.mem.eql(u8, std.mem.sliceTo(args[4], 0), "--borrow")) return error.Invalid;
+            options.borrow = true;
+        }
+        const result = try cas_mod.pushLocalRepositoryWithOptions(alloc, cfg.data_dir, std.mem.sliceTo(args[3], 0), cfg.fsync, options);
         const repo_hex = result.repository_id.toHex();
         std.debug.print(
             "cas push-local repository={s} refs={d} borrowed_repositories={d}\n",
