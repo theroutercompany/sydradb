@@ -109,7 +109,13 @@ pub const Program = struct {
         if (self.exprs.len != 0) self.allocator.free(self.exprs);
         if (self.selectors.len != 0) self.allocator.free(self.selectors);
         if (self.schemas.len != 0) self.allocator.free(self.schemas);
-        if (self.orderings.len != 0) self.allocator.free(self.orderings);
+        if (self.orderings.len != 0) {
+            for (self.orderings) |ordering_list| {
+                for (ordering_list) |ordering| freeOwnedOrderingExpr(self.allocator, ordering);
+                if (ordering_list.len != 0) self.allocator.free(ordering_list);
+            }
+            self.allocator.free(self.orderings);
+        }
         if (self.aggregates.len != 0) self.allocator.free(self.aggregates);
         if (self.cursors.len != 0) self.allocator.free(self.cursors);
         if (self.temp_stores.len != 0) self.allocator.free(self.temp_stores);
@@ -117,6 +123,11 @@ pub const Program = struct {
         self.* = undefined;
     }
 };
+
+fn freeOwnedOrderingExpr(allocator: std.mem.Allocator, ordering: ast.OrderExpr) void {
+    if (ordering.expr.* == .identifier) allocator.free(ordering.expr.identifier.value);
+    allocator.destroy(@constCast(ordering.expr));
+}
 
 pub const DisassemblyLine = struct {
     pc: usize,
