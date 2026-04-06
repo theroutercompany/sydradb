@@ -938,6 +938,51 @@ test "parse select with group fill order" {
     try std.testing.expect(order_clause.direction == .desc);
 }
 
+test "handwritten parser matches supported statement goldens" {
+    const alloc = std.testing.allocator;
+    const contents = @embedFile("parser_cases.tsv");
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len == 0 or line[0] == '#') continue;
+
+        const tab = std.mem.indexOfScalar(u8, line, '\t') orelse return error.InvalidCharacter;
+        const expected = line[0..tab];
+        const query = line[tab + 1 ..];
+
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+
+        var parser_inst = Parser.init(arena.allocator(), query);
+        const statement = try parser_inst.parse();
+        const summary = try statementShapeSummary(alloc, statement);
+        defer alloc.free(summary);
+
+        try std.testing.expectEqualStrings(expected, summary);
+    }
+}
+
+test "handwritten parser matches malformed query goldens" {
+    const alloc = std.testing.allocator;
+    const contents = @embedFile("parser_error_cases.tsv");
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |line_raw| {
+        const line = std.mem.trim(u8, line_raw, " \t\r\n");
+        if (line.len == 0 or line[0] == '#') continue;
+
+        const tab = std.mem.indexOfScalar(u8, line, '\t') orelse return error.InvalidCharacter;
+        const expected_error = line[0..tab];
+        const query = line[tab + 1 ..];
+
+        var arena = std.heap.ArenaAllocator.init(alloc);
+        defer arena.deinit();
+
+        var parser_inst = Parser.init(arena.allocator(), query);
+        const parse_result = parser_inst.parse();
+        try std.testing.expectError(parserErrorByName(expected_error) orelse return error.InvalidCharacter, parse_result);
+    }
+}
+
 test "frontend scaffolding compiles alongside handwritten parser" {
     const alloc = std.testing.allocator;
     var gen = parsergen.ParserGenerator.init(alloc);
@@ -945,4 +990,93 @@ test "frontend scaffolding compiles alongside handwritten parser" {
     defer alloc.free(artifact.emitted_source);
 
     try std.testing.expectEqualStrings("sydraql_core", artifact.grammar_name);
+}
+
+fn statementShapeSummary(alloc: std.mem.Allocator, statement: ast.Statement) ![]u8 {
+    return switch (statement) {
+        .invalid => alloc.dupe(u8, "invalid"),
+        .select => |select_stmt| std.fmt.allocPrint(
+            alloc,
+            "select|proj={d}|selector={s}|predicate={}|group={d}|fill={s}|order={d}|limit={}",
+            .{
+                select_stmt.projections.len,
+                selectorKind(select_stmt.selector),
+                select_stmt.predicate != null,
+                select_stmt.groupings.len,
+                fillKind(select_stmt.fill),
+                select_stmt.ordering.len,
+                select_stmt.limit != null,
+            },
+        ),
+        .insert => |insert_stmt| std.fmt.allocPrint(
+            alloc,
+            "insert|columns={d}|values={d}",
+            .{ insert_stmt.columns.len, insert_stmt.values.len },
+        ),
+        .delete => |delete_stmt| std.fmt.allocPrint(
+            alloc,
+            "delete|selector={s}|predicate={}",
+            .{ seriesKind(delete_stmt.selector.series), delete_stmt.predicate != null },
+        ),
+        .explain => |explain_stmt| std.fmt.allocPrint(
+            alloc,
+            "explain|mode={s}|target={s}",
+            .{ explainModeName(explain_stmt.mode), statementTagName(explain_stmt.target.*) },
+        ),
+    };
+}
+
+fn selectorKind(selector: ?ast.Selector) []const u8 {
+    if (selector) |sel| return seriesKind(sel.series);
+    return "none";
+}
+
+fn seriesKind(series: ast.SeriesRef) []const u8 {
+    return switch (series) {
+        .name => "name",
+        .by_id => "by_id",
+    };
+}
+
+fn fillKind(fill: ?ast.FillClause) []const u8 {
+    if (fill) |fill_clause| {
+        return switch (fill_clause.strategy) {
+            .previous => "previous",
+            .linear => "linear",
+            .null_value => "null",
+            .constant => "constant",
+        };
+    }
+    return "none";
+}
+
+fn explainModeName(mode: ast.ExplainMode) []const u8 {
+    return switch (mode) {
+        .standard => "standard",
+        .bytecode => "bytecode",
+        .tables_used => "tables_used",
+    };
+}
+
+fn statementTagName(statement: ast.Statement) []const u8 {
+    return switch (statement) {
+        .invalid => "invalid",
+        .select => "select",
+        .insert => "insert",
+        .delete => "delete",
+        .explain => "explain",
+    };
+}
+
+fn parserErrorByName(name: []const u8) ?ParseError {
+    if (std.mem.eql(u8, name, "UnexpectedToken")) return error.UnexpectedToken;
+    if (std.mem.eql(u8, name, "UnexpectedStatement")) return error.UnexpectedStatement;
+    if (std.mem.eql(u8, name, "UnexpectedExpression")) return error.UnexpectedExpression;
+    if (std.mem.eql(u8, name, "UnterminatedParenthesis")) return error.UnterminatedParenthesis;
+    if (std.mem.eql(u8, name, "InvalidNumber")) return error.InvalidNumber;
+    if (std.mem.eql(u8, name, "InvalidDuration")) return error.InvalidDuration;
+    if (std.mem.eql(u8, name, "InvalidTimestamp")) return error.InvalidTimestamp;
+    if (std.mem.eql(u8, name, "InvalidLiteral")) return error.InvalidLiteral;
+    if (std.mem.eql(u8, name, "UnterminatedString")) return error.UnterminatedString;
+    return null;
 }

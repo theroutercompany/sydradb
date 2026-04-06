@@ -1,0 +1,8 @@
+# summary<TAB>query
+select|proj=1|selector=name|predicate=true|group=0|fill=none|order=0|limit=true	select value from metrics where time > 1 limit 10
+select|proj=1|selector=name|predicate=false|group=0|fill=none|order=0|limit=false	select tag.host as site from metrics
+insert|columns=0|values=3	insert into metrics values (now(), 42, 'ok')
+delete|selector=name|predicate=true	delete from metrics where value > 10
+explain|mode=bytecode|target=select	explain bytecode select 1
+explain|mode=tables_used|target=select	explain tables_used select 1
+select|proj=1|selector=name|predicate=true|group=1|fill=previous|order=1|limit=false	select avg(value) from metrics where time >= 0 group by time_bucket(300, time) fill(previous) order by time desc

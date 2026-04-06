@@ -1,0 +1,6 @@
+# error<TAB>query
+UnexpectedStatement	metrics
+UnexpectedExpression	select from metrics
+UnexpectedToken	delete metrics where value > 10
+UnexpectedExpression	select value from metrics where time >
+UnexpectedStatement	explain foo select 1
