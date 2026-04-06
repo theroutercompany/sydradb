@@ -858,6 +858,53 @@ pub const RefStore = struct {
         }
     }
 
+    fn writeLooseReflogFile(
+        alloc: std.mem.Allocator,
+        root: std.fs.Dir,
+        log_path: []const u8,
+        entries: []const ReflogEntry,
+        fsync: cfg.FsyncPolicy,
+    ) !void {
+        if (std.fs.path.dirname(log_path)) |dirname| {
+            try root.makePath(dirname);
+        }
+        const temp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{log_path});
+        defer alloc.free(temp_path);
+
+        var file = try root.createFile(temp_path, .{ .truncate = true, .read = true });
+        defer file.close();
+        errdefer root.deleteFile(temp_path) catch {};
+
+        var write_buf: [1024]u8 = undefined;
+        var writer_state = file.writer(&write_buf);
+        const writer = &writer_state.interface;
+        for (entries) |entry| {
+            const old_hex = if (entry.old_id) |id| id.toHex() else [_]u8{'0'} ** 64;
+            const new_hex = entry.new_id.toHex();
+            try writer.print("{d} {s} {s} {s}\n", .{
+                entry.timestamp_ms,
+                old_hex,
+                new_hex,
+                entry.reason,
+            });
+        }
+        try writer_state.end();
+        if (fsync != .none) {
+            try file.sync();
+        }
+        root.rename(temp_path, log_path) catch |err| switch (err) {
+            error.PathAlreadyExists => {
+                root.deleteFile(log_path) catch {};
+                try root.rename(temp_path, log_path);
+            },
+            else => return err,
+        };
+        if (fsync != .none) {
+            var root_for_sync = root;
+            try syncDir(&root_for_sync);
+        }
+    }
+
     pub fn listRefs(self: *RefStore, alloc: std.mem.Allocator) ![]RefEntry {
         if (self.backend == .reftable) {
             const reftable_refs = try self.listReftableRefs(alloc);
@@ -936,6 +983,115 @@ pub const RefStore = struct {
 
         try self.writeReftableSnapshot(refs, reflogs);
         self.backend = .reftable;
+    }
+
+    pub fn rebuildReftableMetadata(self: *RefStore) !struct {
+        state_rebuilt: bool,
+        tables_list_rebuilt: bool,
+    } {
+        const table_names = try scanReftableTableFiles(self.alloc, self.root);
+        defer freeOwnedStrings(self.alloc, table_names);
+
+        if (table_names.len == 0 and self.backend != .reftable) {
+            return .{
+                .state_rebuilt = false,
+                .tables_list_rebuilt = false,
+            };
+        }
+
+        try self.root.makePath("reftable");
+        try writeReftableTablesList(self.alloc, self.root, table_names, self.fsync);
+        try writeReftableState(self.alloc, self.root, .{
+            .next_update_index = try inferNextReftableUpdateIndexFromNames(table_names),
+        }, self.fsync);
+        return .{
+            .state_rebuilt = true,
+            .tables_list_rebuilt = true,
+        };
+    }
+
+    pub fn expireReflogEntries(self: *RefStore, cutoff_ms: i64) !usize {
+        if (self.backend == .reftable and try self.hasReftableTables()) {
+            const refs = try self.listRefs(self.alloc);
+            defer {
+                for (refs) |*entry| entry.deinit(self.alloc);
+                self.alloc.free(refs);
+            }
+            const reflogs = try loadReftableReflogEntries(self.alloc, self.root);
+            defer {
+                for (reflogs) |*entry| entry.deinit(self.alloc);
+                self.alloc.free(reflogs);
+            }
+
+            var kept = std.array_list.Managed(ReflogEntry).init(self.alloc);
+            defer {
+                for (kept.items) |*entry| entry.deinit(self.alloc);
+                kept.deinit();
+            }
+
+            var expired: usize = 0;
+            for (reflogs) |entry| {
+                if (entry.timestamp_ms < cutoff_ms) {
+                    expired += 1;
+                    continue;
+                }
+                try kept.append(.{
+                    .ref_name = try self.alloc.dupe(u8, entry.ref_name),
+                    .old_id = entry.old_id,
+                    .new_id = entry.new_id,
+                    .timestamp_ms = entry.timestamp_ms,
+                    .reason = try self.alloc.dupe(u8, entry.reason),
+                });
+            }
+            if (expired == 0) return 0;
+            try self.replaceReftableSnapshot(refs, kept.items);
+            return expired;
+        }
+
+        const reflog_files = try listFilesRecursive(self.alloc, self.root, "logs/refs");
+        defer freeOwnedStrings(self.alloc, reflog_files);
+
+        var expired: usize = 0;
+        for (reflog_files) |path| {
+            const ref_name = path["logs/refs/".len..];
+            const entries = try loadLooseReflogEntriesForRef(self.alloc, self.root, ref_name);
+            defer {
+                for (entries) |*entry| entry.deinit(self.alloc);
+                self.alloc.free(entries);
+            }
+
+            var kept = std.array_list.Managed(ReflogEntry).init(self.alloc);
+            defer {
+                for (kept.items) |*entry| entry.deinit(self.alloc);
+                kept.deinit();
+            }
+
+            var changed = false;
+            for (entries) |entry| {
+                if (entry.timestamp_ms < cutoff_ms) {
+                    expired += 1;
+                    changed = true;
+                    continue;
+                }
+                try kept.append(.{
+                    .ref_name = try self.alloc.dupe(u8, entry.ref_name),
+                    .old_id = entry.old_id,
+                    .new_id = entry.new_id,
+                    .timestamp_ms = entry.timestamp_ms,
+                    .reason = try self.alloc.dupe(u8, entry.reason),
+                });
+            }
+            if (!changed) continue;
+            if (kept.items.len == 0) {
+                self.root.deleteFile(path) catch |err| switch (err) {
+                    error.FileNotFound => {},
+                    else => return err,
+                };
+                continue;
+            }
+            try writeLooseReflogFile(self.alloc, self.root, path, kept.items, self.fsync);
+        }
+        return expired;
     }
 
     fn readReftableRef(self: *RefStore, ref_name: []const u8) !?object_store.ObjectId {
@@ -1086,6 +1242,43 @@ pub const RefStore = struct {
         try writeReftableTable(self.alloc, self.root, table_name, span, ref_records, reflogs, self.fsync);
         const names = [_][]const u8{table_name};
         try writeReftableTablesList(self.alloc, self.root, names[0..], self.fsync);
+    }
+
+    fn replaceReftableSnapshot(self: *RefStore, refs: []const RefEntry, reflogs: []const ReflogEntry) !void {
+        const existing_names = try scanReftableTableFiles(self.alloc, self.root);
+        defer freeOwnedStrings(self.alloc, existing_names);
+
+        var ref_records = try self.alloc.alloc(ReftableRefRecord, refs.len);
+        defer {
+            for (ref_records) |*record| record.deinit(self.alloc);
+            self.alloc.free(ref_records);
+        }
+        for (refs, 0..) |entry, idx| {
+            ref_records[idx] = .{
+                .name = try self.alloc.dupe(u8, entry.name),
+                .id = entry.id,
+            };
+        }
+
+        var state = try loadOrInitReftableState(self.alloc, self.root);
+        const update_index = state.next_update_index;
+        state.next_update_index += 1;
+        try writeReftableState(self.alloc, self.root, state, self.fsync);
+
+        const span = ReftableSpan{
+            .min_update_index = update_index,
+            .max_update_index = update_index,
+        };
+        const table_name = try reftableTablePathForSpan(self.alloc, span);
+        defer self.alloc.free(table_name);
+        try writeReftableTable(self.alloc, self.root, table_name, span, ref_records, reflogs, self.fsync);
+        const names = [_][]const u8{table_name};
+        try writeReftableTablesList(self.alloc, self.root, names[0..], self.fsync);
+
+        for (existing_names) |name| {
+            if (std.mem.eql(u8, name, table_name)) continue;
+            self.root.deleteFile(name) catch {};
+        }
     }
 
     fn maybeCompactReftable(self: *RefStore) !void {
@@ -1600,6 +1793,21 @@ pub const GcResult = struct {
     mirror_deleted: usize,
 };
 
+pub const PruneOptions = struct {
+    dry_run: bool = false,
+    grace_period_ms: i64 = 24 * 60 * 60 * 1000,
+};
+
+pub const PruneResult = struct {
+    pruned_count: usize,
+    pruned_bytes: u64,
+    stale_segment_files: usize,
+    stale_segment_bytes: u64,
+    stale_wal_files: usize,
+    stale_wal_bytes: u64,
+    mirror_deleted: usize,
+};
+
 pub const FsckMode = enum {
     connectivity_only,
     full,
@@ -1939,8 +2147,7 @@ pub const CasManager = struct {
             migrated_reftable = true;
         }
 
-        try self.refreshCommitGraph();
-        try self.store.verifyActivePackMetadata(self.alloc);
+        _ = try self.repairRepository(data_dir, .{});
         const pack_result = try self.pack();
         return .{
             .migrated_reftable = migrated_reftable,
@@ -1951,15 +2158,151 @@ pub const CasManager = struct {
         };
     }
 
+    pub fn repairRepository(self: *CasManager, data_dir: std.fs.Dir, options: RepairOptions) !RepairReport {
+        _ = data_dir;
+        var report = RepairReport{};
+
+        if (options.rebuild_pack_sidecars) {
+            report.pack_sidecars_rebuilt = try self.store.repairActivePackMetadata(self.alloc);
+        }
+        if (options.rebuild_reftable_metadata) {
+            const rebuilt = try self.refs.rebuildReftableMetadata();
+            report.reftable_state_rebuilt = rebuilt.state_rebuilt;
+            report.reftable_tables_list_rebuilt = rebuilt.tables_list_rebuilt;
+        }
+        if (options.rebuild_side_indexes) {
+            try self.refreshCommitGraph();
+            report.side_indexes_rebuilt = true;
+        }
+
+        return report;
+    }
+
+    pub fn expire(self: *CasManager, data_dir: std.fs.Dir, policy: MaintenancePolicy) !ExpiryReport {
+        _ = data_dir;
+        var report = ExpiryReport{};
+        const now_ms = std.time.milliTimestamp();
+
+        if (policy.materialize_borrowed_packs) {
+            report.borrowed_packs_materialized = try self.materializeBorrowedObjects();
+        }
+        report.reflog_entries_expired = try self.refs.expireReflogEntries(now_ms - policy.reflog_expiry_ms);
+        report.checkpoint_refs_expired = try self.expireCheckpointRefs(now_ms - policy.checkpoint_expiry_ms);
+
+        if (report.borrowed_packs_materialized != 0 or report.reflog_entries_expired != 0 or report.checkpoint_refs_expired != 0) {
+            try self.refreshCommitGraph();
+        }
+        return report;
+    }
+
+    pub fn prune(self: *CasManager, options: PruneOptions) !PruneResult {
+        const now_ms = std.time.milliTimestamp();
+        var prunable = try scanExpiredCruft(self.alloc, self.store.root, now_ms, options.grace_period_ms);
+        defer prunable.deinit(self.alloc);
+
+        var pruned_count: usize = 0;
+        var pruned_bytes: u64 = 0;
+        for (prunable.entries) |entry| {
+            pruned_count += entry.file_count;
+            pruned_bytes += entry.bytes;
+            if (!options.dry_run) {
+                try self.store.root.deleteTree(entry.path);
+            }
+        }
+
+        var stale_segment_files: usize = 0;
+        var stale_segment_bytes: u64 = 0;
+        var stale_wal_files: usize = 0;
+        var stale_wal_bytes: u64 = 0;
+        var mirror_deleted: usize = 0;
+        if (try self.refs.readHead(main_ref) != null) {
+            var head = try self.loadHeadIndex();
+            defer head.deinit();
+            const mirror_result = try cleanupStaleMirrors(self.alloc, self.store.root, head.snapshot, options.dry_run);
+            stale_segment_files = mirror_result.stale_segment_files;
+            stale_segment_bytes = mirror_result.stale_segment_bytes;
+            stale_wal_files = mirror_result.stale_wal_files;
+            stale_wal_bytes = mirror_result.stale_wal_bytes;
+            mirror_deleted = mirror_result.deleted;
+        }
+
+        return .{
+            .pruned_count = pruned_count,
+            .pruned_bytes = pruned_bytes,
+            .stale_segment_files = stale_segment_files,
+            .stale_segment_bytes = stale_segment_bytes,
+            .stale_wal_files = stale_wal_files,
+            .stale_wal_bytes = stale_wal_bytes,
+            .mirror_deleted = mirror_deleted,
+        };
+    }
+
     pub fn vacuum(self: *CasManager, data_dir: std.fs.Dir) !VacuumResult {
+        return try self.vacuumWithPolicy(data_dir, .{});
+    }
+
+    pub fn vacuumWithPolicy(self: *CasManager, data_dir: std.fs.Dir, policy: MaintenancePolicy) !VacuumResult {
         const fsck_report = try self.fsck(data_dir, .{});
+        const repair_report = if (policy.repair_side_indexes)
+            try self.repairRepository(data_dir, .{})
+        else
+            RepairReport{};
+        const expiry_report = try self.expire(data_dir, policy);
         const pack_result = try self.pack();
-        const gc_result = try self.gc(.{ .dry_run = false });
+        const gc_result = try self.gc(.{
+            .dry_run = false,
+            .grace_period_ms = policy.prune_grace_ms,
+        });
         return .{
             .fsck = fsck_report,
+            .repair = repair_report,
+            .expiry = expiry_report,
             .pack = pack_result,
             .gc = gc_result,
         };
+    }
+
+    fn materializeBorrowedObjects(self: *CasManager) !usize {
+        const borrowed_count = self.store.alternates.repo_paths.len;
+        if (borrowed_count == 0) return 0;
+
+        const refs = try self.refs.listRefs(self.alloc);
+        defer {
+            for (refs) |*entry| entry.deinit(self.alloc);
+            self.alloc.free(refs);
+        }
+        var reachable = try self.collectReachable(refs);
+        defer reachable.deinit();
+
+        var it = reachable.keyIterator();
+        while (it.next()) |id_ptr| {
+            if (try self.store.hasLocalObject(self.alloc, id_ptr.*)) continue;
+            const loaded = try self.store.get(self.alloc, id_ptr.*);
+            defer self.alloc.free(loaded.payload);
+            const written = try self.store.put(loaded.obj_type, loaded.payload);
+            if (!written.eql(id_ptr.*)) return error.ObjectHashMismatch;
+        }
+
+        try self.store.configureAlternates(self.alloc, &[_][]const u8{});
+        return borrowed_count;
+    }
+
+    fn expireCheckpointRefs(self: *CasManager, cutoff_ms: i64) !usize {
+        const refs = try self.refs.listRefs(self.alloc);
+        defer {
+            for (refs) |*entry| entry.deinit(self.alloc);
+            self.alloc.free(refs);
+        }
+
+        var expired: usize = 0;
+        for (refs) |entry| {
+            if (!std.mem.startsWith(u8, entry.name, "checkpoints/")) continue;
+            const created_at_ms = parseCheckpointRefTimestamp(entry.name) orelse continue;
+            if (created_at_ms >= cutoff_ms) continue;
+            try self.refs.deleteRef(entry.name, "expire-checkpoint");
+            expired += 1;
+        }
+        return expired;
     }
 
     pub fn resolveCommitSpec(self: *CasManager, spec: []const u8) !object_store.ObjectId {
@@ -3074,8 +3417,37 @@ pub const UpgradeResult = struct {
 
 pub const VacuumResult = struct {
     fsck: FsckReport,
+    repair: RepairReport,
+    expiry: ExpiryReport,
     pack: PackResult,
     gc: GcResult,
+};
+
+pub const RepairOptions = struct {
+    rebuild_side_indexes: bool = true,
+    rebuild_pack_sidecars: bool = true,
+    rebuild_reftable_metadata: bool = true,
+};
+
+pub const RepairReport = struct {
+    pack_sidecars_rebuilt: usize = 0,
+    side_indexes_rebuilt: bool = false,
+    reftable_state_rebuilt: bool = false,
+    reftable_tables_list_rebuilt: bool = false,
+};
+
+pub const MaintenancePolicy = struct {
+    repair_side_indexes: bool = false,
+    reflog_expiry_ms: i64 = 7 * 24 * 60 * 60 * 1000,
+    checkpoint_expiry_ms: i64 = 7 * 24 * 60 * 60 * 1000,
+    prune_grace_ms: i64 = 24 * 60 * 60 * 1000,
+    materialize_borrowed_packs: bool = false,
+};
+
+pub const ExpiryReport = struct {
+    reflog_entries_expired: usize = 0,
+    checkpoint_refs_expired: usize = 0,
+    borrowed_packs_materialized: usize = 0,
 };
 
 pub const LocalExchangeResult = struct {
@@ -3926,6 +4298,12 @@ fn containsString(entries: []const []const u8, needle: []const u8) bool {
         if (std.mem.eql(u8, entry, needle)) return true;
     }
     return false;
+}
+
+fn parseCheckpointRefTimestamp(ref_name: []const u8) ?i64 {
+    if (!std.mem.startsWith(u8, ref_name, "checkpoints/")) return null;
+    const dash_idx = std.mem.lastIndexOfScalar(u8, ref_name, '-') orelse return null;
+    return std.fmt.parseInt(i64, ref_name[dash_idx + 1 ..], 10) catch null;
 }
 
 fn validateReflogFile(alloc: std.mem.Allocator, dir: std.fs.Dir, path: []const u8) !void {
@@ -5989,6 +6367,48 @@ fn loadReftableTableNames(alloc: std.mem.Allocator, root: std.fs.Dir) ![][]u8 {
     return try names.toOwnedSlice();
 }
 
+fn scanReftableTableFiles(alloc: std.mem.Allocator, root: std.fs.Dir) ![][]u8 {
+    var reftable_dir = root.openDir("reftable", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return try alloc.alloc([]u8, 0),
+        else => return err,
+    };
+    defer reftable_dir.close();
+
+    var names = std.array_list.Managed([]u8).init(alloc);
+    errdefer {
+        for (names.items) |name| alloc.free(name);
+        names.deinit();
+    }
+
+    var it = reftable_dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".table")) continue;
+        try names.append(try std.fmt.allocPrint(alloc, "reftable/{s}", .{entry.name}));
+    }
+
+    std.sort.block([]u8, names.items, {}, struct {
+        fn lessThan(_: void, lhs: []u8, rhs: []u8) bool {
+            const lhs_span = parseReftableSpanFromName(lhs) orelse return std.mem.lessThan(u8, lhs, rhs);
+            const rhs_span = parseReftableSpanFromName(rhs) orelse return std.mem.lessThan(u8, lhs, rhs);
+            if (lhs_span.min_update_index != rhs_span.min_update_index) {
+                return lhs_span.min_update_index < rhs_span.min_update_index;
+            }
+            return lhs_span.max_update_index < rhs_span.max_update_index;
+        }
+    }.lessThan);
+    return try names.toOwnedSlice();
+}
+
+fn inferNextReftableUpdateIndexFromNames(table_names: []const []const u8) !u64 {
+    var next_update_index: u64 = 1;
+    for (table_names) |name| {
+        const span = parseReftableSpanFromName(name) orelse return error.InvalidReftableTableName;
+        next_update_index = @max(next_update_index, span.max_update_index + 1);
+    }
+    return next_update_index;
+}
+
 fn writeReftableTablesList(alloc: std.mem.Allocator, root: std.fs.Dir, names: []const []const u8, fsync: cfg.FsyncPolicy) !void {
     _ = alloc;
     const temp_path = reftable_tables_list_path ++ ".tmp";
@@ -6944,7 +7364,201 @@ test "upgrade repository migrates legacy refs to reftable and refreshes format" 
     try std.testing.expect(state.next_update_index >= 2);
 }
 
-test "vacuum preserves the active head while applying pack and gc" {
+test "repair rebuilds pack sidecars side indexes and reftable metadata" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/repair-repo", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    try std.fs.cwd().makePath(data_path);
+
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
+    defer series_catalog.deinit();
+
+    const sid = types.hash64("repair.series");
+    _ = try series_catalog.register("repair.series", "{}", sid);
+    const points = [_]types.Point{.{ .ts = 1_000, .value = 6.0 }};
+    const seg_path = try segment_mod.writeSegment(talloc, data_dir, sid, 0, points[0..]);
+    defer talloc.free(seg_path);
+    try manifest.add(data_dir, sid, 0, 1_000, 1_000, 1, seg_path);
+
+    var cas_manager = try CasManager.init(talloc, data_path, .none);
+    defer cas_manager.deinit();
+    _ = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    _ = try cas_manager.pack();
+    try cas_manager.migrateToReftable(data_dir);
+
+    cas_manager.store.root.deleteFile(commit_graph_path) catch {};
+    cas_manager.store.root.deleteFile(reachability_bitmap_path) catch {};
+    cas_manager.store.root.deleteFile(object_refs_index_path) catch {};
+    cas_manager.store.root.deleteFile("objects/info/multi-pack-index") catch {};
+    cas_manager.refs.root.deleteFile(reftable_tables_list_path) catch {};
+    cas_manager.refs.root.deleteFile(reftable_state_path) catch {};
+
+    var pack_dir = try cas_manager.store.root.openDir("objects/packs", .{ .iterate = true });
+    defer pack_dir.close();
+    var pack_it = pack_dir.iterate();
+    while (try pack_it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (std.mem.endsWith(u8, entry.name, ".rev") or std.mem.endsWith(u8, entry.name, ".manifest")) {
+            try pack_dir.deleteFile(entry.name);
+        }
+    }
+
+    const report = try cas_manager.repairRepository(data_dir, .{});
+    try std.testing.expect(report.pack_sidecars_rebuilt > 0);
+    try std.testing.expect(report.side_indexes_rebuilt);
+    try std.testing.expect(report.reftable_state_rebuilt);
+    try std.testing.expect(report.reftable_tables_list_rebuilt);
+
+    _ = try cas_manager.store.root.statFile(commit_graph_path);
+    _ = try cas_manager.store.root.statFile(reachability_bitmap_path);
+    _ = try cas_manager.store.root.statFile(object_refs_index_path);
+    _ = try cas_manager.store.root.statFile("objects/info/multi-pack-index");
+    _ = try cas_manager.refs.root.statFile(reftable_tables_list_path);
+    _ = try cas_manager.refs.root.statFile(reftable_state_path);
+    _ = try cas_manager.fsck(data_dir, .{});
+}
+
+test "expire trims loose reflogs checkpoints and borrowed alternates" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const source_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/expire-source", .{tmp.sub_path});
+    defer talloc.free(source_path);
+    const dest_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/expire-dest", .{tmp.sub_path});
+    defer talloc.free(dest_path);
+    try std.fs.cwd().makePath(source_path);
+    try std.fs.cwd().makePath(dest_path);
+
+    var source_dir = try std.fs.cwd().openDir(source_path, .{ .iterate = true });
+    defer source_dir.close();
+    var manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, source_dir, .none);
+    defer series_catalog.deinit();
+
+    const sid = types.hash64("expire.series");
+    _ = try series_catalog.register("expire.series", "{}", sid);
+    const points = [_]types.Point{.{ .ts = 1_000, .value = 4.25 }};
+    const seg_path = try segment_mod.writeSegment(talloc, source_dir, sid, 0, points[0..]);
+    defer talloc.free(seg_path);
+    try manifest.add(source_dir, sid, 0, 1_000, 1_000, 1, seg_path);
+
+    var source_cas = try CasManager.init(talloc, source_path, .none);
+    defer source_cas.deinit();
+    const head = try source_cas.bootstrapIfMissing(source_dir, &manifest, &tags, &series_catalog);
+
+    var dest_dir = try std.fs.cwd().openDir(dest_path, .{ .iterate = true });
+    defer dest_dir.close();
+    var dest_cas = try CasManager.init(talloc, dest_path, .none);
+    defer dest_cas.deinit();
+
+    dest_cas.format = legacyCompatibleRepositoryFormat();
+    try writeRepositoryFormat(talloc, dest_cas.store.root, dest_cas.format, .none);
+    dest_cas.refs.setBackend(.loose);
+    dest_cas.refs.root.deleteTree("reftable") catch |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    };
+    try dest_cas.store.configureAlternates(talloc, &[_][]const u8{source_path});
+    try dest_cas.refs.updateHeadAtomic(main_ref, head);
+
+    const now_ms = std.time.milliTimestamp();
+    const old_ms = now_ms - (10 * 60 * 1000);
+    const zero_hex = [_]u8{'0'} ** 64;
+    const head_hex = head.toHex();
+    const loose_reflog = try std.fmt.allocPrint(
+        talloc,
+        "{d} {s} {s} old-main\n{d} {s} {s} recent-main\n",
+        .{ old_ms, zero_hex, head_hex, now_ms, head_hex, head_hex },
+    );
+    defer talloc.free(loose_reflog);
+    try dest_cas.refs.root.makePath("logs/refs/heads");
+    try dest_cas.refs.root.writeFile(.{
+        .sub_path = "logs/refs/heads/main",
+        .data = loose_reflog,
+        .flags = .{},
+    });
+
+    const old_checkpoint = try std.fmt.allocPrint(talloc, "checkpoints/old-{d}", .{old_ms});
+    defer talloc.free(old_checkpoint);
+    const recent_checkpoint = try std.fmt.allocPrint(talloc, "checkpoints/recent-{d}", .{now_ms});
+    defer talloc.free(recent_checkpoint);
+    try dest_cas.refs.updateRefAtomic(old_checkpoint, head);
+    try dest_cas.refs.updateRefAtomic(recent_checkpoint, head);
+
+    const expiry = try dest_cas.expire(dest_dir, .{
+        .reflog_expiry_ms = 60 * 1000,
+        .checkpoint_expiry_ms = 60 * 1000,
+        .materialize_borrowed_packs = true,
+    });
+    try std.testing.expectEqual(@as(usize, 1), expiry.borrowed_packs_materialized);
+    try std.testing.expectEqual(@as(usize, 1), expiry.reflog_entries_expired);
+    try std.testing.expectEqual(@as(usize, 1), expiry.checkpoint_refs_expired);
+    try std.testing.expectEqual(@as(usize, 0), dest_cas.store.alternates.repo_paths.len);
+    try std.testing.expect(try dest_cas.store.hasLocalObject(talloc, head));
+    try std.testing.expect((try dest_cas.refs.readRef(old_checkpoint)) == null);
+    try std.testing.expect((try dest_cas.refs.readRef(recent_checkpoint)) != null);
+
+    const reflog_entries = try dest_cas.loadReflog(main_ref, 8);
+    defer {
+        for (reflog_entries) |*entry| entry.deinit(talloc);
+        talloc.free(reflog_entries);
+    }
+    try std.testing.expectEqual(@as(usize, 1), reflog_entries.len);
+    try std.testing.expect(reflog_entries[0].timestamp_ms >= now_ms - 1_000);
+}
+
+test "prune only deletes expired cruft" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/prune-repo", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    try std.fs.cwd().makePath(data_path);
+
+    var cas_manager = try CasManager.init(talloc, data_path, .none);
+    defer cas_manager.deinit();
+
+    const now_ms = std.time.milliTimestamp();
+    const old_stamp = now_ms - 10_000;
+    const fresh_stamp = now_ms;
+    const old_file = try std.fmt.allocPrint(talloc, "objects/cruft/{d}/packs/old.pack", .{old_stamp});
+    defer talloc.free(old_file);
+    const fresh_file = try std.fmt.allocPrint(talloc, "objects/cruft/{d}/packs/new.pack", .{fresh_stamp});
+    defer talloc.free(fresh_file);
+    try cas_manager.store.root.makePath(std.fs.path.dirname(old_file).?);
+    try cas_manager.store.root.makePath(std.fs.path.dirname(fresh_file).?);
+    try cas_manager.store.root.writeFile(.{ .sub_path = old_file, .data = "old-pack", .flags = .{} });
+    try cas_manager.store.root.writeFile(.{ .sub_path = fresh_file, .data = "fresh-pack", .flags = .{} });
+
+    const dry_run = try cas_manager.prune(.{
+        .dry_run = true,
+        .grace_period_ms = 1_000,
+    });
+    try std.testing.expect(dry_run.pruned_count > 0);
+    _ = try cas_manager.store.root.statFile(old_file);
+
+    const applied = try cas_manager.prune(.{ .grace_period_ms = 1_000 });
+    try std.testing.expect(applied.pruned_count > 0);
+    try std.testing.expectError(error.FileNotFound, cas_manager.store.root.statFile(old_file));
+    _ = try cas_manager.store.root.statFile(fresh_file);
+}
+
+test "vacuum with policy preserves the active head and is idempotent" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -6977,9 +7591,21 @@ test "vacuum preserves the active head while applying pack and gc" {
     try std.testing.expect(!initial.eql(orphan));
     try cas_manager.refs.updateHeadAtomic(main_ref, initial);
 
-    const result = try cas_manager.vacuum(data_dir);
-    try std.testing.expect(result.pack.reachable_objects > 0);
-    try std.testing.expect(result.gc.quarantined_count > 0 or result.gc.pruned_count > 0 or result.gc.deleted > 0);
+    cas_manager.store.root.deleteFile(commit_graph_path) catch {};
+
+    const first = try cas_manager.vacuumWithPolicy(data_dir, .{
+        .repair_side_indexes = true,
+        .prune_grace_ms = 0,
+    });
+    try std.testing.expect(first.pack.reachable_objects > 0);
+    try std.testing.expect(first.repair.side_indexes_rebuilt);
+    try std.testing.expect(first.gc.quarantined_count > 0 or first.gc.pruned_count > 0 or first.gc.deleted > 0);
+
+    const second = try cas_manager.vacuumWithPolicy(data_dir, .{
+        .repair_side_indexes = true,
+        .prune_grace_ms = 0,
+    });
+    try std.testing.expectEqual(first.pack.reachable_objects, second.pack.reachable_objects);
 
     const head = try cas_manager.refs.readHead(main_ref) orelse return error.MissingCasHead;
     try std.testing.expect(head.eql(initial));

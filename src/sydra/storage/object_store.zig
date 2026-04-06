@@ -220,6 +220,16 @@ pub const ObjectStore = struct {
         return try self.hasAlternateObject(id);
     }
 
+    pub fn hasLocalObject(self: *ObjectStore, allocator: std.mem.Allocator, id: ObjectId) !bool {
+        if (self.getLocal(allocator, id)) |loaded| {
+            allocator.free(loaded.payload);
+            return true;
+        } else |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        }
+    }
+
     pub fn configureAlternates(self: *ObjectStore, allocator: std.mem.Allocator, repo_paths: []const []const u8) !void {
         try writeAlternatesFile(allocator, self.root, repo_paths, self.fsync);
         self.alternates.deinit(self.allocator);
@@ -559,6 +569,39 @@ pub const ObjectStore = struct {
             if (counts[@intFromEnum(ObjectType.commit) - 1] != manifest.manifest.commit_count) return error.CorruptPackManifest;
             if (counts[@intFromEnum(ObjectType.ref) - 1] != manifest.manifest.ref_count) return error.CorruptPackManifest;
         }
+    }
+
+    pub fn repairActivePackMetadata(self: *ObjectStore, allocator: std.mem.Allocator) !usize {
+        const idx_paths = try self.listPackIndexPaths(allocator);
+        defer freeOwnedStrings(allocator, idx_paths);
+
+        var rebuilt: usize = 0;
+        for (idx_paths) |idx_path| {
+            var index = try loadPackIndex(allocator, self.root, idx_path);
+            defer index.deinit(allocator);
+
+            const rev_path = try revPathForIndex(allocator, idx_path);
+            defer allocator.free(rev_path);
+            try writePackReverseIndexFile(
+                allocator,
+                self.root,
+                rev_path,
+                index.pack_path,
+                index.object_ids,
+                index.offsets,
+                self.fsync,
+            );
+
+            const manifest_path = try manifestPathForIndex(allocator, idx_path);
+            defer allocator.free(manifest_path);
+            var manifest = try buildPackManifestFromIndex(allocator, self.root, index.pack_path, index.object_ids, index.offsets);
+            defer manifest.deinit(allocator);
+            try writePackManifestFile(allocator, self.root, manifest_path, manifest, self.fsync);
+            rebuilt += 1;
+        }
+
+        try self.rebuildMultiPackIndex(allocator);
+        return rebuilt;
     }
 
     pub fn openPackedBlobReader(self: *ObjectStore, allocator: std.mem.Allocator, id: ObjectId) !?PackedBlobReader {
@@ -1402,6 +1445,76 @@ fn hashRelativeFile(root: std.fs.Dir, alloc: std.mem.Allocator, path: []const u8
     var out: [32]u8 = undefined;
     hasher.final(out[0..]);
     return out;
+}
+
+fn buildPackManifestFromIndex(
+    alloc: std.mem.Allocator,
+    root: std.fs.Dir,
+    pack_path: []const u8,
+    object_ids: []const ObjectId,
+    offsets: []const u64,
+) !PackManifest {
+    const pack_checksum = try hashRelativeFile(root, alloc, pack_path);
+    var manifest = PackManifest{
+        .pack_path = try alloc.dupe(u8, pack_path),
+        .pack_checksum = pack_checksum,
+        .object_count = object_ids.len,
+        .blob_count = 0,
+        .tree_count = 0,
+        .commit_count = 0,
+        .ref_count = 0,
+    };
+    errdefer manifest.deinit(alloc);
+
+    var pack_file = try root.openFile(pack_path, .{ .mode = .read_only });
+    defer pack_file.close();
+
+    for (offsets) |offset| {
+        try pack_file.seekTo(offset + 32);
+        var type_buf: [1]u8 = undefined;
+        if (try pack_file.readAll(type_buf[0..]) != type_buf.len) return error.CorruptPack;
+        const obj_type = std.meta.intToEnum(ObjectType, type_buf[0]) catch return error.UnknownObjectType;
+        switch (obj_type) {
+            .blob => manifest.blob_count += 1,
+            .tree => manifest.tree_count += 1,
+            .commit => manifest.commit_count += 1,
+            .ref => manifest.ref_count += 1,
+        }
+    }
+
+    return manifest;
+}
+
+fn writePackManifestFile(
+    alloc: std.mem.Allocator,
+    root: std.fs.Dir,
+    manifest_path: []const u8,
+    manifest: PackManifest,
+    fsync: cfg.FsyncPolicy,
+) !void {
+    const bytes = try encodePackManifest(alloc, manifest);
+    defer alloc.free(bytes);
+
+    const temp_path = try std.fmt.allocPrint(alloc, "{s}.tmp", .{manifest_path});
+    defer alloc.free(temp_path);
+    var file = try root.createFile(temp_path, .{ .truncate = true, .read = true });
+    defer file.close();
+    errdefer root.deleteFile(temp_path) catch {};
+    try file.writeAll(bytes);
+    if (shouldSync(fsync)) {
+        try file.sync();
+    }
+    root.rename(temp_path, manifest_path) catch |err| switch (err) {
+        error.PathAlreadyExists => {
+            root.deleteFile(manifest_path) catch {};
+            try root.rename(temp_path, manifest_path);
+        },
+        else => return err,
+    };
+    if (shouldSync(fsync)) {
+        var root_for_sync = root;
+        try syncDir(&root_for_sync);
+    }
 }
 
 fn freeOwnedStrings(alloc: std.mem.Allocator, items: [][]u8) void {
