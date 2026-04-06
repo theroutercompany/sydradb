@@ -129,6 +129,26 @@ fallback_response="$(post_until_contains \
   '"legacy_fallback":true' \
   '"fallback_reason":"unsupported_function"')"
 
+failure_headers="$(mktemp)"
+failure_body="$(mktemp)"
+failure_status="$(curl -sS -D "$failure_headers" -o "$failure_body" -w "%{http_code}" \
+  -XPOST "http://127.0.0.1:$PORT/api/v1/sydraql" \
+  --data-binary "select from weather.room1")"
+trap 'rm -f "$failure_headers" "$failure_body"; cleanup' EXIT
+
+if [[ "$failure_status" != "400" ]]; then
+  echo "expected parse failure status 400, got $failure_status" >&2
+  cat "$failure_body" >&2 || true
+  exit 1
+fi
+
+failure_response="$(cat "$failure_body")"
+if [[ "$failure_response" != *'"code":"parse_failed"'* ]]; then
+  echo "expected parse_failed code in sydraQL failure response" >&2
+  echo "$failure_response" >&2
+  exit 1
+fi
+
 after_success="$(metric_value sydradb_query_compile_success_total)"
 after_fallback="$(metric_value sydradb_query_compile_fallback_total)"
 
@@ -145,3 +165,4 @@ fi
 echo "CHECKPOINT sydraql_compiled_ok $compiled_response"
 echo "CHECKPOINT sydraql_metrics_ok success_before=$before_success success_after=$after_success"
 echo "CHECKPOINT sydraql_fallback_ok before=$before_fallback after=$after_fallback"
+echo "CHECKPOINT sydraql_failure_ok status=$failure_status body=$failure_response"

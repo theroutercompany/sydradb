@@ -187,7 +187,13 @@ Error responses for `/api/*` are JSON:
 {"error":"query required","code":"query_required","status":400}
 ```
 
-For sydraQL specifically, `code` now distinguishes unsupported query shapes (`unsupported_query_shape`), validation failures (`validation_failed`), and runtime shadow-mode issues (`shadow_mismatch`).
+For sydraQL specifically, `code` now distinguishes:
+
+- `parse_failed` – lexer/parser failures such as unexpected tokens or malformed literals
+- `validation_failed` – syntactically valid queries that fail semantic validation
+- `unsupported_query_shape` – shapes that the current compiled/runtime contract does not support
+- `shadow_mismatch` – shadow-mode verification failures
+- `execution_error` – other runtime failures that do not fit the categories above
 
 Implementation:
 

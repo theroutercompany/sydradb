@@ -202,6 +202,7 @@ defer cursor.deinit();
 - `const TagsJson = struct { value: []const u8, owned: ?[]u8 }`
 - `fn extractTagsJson(...) !TagsJson` – converts a JSON object into a JSON string
 - `fn buildJsonErrorPayload(...) ![]u8` – serializes the structured JSON error contract before `req.respond(...)`
+- `fn executionErrorContract(...) ExecutionErrorContract` – maps parser, validation, unsupported-shape, and runtime failures onto the public HTTP error contract
 - `fn buildStatusPayload(...) ![]u8` – serializes the `/status` payload so it can be tested directly
 - `fn respondJsonError(...) !void` – JSON error payloads with `error`, `code`, and `status`
 - `fn writeStatsObject(...) !void` – emits the `stats` object for sydraQL responses

@@ -300,16 +300,32 @@ fn handleSydraql(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     try response.end();
 }
 
-fn respondExecutionError(alloc: std.mem.Allocator, req: *std.http.Server.Request, err: query_exec.ExecuteError) !void {
-    const contract: struct {
-        status: std.http.Status,
-        code: []const u8,
-        message: []const u8,
-    } = switch (err) {
+const ExecutionErrorContract = struct {
+    status: std.http.Status,
+    code: []const u8,
+    message: []const u8,
+};
+
+fn executionErrorContract(err: query_exec.ExecuteError) ExecutionErrorContract {
+    return switch (err) {
         error.OutOfMemory => .{
             .status = .internal_server_error,
             .code = "out_of_memory",
             .message = "out of memory",
+        },
+        error.InvalidLiteral,
+        error.UnterminatedString,
+        error.UnexpectedToken,
+        error.UnexpectedStatement,
+        error.UnexpectedExpression,
+        error.UnterminatedParenthesis,
+        error.InvalidNumber,
+        error.InvalidDuration,
+        error.InvalidTimestamp,
+        => .{
+            .status = .bad_request,
+            .code = "parse_failed",
+            .message = @errorName(err),
         },
         error.ValidationFailed => .{
             .status = .bad_request,
@@ -345,6 +361,10 @@ fn respondExecutionError(alloc: std.mem.Allocator, req: *std.http.Server.Request
             .message = @errorName(err),
         },
     };
+}
+
+fn respondExecutionError(alloc: std.mem.Allocator, req: *std.http.Server.Request, err: query_exec.ExecuteError) !void {
+    const contract = executionErrorContract(err);
     return respondJsonError(alloc, req, contract.status, contract.code, contract.message);
 }
 
@@ -702,6 +722,21 @@ test "buildJsonErrorPayload emits structured contract" {
     try std.testing.expectEqualStrings("ingest backpressure: memory limit exceeded", obj.get("error").?.string);
     try std.testing.expectEqualStrings("ingest_backpressure", obj.get("code").?.string);
     try std.testing.expectEqual(@as(i64, 503), obj.get("status").?.integer);
+}
+
+test "executionErrorContract distinguishes parse validation and unsupported failures" {
+    const parse_contract = executionErrorContract(error.UnexpectedToken);
+    try std.testing.expectEqual(std.http.Status.bad_request, parse_contract.status);
+    try std.testing.expectEqualStrings("parse_failed", parse_contract.code);
+    try std.testing.expectEqualStrings("UnexpectedToken", parse_contract.message);
+
+    const validation_contract = executionErrorContract(error.ValidationFailed);
+    try std.testing.expectEqual(std.http.Status.bad_request, validation_contract.status);
+    try std.testing.expectEqualStrings("validation_failed", validation_contract.code);
+
+    const unsupported_contract = executionErrorContract(error.UnsupportedFunction);
+    try std.testing.expectEqual(std.http.Status.bad_request, unsupported_contract.status);
+    try std.testing.expectEqualStrings("unsupported_query_shape", unsupported_contract.code);
 }
 
 test "buildStatusPayload emits extended runtime counters" {
