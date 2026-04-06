@@ -98,10 +98,15 @@ Behavior:
 `GET /status` includes:
 
 - `runtime.local_ingest_enabled`
+- `runtime.local_ingest_connections_total`
 - `runtime.local_ingest_connections_current`
 - `runtime.local_ingest_append_points_total`
+- `runtime.local_ingest_append_batch_points_avg`
 - `runtime.local_ingest_rejected_total`
 - `runtime.queue_pending_bytes_max`
+- `runtime.tag_index_dirty`
+- `runtime.tag_index_save_total`
+- `runtime.tag_index_save_skipped_total`
 
 `GET /metrics` adds counters and gauges such as:
 
@@ -111,8 +116,14 @@ Behavior:
 - `sydradb_local_ingest_append_batches_total`
 - `sydradb_local_ingest_append_points_total`
 - `sydradb_local_ingest_append_batch_points_max`
+- `sydradb_local_ingest_append_batch_points_avg`
 - `sydradb_local_ingest_rejected_total`
 - `sydradb_queue_pending_bytes_max`
+- `sydradb_memtable_append_seconds_total`
+- `sydradb_tag_index_dirty`
+- `sydradb_tag_index_save_total`
+- `sydradb_tag_index_save_skipped_total`
+- `sydradb_tag_index_save_seconds_total`
 
 ## macOS Note
 

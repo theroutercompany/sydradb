@@ -491,19 +491,26 @@ const StatusSnapshot = struct {
     query_compiler_mode: []const u8,
     compatibility_debt: cas_mod.CompatibilityDebtReport,
     local_ingest_enabled: bool,
+    local_ingest_connections_total: u64,
     local_ingest_connections_current: u64,
     local_ingest_append_points_total: u64,
+    local_ingest_append_batch_points_avg: f64,
     local_ingest_rejected_total: u64,
     queue_depth: usize,
     queue_pending_bytes_max: usize,
     maintenance_pause_active: bool,
     memtable_bytes: usize,
+    tag_index_dirty: bool,
+    tag_index_save_total: u64,
+    tag_index_save_skipped_total: u64,
+    tag_index_save_seconds_total: f64,
     drain_timeout_total: u64,
     flush_total: u64,
     flush_points_total: u64,
     flush_seconds_total: f64,
     wal_append_total: u64,
     wal_append_seconds_total: f64,
+    memtable_append_seconds_total: f64,
     ingest_total: u64,
     ingest_rejected_total: u64,
     ingest_rejected_mem_limit_total: u64,
@@ -527,25 +534,38 @@ const StatusSnapshot = struct {
 
 fn buildStatusSnapshot(eng: *Engine) StatusSnapshot {
     const compatibility_debt = eng.currentCompatibilityDebt() catch cas_mod.CompatibilityDebtReport{};
+    const local_ingest_append_batches_total = eng.metrics.local_ingest_append_batches_total.load(.monotonic);
+    const local_ingest_append_points_total = eng.metrics.local_ingest_append_points_total.load(.monotonic);
     return .{
         .cas_mode = @tagName(eng.config.cas_mode),
         .metadata_read_mode = @tagName(eng.config.metadata_read_mode),
         .query_compiler_mode = @tagName(eng.config.query_compiler_mode),
         .compatibility_debt = compatibility_debt,
         .local_ingest_enabled = eng.config.ingest_socket_path.len != 0,
+        .local_ingest_connections_total = eng.metrics.local_ingest_connections_total.load(.monotonic),
         .local_ingest_connections_current = eng.metrics.local_ingest_connections_current.load(.monotonic),
-        .local_ingest_append_points_total = eng.metrics.local_ingest_append_points_total.load(.monotonic),
+        .local_ingest_append_points_total = local_ingest_append_points_total,
+        .local_ingest_append_batch_points_avg = if (local_ingest_append_batches_total == 0)
+            0
+        else
+            @as(f64, @floatFromInt(local_ingest_append_points_total)) /
+                @as(f64, @floatFromInt(local_ingest_append_batches_total)),
         .local_ingest_rejected_total = eng.metrics.local_ingest_rejected_total.load(.monotonic),
         .queue_depth = eng.queue.len(),
         .queue_pending_bytes_max = eng.metrics.queue_pending_bytes_max.load(.monotonic),
         .maintenance_pause_active = eng.metrics.maintenance_pause_active.load(.monotonic),
         .memtable_bytes = eng.mem.bytes.load(.monotonic),
+        .tag_index_dirty = eng.tag_index_dirty.load(.monotonic),
+        .tag_index_save_total = eng.metrics.tag_index_save_total.load(.monotonic),
+        .tag_index_save_skipped_total = eng.metrics.tag_index_save_skipped_total.load(.monotonic),
+        .tag_index_save_seconds_total = @as(f64, @floatFromInt(eng.metrics.tag_index_save_ns_total.load(.monotonic))) / 1_000_000_000.0,
         .drain_timeout_total = eng.metrics.drain_timeout_total.load(.monotonic),
         .flush_total = eng.metrics.flush_total.load(.monotonic),
         .flush_points_total = eng.metrics.flush_points_total.load(.monotonic),
         .flush_seconds_total = @as(f64, @floatFromInt(eng.metrics.flush_ns_total.load(.monotonic))) / 1_000_000_000.0,
         .wal_append_total = eng.metrics.wal_append_total.load(.monotonic),
         .wal_append_seconds_total = @as(f64, @floatFromInt(eng.metrics.wal_append_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .memtable_append_seconds_total = @as(f64, @floatFromInt(eng.metrics.memtable_append_ns_total.load(.monotonic))) / 1_000_000_000.0,
         .ingest_total = eng.metrics.ingest_total.load(.monotonic),
         .ingest_rejected_total = eng.metrics.ingest_rejected_total.load(.monotonic),
         .ingest_rejected_mem_limit_total = eng.metrics.ingest_rejected_mem_limit_total.load(.monotonic),
@@ -618,10 +638,14 @@ fn writeStatusPayload(jw: *std.json.Stringify, snapshot: StatusSnapshot) !void {
     try jw.beginObject();
     try jw.objectField("local_ingest_enabled");
     try jw.write(snapshot.local_ingest_enabled);
+    try jw.objectField("local_ingest_connections_total");
+    try jw.write(snapshot.local_ingest_connections_total);
     try jw.objectField("local_ingest_connections_current");
     try jw.write(snapshot.local_ingest_connections_current);
     try jw.objectField("local_ingest_append_points_total");
     try jw.write(snapshot.local_ingest_append_points_total);
+    try jw.objectField("local_ingest_append_batch_points_avg");
+    try jw.write(snapshot.local_ingest_append_batch_points_avg);
     try jw.objectField("local_ingest_rejected_total");
     try jw.write(snapshot.local_ingest_rejected_total);
     try jw.objectField("queue_depth");
@@ -632,6 +656,14 @@ fn writeStatusPayload(jw: *std.json.Stringify, snapshot: StatusSnapshot) !void {
     try jw.write(snapshot.maintenance_pause_active);
     try jw.objectField("memtable_bytes");
     try jw.write(snapshot.memtable_bytes);
+    try jw.objectField("tag_index_dirty");
+    try jw.write(snapshot.tag_index_dirty);
+    try jw.objectField("tag_index_save_total");
+    try jw.write(snapshot.tag_index_save_total);
+    try jw.objectField("tag_index_save_skipped_total");
+    try jw.write(snapshot.tag_index_save_skipped_total);
+    try jw.objectField("tag_index_save_seconds_total");
+    try jw.write(snapshot.tag_index_save_seconds_total);
     try jw.objectField("drain_timeout_total");
     try jw.write(snapshot.drain_timeout_total);
     try jw.objectField("flush_total");
@@ -644,6 +676,8 @@ fn writeStatusPayload(jw: *std.json.Stringify, snapshot: StatusSnapshot) !void {
     try jw.write(snapshot.wal_append_total);
     try jw.objectField("wal_append_seconds_total");
     try jw.write(snapshot.wal_append_seconds_total);
+    try jw.objectField("memtable_append_seconds_total");
+    try jw.write(snapshot.memtable_append_seconds_total);
     try jw.objectField("ingest_total");
     try jw.write(snapshot.ingest_total);
     try jw.objectField("ingest_rejected_total");
@@ -933,19 +967,26 @@ test "buildStatusPayload emits extended runtime counters" {
             .loose_refs_present = 3,
         },
         .local_ingest_enabled = true,
+        .local_ingest_connections_total = 7,
         .local_ingest_connections_current = 2,
         .local_ingest_append_points_total = 9,
+        .local_ingest_append_batch_points_avg = 4.5,
         .local_ingest_rejected_total = 4,
         .queue_depth = 2,
         .queue_pending_bytes_max = 8192,
         .maintenance_pause_active = true,
         .memtable_bytes = 4096,
+        .tag_index_dirty = true,
+        .tag_index_save_total = 8,
+        .tag_index_save_skipped_total = 13,
+        .tag_index_save_seconds_total = 0.015,
         .drain_timeout_total = 6,
         .flush_total = 3,
         .flush_points_total = 17,
         .flush_seconds_total = 0.125,
         .wal_append_total = 11,
         .wal_append_seconds_total = 0.02,
+        .memtable_append_seconds_total = 0.03,
         .ingest_total = 42,
         .ingest_rejected_total = 4,
         .ingest_rejected_mem_limit_total = 4,
@@ -983,18 +1024,25 @@ test "buildStatusPayload emits extended runtime counters" {
 
     const runtime = root.get("runtime").?.object;
     try std.testing.expectEqual(true, runtime.get("local_ingest_enabled").?.bool);
+    try std.testing.expectEqual(@as(i64, 7), runtime.get("local_ingest_connections_total").?.integer);
     try std.testing.expectEqual(@as(i64, 2), runtime.get("local_ingest_connections_current").?.integer);
     try std.testing.expectEqual(@as(i64, 9), runtime.get("local_ingest_append_points_total").?.integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 4.5), runtime.get("local_ingest_append_batch_points_avg").?.float, 0.0001);
     try std.testing.expectEqual(@as(i64, 4), runtime.get("local_ingest_rejected_total").?.integer);
     try std.testing.expectEqual(@as(i64, 2), runtime.get("queue_depth").?.integer);
     try std.testing.expectEqual(@as(i64, 8192), runtime.get("queue_pending_bytes_max").?.integer);
     try std.testing.expectEqual(true, runtime.get("maintenance_pause_active").?.bool);
     try std.testing.expectEqual(@as(i64, 4096), runtime.get("memtable_bytes").?.integer);
+    try std.testing.expectEqual(true, runtime.get("tag_index_dirty").?.bool);
+    try std.testing.expectEqual(@as(i64, 8), runtime.get("tag_index_save_total").?.integer);
+    try std.testing.expectEqual(@as(i64, 13), runtime.get("tag_index_save_skipped_total").?.integer);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.015), runtime.get("tag_index_save_seconds_total").?.float, 0.0001);
     try std.testing.expectEqual(@as(i64, 6), runtime.get("drain_timeout_total").?.integer);
     try std.testing.expectEqual(@as(i64, 17), runtime.get("flush_points_total").?.integer);
     try std.testing.expectApproxEqAbs(@as(f64, 0.125), runtime.get("flush_seconds_total").?.float, 0.0001);
     try std.testing.expectEqual(@as(i64, 11), runtime.get("wal_append_total").?.integer);
     try std.testing.expectApproxEqAbs(@as(f64, 0.02), runtime.get("wal_append_seconds_total").?.float, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.03), runtime.get("memtable_append_seconds_total").?.float, 0.0001);
     try std.testing.expectEqual(@as(i64, 2048), runtime.get("wal_bytes_total").?.integer);
     try std.testing.expectEqual(@as(i64, 1), runtime.get("wal_append_failed_total").?.integer);
     try std.testing.expectEqual(@as(i64, 2), runtime.get("memtable_append_failed_total").?.integer);
@@ -1297,6 +1345,11 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     const local_ingest_append_points_total = eng.metrics.local_ingest_append_points_total.load(.monotonic);
     const local_ingest_append_seconds_total = @as(f64, @floatFromInt(eng.metrics.local_ingest_append_ns_total.load(.monotonic))) / 1_000_000_000.0;
     const local_ingest_append_batch_points_max = eng.metrics.local_ingest_append_batch_points_max.load(.monotonic);
+    const local_ingest_append_batch_points_avg = if (local_ingest_append_batches_total == 0)
+        0
+    else
+        @as(f64, @floatFromInt(local_ingest_append_points_total)) /
+            @as(f64, @floatFromInt(local_ingest_append_batches_total));
     const local_ingest_rejected_total = eng.metrics.local_ingest_rejected_total.load(.monotonic);
     const local_ingest_unknown_decl_total = eng.metrics.local_ingest_unknown_decl_total.load(.monotonic);
     const local_ingest_frame_too_large_total = eng.metrics.local_ingest_frame_too_large_total.load(.monotonic);
@@ -1305,6 +1358,11 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     const queue_pending_bytes_max = eng.metrics.queue_pending_bytes_max.load(.monotonic);
     const maintenance_pause_active = eng.metrics.maintenance_pause_active.load(.monotonic);
     const memtable_bytes = eng.mem.bytes.load(.monotonic);
+    const memtable_append_seconds_total = @as(f64, @floatFromInt(eng.metrics.memtable_append_ns_total.load(.monotonic))) / 1_000_000_000.0;
+    const tag_index_dirty = eng.tag_index_dirty.load(.monotonic);
+    const tag_index_save_total = eng.metrics.tag_index_save_total.load(.monotonic);
+    const tag_index_save_skipped_total = eng.metrics.tag_index_save_skipped_total.load(.monotonic);
+    const tag_index_save_seconds_total = @as(f64, @floatFromInt(eng.metrics.tag_index_save_ns_total.load(.monotonic))) / 1_000_000_000.0;
     const flush_seconds_total = @as(f64, @floatFromInt(flush_ns_total)) / 1_000_000_000.0;
 
     var buf = std.array_list.Managed(u8).init(alloc);
@@ -1323,7 +1381,12 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     try writer.print("# HELP sydradb_wal_bytes_total Total bytes written to WAL\n# TYPE sydradb_wal_bytes_total counter\nsydradb_wal_bytes_total {d}\n", .{wal_bytes_total});
     try writer.print("# HELP sydradb_wal_append_failed_total Total WAL append failures observed by the writer loop\n# TYPE sydradb_wal_append_failed_total counter\nsydradb_wal_append_failed_total {d}\n", .{wal_append_failed_total});
     try writer.print("# HELP sydradb_drain_timeout_total Total waitForDrained calls that timed out before the engine became queryable\n# TYPE sydradb_drain_timeout_total counter\nsydradb_drain_timeout_total {d}\n", .{drain_timeout_total});
+    try writer.print("# HELP sydradb_memtable_append_seconds_total Aggregate memtable append duration in seconds\n# TYPE sydradb_memtable_append_seconds_total counter\nsydradb_memtable_append_seconds_total {d:.6}\n", .{memtable_append_seconds_total});
     try writer.print("# HELP sydradb_memtable_append_failed_total Total memtable append failures observed by the writer loop\n# TYPE sydradb_memtable_append_failed_total counter\nsydradb_memtable_append_failed_total {d}\n", .{memtable_append_failed_total});
+    try writer.print("# HELP sydradb_tag_index_dirty 1 when the tag index has unsaved declaration-side changes, 0 otherwise\n# TYPE sydradb_tag_index_dirty gauge\nsydradb_tag_index_dirty {d}\n", .{@intFromBool(tag_index_dirty)});
+    try writer.print("# HELP sydradb_tag_index_save_total Total persisted tag index snapshots\n# TYPE sydradb_tag_index_save_total counter\nsydradb_tag_index_save_total {d}\n", .{tag_index_save_total});
+    try writer.print("# HELP sydradb_tag_index_save_skipped_total Total flush passes that skipped tag index persistence because metadata was unchanged\n# TYPE sydradb_tag_index_save_skipped_total counter\nsydradb_tag_index_save_skipped_total {d}\n", .{tag_index_save_skipped_total});
+    try writer.print("# HELP sydradb_tag_index_save_seconds_total Aggregate tag index persistence duration in seconds\n# TYPE sydradb_tag_index_save_seconds_total counter\nsydradb_tag_index_save_seconds_total {d:.6}\n", .{tag_index_save_seconds_total});
     try writer.print("# HELP sydradb_ingest_quarantined_total Total ingest records written to quarantine after writer-loop failures\n# TYPE sydradb_ingest_quarantined_total counter\nsydradb_ingest_quarantined_total {d}\n", .{ingest_quarantined_total});
     try writer.print("# HELP sydradb_ingest_quarantine_write_failed_total Total failures while writing ingest quarantine records\n# TYPE sydradb_ingest_quarantine_write_failed_total counter\nsydradb_ingest_quarantine_write_failed_total {d}\n", .{ingest_quarantine_write_failed_total});
     try writer.print("# HELP sydradb_cas_sync_total Total CAS snapshot sync operations completed by the engine\n# TYPE sydradb_cas_sync_total counter\nsydradb_cas_sync_total {d}\n", .{cas_sync_total});
@@ -1351,6 +1414,7 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     try writer.print("# HELP sydradb_local_ingest_append_points_total Total points accepted through the local ingest socket\n# TYPE sydradb_local_ingest_append_points_total counter\nsydradb_local_ingest_append_points_total {d}\n", .{local_ingest_append_points_total});
     try writer.print("# HELP sydradb_local_ingest_append_seconds_total Aggregate local ingest append handling time in seconds\n# TYPE sydradb_local_ingest_append_seconds_total counter\nsydradb_local_ingest_append_seconds_total {d:.6}\n", .{local_ingest_append_seconds_total});
     try writer.print("# HELP sydradb_local_ingest_append_batch_points_max Largest local ingest append batch accepted since start\n# TYPE sydradb_local_ingest_append_batch_points_max gauge\nsydradb_local_ingest_append_batch_points_max {d}\n", .{local_ingest_append_batch_points_max});
+    try writer.print("# HELP sydradb_local_ingest_append_batch_points_avg Average points accepted per local ingest append batch\n# TYPE sydradb_local_ingest_append_batch_points_avg gauge\nsydradb_local_ingest_append_batch_points_avg {d:.6}\n", .{local_ingest_append_batch_points_avg});
     try writer.print("# HELP sydradb_local_ingest_rejected_total Total local ingest requests rejected before enqueue\n# TYPE sydradb_local_ingest_rejected_total counter\nsydradb_local_ingest_rejected_total {d}\n", .{local_ingest_rejected_total});
     try writer.print("# HELP sydradb_local_ingest_unknown_decl_total Total local ingest append batches rejected due to unknown declarations\n# TYPE sydradb_local_ingest_unknown_decl_total counter\nsydradb_local_ingest_unknown_decl_total {d}\n", .{local_ingest_unknown_decl_total});
     try writer.print("# HELP sydradb_local_ingest_frame_too_large_total Total local ingest frames rejected for exceeding the configured size limit\n# TYPE sydradb_local_ingest_frame_too_large_total counter\nsydradb_local_ingest_frame_too_large_total {d}\n", .{local_ingest_frame_too_large_total});

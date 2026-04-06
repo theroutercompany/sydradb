@@ -20,6 +20,12 @@ const Scenario = struct {
     writers: usize,
     points_per_writer: usize,
     warm_socket: bool,
+    predeclare_direct: bool = true,
+};
+
+const WorkloadClass = enum {
+    transport_bound,
+    storage_bound,
 };
 
 const scenarios = [_]Scenario{
@@ -54,6 +60,7 @@ const scenarios = [_]Scenario{
         .writers = 1,
         .points_per_writer = 10_000,
         .warm_socket = false,
+        .predeclare_direct = false,
     },
     .{
         .name = "steady_state_100k",
@@ -67,13 +74,21 @@ const scenarios = [_]Scenario{
 
 const TransportMetrics = struct {
     queue_pending_bytes_max: usize = 0,
+    flush_seconds_total: f64 = 0,
+    wal_append_seconds_total: f64 = 0,
+    memtable_append_seconds_total: f64 = 0,
+    tag_index_save_total: u64 = 0,
+    tag_index_save_skipped_total: u64 = 0,
+    tag_index_save_seconds_total: f64 = 0,
     local_ingest_declare_batches_total: u64 = 0,
     local_ingest_declare_total: u64 = 0,
     local_ingest_declare_seconds_total: f64 = 0,
+    local_ingest_connections_total: u64 = 0,
     local_ingest_append_batches_total: u64 = 0,
     local_ingest_append_points_total: u64 = 0,
     local_ingest_append_seconds_total: f64 = 0,
     local_ingest_append_batch_points_max: usize = 0,
+    local_ingest_append_batch_points_avg: f64 = 0,
     local_ingest_rejected_total: u64 = 0,
 };
 
@@ -81,12 +96,16 @@ const BenchmarkResult = struct {
     transport: []const u8,
     points: usize,
     elapsed_ns: u64,
+    active_ns: u64 = 0,
+    barrier_ns: u64 = 0,
     metrics: TransportMetrics = .{},
+    client_stats: ?ingest_socket.ClientStats = null,
 };
 
 const DirectWorkerContext = struct {
     eng: *Engine,
-    series_ids: []const types.SeriesId,
+    specs: []const SeriesSpec,
+    series_ids: ?[]const types.SeriesId = null,
     points: usize,
     writer_idx: usize,
     batch_size: usize,
@@ -217,6 +236,47 @@ fn scenarioMatches(selected: ?[]const u8, scenario: Scenario) bool {
     return selected == null or std.mem.eql(u8, selected.?, scenario.name);
 }
 
+fn scenarioWorkloadClass(scenario: Scenario) WorkloadClass {
+    return switch (scenario.name[0]) {
+        else => if (std.mem.eql(u8, scenario.name, "warm_declared_10k") or std.mem.eql(u8, scenario.name, "cold_declare_10k"))
+            .storage_bound
+        else
+            .transport_bound,
+    };
+}
+
+fn workloadClassName(class: WorkloadClass) []const u8 {
+    return @tagName(class);
+}
+
+fn snapshotEngineMetrics(eng: *Engine) TransportMetrics {
+    const local_ingest_append_batches_total = eng.metrics.local_ingest_append_batches_total.load(.monotonic);
+    const local_ingest_append_points_total = eng.metrics.local_ingest_append_points_total.load(.monotonic);
+    return .{
+        .queue_pending_bytes_max = eng.metrics.queue_pending_bytes_max.load(.monotonic),
+        .flush_seconds_total = @as(f64, @floatFromInt(eng.metrics.flush_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .wal_append_seconds_total = @as(f64, @floatFromInt(eng.metrics.wal_append_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .memtable_append_seconds_total = @as(f64, @floatFromInt(eng.metrics.memtable_append_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .tag_index_save_total = eng.metrics.tag_index_save_total.load(.monotonic),
+        .tag_index_save_skipped_total = eng.metrics.tag_index_save_skipped_total.load(.monotonic),
+        .tag_index_save_seconds_total = @as(f64, @floatFromInt(eng.metrics.tag_index_save_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .local_ingest_declare_batches_total = eng.metrics.local_ingest_declare_batches_total.load(.monotonic),
+        .local_ingest_declare_total = eng.metrics.local_ingest_declare_total.load(.monotonic),
+        .local_ingest_declare_seconds_total = @as(f64, @floatFromInt(eng.metrics.local_ingest_declare_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .local_ingest_connections_total = eng.metrics.local_ingest_connections_total.load(.monotonic),
+        .local_ingest_append_batches_total = local_ingest_append_batches_total,
+        .local_ingest_append_points_total = local_ingest_append_points_total,
+        .local_ingest_append_seconds_total = @as(f64, @floatFromInt(eng.metrics.local_ingest_append_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .local_ingest_append_batch_points_max = eng.metrics.local_ingest_append_batch_points_max.load(.monotonic),
+        .local_ingest_append_batch_points_avg = if (local_ingest_append_batches_total == 0)
+            0
+        else
+            @as(f64, @floatFromInt(local_ingest_append_points_total)) /
+                @as(f64, @floatFromInt(local_ingest_append_batches_total)),
+        .local_ingest_rejected_total = eng.metrics.local_ingest_rejected_total.load(.monotonic),
+    };
+}
+
 fn partitionSeries(total: usize, writers: usize, writer_idx: usize) struct { start: usize, count: usize } {
     const base = total / writers;
     const rem = total % writers;
@@ -238,7 +298,13 @@ fn directWorker(ctx: DirectWorkerContext) void {
         const take = @min(batch.len, remaining);
         for (0..take) |idx| {
             const global_idx = emitted + idx;
-            const series_id = ctx.series_ids[global_idx % ctx.series_ids.len];
+            const spec = ctx.specs[global_idx % ctx.specs.len];
+            const series_id = if (ctx.series_ids) |series_ids|
+                series_ids[global_idx % series_ids.len]
+            else
+                ctx.eng.declareExactSeriesCanonical(spec.name, spec.canonical_tags, null) catch |err| {
+                    std.debug.panic("direct declare failed: {s}", .{@errorName(err)});
+                };
             batch[idx] = .{
                 .series_id = series_id,
                 .ts = start_ts + @as(i64, @intCast(global_idx)),
@@ -328,10 +394,12 @@ fn runDirectEngineBenchmark(alloc: std.mem.Allocator, scenario: Scenario, specs:
     var eng = try Engine.init(alloc, try makeConfig(alloc, data_path));
     defer eng.deinit();
 
-    const series_ids = try alloc.alloc(types.SeriesId, specs.len);
-    defer alloc.free(series_ids);
-    for (specs, 0..) |spec, idx| {
-        series_ids[idx] = try eng.declareExactSeriesCanonical(spec.name, spec.canonical_tags, null);
+    const series_ids = if (scenario.predeclare_direct) try alloc.alloc(types.SeriesId, specs.len) else null;
+    defer if (series_ids) |owned| alloc.free(owned);
+    if (series_ids) |owned| {
+        for (specs, 0..) |spec, idx| {
+            owned[idx] = try eng.declareExactSeriesCanonical(spec.name, spec.canonical_tags, null);
+        }
     }
 
     const threads = try alloc.alloc(std.Thread, scenario.writers);
@@ -344,7 +412,8 @@ fn runDirectEngineBenchmark(alloc: std.mem.Allocator, scenario: Scenario, specs:
         const range = partitionSeries(specs.len, scenario.writers, writer_idx);
         contexts[writer_idx] = .{
             .eng = eng,
-            .series_ids = series_ids[range.start .. range.start + range.count],
+            .specs = specs[range.start .. range.start + range.count],
+            .series_ids = if (series_ids) |owned| owned[range.start .. range.start + range.count] else null,
             .points = scenario.points_per_writer,
             .writer_idx = writer_idx,
             .batch_size = 256,
@@ -352,16 +421,19 @@ fn runDirectEngineBenchmark(alloc: std.mem.Allocator, scenario: Scenario, specs:
         threads[writer_idx] = try std.Thread.spawn(.{}, directWorker, .{contexts[writer_idx]});
     }
     for (threads) |thread| thread.join();
+    const active_ns = @as(u64, @intCast(std.time.nanoTimestamp() - start_ns));
+    const barrier_start_ns = std.time.nanoTimestamp();
     _ = try eng.flushAndDrain(60_000);
-    const elapsed_ns = @as(u64, @intCast(std.time.nanoTimestamp() - start_ns));
+    const barrier_ns = @as(u64, @intCast(std.time.nanoTimestamp() - barrier_start_ns));
+    const elapsed_ns = active_ns + barrier_ns;
 
     return .{
         .transport = "direct_engine",
         .points = scenario.points_per_writer * scenario.writers,
         .elapsed_ns = elapsed_ns,
-        .metrics = .{
-            .queue_pending_bytes_max = eng.metrics.queue_pending_bytes_max.load(.monotonic),
-        },
+        .active_ns = active_ns,
+        .barrier_ns = barrier_ns,
+        .metrics = snapshotEngineMetrics(eng),
     };
 }
 
@@ -391,16 +463,19 @@ fn runCliDirectBenchmark(alloc: std.mem.Allocator, scenario: Scenario, specs: []
         threads[writer_idx] = try std.Thread.spawn(.{}, cliWorker, .{contexts[writer_idx]});
     }
     for (threads) |thread| thread.join();
+    const active_ns = @as(u64, @intCast(std.time.nanoTimestamp() - start_ns));
+    const barrier_start_ns = std.time.nanoTimestamp();
     _ = try eng.flushAndDrain(60_000);
-    const elapsed_ns = @as(u64, @intCast(std.time.nanoTimestamp() - start_ns));
+    const barrier_ns = @as(u64, @intCast(std.time.nanoTimestamp() - barrier_start_ns));
+    const elapsed_ns = active_ns + barrier_ns;
 
     return .{
         .transport = "cli_direct_ndjson",
         .points = scenario.points_per_writer * scenario.writers,
         .elapsed_ns = elapsed_ns,
-        .metrics = .{
-            .queue_pending_bytes_max = eng.metrics.queue_pending_bytes_max.load(.monotonic),
-        },
+        .active_ns = active_ns,
+        .barrier_ns = barrier_ns,
+        .metrics = snapshotEngineMetrics(eng),
     };
 }
 
@@ -437,14 +512,19 @@ fn runHttpBenchmark(alloc: std.mem.Allocator, scenario: Scenario, specs: []const
         threads[writer_idx] = try std.Thread.spawn(.{}, httpWorker, .{contexts[writer_idx]});
     }
     for (threads) |thread| thread.join();
+    const active_ns = @as(u64, @intCast(std.time.nanoTimestamp() - start_ns));
+    const barrier_start_ns = std.time.nanoTimestamp();
     try waitForQueryableOverHttp(alloc, server.http_port, 60_000);
-    const elapsed_ns = @as(u64, @intCast(std.time.nanoTimestamp() - start_ns));
+    const barrier_ns = @as(u64, @intCast(std.time.nanoTimestamp() - barrier_start_ns));
+    const elapsed_ns = active_ns + barrier_ns;
     const metrics = try fetchMetrics(alloc, server.http_port);
 
     return .{
         .transport = "http_ndjson",
         .points = scenario.points_per_writer * scenario.writers,
         .elapsed_ns = elapsed_ns,
+        .active_ns = active_ns,
+        .barrier_ns = barrier_ns,
         .metrics = metrics,
     };
 }
@@ -480,17 +560,36 @@ fn runSocketBenchmark(alloc: std.mem.Allocator, scenario: Scenario, specs: []con
         threads[writer_idx] = try std.Thread.spawn(.{}, socketWorker, .{&states[writer_idx]});
     }
     for (threads) |thread| thread.join();
+    const active_ns = @as(u64, @intCast(std.time.nanoTimestamp() - start_ns));
+    const barrier_start_ns = std.time.nanoTimestamp();
     var flush_client = try ingest_socket.Client.connectWithRetry(alloc, server.socket_path.?, 40, 10);
     defer flush_client.deinit();
     _ = try flush_client.flushAndDrain(60_000);
-    const elapsed_ns = @as(u64, @intCast(std.time.nanoTimestamp() - start_ns));
+    const barrier_ns = @as(u64, @intCast(std.time.nanoTimestamp() - barrier_start_ns));
+    const elapsed_ns = active_ns + barrier_ns;
     const metrics = try fetchMetrics(alloc, server.http_port);
+    var client_stats = ingest_socket.ClientStats{};
+    for (states) |*state| {
+        const snapshot = state.client.statsSnapshot();
+        client_stats.cache_hits_total += snapshot.cache_hits_total;
+        client_stats.cache_misses_total += snapshot.cache_misses_total;
+        client_stats.reconnect_total += snapshot.reconnect_total;
+        client_stats.declare_frames_sent_total += snapshot.declare_frames_sent_total;
+        client_stats.declare_entries_sent_total += snapshot.declare_entries_sent_total;
+        client_stats.append_frames_sent_total += snapshot.append_frames_sent_total;
+        client_stats.append_points_sent_total += snapshot.append_points_sent_total;
+    }
+    const flush_snapshot = flush_client.statsSnapshot();
+    client_stats.reconnect_total += flush_snapshot.reconnect_total;
 
     return .{
         .transport = if (scenario.warm_socket) "uds_binary_warm" else "uds_binary_cold",
         .points = scenario.points_per_writer * scenario.writers,
         .elapsed_ns = elapsed_ns,
+        .active_ns = active_ns,
+        .barrier_ns = barrier_ns,
         .metrics = metrics,
+        .client_stats = client_stats,
     };
 }
 
@@ -641,13 +740,21 @@ fn fetchMetrics(alloc: std.mem.Allocator, port: u16) !TransportMetrics {
     if (response.status_code != 200) return error.InvalidHttpStatus;
     return .{
         .queue_pending_bytes_max = parseMetricUsize(response.body, "sydradb_queue_pending_bytes_max"),
+        .flush_seconds_total = parseMetricF64(response.body, "sydradb_flush_seconds_total"),
+        .wal_append_seconds_total = parseMetricF64(response.body, "sydradb_wal_append_seconds_total"),
+        .memtable_append_seconds_total = parseMetricF64(response.body, "sydradb_memtable_append_seconds_total"),
+        .tag_index_save_total = parseMetricU64(response.body, "sydradb_tag_index_save_total"),
+        .tag_index_save_skipped_total = parseMetricU64(response.body, "sydradb_tag_index_save_skipped_total"),
+        .tag_index_save_seconds_total = parseMetricF64(response.body, "sydradb_tag_index_save_seconds_total"),
         .local_ingest_declare_batches_total = parseMetricU64(response.body, "sydradb_local_ingest_declare_batches_total"),
         .local_ingest_declare_total = parseMetricU64(response.body, "sydradb_local_ingest_declare_total"),
         .local_ingest_declare_seconds_total = parseMetricF64(response.body, "sydradb_local_ingest_declare_seconds_total"),
+        .local_ingest_connections_total = parseMetricU64(response.body, "sydradb_local_ingest_connections_total"),
         .local_ingest_append_batches_total = parseMetricU64(response.body, "sydradb_local_ingest_append_batches_total"),
         .local_ingest_append_points_total = parseMetricU64(response.body, "sydradb_local_ingest_append_points_total"),
         .local_ingest_append_seconds_total = parseMetricF64(response.body, "sydradb_local_ingest_append_seconds_total"),
         .local_ingest_append_batch_points_max = parseMetricUsize(response.body, "sydradb_local_ingest_append_batch_points_max"),
+        .local_ingest_append_batch_points_avg = parseMetricF64(response.body, "sydradb_local_ingest_append_batch_points_avg"),
         .local_ingest_rejected_total = parseMetricU64(response.body, "sydradb_local_ingest_rejected_total"),
     };
 }
@@ -766,15 +873,28 @@ fn parseMetricF64(metrics_text: []const u8, metric_name: []const u8) f64 {
 fn printResult(scenario: Scenario, result: BenchmarkResult) void {
     const seconds = @as(f64, @floatFromInt(result.elapsed_ns)) / 1_000_000_000.0;
     const points_per_second = if (seconds == 0) 0 else @as(f64, @floatFromInt(result.points)) / seconds;
+    const active_ms = @as(f64, @floatFromInt(result.active_ns)) / 1_000_000.0;
+    const barrier_ms = @as(f64, @floatFromInt(result.barrier_ns)) / 1_000_000.0;
+    const client_stats = result.client_stats orelse ingest_socket.ClientStats{};
     std.debug.print(
-        "scenario={s} transport={s} points={d} elapsed_ms={d:.2} points_per_sec={d:.0} queue_pending_bytes_max={d} local_declare_batches={d} local_declare_total={d} local_declare_s={d:.6} local_append_batches={d} local_append_points={d} local_append_s={d:.6} local_append_batch_points_max={d} local_rejected={d}\n",
+        "scenario={s} class={s} transport={s} points={d} elapsed_ms={d:.2} active_ms={d:.2} barrier_ms={d:.2} points_per_sec={d:.0} queue_pending_bytes_max={d} flush_s={d:.6} wal_s={d:.6} memtable_s={d:.6} tag_save_total={d} tag_save_skipped={d} tag_save_s={d:.6} local_connections={d} local_declare_batches={d} local_declare_total={d} local_declare_s={d:.6} local_append_batches={d} local_append_points={d} local_append_s={d:.6} local_append_batch_points_max={d} local_append_batch_points_avg={d:.6} local_rejected={d} client_cache_hits={d} client_cache_misses={d} client_reconnects={d} client_declare_frames={d} client_append_frames={d} client_append_points_avg={d:.6}\n",
         .{
             scenario.name,
+            workloadClassName(scenarioWorkloadClass(scenario)),
             result.transport,
             result.points,
             seconds * 1000.0,
+            active_ms,
+            barrier_ms,
             points_per_second,
             result.metrics.queue_pending_bytes_max,
+            result.metrics.flush_seconds_total,
+            result.metrics.wal_append_seconds_total,
+            result.metrics.memtable_append_seconds_total,
+            result.metrics.tag_index_save_total,
+            result.metrics.tag_index_save_skipped_total,
+            result.metrics.tag_index_save_seconds_total,
+            result.metrics.local_ingest_connections_total,
             result.metrics.local_ingest_declare_batches_total,
             result.metrics.local_ingest_declare_total,
             result.metrics.local_ingest_declare_seconds_total,
@@ -782,7 +902,14 @@ fn printResult(scenario: Scenario, result: BenchmarkResult) void {
             result.metrics.local_ingest_append_points_total,
             result.metrics.local_ingest_append_seconds_total,
             result.metrics.local_ingest_append_batch_points_max,
+            result.metrics.local_ingest_append_batch_points_avg,
             result.metrics.local_ingest_rejected_total,
+            client_stats.cache_hits_total,
+            client_stats.cache_misses_total,
+            client_stats.reconnect_total,
+            client_stats.declare_frames_sent_total,
+            client_stats.append_frames_sent_total,
+            client_stats.averageAppendPointsPerFrame(),
         },
     );
 }
