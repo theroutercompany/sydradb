@@ -4,6 +4,7 @@ const session_mod = @import("session.zig");
 const prepared_query = @import("../../query/prepared.zig");
 const translator = @import("../../query/translator.zig");
 const query_exec = @import("../../query/exec.zig");
+const compiler_diagnostics = @import("../../query/compiler/diagnostics.zig");
 const frontend = @import("../../query/frontend.zig");
 const query_common = @import("../../query/common.zig");
 const plan = @import("../../query/plan.zig");
@@ -20,6 +21,11 @@ const max_message_size: usize = 16 * 1024 * 1024;
 const PreparedQueryOutcome = union(enum) {
     handled,
     fallback: []const u8,
+};
+
+const PgwireExecutionErrorContract = struct {
+    sqlstate: []const u8,
+    message: []const u8,
 };
 
 const DescribedColumnState = struct {
@@ -957,6 +963,53 @@ fn classifySqlPrepareFallback(alloc: std.mem.Allocator, sql: []const u8) ![]cons
     return try alloc.dupe(u8, "compiler_not_implemented");
 }
 
+fn pgwireExecutionErrorContract(err: query_exec.ExecuteError) PgwireExecutionErrorContract {
+    if (compiler_diagnostics.fromCompileError(err)) |reason| {
+        return switch (reason) {
+            .series_not_found => .{
+                .sqlstate = "42P01",
+                .message = compiler_diagnostics.diagnosticMessage(reason),
+            },
+            .ambiguous_selector => .{
+                .sqlstate = "22023",
+                .message = compiler_diagnostics.diagnosticMessage(reason),
+            },
+            .shadow_mismatch => .{
+                .sqlstate = "XX000",
+                .message = compiler_diagnostics.diagnosticMessage(reason),
+            },
+            else => .{
+                .sqlstate = "0A000",
+                .message = compiler_diagnostics.diagnosticMessage(reason),
+            },
+        };
+    }
+
+    return switch (err) {
+        error.ValidationFailed => .{
+            .sqlstate = "22023",
+            .message = "validation failed",
+        },
+        error.InvalidLiteral,
+        error.UnterminatedString,
+        error.UnexpectedToken,
+        error.UnexpectedStatement,
+        error.UnexpectedExpression,
+        error.UnterminatedParenthesis,
+        error.InvalidNumber,
+        error.InvalidDuration,
+        error.InvalidTimestamp,
+        => .{
+            .sqlstate = "42601",
+            .message = "syntax error",
+        },
+        else => .{
+            .sqlstate = "XX000",
+            .message = @errorName(err),
+        },
+    };
+}
+
 fn handleSydraqlQuery(
     alloc: std.mem.Allocator,
     writer: std.Io.AnyWriter,
@@ -965,7 +1018,8 @@ fn handleSydraqlQuery(
 ) !void {
     const start_time = std.time.microTimestamp();
     var cursor = query_exec.execute(alloc, engine, sydraql) catch |err| {
-        try protocol.writeErrorResponse(writer, "ERROR", "0A000", @errorName(err));
+        const contract = pgwireExecutionErrorContract(err);
+        try protocol.writeErrorResponse(writer, "ERROR", contract.sqlstate, contract.message);
         try protocol.writeReadyForQuery(writer, 'I');
         return;
     };
@@ -1305,6 +1359,32 @@ test "writeExecutionModeNotices emits normalized fallback telemetry" {
     const written = allocating_writer.written();
     try std.testing.expect(std.mem.indexOf(u8, written, "execution_mode=translator legacy_fallback=true") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "fallback_reason=frontend_lexer_mismatch") != null);
+}
+
+test "pgwireExecutionErrorContract maps stable sydraql failures" {
+    const unsupported = pgwireExecutionErrorContract(error.UnsupportedFunction);
+    try std.testing.expectEqualStrings("0A000", unsupported.sqlstate);
+    try std.testing.expectEqualStrings(compiler_diagnostics.diagnosticMessage(.unsupported_function), unsupported.message);
+
+    const missing_series = pgwireExecutionErrorContract(error.SeriesNotFound);
+    try std.testing.expectEqualStrings("42P01", missing_series.sqlstate);
+    try std.testing.expectEqualStrings(compiler_diagnostics.diagnosticMessage(.series_not_found), missing_series.message);
+
+    const ambiguous = pgwireExecutionErrorContract(error.AmbiguousSelector);
+    try std.testing.expectEqualStrings("22023", ambiguous.sqlstate);
+    try std.testing.expectEqualStrings(compiler_diagnostics.diagnosticMessage(.ambiguous_selector), ambiguous.message);
+
+    const shadow = pgwireExecutionErrorContract(error.ShadowMismatch);
+    try std.testing.expectEqualStrings("XX000", shadow.sqlstate);
+    try std.testing.expectEqualStrings(compiler_diagnostics.diagnosticMessage(.shadow_mismatch), shadow.message);
+
+    const validation = pgwireExecutionErrorContract(error.ValidationFailed);
+    try std.testing.expectEqualStrings("22023", validation.sqlstate);
+    try std.testing.expectEqualStrings("validation failed", validation.message);
+
+    const syntax = pgwireExecutionErrorContract(error.UnexpectedToken);
+    try std.testing.expectEqualStrings("42601", syntax.sqlstate);
+    try std.testing.expectEqualStrings("syntax error", syntax.message);
 }
 
 test "sql core prepared path handles simple select queries" {
@@ -1822,6 +1902,47 @@ test "simple query rejects oversized query text with stable program limit error"
     const written = allocating_writer.written();
     try std.testing.expect(std.mem.indexOf(u8, written, "54000") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, query_common.query_text_too_large_message) != null);
+}
+
+test "simple query maps missing translated sydraql series to stable undefined-table error" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/pgwire-missing-series", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .compiled,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    var payload = std.array_list.Managed(u8).init(alloc);
+    defer payload.deinit();
+    try payload.appendSlice("SELECT value FROM missing.series WHERE time >= 0");
+    try payload.append(0);
+
+    var allocating_writer: std.Io.Writer.Allocating = .init(alloc);
+    defer allocating_writer.deinit();
+
+    try handleSimpleQuery(alloc, anyWriter(&allocating_writer.writer), payload.items, engine);
+
+    const written = allocating_writer.written();
+    try std.testing.expect(std.mem.indexOf(u8, written, "42P01") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, compiler_diagnostics.diagnosticMessage(.series_not_found)) != null);
 }
 
 test "extended protocol rejects oversized parse text with stable program limit error" {

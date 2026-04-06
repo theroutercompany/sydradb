@@ -198,6 +198,12 @@ Execution:
 
 Diagnostics:
 
+- On direct sydraQL execution failures, the current stable pgwire contract is:
+  - `42601` for syntax errors
+  - `22023` for validation failures and ambiguous selectors
+  - `42P01` when a translated selector cannot be resolved
+  - `0A000` for compiler-deferred unsupported shapes
+  - `XX000` for shadow mismatches and uncategorized runtime failures
 - Collects operator stats via `cursor.collectOperatorStats`.
 - Computes:
   - `rows_emitted` (from stream count)
