@@ -14,7 +14,7 @@ const wal_mod = @import("wal.zig");
 pub const current_format_version: u16 = 1;
 pub const main_ref = "heads/main";
 pub const legacy_repository_format_version: u16 = 1;
-pub const current_repository_format_version: u16 = 2;
+pub const current_repository_format_version: u16 = 3;
 pub const default_extent_chunk_bytes: u32 = 64 * 1024;
 const store_format_path = "objects/info/store-format";
 const store_format_magic = "SYDSTORE1";
@@ -1347,10 +1347,32 @@ pub const CommitWriter = struct {
         return try self.writePreparedSnapshot(&snapshot, parent, reason);
     }
 
+    pub fn writeCanonicalSnapshot(
+        self: *CommitWriter,
+        snapshot: *const LegacySnapshot,
+        parents: []const object_store.ObjectId,
+        created_at_ms: i64,
+        reason: []const u8,
+    ) !object_store.ObjectId {
+        return try self.writePreparedSnapshotWithMetadata(snapshot, parents, created_at_ms, reason);
+    }
+
     fn writePreparedSnapshot(
         self: *CommitWriter,
         snapshot: *const LegacySnapshot,
         parent: ?object_store.ObjectId,
+        reason: []const u8,
+    ) !object_store.ObjectId {
+        const parent_ids = try buildParentSlice(self.alloc, parent);
+        defer self.alloc.free(parent_ids);
+        return try self.writePreparedSnapshotWithMetadata(snapshot, parent_ids, std.time.milliTimestamp(), reason);
+    }
+
+    fn writePreparedSnapshotWithMetadata(
+        self: *CommitWriter,
+        snapshot: *const LegacySnapshot,
+        parents: []const object_store.ObjectId,
+        created_at_ms: i64,
         reason: []const u8,
     ) !object_store.ObjectId {
         const tag_payload = try encodeTagSnapshot(self.alloc, snapshot.tag_snapshot);
@@ -1456,17 +1478,16 @@ pub const CommitWriter = struct {
         });
         const root_id = try self.putTree(root_entries.items);
 
-        const parent_ids = try buildParentSlice(self.alloc, parent);
-        defer self.alloc.free(parent_ids);
         const reason_copy = try self.alloc.dupe(u8, reason);
         defer self.alloc.free(reason_copy);
         const commit = Commit{
             .format_version = current_format_version,
             .root = root_id,
-            .parents = parent_ids,
-            .created_at_ms = std.time.milliTimestamp(),
+            .parents = try self.alloc.dupe(object_store.ObjectId, parents),
+            .created_at_ms = created_at_ms,
             .reason = reason_copy,
         };
+        defer self.alloc.free(commit.parents);
         const commit_payload = try encodeCommit(self.alloc, commit);
         defer self.alloc.free(commit_payload);
         return try self.store.put(.commit, commit_payload);
@@ -1843,6 +1864,7 @@ pub const FsckReport = struct {
     stale_reflog_files: usize,
     dangling_objects: usize,
     lost_found_objects: usize,
+    compatibility_debt: CompatibilityDebtReport = .{},
 };
 
 pub const PackResult = struct {
@@ -2138,7 +2160,7 @@ pub const CasManager = struct {
     }
 
     pub fn upgradeRepository(self: *CasManager, data_dir: std.fs.Dir) !UpgradeResult {
-        _ = try self.fsck(data_dir, .{});
+        const fsck_before = try self.fsck(data_dir, .{});
 
         var migrated_reftable = false;
         if (self.format.ref_backend != .reftable or self.format.version < current_repository_format_version) {
@@ -2151,14 +2173,18 @@ pub const CasManager = struct {
         }
 
         try self.ensureHeadSymRef();
+        const normalized_commits = try self.normalizeRepository(data_dir, .{});
         _ = try self.repairRepository(data_dir, .{});
         const pack_result = try self.pack();
+        const fsck_after = try self.fsck(data_dir, .{});
         return .{
             .migrated_reftable = migrated_reftable,
             .format_version = self.format.version,
             .ref_backend = self.format.ref_backend,
             .reachable_objects = pack_result.reachable_objects,
             .rewritten_objects = pack_result.rewritten_objects,
+            .normalized_commits = normalized_commits,
+            .compatibility_debt = if (normalized_commits == 0) fsck_before.compatibility_debt else fsck_after.compatibility_debt,
         };
     }
 
@@ -2195,6 +2221,46 @@ pub const CasManager = struct {
         if ((try self.refs.readSymRef("HEAD")) == null) {
             try self.refs.writeSymRef("HEAD", main_ref);
         }
+    }
+
+    pub fn normalizeRepository(self: *CasManager, data_dir: std.fs.Dir, options: NormalizeOptions) !usize {
+        _ = options;
+        const refs = try self.refs.listRefs(self.alloc);
+        defer {
+            for (refs) |*entry| entry.deinit(self.alloc);
+            self.alloc.free(refs);
+        }
+        if (refs.len == 0) return 0;
+
+        var normalized_map = std.AutoHashMap(object_store.ObjectId, object_store.ObjectId).init(self.alloc);
+        defer normalized_map.deinit();
+        var rewritten_commits: usize = 0;
+
+        var updates = std.array_list.Managed(RefTxnUpdate).init(self.alloc);
+        defer {
+            for (updates.items) |update| {
+                self.alloc.free(@constCast(update.ref_name));
+            }
+            updates.deinit();
+        }
+
+        for (refs) |entry| {
+            const normalized_id = try self.normalizeCommitRecursive(data_dir, entry.id, &normalized_map, &rewritten_commits);
+            if (!normalized_id.eql(entry.id)) {
+                try updates.append(.{
+                    .ref_name = try self.alloc.dupe(u8, entry.name),
+                    .expected_old = entry.id,
+                    .new_id = normalized_id,
+                });
+            }
+        }
+
+        if (updates.items.len != 0) {
+            try self.refs.updateRefTxn(updates.items, "normalize-repository");
+            try self.ensureHeadSymRef();
+            try self.refreshCommitGraph();
+        }
+        return rewritten_commits;
     }
 
     pub fn expire(self: *CasManager, data_dir: std.fs.Dir, policy: MaintenancePolicy) !ExpiryReport {
@@ -2636,6 +2702,12 @@ pub const CasManager = struct {
             else => return err,
         }
 
+        var refs_index = loadObjectRefsIndex(self.alloc, self.store.root) catch |err| switch (err) {
+            error.FileNotFound, error.CorruptObjectRefsIndex, error.UnsupportedObjectRefsIndexVersion => null,
+            else => return err,
+        };
+        defer if (refs_index) |*index| index.deinit(self.alloc);
+
         var it = direct_reachable.keyIterator();
         while (it.next()) |id_ptr| {
             const loaded = try self.store.get(self.alloc, id_ptr.*);
@@ -2643,9 +2715,39 @@ pub const CasManager = struct {
             switch (loaded.obj_type) {
                 .commit => report.commit_objects += 1,
                 .tree => report.tree_objects += 1,
-                .blob => report.blob_objects += 1,
+                .blob => {
+                    report.blob_objects += 1;
+                    if (refs_index) |index| {
+                        if (index.lookup(id_ptr.*)) |record| {
+                            switch (record.role) {
+                                .segment_descriptor => {
+                                    const descriptor = try decodeSegmentDescriptor(self.alloc, loaded.payload);
+                                    defer descriptor.deinit(self.alloc);
+                                    if (descriptor.segmentRoot() == null) report.compatibility_debt.legacy_segment_descriptors += 1;
+                                },
+                                .wal_index => {
+                                    var wal_index = try decodeWalIndex(self.alloc, loaded.payload);
+                                    defer wal_index.deinit(self.alloc);
+                                    for (wal_index.entries) |entry| {
+                                        if (entry.journalRoot() == null) report.compatibility_debt.legacy_wal_descriptors += 1;
+                                    }
+                                },
+                                else => {},
+                            }
+                        }
+                    }
+                },
                 else => return error.UnsupportedCasObjectType,
             }
+        }
+
+        if (self.format.version >= current_repository_format_version and self.format.ref_backend == .reftable) {
+            const loose_refs = try self.refs.listLooseRefs(self.alloc);
+            defer {
+                for (loose_refs) |*entry| entry.deinit(self.alloc);
+                self.alloc.free(loose_refs);
+            }
+            report.compatibility_debt.loose_refs_present = loose_refs.len;
         }
 
         if (loadCommitGraph(self.alloc, self.store.root)) |loaded_graph| {
@@ -2929,6 +3031,146 @@ pub const CasManager = struct {
         }
 
         return seen;
+    }
+
+    fn normalizeCommitRecursive(
+        self: *CasManager,
+        data_dir: std.fs.Dir,
+        commit_id: object_store.ObjectId,
+        normalized_map: *std.AutoHashMap(object_store.ObjectId, object_store.ObjectId),
+        rewritten_commits: *usize,
+    ) !object_store.ObjectId {
+        if (normalized_map.get(commit_id)) |existing| return existing;
+
+        const loaded = try self.store.get(self.alloc, commit_id);
+        defer self.alloc.free(loaded.payload);
+        if (loaded.obj_type != .commit) return error.InvalidCommitObject;
+        var commit = try decodeCommit(self.alloc, loaded.payload);
+        defer commit.deinit(self.alloc);
+
+        var normalized_parents = try self.alloc.alloc(object_store.ObjectId, commit.parents.len);
+        defer self.alloc.free(normalized_parents);
+        var parents_changed = false;
+        for (commit.parents, 0..) |parent, idx| {
+            normalized_parents[idx] = try self.normalizeCommitRecursive(data_dir, parent, normalized_map, rewritten_commits);
+            if (!normalized_parents[idx].eql(parent)) parents_changed = true;
+        }
+
+        var snapshot = try self.loadSnapshotForSpec((commit_id.toHex())[0..]);
+        defer snapshot.deinit(self.alloc);
+
+        const canonical = try self.canonicalizeSnapshot(data_dir, snapshot);
+        defer canonical.snapshot.deinit(self.alloc);
+
+        const changed = parents_changed or canonical.changed;
+        if (!changed) {
+            try normalized_map.put(commit_id, commit_id);
+            return commit_id;
+        }
+
+        var writer = CommitWriter{ .alloc = self.alloc, .store = &self.store, .extent_chunk_bytes = self.format.extent_chunk_bytes };
+        const normalized_id = try writer.writeCanonicalSnapshot(&canonical.snapshot, normalized_parents, commit.created_at_ms, commit.reason);
+        try normalized_map.put(commit_id, normalized_id);
+        rewritten_commits.* += 1;
+        return normalized_id;
+    }
+
+    fn canonicalizeSnapshot(
+        self: *CasManager,
+        data_dir: std.fs.Dir,
+        snapshot: Snapshot,
+    ) !struct {
+        snapshot: LegacySnapshot,
+        changed: bool,
+    } {
+        var changed = false;
+
+        const descriptors = try self.alloc.alloc(SegmentDescriptor, snapshot.segment_descriptors.len);
+        errdefer {
+            for (descriptors[0..]) |*descriptor| {
+                if (descriptor.path.len != 0) descriptor.deinit(self.alloc);
+            }
+            self.alloc.free(descriptors);
+        }
+        for (snapshot.segment_descriptors, 0..) |descriptor, idx| {
+            var next = try cloneSegmentDescriptor(self.alloc, descriptor);
+            if (next.segmentRoot() == null) {
+                next.segment_root = try self.canonicalSegmentRoot(data_dir, descriptor);
+                changed = true;
+            }
+            descriptors[idx] = next;
+        }
+
+        var tag_snapshot = try cloneTagSnapshot(self.alloc, snapshot.tag_snapshot);
+        errdefer tag_snapshot.deinit(self.alloc);
+        var series_catalog_snapshot = try cloneSeriesCatalogSnapshot(self.alloc, snapshot.series_catalog_snapshot);
+        errdefer series_catalog_snapshot.deinit(self.alloc);
+
+        const wal_entries = try self.alloc.alloc(WalChunkDescriptor, snapshot.wal_index.entries.len);
+        errdefer {
+            for (wal_entries[0..]) |*entry| {
+                if (entry.name.len != 0) entry.deinit(self.alloc);
+            }
+            self.alloc.free(wal_entries);
+        }
+        for (snapshot.wal_index.entries, 0..) |entry, idx| {
+            var next = try cloneWalChunkDescriptor(self.alloc, entry);
+            if (next.journalRoot() == null) {
+                next.journal_root = try self.canonicalJournalRoot(data_dir, entry);
+                changed = true;
+            }
+            wal_entries[idx] = next;
+        }
+
+        var wal_index = WalIndex{ .entries = wal_entries };
+        errdefer wal_index.deinit(self.alloc);
+        var checkpoint_state = try buildCheckpointState(self.alloc, descriptors, wal_index.entries);
+        errdefer checkpoint_state.deinit(self.alloc);
+        if (!checkpointStatesEql(checkpoint_state, snapshot.checkpoint_state)) changed = true;
+
+        return .{
+            .snapshot = .{
+                .segment_descriptors = descriptors,
+                .tag_snapshot = tag_snapshot,
+                .series_catalog_snapshot = series_catalog_snapshot,
+                .wal_index = wal_index,
+                .checkpoint_state = checkpoint_state,
+            },
+            .changed = changed,
+        };
+    }
+
+    fn canonicalSegmentRoot(self: *CasManager, data_dir: std.fs.Dir, descriptor: SegmentDescriptor) !object_store.ObjectId {
+        if (descriptor.segmentRoot()) |root_id| return root_id;
+        if (descriptor.mirrorPath().len != 0 and pathExists(data_dir, descriptor.mirrorPath()) catch false) {
+            return try segment_mod.writeSegmentRootForFile(self.alloc, data_dir, &self.store, descriptor.mirrorPath(), self.format.extent_chunk_bytes);
+        }
+        const points = try segment_mod.readAllDescriptor(self.alloc, data_dir, &self.store, descriptor);
+        defer self.alloc.free(points);
+        return try segment_mod.writeSegmentRoot(self.alloc, &self.store, .{
+            .series_id = descriptor.series_id,
+            .hour_bucket = descriptor.hour_bucket,
+            .ts_codec = descriptor.ts_codec,
+            .val_codec = descriptor.val_codec,
+            .selector = null,
+        }, points, self.format.extent_chunk_bytes);
+    }
+
+    fn canonicalJournalRoot(self: *CasManager, data_dir: std.fs.Dir, entry: WalChunkDescriptor) !object_store.ObjectId {
+        if (entry.journalRoot()) |root_id| return root_id;
+        if (entry.mirrorName().len != 0) {
+            const path = try std.fmt.allocPrint(self.alloc, "wal/{s}", .{entry.mirrorName()});
+            defer self.alloc.free(path);
+            if (pathExists(data_dir, path) catch false) {
+                return try wal_mod.writeJournalRootForWalFile(self.alloc, data_dir, &self.store, entry.mirrorName());
+            }
+        }
+        if (entry.contentRef()) |content| {
+            const bytes = try readContentRefBytes(self.alloc, &self.store, content);
+            defer self.alloc.free(bytes);
+            return try wal_mod.writeJournalRootFromBytes(self.alloc, &self.store, bytes);
+        }
+        return error.MissingWalContentId;
     }
 };
 
@@ -3421,12 +3663,24 @@ pub const BundleResult = struct {
     reftable_file_count: usize = 0,
 };
 
+pub const CompatibilityDebtReport = struct {
+    legacy_segment_descriptors: usize = 0,
+    legacy_wal_descriptors: usize = 0,
+    loose_refs_present: usize = 0,
+};
+
+pub const NormalizeOptions = struct {
+    normalize_active_refs: bool = true,
+};
+
 pub const UpgradeResult = struct {
     migrated_reftable: bool,
     format_version: u16,
     ref_backend: RefBackend,
     reachable_objects: usize,
     rewritten_objects: usize,
+    normalized_commits: usize = 0,
+    compatibility_debt: CompatibilityDebtReport = .{},
 };
 
 pub const VacuumResult = struct {
@@ -6406,6 +6660,88 @@ fn containsObjectId(entries: []const object_store.ObjectId, needle: object_store
     return false;
 }
 
+fn checkpointStatesEql(lhs: CheckpointState, rhs: CheckpointState) bool {
+    if (lhs.highwaters.len != rhs.highwaters.len) return false;
+    for (lhs.highwaters, rhs.highwaters) |lhs_entry, rhs_entry| {
+        if (!lhs_entry.eql(rhs_entry)) return false;
+    }
+    if (lhs.wal_entries.len != rhs.wal_entries.len) return false;
+    for (lhs.wal_entries, rhs.wal_entries) |lhs_entry, rhs_entry| {
+        if (!lhs_entry.eql(rhs_entry)) return false;
+    }
+    return true;
+}
+
+fn cloneSegmentDescriptor(alloc: std.mem.Allocator, descriptor: SegmentDescriptor) !SegmentDescriptor {
+    return .{
+        .path = try alloc.dupe(u8, descriptor.path),
+        .mirror_path = &[_]u8{},
+        .segment_root = descriptor.segment_root,
+        .content_id = descriptor.content_id,
+        .content = descriptor.content,
+        .file_hash = descriptor.file_hash,
+        .file_size = descriptor.file_size,
+        .series_id = descriptor.series_id,
+        .hour_bucket = descriptor.hour_bucket,
+        .start_ts = descriptor.start_ts,
+        .end_ts = descriptor.end_ts,
+        .count = descriptor.count,
+        .ts_codec = descriptor.ts_codec,
+        .val_codec = descriptor.val_codec,
+    };
+}
+
+fn cloneWalChunkDescriptor(alloc: std.mem.Allocator, entry: WalChunkDescriptor) !WalChunkDescriptor {
+    return .{
+        .name = try alloc.dupe(u8, entry.name),
+        .mirror_name = &[_]u8{},
+        .journal_root = entry.journal_root,
+        .content_id = entry.content_id,
+        .content = entry.content,
+        .file_size = entry.file_size,
+        .file_hash = entry.file_hash,
+        .mutable = entry.mutable,
+        .captured_bytes = entry.captured_bytes,
+    };
+}
+
+fn cloneTagSnapshot(alloc: std.mem.Allocator, snapshot: TagSnapshot) !TagSnapshot {
+    const entries = try alloc.alloc(TagSnapshotEntry, snapshot.entries.len);
+    errdefer {
+        for (entries[0..]) |*entry| {
+            if (entry.key.len != 0) entry.deinit(alloc);
+        }
+        alloc.free(entries);
+    }
+    for (entries) |*entry| entry.* = .{ .key = &[_]u8{}, .series_ids = &[_]types.SeriesId{} };
+    for (snapshot.entries, 0..) |entry, idx| {
+        entries[idx] = .{
+            .key = try alloc.dupe(u8, entry.key),
+            .series_ids = try alloc.dupe(types.SeriesId, entry.series_ids),
+        };
+    }
+    return .{ .entries = entries };
+}
+
+fn cloneSeriesCatalogSnapshot(alloc: std.mem.Allocator, snapshot: SeriesCatalogSnapshot) !SeriesCatalogSnapshot {
+    const entries = try alloc.alloc(SeriesCatalogSnapshotEntry, snapshot.entries.len);
+    errdefer {
+        for (entries[0..]) |*entry| {
+            if (entry.series.len != 0) entry.deinit(alloc);
+        }
+        alloc.free(entries);
+    }
+    for (entries) |*entry| entry.* = .{ .series = &[_]u8{}, .canonical_tags = &[_]u8{}, .series_id = 0 };
+    for (snapshot.entries, 0..) |entry, idx| {
+        entries[idx] = .{
+            .series = try alloc.dupe(u8, entry.series),
+            .canonical_tags = try alloc.dupe(u8, entry.canonical_tags),
+            .series_id = entry.series_id,
+        };
+    }
+    return .{ .entries = entries };
+}
+
 fn sortDescriptors(descriptors: []SegmentDescriptor) void {
     std.sort.block(SegmentDescriptor, descriptors, {}, struct {
         fn lessThan(_: void, lhs: SegmentDescriptor, rhs: SegmentDescriptor) bool {
@@ -7955,6 +8291,18 @@ fn materializeSnapshotMirrors(
         defer alloc.free(path);
         try writeContentRefToPath(alloc, data_dir, store, path, content);
     }
+}
+
+fn readContentRefBytes(alloc: std.mem.Allocator, store: *object_store.ObjectStore, content: ContentRef) ![]u8 {
+    return switch (content) {
+        .blob => |content_id| blk: {
+            const loaded = try store.get(alloc, content_id);
+            defer alloc.free(loaded.payload);
+            if (loaded.obj_type != .blob) return error.InvalidContentBlobObject;
+            break :blk try alloc.dupe(u8, loaded.payload);
+        },
+        .extent_tree => |tree| try extents.readAll(alloc, store, tree),
+    };
 }
 
 fn writeContentRefToPath(
