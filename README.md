@@ -75,6 +75,7 @@ Current contract notes:
 - Market APIs require `ts_ns` / `*_ts_ns` fields and treat them as nanosecond epoch time end-to-end.
 - Market ingest is schema-validated and fans out each row into sibling exact-series metrics such as `market.trade.price` and `market.bar.close`.
 - Derived outputs carry provenance labels including `data_revision`, `definition_id`, and `definition_version`.
+- `GET /api/v1/analysis/catalog` is intentionally conservative. Today it advertises only analysis behavior that is fully implemented and stable.
 - Native multi-column storage is not implemented yet; that remains a later internal foundation project.
 
 ## Nix
@@ -217,6 +218,7 @@ cas_mode = "off"  # off|dual_write
 metadata_read_mode = "legacy"  # legacy|shadow|primary
 query_compiler_mode = "compiled"  # legacy|shadow|compiled
 market_storage_mode = "fanout_v1" # fanout_v1|dual_write_v1|native_v1
+market_storage_read_mode = "fanout" # fanout|shadow|native
 # Per-namespace TTL
 retention.weather = 30
 ```
@@ -238,6 +240,7 @@ Config notes:
 - `metadata_read_mode = "primary"` serves metadata from CAS and can boot even if `MANIFEST`, `tags.json`, or `series_catalog.jsonl` are missing.
 - `query_compiler_mode = "compiled"` is the default execution mode. Unsupported query shapes fall back to the legacy pipeline and emit visible fallback metrics.
 - `market_storage_mode` currently defaults to `fanout_v1`. `dual_write_v1` and `native_v1` are forward-looking internal modes and should still be treated as preview plumbing rather than a broad compatibility guarantee.
+- `market_storage_read_mode` currently defaults to `fanout`. `shadow` and `native` are scaffolding for future parity work and do not yet change the market read path.
 - Without `sydradb.toml`, fresh repositories default to `cas_mode = "dual_write"` plus `metadata_read_mode = "primary"`. Existing repositories without a migrated `objects/info/store-format` marker stay on `off` plus `legacy` until `cas migrate-reftable` or `cas upgrade` is run.
 - CAS repositories persist `objects/info/store-format` to version repository-wide storage behavior separately from per-object codecs. Fresh repositories initialize format v3 with a reftable ref backend plus canonical `segment_root` / `journal_root` metadata for active history. Legacy repositories stay in the older compatibility format until explicitly migrated and normalized.
 - WAL recovery order is sourced from the CAS commit graph when CAS is enabled, with any uncaptured live WAL files appended as tail replay.

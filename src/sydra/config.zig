@@ -5,6 +5,7 @@ pub const CasMode = enum { off, dual_write };
 pub const QueryCompilerMode = enum { legacy, shadow, compiled };
 pub const MetadataReadMode = enum { legacy, shadow, primary };
 pub const MarketStorageMode = enum { fanout_v1, dual_write_v1, native_v1 };
+pub const MarketStorageReadMode = enum { fanout, shadow, native };
 
 pub const Config = struct {
     data_dir: []const u8,
@@ -21,6 +22,7 @@ pub const Config = struct {
     metadata_read_mode: MetadataReadMode = .legacy,
     query_compiler_mode: QueryCompilerMode = .compiled,
     market_storage_mode: MarketStorageMode = .fanout_v1,
+    market_storage_read_mode: MarketStorageReadMode = .fanout,
     retention_ns: std.StringHashMap(u32),
 
     pub fn deinit(self: *Config, alloc: std.mem.Allocator) void {
@@ -56,6 +58,7 @@ fn parseToml(alloc: std.mem.Allocator, text: []const u8) !Config {
         .metadata_read_mode = .legacy,
         .query_compiler_mode = .compiled,
         .market_storage_mode = .fanout_v1,
+        .market_storage_read_mode = .fanout,
         .retention_ns = std.StringHashMap(u32).init(alloc),
     };
     var it = std.mem.tokenizeAny(u8, text, "\n\r");
@@ -141,6 +144,18 @@ fn parseToml(alloc: std.mem.Allocator, text: []const u8) !Config {
                 cfg.market_storage_mode = .native_v1;
             } else {
                 return error.InvalidMarketStorageMode;
+            }
+        } else if (std.mem.eql(u8, key_raw, "market_storage_read_mode")) {
+            var v2 = val_raw;
+            if (v2.len >= 2 and v2[0] == '"' and v2[v2.len - 1] == '"') v2 = v2[1 .. v2.len - 1];
+            if (std.mem.eql(u8, v2, "fanout")) {
+                cfg.market_storage_read_mode = .fanout;
+            } else if (std.mem.eql(u8, v2, "shadow")) {
+                cfg.market_storage_read_mode = .shadow;
+            } else if (std.mem.eql(u8, v2, "native")) {
+                cfg.market_storage_read_mode = .native;
+            } else {
+                return error.InvalidMarketStorageReadMode;
             }
         } else if (std.mem.startsWith(u8, key_raw, "retention.")) {
             const ns = key_raw["retention.".len..];
