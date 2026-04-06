@@ -44,15 +44,6 @@ fn makeConfig(
     };
 }
 
-fn waitForQueueEmpty(engine: *engine_mod.Engine, timeout_ms: u64) !void {
-    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
-    while (std.time.milliTimestamp() < deadline) {
-        if (engine.queue.len() == 0) return;
-        sleepMs(10);
-    }
-    return error.Timeout;
-}
-
 fn seedRepo(
     alloc: std.mem.Allocator,
     data_path: []const u8,
@@ -86,7 +77,7 @@ fn seedRepo(
         }
     }
 
-    try waitForQueueEmpty(engine, 10_000);
+    try engine.waitForDrained(10_000);
     engine.deinit();
 
     var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });

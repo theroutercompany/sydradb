@@ -37,15 +37,6 @@ fn makeConfig(alloc: std.mem.Allocator, data_dir: []const u8) !cfg.Config {
     };
 }
 
-fn waitForQueueEmpty(engine: *engine_mod.Engine, timeout_ms: u64) !void {
-    const deadline = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
-    while (std.time.milliTimestamp() < deadline) {
-        if (engine.queue.len() == 0) return;
-        sleepMs(10);
-    }
-    return error.Timeout;
-}
-
 fn ingestSeries(
     alloc: std.mem.Allocator,
     engine: *engine_mod.Engine,
@@ -242,7 +233,7 @@ pub fn main() !void {
 
         const ingest_start = std.time.microTimestamp();
         try seedDataset(alloc, engine, total_series, options.points_per_series);
-        try waitForQueueEmpty(engine, 5_000);
+        try engine.waitForDrained(5_000);
         const ingest_end = std.time.microTimestamp();
 
         std.debug.print(
