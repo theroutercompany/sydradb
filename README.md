@@ -149,6 +149,7 @@ zig build bench-ingest-transport -- --scenario steady_state_100k
 Scenario definitions live under [`benchmarks/README.md`](/Users/rexliu/sydradb/benchmarks/README.md), [`benchmarks/alloc/scenarios.json`](/Users/rexliu/sydradb/benchmarks/alloc/scenarios.json), [`benchmarks/sydraql/scenarios.json`](/Users/rexliu/sydradb/benchmarks/sydraql/scenarios.json), [`benchmarks/cas/scenarios.json`](/Users/rexliu/sydradb/benchmarks/cas/scenarios.json), and [`benchmarks/ingest_transport/scenarios.json`](/Users/rexliu/sydradb/benchmarks/ingest_transport/scenarios.json).
 
 Checked-in sample runs are published in [`benchmarks/v0.4.0-summary.md`](/Users/rexliu/sydradb/benchmarks/v0.4.0-summary.md) and [`benchmarks/v0.4.0-ingest-transport-summary.md`](/Users/rexliu/sydradb/benchmarks/v0.4.0-ingest-transport-summary.md).
+The current preview promotion checklist for local exact-series ingest lives in [`benchmarks/local-ingest-preview-checklist.md`](/Users/rexliu/sydradb/benchmarks/local-ingest-preview-checklist.md).
 
 ## Demos
 
@@ -161,6 +162,7 @@ bash demos/demo-cas-lifecycle.sh
 bash demos/demo-pgwire-preview.sh
 bash demos/demo-local-ingest-socket.sh
 bash demos/demo-combined-http-socket.sh
+bash demos/demo-http-large-ingest.sh
 zig build demo-smoke
 ```
 

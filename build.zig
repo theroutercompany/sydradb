@@ -107,6 +107,12 @@ pub fn build(b: *std.Build) void {
     combined_http_socket_smoke.step.dependOn(b.getInstallStep());
     demo_smoke.dependOn(&combined_http_socket_smoke.step);
 
+    const http_large_ingest_smoke = b.addSystemCommand(&.{ "bash", "-lc", "SYDRADB_BIN=\"$1\" bash demos/demo-http-large-ingest.sh", "demo-http-large-ingest" });
+    http_large_ingest_smoke.addArtifactArg(exe);
+    http_large_ingest_smoke.setCwd(repo_root);
+    http_large_ingest_smoke.step.dependOn(b.getInstallStep());
+    demo_smoke.dependOn(&http_large_ingest_smoke.step);
+
     const unit_tests = if (is015) blk2: {
         const root_mod = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize });
         root_mod.addImport("build_options", build_options_module);
