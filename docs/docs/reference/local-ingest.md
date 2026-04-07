@@ -112,10 +112,19 @@ Behavior:
 - `runtime.exact_series_declare_series_catalog_seconds_total`
 - `runtime.exact_series_declare_wal_registration_seconds_total`
 - `runtime.exact_series_declare_tag_index_seconds_total`
+- `runtime.exact_series_declare_selector_key_seconds_total`
+- `runtime.exact_series_declare_tag_pairs_total`
 - `runtime.exact_series_declare_inserted_total`
 - `runtime.exact_series_declare_unchanged_total`
 - `runtime.exact_series_declare_descriptor_conflict_total`
 - `runtime.exact_series_declare_series_conflict_total`
+- `runtime.flush_queue_drain_wait_seconds_total`
+- `runtime.flush_manifest_seconds_total`
+- `runtime.flush_segment_write_seconds_total`
+- `runtime.flush_selector_metadata_seconds_total`
+- `runtime.flush_segments_written_total`
+- `runtime.flush_series_buckets_total`
+- `runtime.flush_hour_slices_total`
 
 `GET /metrics` adds counters and gauges such as:
 
@@ -137,10 +146,19 @@ Behavior:
 - `sydradb_exact_series_declare_series_catalog_seconds_total`
 - `sydradb_exact_series_declare_wal_registration_seconds_total`
 - `sydradb_exact_series_declare_tag_index_seconds_total`
+- `sydradb_exact_series_declare_selector_key_seconds_total`
+- `sydradb_exact_series_declare_tag_pairs_total`
 - `sydradb_exact_series_declare_inserted_total`
 - `sydradb_exact_series_declare_unchanged_total`
 - `sydradb_exact_series_declare_descriptor_conflict_total`
 - `sydradb_exact_series_declare_series_conflict_total`
+- `sydradb_flush_queue_drain_wait_seconds_total`
+- `sydradb_flush_manifest_seconds_total`
+- `sydradb_flush_segment_write_seconds_total`
+- `sydradb_flush_selector_metadata_seconds_total`
+- `sydradb_flush_segments_written_total`
+- `sydradb_flush_series_buckets_total`
+- `sydradb_flush_hour_slices_total`
 
 ## macOS Note
 

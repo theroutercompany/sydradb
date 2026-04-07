@@ -22,6 +22,11 @@
       "command": "zig build bench-ingest-transport -- --scenario cold_declare_10k"
     },
     {
+      "name": "cold_declare_fanout_4x2500",
+      "description": "4 writers each cold-declaring 2500 unique series before append",
+      "command": "zig build bench-ingest-transport -- --scenario cold_declare_fanout_4x2500"
+    },
+    {
       "name": "steady_state_100k",
       "description": "100k warm-declared points to measure sustained same-host append",
       "command": "zig build bench-ingest-transport -- --scenario steady_state_100k"
