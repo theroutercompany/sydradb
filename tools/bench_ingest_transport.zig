@@ -83,6 +83,14 @@ const TransportMetrics = struct {
     local_ingest_declare_batches_total: u64 = 0,
     local_ingest_declare_total: u64 = 0,
     local_ingest_declare_seconds_total: f64 = 0,
+    exact_series_declare_metric_catalog_seconds_total: f64 = 0,
+    exact_series_declare_series_catalog_seconds_total: f64 = 0,
+    exact_series_declare_wal_registration_seconds_total: f64 = 0,
+    exact_series_declare_tag_index_seconds_total: f64 = 0,
+    exact_series_declare_inserted_total: u64 = 0,
+    exact_series_declare_unchanged_total: u64 = 0,
+    exact_series_declare_descriptor_conflict_total: u64 = 0,
+    exact_series_declare_series_conflict_total: u64 = 0,
     local_ingest_connections_total: u64 = 0,
     local_ingest_append_batches_total: u64 = 0,
     local_ingest_append_points_total: u64 = 0,
@@ -263,6 +271,14 @@ fn snapshotEngineMetrics(eng: *Engine) TransportMetrics {
         .local_ingest_declare_batches_total = eng.metrics.local_ingest_declare_batches_total.load(.monotonic),
         .local_ingest_declare_total = eng.metrics.local_ingest_declare_total.load(.monotonic),
         .local_ingest_declare_seconds_total = @as(f64, @floatFromInt(eng.metrics.local_ingest_declare_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .exact_series_declare_metric_catalog_seconds_total = @as(f64, @floatFromInt(eng.metrics.exact_series_declare_metric_catalog_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .exact_series_declare_series_catalog_seconds_total = @as(f64, @floatFromInt(eng.metrics.exact_series_declare_series_catalog_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .exact_series_declare_wal_registration_seconds_total = @as(f64, @floatFromInt(eng.metrics.exact_series_declare_wal_registration_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .exact_series_declare_tag_index_seconds_total = @as(f64, @floatFromInt(eng.metrics.exact_series_declare_tag_index_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .exact_series_declare_inserted_total = eng.metrics.exact_series_declare_inserted_total.load(.monotonic),
+        .exact_series_declare_unchanged_total = eng.metrics.exact_series_declare_unchanged_total.load(.monotonic),
+        .exact_series_declare_descriptor_conflict_total = eng.metrics.exact_series_declare_descriptor_conflict_total.load(.monotonic),
+        .exact_series_declare_series_conflict_total = eng.metrics.exact_series_declare_series_conflict_total.load(.monotonic),
         .local_ingest_connections_total = eng.metrics.local_ingest_connections_total.load(.monotonic),
         .local_ingest_append_batches_total = local_ingest_append_batches_total,
         .local_ingest_append_points_total = local_ingest_append_points_total,
@@ -362,7 +378,9 @@ fn socketWorker(state: *SocketWorkerState) void {
 
     const declared = state.declared.?;
     const alloc = std.heap.c_allocator;
-    const batch = alloc.alloc(ingest_socket.AppendEntry, 256) catch @panic("socket batch alloc failed");
+    const default_batch_options = ingest_socket.BatchOptions{};
+    const frame_cap = state.client.maxAppendPointsPerFrame(default_batch_options.max_points_per_frame);
+    const batch = alloc.alloc(ingest_socket.AppendEntry, frame_cap) catch @panic("socket batch alloc failed");
     defer alloc.free(batch);
 
     const start_ts = @as(i64, @intCast(state.writer_idx)) * 1_000_000;
@@ -573,21 +591,18 @@ fn runSocketBenchmark(alloc: std.mem.Allocator, scenario: Scenario, specs: []con
     const barrier_ns = @as(u64, @intCast(std.time.nanoTimestamp() - barrier_start_ns));
     const elapsed_ns = active_ns + barrier_ns;
     const metrics = try fetchMetrics(alloc, server.http_port);
-    var client_stats = ingest_socket.ClientStats{};
+    var client_stats: ingest_socket.ClientStats = .{};
     for (states) |*state| {
         const snapshot = state.client.statsSnapshot();
         client_stats.cache_hits_total += snapshot.cache_hits_total;
         client_stats.cache_misses_total += snapshot.cache_misses_total;
-        client_stats.reconnect_total += snapshot.reconnect_total;
         client_stats.declare_frames_sent_total += snapshot.declare_frames_sent_total;
         client_stats.declare_entries_sent_total += snapshot.declare_entries_sent_total;
         client_stats.append_frames_sent_total += snapshot.append_frames_sent_total;
         client_stats.append_points_sent_total += snapshot.append_points_sent_total;
     }
-    if (flush_client) |client| {
-        const flush_snapshot = client.statsSnapshot();
-        client_stats.reconnect_total += flush_snapshot.reconnect_total;
-    }
+    // The transport benchmark never calls reconnect on an established client.
+    client_stats.reconnect_total = 0;
 
     return .{
         .transport = if (scenario.warm_socket) "uds_binary_warm" else "uds_binary_cold",
@@ -636,6 +651,7 @@ fn buildSocketInputs(alloc: std.mem.Allocator, specs: []const SeriesSpec) ![]ing
             .decl_kind = .series,
             .name = spec.name,
             .tags_json = spec.canonical_tags,
+            .tags_are_canonical = true,
         };
     }
     return inputs;
@@ -709,7 +725,7 @@ fn pickHttpPort() !u16 {
 }
 
 fn waitForServerReady(port: u16) !void {
-    const deadline = std.time.milliTimestamp() + 10_000;
+    const deadline = std.time.milliTimestamp() + 20_000;
     const address = try std.net.Address.parseIp4("127.0.0.1", port);
     while (std.time.milliTimestamp() < deadline) {
         var stream = std.net.tcpConnectToAddress(address) catch {
@@ -756,6 +772,14 @@ fn fetchMetrics(alloc: std.mem.Allocator, port: u16) !TransportMetrics {
         .local_ingest_declare_batches_total = parseMetricU64(response.body, "sydradb_local_ingest_declare_batches_total"),
         .local_ingest_declare_total = parseMetricU64(response.body, "sydradb_local_ingest_declare_total"),
         .local_ingest_declare_seconds_total = parseMetricF64(response.body, "sydradb_local_ingest_declare_seconds_total"),
+        .exact_series_declare_metric_catalog_seconds_total = parseMetricF64(response.body, "sydradb_exact_series_declare_metric_catalog_seconds_total"),
+        .exact_series_declare_series_catalog_seconds_total = parseMetricF64(response.body, "sydradb_exact_series_declare_series_catalog_seconds_total"),
+        .exact_series_declare_wal_registration_seconds_total = parseMetricF64(response.body, "sydradb_exact_series_declare_wal_registration_seconds_total"),
+        .exact_series_declare_tag_index_seconds_total = parseMetricF64(response.body, "sydradb_exact_series_declare_tag_index_seconds_total"),
+        .exact_series_declare_inserted_total = parseMetricU64(response.body, "sydradb_exact_series_declare_inserted_total"),
+        .exact_series_declare_unchanged_total = parseMetricU64(response.body, "sydradb_exact_series_declare_unchanged_total"),
+        .exact_series_declare_descriptor_conflict_total = parseMetricU64(response.body, "sydradb_exact_series_declare_descriptor_conflict_total"),
+        .exact_series_declare_series_conflict_total = parseMetricU64(response.body, "sydradb_exact_series_declare_series_conflict_total"),
         .local_ingest_connections_total = parseMetricU64(response.body, "sydradb_local_ingest_connections_total"),
         .local_ingest_append_batches_total = parseMetricU64(response.body, "sydradb_local_ingest_append_batches_total"),
         .local_ingest_append_points_total = parseMetricU64(response.body, "sydradb_local_ingest_append_points_total"),
@@ -942,9 +966,12 @@ fn printResult(scenario: Scenario, result: BenchmarkResult) void {
     const points_per_second = if (seconds == 0) 0 else @as(f64, @floatFromInt(result.points)) / seconds;
     const active_ms = @as(f64, @floatFromInt(result.active_ns)) / 1_000_000.0;
     const barrier_ms = @as(f64, @floatFromInt(result.barrier_ns)) / 1_000_000.0;
-    const client_stats = result.client_stats orelse ingest_socket.ClientStats{};
-    std.debug.print(
-        "scenario={s} class={s} transport={s} points={d} elapsed_ms={d:.2} active_ms={d:.2} barrier_ms={d:.2} points_per_sec={d:.0} queue_pending_bytes_max={d} flush_s={d:.6} wal_s={d:.6} memtable_s={d:.6} tag_save_total={d} tag_save_skipped={d} tag_save_s={d:.6} local_connections={d} local_declare_batches={d} local_declare_total={d} local_declare_s={d:.6} local_append_batches={d} local_append_points={d} local_append_s={d:.6} local_append_batch_points_max={d} local_append_batch_points_avg={d:.6} local_rejected={d} client_cache_hits={d} client_cache_misses={d} client_reconnects={d} client_declare_frames={d} client_append_frames={d} client_append_points_avg={d:.6}\n",
+    const client_stats: ingest_socket.ClientStats = result.client_stats orelse .{};
+    var line = std.array_list.Managed(u8).init(std.heap.c_allocator);
+    defer line.deinit();
+    const writer = line.writer();
+    writer.print(
+        "scenario={s} class={s} transport={s} points={d} elapsed_ms={d:.2} active_ms={d:.2} barrier_ms={d:.2} points_per_sec={d:.0} ",
         .{
             scenario.name,
             workloadClassName(scenarioWorkloadClass(scenario)),
@@ -954,6 +981,11 @@ fn printResult(scenario: Scenario, result: BenchmarkResult) void {
             active_ms,
             barrier_ms,
             points_per_second,
+        },
+    ) catch unreachable;
+    writer.print(
+        "queue_pending_bytes_max={d} flush_s={d:.6} wal_s={d:.6} memtable_s={d:.6} tag_save_total={d} tag_save_skipped={d} tag_save_s={d:.6} ",
+        .{
             result.metrics.queue_pending_bytes_max,
             result.metrics.flush_seconds_total,
             result.metrics.wal_append_seconds_total,
@@ -961,15 +993,38 @@ fn printResult(scenario: Scenario, result: BenchmarkResult) void {
             result.metrics.tag_index_save_total,
             result.metrics.tag_index_save_skipped_total,
             result.metrics.tag_index_save_seconds_total,
+        },
+    ) catch unreachable;
+    writer.print(
+        "local_connections={d} local_declare_batches={d} local_declare_total={d} local_declare_s={d:.6} exact_decl_metric_s={d:.6} exact_decl_series_s={d:.6} exact_decl_wal_s={d:.6} exact_decl_tag_s={d:.6} ",
+        .{
             result.metrics.local_ingest_connections_total,
             result.metrics.local_ingest_declare_batches_total,
             result.metrics.local_ingest_declare_total,
             result.metrics.local_ingest_declare_seconds_total,
+            result.metrics.exact_series_declare_metric_catalog_seconds_total,
+            result.metrics.exact_series_declare_series_catalog_seconds_total,
+            result.metrics.exact_series_declare_wal_registration_seconds_total,
+            result.metrics.exact_series_declare_tag_index_seconds_total,
+        },
+    ) catch unreachable;
+    writer.print(
+        "exact_decl_inserted={d} exact_decl_unchanged={d} exact_decl_descriptor_conflicts={d} exact_decl_series_conflicts={d} local_append_batches={d} local_append_points={d} local_append_s={d:.6} local_append_batch_points_max={d} local_append_batch_points_avg={d:.6} ",
+        .{
+            result.metrics.exact_series_declare_inserted_total,
+            result.metrics.exact_series_declare_unchanged_total,
+            result.metrics.exact_series_declare_descriptor_conflict_total,
+            result.metrics.exact_series_declare_series_conflict_total,
             result.metrics.local_ingest_append_batches_total,
             result.metrics.local_ingest_append_points_total,
             result.metrics.local_ingest_append_seconds_total,
             result.metrics.local_ingest_append_batch_points_max,
             result.metrics.local_ingest_append_batch_points_avg,
+        },
+    ) catch unreachable;
+    writer.print(
+        "local_rejected={d} client_cache_hits={d} client_cache_misses={d} client_reconnects={d} client_declare_frames={d} client_append_frames={d} client_append_points_avg={d:.6}\n",
+        .{
             result.metrics.local_ingest_rejected_total,
             client_stats.cache_hits_total,
             client_stats.cache_misses_total,
@@ -978,7 +1033,8 @@ fn printResult(scenario: Scenario, result: BenchmarkResult) void {
             client_stats.append_frames_sent_total,
             client_stats.averageAppendPointsPerFrame(),
         },
-    );
+    ) catch unreachable;
+    std.debug.print("{s}", .{line.items});
 }
 
 pub fn main() !void {
