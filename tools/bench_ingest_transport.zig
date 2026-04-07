@@ -21,6 +21,7 @@ const Scenario = struct {
     points_per_writer: usize,
     warm_socket: bool,
     predeclare_direct: bool = true,
+    include_in_default_run: bool = true,
 };
 
 const WorkloadClass = enum {
@@ -63,6 +64,16 @@ const scenarios = [_]Scenario{
         .predeclare_direct = false,
     },
     .{
+        .name = "cold_declare_fanout_4x2500",
+        .description = "4 writers each cold-declaring 2500 unique series before append",
+        .series_count = 10_000,
+        .writers = 4,
+        .points_per_writer = 2_500,
+        .warm_socket = false,
+        .predeclare_direct = false,
+        .include_in_default_run = false,
+    },
+    .{
         .name = "steady_state_100k",
         .description = "100k warm-declared points to measure sustained same-host append",
         .series_count = 1,
@@ -87,10 +98,19 @@ const TransportMetrics = struct {
     exact_series_declare_series_catalog_seconds_total: f64 = 0,
     exact_series_declare_wal_registration_seconds_total: f64 = 0,
     exact_series_declare_tag_index_seconds_total: f64 = 0,
+    exact_series_declare_selector_key_seconds_total: f64 = 0,
+    exact_series_declare_tag_pairs_total: u64 = 0,
     exact_series_declare_inserted_total: u64 = 0,
     exact_series_declare_unchanged_total: u64 = 0,
     exact_series_declare_descriptor_conflict_total: u64 = 0,
     exact_series_declare_series_conflict_total: u64 = 0,
+    flush_queue_drain_wait_seconds_total: f64 = 0,
+    flush_manifest_seconds_total: f64 = 0,
+    flush_segment_write_seconds_total: f64 = 0,
+    flush_selector_metadata_seconds_total: f64 = 0,
+    flush_segments_written_total: u64 = 0,
+    flush_series_buckets_total: u64 = 0,
+    flush_hour_slices_total: u64 = 0,
     local_ingest_connections_total: u64 = 0,
     local_ingest_append_batches_total: u64 = 0,
     local_ingest_append_points_total: u64 = 0,
@@ -229,6 +249,7 @@ fn parseArgs(alloc: std.mem.Allocator) !?[]const u8 {
                 \\  fanout_four_writers
                 \\  warm_declared_10k
                 \\  cold_declare_10k
+                \\  cold_declare_fanout_4x2500
                 \\  steady_state_100k
                 \\
             , .{});
@@ -241,7 +262,8 @@ fn parseArgs(alloc: std.mem.Allocator) !?[]const u8 {
 }
 
 fn scenarioMatches(selected: ?[]const u8, scenario: Scenario) bool {
-    return selected == null or std.mem.eql(u8, selected.?, scenario.name);
+    if (selected == null) return scenario.include_in_default_run;
+    return std.mem.eql(u8, selected.?, scenario.name);
 }
 
 fn scenarioWorkloadClass(scenario: Scenario) WorkloadClass {
@@ -263,6 +285,13 @@ fn snapshotEngineMetrics(eng: *Engine) TransportMetrics {
     return .{
         .queue_pending_bytes_max = eng.metrics.queue_pending_bytes_max.load(.monotonic),
         .flush_seconds_total = @as(f64, @floatFromInt(eng.metrics.flush_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .flush_queue_drain_wait_seconds_total = @as(f64, @floatFromInt(eng.metrics.flush_queue_drain_wait_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .flush_manifest_seconds_total = @as(f64, @floatFromInt(eng.metrics.flush_manifest_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .flush_segment_write_seconds_total = @as(f64, @floatFromInt(eng.metrics.flush_segment_write_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .flush_selector_metadata_seconds_total = @as(f64, @floatFromInt(eng.metrics.flush_selector_metadata_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .flush_segments_written_total = eng.metrics.flush_segments_written_total.load(.monotonic),
+        .flush_series_buckets_total = eng.metrics.flush_series_buckets_total.load(.monotonic),
+        .flush_hour_slices_total = eng.metrics.flush_hour_slices_total.load(.monotonic),
         .wal_append_seconds_total = @as(f64, @floatFromInt(eng.metrics.wal_append_ns_total.load(.monotonic))) / 1_000_000_000.0,
         .memtable_append_seconds_total = @as(f64, @floatFromInt(eng.metrics.memtable_append_ns_total.load(.monotonic))) / 1_000_000_000.0,
         .tag_index_save_total = eng.metrics.tag_index_save_total.load(.monotonic),
@@ -275,6 +304,8 @@ fn snapshotEngineMetrics(eng: *Engine) TransportMetrics {
         .exact_series_declare_series_catalog_seconds_total = @as(f64, @floatFromInt(eng.metrics.exact_series_declare_series_catalog_ns_total.load(.monotonic))) / 1_000_000_000.0,
         .exact_series_declare_wal_registration_seconds_total = @as(f64, @floatFromInt(eng.metrics.exact_series_declare_wal_registration_ns_total.load(.monotonic))) / 1_000_000_000.0,
         .exact_series_declare_tag_index_seconds_total = @as(f64, @floatFromInt(eng.metrics.exact_series_declare_tag_index_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .exact_series_declare_selector_key_seconds_total = @as(f64, @floatFromInt(eng.metrics.exact_series_declare_selector_key_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .exact_series_declare_tag_pairs_total = eng.metrics.exact_series_declare_tag_pairs_total.load(.monotonic),
         .exact_series_declare_inserted_total = eng.metrics.exact_series_declare_inserted_total.load(.monotonic),
         .exact_series_declare_unchanged_total = eng.metrics.exact_series_declare_unchanged_total.load(.monotonic),
         .exact_series_declare_descriptor_conflict_total = eng.metrics.exact_series_declare_descriptor_conflict_total.load(.monotonic),
@@ -356,16 +387,40 @@ fn cliWorker(ctx: CliWorkerContext) void {
 }
 
 fn httpWorker(ctx: HttpWorkerContext) void {
-    const response = httpRequest(ctx.alloc, ctx.port, "/api/v1/ingest", .{
+    const response = httpRequestWithRetry(ctx.alloc, ctx.port, "/api/v1/ingest", .{
         .method = "POST",
         .content_type = "application/x-ndjson",
         .body_path = ctx.body_path,
-    }) catch |err| {
+    }, 3, 50) catch |err| {
         std.debug.panic("http ingest failed: {s}", .{@errorName(err)});
     };
     defer ctx.alloc.free(response.body);
     if (response.status_code != 200) {
         std.debug.panic("unexpected HTTP ingest status {d}: {s}", .{ response.status_code, response.body });
+    }
+}
+
+fn httpRequestWithRetry(
+    alloc: std.mem.Allocator,
+    port: u16,
+    path: []const u8,
+    options: HttpRequestOptions,
+    attempts: usize,
+    retry_delay_ms: u64,
+) !HttpResponse {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        return httpRequest(alloc, port, path, options) catch |err| switch (err) {
+            error.EndOfStream,
+            error.ConnectionResetByPeer,
+            error.ConnectionRefused,
+            => {
+                if (attempt + 1 >= attempts) return err;
+                std.Thread.sleep(retry_delay_ms * std.time.ns_per_ms);
+                continue;
+            },
+            else => return err,
+        };
     }
 }
 
@@ -725,7 +780,7 @@ fn pickHttpPort() !u16 {
 }
 
 fn waitForServerReady(port: u16) !void {
-    const deadline = std.time.milliTimestamp() + 20_000;
+    const deadline = std.time.milliTimestamp() + 30_000;
     const address = try std.net.Address.parseIp4("127.0.0.1", port);
     while (std.time.milliTimestamp() < deadline) {
         var stream = std.net.tcpConnectToAddress(address) catch {
@@ -764,6 +819,13 @@ fn fetchMetrics(alloc: std.mem.Allocator, port: u16) !TransportMetrics {
     return .{
         .queue_pending_bytes_max = parseMetricUsize(response.body, "sydradb_queue_pending_bytes_max"),
         .flush_seconds_total = parseMetricF64(response.body, "sydradb_flush_seconds_total"),
+        .flush_queue_drain_wait_seconds_total = parseMetricF64(response.body, "sydradb_flush_queue_drain_wait_seconds_total"),
+        .flush_manifest_seconds_total = parseMetricF64(response.body, "sydradb_flush_manifest_seconds_total"),
+        .flush_segment_write_seconds_total = parseMetricF64(response.body, "sydradb_flush_segment_write_seconds_total"),
+        .flush_selector_metadata_seconds_total = parseMetricF64(response.body, "sydradb_flush_selector_metadata_seconds_total"),
+        .flush_segments_written_total = parseMetricU64(response.body, "sydradb_flush_segments_written_total"),
+        .flush_series_buckets_total = parseMetricU64(response.body, "sydradb_flush_series_buckets_total"),
+        .flush_hour_slices_total = parseMetricU64(response.body, "sydradb_flush_hour_slices_total"),
         .wal_append_seconds_total = parseMetricF64(response.body, "sydradb_wal_append_seconds_total"),
         .memtable_append_seconds_total = parseMetricF64(response.body, "sydradb_memtable_append_seconds_total"),
         .tag_index_save_total = parseMetricU64(response.body, "sydradb_tag_index_save_total"),
@@ -776,6 +838,8 @@ fn fetchMetrics(alloc: std.mem.Allocator, port: u16) !TransportMetrics {
         .exact_series_declare_series_catalog_seconds_total = parseMetricF64(response.body, "sydradb_exact_series_declare_series_catalog_seconds_total"),
         .exact_series_declare_wal_registration_seconds_total = parseMetricF64(response.body, "sydradb_exact_series_declare_wal_registration_seconds_total"),
         .exact_series_declare_tag_index_seconds_total = parseMetricF64(response.body, "sydradb_exact_series_declare_tag_index_seconds_total"),
+        .exact_series_declare_selector_key_seconds_total = parseMetricF64(response.body, "sydradb_exact_series_declare_selector_key_seconds_total"),
+        .exact_series_declare_tag_pairs_total = parseMetricU64(response.body, "sydradb_exact_series_declare_tag_pairs_total"),
         .exact_series_declare_inserted_total = parseMetricU64(response.body, "sydradb_exact_series_declare_inserted_total"),
         .exact_series_declare_unchanged_total = parseMetricU64(response.body, "sydradb_exact_series_declare_unchanged_total"),
         .exact_series_declare_descriptor_conflict_total = parseMetricU64(response.body, "sydradb_exact_series_declare_descriptor_conflict_total"),
@@ -984,10 +1048,17 @@ fn printResult(scenario: Scenario, result: BenchmarkResult) void {
         },
     ) catch unreachable;
     writer.print(
-        "queue_pending_bytes_max={d} flush_s={d:.6} wal_s={d:.6} memtable_s={d:.6} tag_save_total={d} tag_save_skipped={d} tag_save_s={d:.6} ",
+        "queue_pending_bytes_max={d} flush_s={d:.6} flush_drain_wait_s={d:.6} flush_manifest_s={d:.6} flush_segment_s={d:.6} flush_selector_s={d:.6} flush_segments_total={d} flush_series_buckets_total={d} flush_hour_slices_total={d} wal_s={d:.6} memtable_s={d:.6} tag_save_total={d} tag_save_skipped={d} tag_save_s={d:.6} ",
         .{
             result.metrics.queue_pending_bytes_max,
             result.metrics.flush_seconds_total,
+            result.metrics.flush_queue_drain_wait_seconds_total,
+            result.metrics.flush_manifest_seconds_total,
+            result.metrics.flush_segment_write_seconds_total,
+            result.metrics.flush_selector_metadata_seconds_total,
+            result.metrics.flush_segments_written_total,
+            result.metrics.flush_series_buckets_total,
+            result.metrics.flush_hour_slices_total,
             result.metrics.wal_append_seconds_total,
             result.metrics.memtable_append_seconds_total,
             result.metrics.tag_index_save_total,
@@ -996,7 +1067,7 @@ fn printResult(scenario: Scenario, result: BenchmarkResult) void {
         },
     ) catch unreachable;
     writer.print(
-        "local_connections={d} local_declare_batches={d} local_declare_total={d} local_declare_s={d:.6} exact_decl_metric_s={d:.6} exact_decl_series_s={d:.6} exact_decl_wal_s={d:.6} exact_decl_tag_s={d:.6} ",
+        "local_connections={d} local_declare_batches={d} local_declare_total={d} local_declare_s={d:.6} exact_decl_metric_s={d:.6} exact_decl_series_s={d:.6} exact_decl_wal_s={d:.6} exact_decl_tag_s={d:.6} exact_decl_selector_s={d:.6} exact_decl_tag_pairs={d} ",
         .{
             result.metrics.local_ingest_connections_total,
             result.metrics.local_ingest_declare_batches_total,
@@ -1006,6 +1077,8 @@ fn printResult(scenario: Scenario, result: BenchmarkResult) void {
             result.metrics.exact_series_declare_series_catalog_seconds_total,
             result.metrics.exact_series_declare_wal_registration_seconds_total,
             result.metrics.exact_series_declare_tag_index_seconds_total,
+            result.metrics.exact_series_declare_selector_key_seconds_total,
+            result.metrics.exact_series_declare_tag_pairs_total,
         },
     ) catch unreachable;
     writer.print(

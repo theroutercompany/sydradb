@@ -500,6 +500,8 @@ const StatusSnapshot = struct {
     exact_series_declare_series_catalog_seconds_total: f64,
     exact_series_declare_wal_registration_seconds_total: f64,
     exact_series_declare_tag_index_seconds_total: f64,
+    exact_series_declare_selector_key_seconds_total: f64,
+    exact_series_declare_tag_pairs_total: u64,
     exact_series_declare_inserted_total: u64,
     exact_series_declare_unchanged_total: u64,
     exact_series_declare_descriptor_conflict_total: u64,
@@ -516,6 +518,13 @@ const StatusSnapshot = struct {
     flush_total: u64,
     flush_points_total: u64,
     flush_seconds_total: f64,
+    flush_queue_drain_wait_seconds_total: f64,
+    flush_manifest_seconds_total: f64,
+    flush_segment_write_seconds_total: f64,
+    flush_selector_metadata_seconds_total: f64,
+    flush_segments_written_total: u64,
+    flush_series_buckets_total: u64,
+    flush_hour_slices_total: u64,
     wal_append_total: u64,
     wal_append_seconds_total: f64,
     memtable_append_seconds_total: f64,
@@ -563,6 +572,8 @@ fn buildStatusSnapshot(eng: *Engine) StatusSnapshot {
         .exact_series_declare_series_catalog_seconds_total = @as(f64, @floatFromInt(eng.metrics.exact_series_declare_series_catalog_ns_total.load(.monotonic))) / 1_000_000_000.0,
         .exact_series_declare_wal_registration_seconds_total = @as(f64, @floatFromInt(eng.metrics.exact_series_declare_wal_registration_ns_total.load(.monotonic))) / 1_000_000_000.0,
         .exact_series_declare_tag_index_seconds_total = @as(f64, @floatFromInt(eng.metrics.exact_series_declare_tag_index_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .exact_series_declare_selector_key_seconds_total = @as(f64, @floatFromInt(eng.metrics.exact_series_declare_selector_key_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .exact_series_declare_tag_pairs_total = eng.metrics.exact_series_declare_tag_pairs_total.load(.monotonic),
         .exact_series_declare_inserted_total = eng.metrics.exact_series_declare_inserted_total.load(.monotonic),
         .exact_series_declare_unchanged_total = eng.metrics.exact_series_declare_unchanged_total.load(.monotonic),
         .exact_series_declare_descriptor_conflict_total = eng.metrics.exact_series_declare_descriptor_conflict_total.load(.monotonic),
@@ -579,6 +590,13 @@ fn buildStatusSnapshot(eng: *Engine) StatusSnapshot {
         .flush_total = eng.metrics.flush_total.load(.monotonic),
         .flush_points_total = eng.metrics.flush_points_total.load(.monotonic),
         .flush_seconds_total = @as(f64, @floatFromInt(eng.metrics.flush_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .flush_queue_drain_wait_seconds_total = @as(f64, @floatFromInt(eng.metrics.flush_queue_drain_wait_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .flush_manifest_seconds_total = @as(f64, @floatFromInt(eng.metrics.flush_manifest_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .flush_segment_write_seconds_total = @as(f64, @floatFromInt(eng.metrics.flush_segment_write_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .flush_selector_metadata_seconds_total = @as(f64, @floatFromInt(eng.metrics.flush_selector_metadata_ns_total.load(.monotonic))) / 1_000_000_000.0,
+        .flush_segments_written_total = eng.metrics.flush_segments_written_total.load(.monotonic),
+        .flush_series_buckets_total = eng.metrics.flush_series_buckets_total.load(.monotonic),
+        .flush_hour_slices_total = eng.metrics.flush_hour_slices_total.load(.monotonic),
         .wal_append_total = eng.metrics.wal_append_total.load(.monotonic),
         .wal_append_seconds_total = @as(f64, @floatFromInt(eng.metrics.wal_append_ns_total.load(.monotonic))) / 1_000_000_000.0,
         .memtable_append_seconds_total = @as(f64, @floatFromInt(eng.metrics.memtable_append_ns_total.load(.monotonic))) / 1_000_000_000.0,
@@ -672,6 +690,10 @@ fn writeStatusPayload(jw: *std.json.Stringify, snapshot: StatusSnapshot) !void {
     try jw.write(snapshot.exact_series_declare_wal_registration_seconds_total);
     try jw.objectField("exact_series_declare_tag_index_seconds_total");
     try jw.write(snapshot.exact_series_declare_tag_index_seconds_total);
+    try jw.objectField("exact_series_declare_selector_key_seconds_total");
+    try jw.write(snapshot.exact_series_declare_selector_key_seconds_total);
+    try jw.objectField("exact_series_declare_tag_pairs_total");
+    try jw.write(snapshot.exact_series_declare_tag_pairs_total);
     try jw.objectField("exact_series_declare_inserted_total");
     try jw.write(snapshot.exact_series_declare_inserted_total);
     try jw.objectField("exact_series_declare_unchanged_total");
@@ -704,6 +726,20 @@ fn writeStatusPayload(jw: *std.json.Stringify, snapshot: StatusSnapshot) !void {
     try jw.write(snapshot.flush_points_total);
     try jw.objectField("flush_seconds_total");
     try jw.write(snapshot.flush_seconds_total);
+    try jw.objectField("flush_queue_drain_wait_seconds_total");
+    try jw.write(snapshot.flush_queue_drain_wait_seconds_total);
+    try jw.objectField("flush_manifest_seconds_total");
+    try jw.write(snapshot.flush_manifest_seconds_total);
+    try jw.objectField("flush_segment_write_seconds_total");
+    try jw.write(snapshot.flush_segment_write_seconds_total);
+    try jw.objectField("flush_selector_metadata_seconds_total");
+    try jw.write(snapshot.flush_selector_metadata_seconds_total);
+    try jw.objectField("flush_segments_written_total");
+    try jw.write(snapshot.flush_segments_written_total);
+    try jw.objectField("flush_series_buckets_total");
+    try jw.write(snapshot.flush_series_buckets_total);
+    try jw.objectField("flush_hour_slices_total");
+    try jw.write(snapshot.flush_hour_slices_total);
     try jw.objectField("wal_append_total");
     try jw.write(snapshot.wal_append_total);
     try jw.objectField("wal_append_seconds_total");
@@ -1008,6 +1044,8 @@ test "buildStatusPayload emits extended runtime counters" {
         .exact_series_declare_series_catalog_seconds_total = 0.022,
         .exact_series_declare_wal_registration_seconds_total = 0.033,
         .exact_series_declare_tag_index_seconds_total = 0.044,
+        .exact_series_declare_selector_key_seconds_total = 0.055,
+        .exact_series_declare_tag_pairs_total = 14,
         .exact_series_declare_inserted_total = 10,
         .exact_series_declare_unchanged_total = 11,
         .exact_series_declare_descriptor_conflict_total = 12,
@@ -1024,6 +1062,13 @@ test "buildStatusPayload emits extended runtime counters" {
         .flush_total = 3,
         .flush_points_total = 17,
         .flush_seconds_total = 0.125,
+        .flush_queue_drain_wait_seconds_total = 0.126,
+        .flush_manifest_seconds_total = 0.127,
+        .flush_segment_write_seconds_total = 0.128,
+        .flush_selector_metadata_seconds_total = 0.129,
+        .flush_segments_written_total = 18,
+        .flush_series_buckets_total = 19,
+        .flush_hour_slices_total = 20,
         .wal_append_total = 11,
         .wal_append_seconds_total = 0.02,
         .memtable_append_seconds_total = 0.03,
@@ -1073,6 +1118,8 @@ test "buildStatusPayload emits extended runtime counters" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.022), runtime.get("exact_series_declare_series_catalog_seconds_total").?.float, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f64, 0.033), runtime.get("exact_series_declare_wal_registration_seconds_total").?.float, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f64, 0.044), runtime.get("exact_series_declare_tag_index_seconds_total").?.float, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.055), runtime.get("exact_series_declare_selector_key_seconds_total").?.float, 0.0001);
+    try std.testing.expectEqual(@as(i64, 14), runtime.get("exact_series_declare_tag_pairs_total").?.integer);
     try std.testing.expectEqual(@as(i64, 10), runtime.get("exact_series_declare_inserted_total").?.integer);
     try std.testing.expectEqual(@as(i64, 11), runtime.get("exact_series_declare_unchanged_total").?.integer);
     try std.testing.expectEqual(@as(i64, 12), runtime.get("exact_series_declare_descriptor_conflict_total").?.integer);
@@ -1088,6 +1135,13 @@ test "buildStatusPayload emits extended runtime counters" {
     try std.testing.expectEqual(@as(i64, 6), runtime.get("drain_timeout_total").?.integer);
     try std.testing.expectEqual(@as(i64, 17), runtime.get("flush_points_total").?.integer);
     try std.testing.expectApproxEqAbs(@as(f64, 0.125), runtime.get("flush_seconds_total").?.float, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.126), runtime.get("flush_queue_drain_wait_seconds_total").?.float, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.127), runtime.get("flush_manifest_seconds_total").?.float, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.128), runtime.get("flush_segment_write_seconds_total").?.float, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.129), runtime.get("flush_selector_metadata_seconds_total").?.float, 0.0001);
+    try std.testing.expectEqual(@as(i64, 18), runtime.get("flush_segments_written_total").?.integer);
+    try std.testing.expectEqual(@as(i64, 19), runtime.get("flush_series_buckets_total").?.integer);
+    try std.testing.expectEqual(@as(i64, 20), runtime.get("flush_hour_slices_total").?.integer);
     try std.testing.expectEqual(@as(i64, 11), runtime.get("wal_append_total").?.integer);
     try std.testing.expectApproxEqAbs(@as(f64, 0.02), runtime.get("wal_append_seconds_total").?.float, 0.0001);
     try std.testing.expectApproxEqAbs(@as(f64, 0.03), runtime.get("memtable_append_seconds_total").?.float, 0.0001);
@@ -1393,6 +1447,8 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     const exact_series_declare_series_catalog_seconds_total = @as(f64, @floatFromInt(eng.metrics.exact_series_declare_series_catalog_ns_total.load(.monotonic))) / 1_000_000_000.0;
     const exact_series_declare_wal_registration_seconds_total = @as(f64, @floatFromInt(eng.metrics.exact_series_declare_wal_registration_ns_total.load(.monotonic))) / 1_000_000_000.0;
     const exact_series_declare_tag_index_seconds_total = @as(f64, @floatFromInt(eng.metrics.exact_series_declare_tag_index_ns_total.load(.monotonic))) / 1_000_000_000.0;
+    const exact_series_declare_selector_key_seconds_total = @as(f64, @floatFromInt(eng.metrics.exact_series_declare_selector_key_ns_total.load(.monotonic))) / 1_000_000_000.0;
+    const exact_series_declare_tag_pairs_total = eng.metrics.exact_series_declare_tag_pairs_total.load(.monotonic);
     const exact_series_declare_inserted_total = eng.metrics.exact_series_declare_inserted_total.load(.monotonic);
     const exact_series_declare_unchanged_total = eng.metrics.exact_series_declare_unchanged_total.load(.monotonic);
     const exact_series_declare_descriptor_conflict_total = eng.metrics.exact_series_declare_descriptor_conflict_total.load(.monotonic);
@@ -1420,6 +1476,13 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     const tag_index_save_skipped_total = eng.metrics.tag_index_save_skipped_total.load(.monotonic);
     const tag_index_save_seconds_total = @as(f64, @floatFromInt(eng.metrics.tag_index_save_ns_total.load(.monotonic))) / 1_000_000_000.0;
     const flush_seconds_total = @as(f64, @floatFromInt(flush_ns_total)) / 1_000_000_000.0;
+    const flush_queue_drain_wait_seconds_total = @as(f64, @floatFromInt(eng.metrics.flush_queue_drain_wait_ns_total.load(.monotonic))) / 1_000_000_000.0;
+    const flush_manifest_seconds_total = @as(f64, @floatFromInt(eng.metrics.flush_manifest_ns_total.load(.monotonic))) / 1_000_000_000.0;
+    const flush_segment_write_seconds_total = @as(f64, @floatFromInt(eng.metrics.flush_segment_write_ns_total.load(.monotonic))) / 1_000_000_000.0;
+    const flush_selector_metadata_seconds_total = @as(f64, @floatFromInt(eng.metrics.flush_selector_metadata_ns_total.load(.monotonic))) / 1_000_000_000.0;
+    const flush_segments_written_total = eng.metrics.flush_segments_written_total.load(.monotonic);
+    const flush_series_buckets_total = eng.metrics.flush_series_buckets_total.load(.monotonic);
+    const flush_hour_slices_total = eng.metrics.flush_hour_slices_total.load(.monotonic);
 
     var buf = std.array_list.Managed(u8).init(alloc);
     defer buf.deinit();
@@ -1431,7 +1494,14 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     try writer.print("# HELP sydradb_ingest_rejected_mem_limit_total Total ingest requests rejected due to mem_limit_bytes\n# TYPE sydradb_ingest_rejected_mem_limit_total counter\nsydradb_ingest_rejected_mem_limit_total {d}\n", .{ingest_rejected_mem_limit_total});
     try writer.print("# HELP sydradb_flush_total Total flush operations\n# TYPE sydradb_flush_total counter\nsydradb_flush_total {d}\n", .{flush_total});
     try writer.print("# HELP sydradb_flush_seconds_total Aggregate flush duration in seconds\n# TYPE sydradb_flush_seconds_total counter\nsydradb_flush_seconds_total {d:.6}\n", .{flush_seconds_total});
+    try writer.print("# HELP sydradb_flush_queue_drain_wait_seconds_total Aggregate time spent waiting for flushAndDrain to observe a queryable state\n# TYPE sydradb_flush_queue_drain_wait_seconds_total counter\nsydradb_flush_queue_drain_wait_seconds_total {d:.6}\n", .{flush_queue_drain_wait_seconds_total});
+    try writer.print("# HELP sydradb_flush_manifest_seconds_total Aggregate flush time spent appending manifest metadata\n# TYPE sydradb_flush_manifest_seconds_total counter\nsydradb_flush_manifest_seconds_total {d:.6}\n", .{flush_manifest_seconds_total});
+    try writer.print("# HELP sydradb_flush_segment_write_seconds_total Aggregate flush time spent writing segment payloads\n# TYPE sydradb_flush_segment_write_seconds_total counter\nsydradb_flush_segment_write_seconds_total {d:.6}\n", .{flush_segment_write_seconds_total});
+    try writer.print("# HELP sydradb_flush_selector_metadata_seconds_total Aggregate flush time spent resolving selector metadata for segment writes\n# TYPE sydradb_flush_selector_metadata_seconds_total counter\nsydradb_flush_selector_metadata_seconds_total {d:.6}\n", .{flush_selector_metadata_seconds_total});
     try writer.print("# HELP sydradb_flush_points_total Total points flushed to disk\n# TYPE sydradb_flush_points_total counter\nsydradb_flush_points_total {d}\n", .{flush_points_total});
+    try writer.print("# HELP sydradb_flush_segments_written_total Total segment files written by flushes\n# TYPE sydradb_flush_segments_written_total counter\nsydradb_flush_segments_written_total {d}\n", .{flush_segments_written_total});
+    try writer.print("# HELP sydradb_flush_series_buckets_total Total in-memory series buckets visited during flush planning\n# TYPE sydradb_flush_series_buckets_total counter\nsydradb_flush_series_buckets_total {d}\n", .{flush_series_buckets_total});
+    try writer.print("# HELP sydradb_flush_hour_slices_total Total per-series hour slices emitted during flush planning\n# TYPE sydradb_flush_hour_slices_total counter\nsydradb_flush_hour_slices_total {d}\n", .{flush_hour_slices_total});
     try writer.print("# HELP sydradb_wal_append_total Total WAL append operations performed by the writer loop\n# TYPE sydradb_wal_append_total counter\nsydradb_wal_append_total {d}\n", .{wal_append_total});
     try writer.print("# HELP sydradb_wal_append_seconds_total Aggregate WAL append duration in seconds\n# TYPE sydradb_wal_append_seconds_total counter\nsydradb_wal_append_seconds_total {d:.6}\n", .{wal_append_seconds_total});
     try writer.print("# HELP sydradb_wal_bytes_total Total bytes written to WAL\n# TYPE sydradb_wal_bytes_total counter\nsydradb_wal_bytes_total {d}\n", .{wal_bytes_total});
@@ -1470,6 +1540,8 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     try writer.print("# HELP sydradb_exact_series_declare_series_catalog_seconds_total Aggregate exact-series declaration time spent in series catalog work\n# TYPE sydradb_exact_series_declare_series_catalog_seconds_total counter\nsydradb_exact_series_declare_series_catalog_seconds_total {d:.6}\n", .{exact_series_declare_series_catalog_seconds_total});
     try writer.print("# HELP sydradb_exact_series_declare_wal_registration_seconds_total Aggregate exact-series declaration time spent persisting WAL registrations\n# TYPE sydradb_exact_series_declare_wal_registration_seconds_total counter\nsydradb_exact_series_declare_wal_registration_seconds_total {d:.6}\n", .{exact_series_declare_wal_registration_seconds_total});
     try writer.print("# HELP sydradb_exact_series_declare_tag_index_seconds_total Aggregate exact-series declaration time spent updating the tag index\n# TYPE sydradb_exact_series_declare_tag_index_seconds_total counter\nsydradb_exact_series_declare_tag_index_seconds_total {d:.6}\n", .{exact_series_declare_tag_index_seconds_total});
+    try writer.print("# HELP sydradb_exact_series_declare_selector_key_seconds_total Aggregate exact-series declaration time spent building selector keys\n# TYPE sydradb_exact_series_declare_selector_key_seconds_total counter\nsydradb_exact_series_declare_selector_key_seconds_total {d:.6}\n", .{exact_series_declare_selector_key_seconds_total});
+    try writer.print("# HELP sydradb_exact_series_declare_tag_pairs_total Total canonical string tag pairs prepared during exact-series declaration\n# TYPE sydradb_exact_series_declare_tag_pairs_total counter\nsydradb_exact_series_declare_tag_pairs_total {d}\n", .{exact_series_declare_tag_pairs_total});
     try writer.print("# HELP sydradb_exact_series_declare_inserted_total Total exact-series declarations that inserted a new series mapping\n# TYPE sydradb_exact_series_declare_inserted_total counter\nsydradb_exact_series_declare_inserted_total {d}\n", .{exact_series_declare_inserted_total});
     try writer.print("# HELP sydradb_exact_series_declare_unchanged_total Total exact-series declarations that resolved to an existing series mapping\n# TYPE sydradb_exact_series_declare_unchanged_total counter\nsydradb_exact_series_declare_unchanged_total {d}\n", .{exact_series_declare_unchanged_total});
     try writer.print("# HELP sydradb_exact_series_declare_descriptor_conflict_total Total exact-series declarations rejected due to metric descriptor conflicts\n# TYPE sydradb_exact_series_declare_descriptor_conflict_total counter\nsydradb_exact_series_declare_descriptor_conflict_total {d}\n", .{exact_series_declare_descriptor_conflict_total});
