@@ -457,6 +457,12 @@ pub const Engine = struct {
     pub const ExactSeriesBatchDeclarationResult = struct {
         status: ExactSeriesDeclarationStatus = .ok,
         series_id: ?types.SeriesId = null,
+        registration: ExactSeriesRegistration = .unchanged,
+    };
+
+    pub const ExactSeriesRegistration = enum {
+        inserted,
+        unchanged,
     };
 
     pub const ExactSeriesDeclarationResult = struct {
@@ -698,6 +704,14 @@ pub const Engine = struct {
         local_ingest_unknown_decl_total: AtomicU64,
         local_ingest_frame_too_large_total: AtomicU64,
         local_ingest_protocol_error_total: AtomicU64,
+        exact_series_declare_metric_catalog_ns_total: AtomicU64,
+        exact_series_declare_series_catalog_ns_total: AtomicU64,
+        exact_series_declare_wal_registration_ns_total: AtomicU64,
+        exact_series_declare_tag_index_ns_total: AtomicU64,
+        exact_series_declare_inserted_total: AtomicU64,
+        exact_series_declare_unchanged_total: AtomicU64,
+        exact_series_declare_descriptor_conflict_total: AtomicU64,
+        exact_series_declare_series_conflict_total: AtomicU64,
 
         pub fn init() Metrics {
             return .{
@@ -760,6 +774,14 @@ pub const Engine = struct {
                 .local_ingest_unknown_decl_total = AtomicU64.init(0),
                 .local_ingest_frame_too_large_total = AtomicU64.init(0),
                 .local_ingest_protocol_error_total = AtomicU64.init(0),
+                .exact_series_declare_metric_catalog_ns_total = AtomicU64.init(0),
+                .exact_series_declare_series_catalog_ns_total = AtomicU64.init(0),
+                .exact_series_declare_wal_registration_ns_total = AtomicU64.init(0),
+                .exact_series_declare_tag_index_ns_total = AtomicU64.init(0),
+                .exact_series_declare_inserted_total = AtomicU64.init(0),
+                .exact_series_declare_unchanged_total = AtomicU64.init(0),
+                .exact_series_declare_descriptor_conflict_total = AtomicU64.init(0),
+                .exact_series_declare_series_conflict_total = AtomicU64.init(0),
             };
         }
     };
@@ -1930,11 +1952,53 @@ pub const Engine = struct {
         return false;
     }
 
+    fn cachedFlushSelectorMetadata(
+        self: *Engine,
+        cache: *std.AutoHashMap(types.SeriesId, ?segment_mod.SelectorMetadata),
+        sid: types.SeriesId,
+    ) !?segment_mod.SelectorMetadataView {
+        const gop = try cache.getOrPut(sid);
+        if (!gop.found_existing) {
+            const resolution = self.metadata.series_catalog.resolveBySeriesId(sid);
+            gop.value_ptr.* = switch (resolution.status) {
+                .resolved, .exact_match => .{
+                    .series = try self.alloc.dupe(u8, resolution.series.?),
+                    .canonical_tags = try self.alloc.dupe(u8, resolution.canonical_tags.?),
+                },
+                .not_found, .ambiguous => null,
+            };
+        }
+        if (gop.value_ptr.*) |*selector| {
+            return .{
+                .series = selector.series,
+                .canonical_tags = selector.canonical_tags,
+            };
+        }
+        return null;
+    }
+
     fn flushMemtable(self: *Engine) !bool {
         const start_ns = std.time.nanoTimestamp();
         var points_written: usize = 0;
         var segments_written: usize = 0;
-        // write per-series per-hour segments, update manifest, then clear memtable
+        var manifest_entries = std.array_list.Managed(manifest_mod.AddInput).init(self.alloc);
+        defer {
+            for (manifest_entries.items) |entry| self.alloc.free(@constCast(entry.path));
+            manifest_entries.deinit();
+        }
+        try manifest_entries.ensureTotalCapacity(self.mem.series.count());
+
+        var selector_cache = std.AutoHashMap(types.SeriesId, ?segment_mod.SelectorMetadata).init(self.alloc);
+        defer {
+            var selector_it = selector_cache.valueIterator();
+            while (selector_it.next()) |entry| {
+                if (entry.*) |*selector| selector.deinit(self.alloc);
+            }
+            selector_cache.deinit();
+        }
+        try selector_cache.ensureUnusedCapacity(@intCast(self.mem.series.count()));
+
+        // write per-series per-hour segments, batch manifest updates, then clear memtable
         var it = self.mem.series.iterator();
         while (it.next()) |entry| {
             const sid = entry.key_ptr.*;
@@ -1947,32 +2011,46 @@ pub const Engine = struct {
                     }
                 }.lessThan);
             }
-            // Partition by hour (UTC)
-            var start_idx: usize = 0;
-            while (start_idx < buffer.points.items.len) {
-                const hour = self.hourBucketForSeries(sid, buffer.points.items[start_idx].ts);
-                var end_idx = start_idx + 1;
-                while (end_idx < buffer.points.items.len and self.hourBucketForSeries(sid, buffer.points.items[end_idx].ts) == hour) : (end_idx += 1) {}
-                const slice = buffer.points.items[start_idx..end_idx];
-                // write segment
-                const selector_resolution = self.metadata.series_catalog.resolveBySeriesId(sid);
-                const selector_metadata = switch (selector_resolution.status) {
-                    .resolved, .exact_match => segment_mod.SelectorMetadataView{
-                        .series = selector_resolution.series.?,
-                        .canonical_tags = selector_resolution.canonical_tags.?,
-                    },
-                    .not_found, .ambiguous => null,
-                };
-                const seg_path = try segment_mod.writeSegmentWithMetadata(self.alloc, self.data_dir, sid, hour, slice, selector_metadata);
-                const c: u32 = @intCast(slice.len);
-                try self.metadata.manifest.add(self.data_dir, sid, hour, slice[0].ts, slice[slice.len - 1].ts, c, seg_path);
-                self.alloc.free(seg_path);
-                points_written += slice.len;
+            const selector_metadata = try self.cachedFlushSelectorMetadata(&selector_cache, sid);
+            const first_hour = self.hourBucketForSeries(sid, buffer.points.items[0].ts);
+            const last_hour = self.hourBucketForSeries(sid, buffer.points.items[buffer.points.items.len - 1].ts);
+
+            if (buffer.points.items.len == 1 or first_hour == last_hour) {
+                const seg_path = try segment_mod.writeSegmentWithMetadata(self.alloc, self.data_dir, sid, first_hour, buffer.points.items, selector_metadata);
+                try manifest_entries.append(.{
+                    .series_id = sid,
+                    .hour_bucket = first_hour,
+                    .start_ts = buffer.points.items[0].ts,
+                    .end_ts = buffer.points.items[buffer.points.items.len - 1].ts,
+                    .count = @intCast(buffer.points.items.len),
+                    .path = seg_path,
+                });
+                points_written += buffer.points.items.len;
                 segments_written += 1;
-                start_idx = end_idx;
+            } else {
+                var start_idx: usize = 0;
+                while (start_idx < buffer.points.items.len) {
+                    const hour = self.hourBucketForSeries(sid, buffer.points.items[start_idx].ts);
+                    var end_idx = start_idx + 1;
+                    while (end_idx < buffer.points.items.len and self.hourBucketForSeries(sid, buffer.points.items[end_idx].ts) == hour) : (end_idx += 1) {}
+                    const slice = buffer.points.items[start_idx..end_idx];
+                    const seg_path = try segment_mod.writeSegmentWithMetadata(self.alloc, self.data_dir, sid, hour, slice, selector_metadata);
+                    try manifest_entries.append(.{
+                        .series_id = sid,
+                        .hour_bucket = hour,
+                        .start_ts = slice[0].ts,
+                        .end_ts = slice[slice.len - 1].ts,
+                        .count = @intCast(slice.len),
+                        .path = seg_path,
+                    });
+                    points_written += slice.len;
+                    segments_written += 1;
+                    start_idx = end_idx;
+                }
             }
             buffer.clearRetainingCapacity();
         }
+        try self.metadata.manifest.addBatch(self.data_dir, manifest_entries.items);
         self.mem.bytes.store(0, .monotonic);
         if (segments_written > 0) {
             const duration_ns_i128 = std.time.nanoTimestamp() - start_ns;
@@ -2660,17 +2738,27 @@ pub const Engine = struct {
     }
 
     pub fn noteTags(self: *Engine, series_id: types.SeriesId, tags: []const u8) void {
-        // tags is expected to be a JSON object; we parse and update tag→series mapping
+        var dirty = false;
+        var scratch = std.array_list.Managed(u8).init(self.alloc);
+        defer scratch.deinit();
+
+        if (self.noteSimpleStringTags(series_id, tags, &scratch, &dirty) catch false) {
+            if (dirty) self.tag_index_dirty.store(true, .monotonic);
+            return;
+        }
+
+        // Fallback for non-canonical or non-string tag payloads.
         var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, tags, .{}) catch return;
         defer parsed.deinit();
         if (parsed.value != .object) return;
-        var dirty = false;
         var it = parsed.value.object.iterator();
         while (it.next()) |e| {
             if (e.value_ptr.* == .string) {
-                const key = std.fmt.allocPrint(self.alloc, "{s}={s}", .{ e.key_ptr.*, e.value_ptr.string }) catch continue;
-                defer self.alloc.free(key);
-                const inserted = self.metadata.tags.add(key, series_id) catch |err| {
+                scratch.clearRetainingCapacity();
+                scratch.appendSlice(e.key_ptr.*) catch continue;
+                scratch.append('=') catch continue;
+                scratch.appendSlice(e.value_ptr.string) catch continue;
+                const inserted = self.metadata.tags.add(scratch.items, series_id) catch |err| {
                     std.log.warn("tag index add failed: {s}", .{@errorName(err)});
                     continue;
                 };
@@ -2685,46 +2773,98 @@ pub const Engine = struct {
         inputs: []const ExactSeriesCanonicalDeclarationInput,
         results: []const ExactSeriesBatchDeclarationResult,
     ) !void {
-        var groups = std.StringHashMap(std.array_list.Managed(types.SeriesId)).init(self.alloc);
-        defer {
-            var it = groups.iterator();
-            while (it.next()) |entry| entry.value_ptr.deinit();
-            groups.deinit();
-        }
-
-        for (inputs, results) |input, result| {
-            if (result.status != .ok) continue;
-            const series_id = result.series_id orelse continue;
-            const gop = try groups.getOrPut(input.canonical_tags);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = std.array_list.Managed(types.SeriesId).init(self.alloc);
-            }
-            try gop.value_ptr.append(series_id);
-        }
-
         var dirty = false;
-        var group_it = groups.iterator();
-        while (group_it.next()) |entry| {
-            var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, entry.key_ptr.*, .{}) catch continue;
-            defer parsed.deinit();
-            if (parsed.value != .object) continue;
+        var scratch = std.array_list.Managed(u8).init(self.alloc);
+        defer scratch.deinit();
+        for (inputs, results) |input, result| {
+            if (result.status != .ok or result.registration != .inserted) continue;
+            const series_id = result.series_id orelse continue;
+            if (try self.noteSimpleStringTags(series_id, input.canonical_tags, &scratch, &dirty)) {
+                continue;
+            }
 
+            var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, input.canonical_tags, .{}) catch continue;
+            if (parsed.value != .object) {
+                parsed.deinit();
+                continue;
+            }
             var json_it = parsed.value.object.iterator();
             while (json_it.next()) |tag_entry| {
                 if (tag_entry.value_ptr.* != .string) continue;
-                const key = std.fmt.allocPrint(self.alloc, "{s}={s}", .{ tag_entry.key_ptr.*, tag_entry.value_ptr.string }) catch continue;
-                defer self.alloc.free(key);
-                for (entry.value_ptr.items) |series_id| {
-                    const inserted = self.metadata.tags.add(key, series_id) catch |err| {
-                        std.log.warn("tag index add failed: {s}", .{@errorName(err)});
-                        continue;
-                    };
-                    dirty = dirty or inserted;
-                }
+                scratch.clearRetainingCapacity();
+                scratch.appendSlice(tag_entry.key_ptr.*) catch continue;
+                scratch.append('=') catch continue;
+                scratch.appendSlice(tag_entry.value_ptr.string) catch continue;
+                const inserted = self.metadata.tags.add(scratch.items, series_id) catch |err| {
+                    std.log.warn("tag index add failed: {s}", .{@errorName(err)});
+                    continue;
+                };
+                dirty = dirty or inserted;
             }
+            parsed.deinit();
         }
 
         if (dirty) self.tag_index_dirty.store(true, .monotonic);
+    }
+
+    fn noteSimpleStringTags(
+        self: *Engine,
+        series_id: types.SeriesId,
+        tags: []const u8,
+        scratch: *std.array_list.Managed(u8),
+        dirty: *bool,
+    ) !bool {
+        const trimmed = std.mem.trim(u8, tags, " \t\r\n");
+        if (trimmed.len < 2 or trimmed[0] != '{' or trimmed[trimmed.len - 1] != '}') return false;
+        if (trimmed.len == 2) return true;
+
+        var offset: usize = 1;
+        while (offset < trimmed.len - 1) {
+            const key = scanSimpleJsonString(trimmed, &offset) orelse return false;
+            if (offset >= trimmed.len - 1 or trimmed[offset] != ':') return false;
+            offset += 1;
+            const value = scanSimpleJsonString(trimmed, &offset) orelse return false;
+
+            scratch.clearRetainingCapacity();
+            try scratch.ensureTotalCapacity(key.len + 1 + value.len);
+            try scratch.appendSlice(key);
+            try scratch.append('=');
+            try scratch.appendSlice(value);
+
+            const inserted = self.metadata.tags.add(scratch.items, series_id) catch |err| {
+                std.log.warn("tag index add failed: {s}", .{@errorName(err)});
+                if (offset == trimmed.len - 1) return true;
+                if (trimmed[offset] != ',') return false;
+                offset += 1;
+                continue;
+            };
+            dirty.* = dirty.* or inserted;
+
+            if (offset == trimmed.len - 1) return true;
+            if (trimmed[offset] != ',') return false;
+            offset += 1;
+        }
+        return offset == trimmed.len - 1;
+    }
+
+    fn scanSimpleJsonString(json: []const u8, offset: *usize) ?[]const u8 {
+        if (offset.* >= json.len or json[offset.*] != '"') return null;
+        offset.* += 1;
+        const start = offset.*;
+        while (offset.* < json.len) : (offset.* += 1) {
+            const ch = json[offset.*];
+            switch (ch) {
+                '"' => {
+                    const value = json[start..offset.*];
+                    offset.* += 1;
+                    return value;
+                },
+                '\\' => return null,
+                0...31 => return null,
+                else => {},
+            }
+        }
+        return null;
     }
 
     fn appendMemtablePoint(self: *Engine, sid: types.SeriesId, ts: i64, value: f64) !void {
@@ -2828,14 +2968,14 @@ pub const Engine = struct {
                 if (self.cas != null) {
                     self.verifyCasState() catch {
                         if (std.time.milliTimestamp() >= deadline) break;
-                        sleepMs(10);
+                        sleepMs(1);
                         continue;
                     };
                 }
                 return;
             }
             if (std.time.milliTimestamp() >= deadline) break;
-            sleepMs(10);
+            sleepMs(1);
         }
         _ = self.metrics.drain_timeout_total.fetchAdd(1, .monotonic);
         return WaitError.Timeout;
@@ -3024,6 +3164,32 @@ pub const Engine = struct {
         _ = try self.wal.appendSeriesRegistration(series_id, series_name, canonical_tags);
     }
 
+    fn descriptorInputsEquivalent(
+        lhs: metric_catalog_mod.DescriptorInput,
+        rhs: metric_catalog_mod.DescriptorInput,
+    ) bool {
+        return lhs.kind == rhs.kind and
+            std.mem.eql(u8, lhs.metric, rhs.metric) and
+            optionalBytesEqualNormalized(lhs.unit, rhs.unit) and
+            optionalBytesEqualNormalized(lhs.description, rhs.description) and
+            optionalBytesEqualNormalized(lhs.source_metric, rhs.source_metric) and
+            optionalBytesEqualNormalized(lhs.source_field, rhs.source_field);
+    }
+
+    fn optionalBytesEqualNormalized(lhs: ?[]const u8, rhs: ?[]const u8) bool {
+        return optionalBytesNormalized(lhs) == null and optionalBytesNormalized(rhs) == null or
+            (optionalBytesNormalized(lhs) != null and optionalBytesNormalized(rhs) != null and
+            std.mem.eql(u8, optionalBytesNormalized(lhs).?, optionalBytesNormalized(rhs).?));
+    }
+
+    fn optionalBytesNormalized(value: ?[]const u8) ?[]const u8 {
+        if (value) |slice| {
+            const trimmed = std.mem.trim(u8, slice, " \t\r\n");
+            if (trimmed.len != 0) return trimmed;
+        }
+        return null;
+    }
+
     pub fn declareExactSeriesCanonicalBatch(
         self: *Engine,
         inputs: []const ExactSeriesCanonicalDeclarationInput,
@@ -3039,16 +3205,34 @@ pub const Engine = struct {
             result.* = .{};
         }
 
+        const descriptor_phase_start_ns = std.time.nanoTimestamp();
+        const descriptor_slots = try self.alloc.alloc(?usize, inputs.len);
+        defer self.alloc.free(descriptor_slots);
+        @memset(descriptor_slots, null);
+
         var descriptor_inputs = std.array_list.Managed(metric_catalog_mod.DescriptorInput).init(self.alloc);
         defer descriptor_inputs.deinit();
-        var descriptor_result_indices = std.array_list.Managed(usize).init(self.alloc);
-        defer descriptor_result_indices.deinit();
+        try descriptor_inputs.ensureTotalCapacity(inputs.len);
+        var descriptor_unique_by_metric = std.StringHashMap(usize).init(self.alloc);
+        defer descriptor_unique_by_metric.deinit();
 
         for (inputs, 0..) |input, idx| {
-            if (input.descriptor) |descriptor| {
-                try descriptor_inputs.append(descriptor);
-                try descriptor_result_indices.append(idx);
+            const descriptor = input.descriptor orelse continue;
+            if (results[idx].status != .ok) continue;
+
+            if (descriptor_unique_by_metric.get(descriptor.metric)) |existing_slot| {
+                const existing_descriptor = descriptor_inputs.items[existing_slot];
+                if (descriptorInputsEquivalent(existing_descriptor, descriptor)) {
+                    descriptor_slots[idx] = existing_slot;
+                } else {
+                    results[idx].status = .metric_descriptor_conflict;
+                }
+                continue;
             }
+
+            try descriptor_inputs.append(descriptor);
+            descriptor_slots[idx] = descriptor_inputs.items.len - 1;
+            try descriptor_unique_by_metric.put(descriptor.metric, descriptor_inputs.items.len - 1);
         }
 
         if (descriptor_inputs.items.len != 0) {
@@ -3056,62 +3240,129 @@ pub const Engine = struct {
             defer self.alloc.free(descriptor_results);
 
             try self.metadata.metric_catalog.registerBatch(descriptor_inputs.items, descriptor_results);
-            for (descriptor_results, 0..) |descriptor_result, compact_idx| {
-                const result_idx = descriptor_result_indices.items[compact_idx];
-                if (descriptor_result == .conflict) {
-                    results[result_idx] = .{
-                        .status = .metric_descriptor_conflict,
-                        .series_id = null,
-                    };
+            for (descriptor_slots, 0..) |slot, idx| {
+                const descriptor_slot = slot orelse continue;
+                if (descriptor_results[descriptor_slot] == .conflict) {
+                    results[idx].status = .metric_descriptor_conflict;
                 }
             }
         }
+        _ = self.metrics.exact_series_declare_metric_catalog_ns_total.fetchAdd(
+            @intCast(std.time.nanoTimestamp() - descriptor_phase_start_ns),
+            .monotonic,
+        );
 
-        var series_inputs = std.array_list.Managed(series_catalog_mod.CanonicalRegisterInput).init(self.alloc);
-        defer series_inputs.deinit();
-        var series_result_indices = std.array_list.Managed(usize).init(self.alloc);
-        defer series_result_indices.deinit();
+        const series_phase_start_ns = std.time.nanoTimestamp();
+        const series_slots = try self.alloc.alloc(?usize, inputs.len);
+        defer self.alloc.free(series_slots);
+        @memset(series_slots, null);
+
+        var unique_series_inputs = std.array_list.Managed(series_catalog_mod.CanonicalRegisterInput).init(self.alloc);
+        defer unique_series_inputs.deinit();
+        try unique_series_inputs.ensureTotalCapacity(inputs.len);
+        var unique_series_owner_indices = std.array_list.Managed(usize).init(self.alloc);
+        defer unique_series_owner_indices.deinit();
+        try unique_series_owner_indices.ensureTotalCapacity(inputs.len);
+        var unique_series_by_id = std.AutoHashMap(types.SeriesId, usize).init(self.alloc);
+        defer unique_series_by_id.deinit();
 
         for (inputs, 0..) |input, idx| {
             if (results[idx].status != .ok) continue;
             const series_id = types.seriesIdFrom(input.name, input.canonical_tags);
-            try series_inputs.append(.{
+
+            if (unique_series_by_id.get(series_id)) |existing_slot| {
+                const existing = unique_series_inputs.items[existing_slot];
+                if (std.mem.eql(u8, existing.series, input.name) and std.mem.eql(u8, existing.canonical_tags, input.canonical_tags)) {
+                    series_slots[idx] = existing_slot;
+                } else {
+                    results[idx].status = .series_conflict;
+                }
+                continue;
+            }
+
+            try unique_series_inputs.append(.{
                 .series = input.name,
                 .canonical_tags = input.canonical_tags,
                 .series_id = series_id,
             });
-            try series_result_indices.append(idx);
+            try unique_series_owner_indices.append(idx);
+            series_slots[idx] = unique_series_inputs.items.len - 1;
+            try unique_series_by_id.put(series_id, unique_series_inputs.items.len - 1);
         }
 
-        if (series_inputs.items.len != 0) {
-            const series_results = try self.alloc.alloc(series_catalog_mod.RegisterBatchResult, series_inputs.items.len);
-            defer self.alloc.free(series_results);
+        var series_results: []series_catalog_mod.RegisterBatchResult = &.{};
+        defer if (series_results.len != 0) self.alloc.free(series_results);
+        var wal_registrations = std.array_list.Managed(series_catalog_mod.PendingWalRegistration).init(self.alloc);
+        defer wal_registrations.deinit();
 
-            var wal_registrations = std.array_list.Managed(series_catalog_mod.PendingWalRegistration).init(self.alloc);
-            defer wal_registrations.deinit();
+        if (unique_series_inputs.items.len != 0) {
+            series_results = try self.alloc.alloc(series_catalog_mod.RegisterBatchResult, unique_series_inputs.items.len);
+            try self.metadata.series_catalog.registerCanonicalBatch(unique_series_inputs.items, series_results, &wal_registrations);
+        }
+        _ = self.metrics.exact_series_declare_series_catalog_ns_total.fetchAdd(
+            @intCast(std.time.nanoTimestamp() - series_phase_start_ns),
+            .monotonic,
+        );
 
-            try self.metadata.series_catalog.registerCanonicalBatch(series_inputs.items, series_results, &wal_registrations);
-            if (wal_registrations.items.len != 0) {
-                _ = try self.wal.appendSeriesRegistrationBatch(wal_registrations.items);
-            }
+        const wal_phase_start_ns = std.time.nanoTimestamp();
+        if (wal_registrations.items.len != 0) {
+            _ = try self.wal.appendSeriesRegistrationBatch(wal_registrations.items);
+        }
+        _ = self.metrics.exact_series_declare_wal_registration_ns_total.fetchAdd(
+            @intCast(std.time.nanoTimestamp() - wal_phase_start_ns),
+            .monotonic,
+        );
 
-            for (series_results, 0..) |series_result, compact_idx| {
-                const result_idx = series_result_indices.items[compact_idx];
-                const series_id = series_inputs.items[compact_idx].series_id;
-                results[result_idx] = switch (series_result) {
-                    .inserted, .unchanged => .{
-                        .status = .ok,
-                        .series_id = series_id,
-                    },
-                    .conflict => .{
-                        .status = .series_conflict,
-                        .series_id = null,
-                    },
-                };
-            }
+        for (series_slots, 0..) |slot, idx| {
+            const series_slot = slot orelse continue;
+            if (results[idx].status != .ok) continue;
+
+            const series_id = unique_series_inputs.items[series_slot].series_id;
+            const owner_idx = unique_series_owner_indices.items[series_slot];
+            results[idx] = switch (series_results[series_slot]) {
+                .inserted => .{
+                    .status = .ok,
+                    .series_id = series_id,
+                    .registration = if (idx == owner_idx) .inserted else .unchanged,
+                },
+                .unchanged => .{
+                    .status = .ok,
+                    .series_id = series_id,
+                    .registration = .unchanged,
+                },
+                .conflict => .{
+                    .status = .series_conflict,
+                    .series_id = null,
+                    .registration = .unchanged,
+                },
+            };
         }
 
+        const tag_phase_start_ns = std.time.nanoTimestamp();
         try self.noteTagsBatch(inputs, results);
+        _ = self.metrics.exact_series_declare_tag_index_ns_total.fetchAdd(
+            @intCast(std.time.nanoTimestamp() - tag_phase_start_ns),
+            .monotonic,
+        );
+
+        var inserted_total: u64 = 0;
+        var unchanged_total: u64 = 0;
+        var descriptor_conflict_total: u64 = 0;
+        var series_conflict_total: u64 = 0;
+        for (results) |result| {
+            switch (result.status) {
+                .ok => switch (result.registration) {
+                    .inserted => inserted_total += 1,
+                    .unchanged => unchanged_total += 1,
+                },
+                .metric_descriptor_conflict => descriptor_conflict_total += 1,
+                .series_conflict => series_conflict_total += 1,
+            }
+        }
+        _ = self.metrics.exact_series_declare_inserted_total.fetchAdd(inserted_total, .monotonic);
+        _ = self.metrics.exact_series_declare_unchanged_total.fetchAdd(unchanged_total, .monotonic);
+        _ = self.metrics.exact_series_declare_descriptor_conflict_total.fetchAdd(descriptor_conflict_total, .monotonic);
+        _ = self.metrics.exact_series_declare_series_conflict_total.fetchAdd(series_conflict_total, .monotonic);
     }
 
     pub fn declareExactSeriesCanonical(

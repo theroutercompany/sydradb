@@ -176,8 +176,19 @@ pub const SeriesCatalog = struct {
 
         var inserted_indices = std.array_list.Managed(usize).init(self.alloc);
         defer inserted_indices.deinit();
+        try inserted_indices.ensureTotalCapacity(inputs.len);
+        try self.entries.ensureUnusedCapacity(self.alloc, inputs.len);
 
         for (inputs, 0..) |input, idx| {
+            if (self.series_id_index.get(input.series_id)) |existing_idx| {
+                const existing = self.entries.items[existing_idx];
+                out[idx] = if (std.mem.eql(u8, existing.series, input.series) and std.mem.eql(u8, existing.canonical_tags, input.canonical_tags))
+                    .unchanged
+                else
+                    .conflict;
+                continue;
+            }
+
             const owned_series = try self.alloc.dupe(u8, input.series);
             errdefer self.alloc.free(owned_series);
 
@@ -479,6 +490,9 @@ pub fn canonicalizeTagsJson(alloc: std.mem.Allocator, tags_json: []const u8) ![]
     if (trimmed.len == 0 or std.mem.eql(u8, trimmed, default_tags_json)) {
         return alloc.dupe(u8, default_tags_json);
     }
+    if (isSimpleCanonicalStringObject(trimmed)) {
+        return alloc.dupe(u8, trimmed);
+    }
 
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, trimmed, .{});
     defer parsed.deinit();
@@ -496,6 +510,50 @@ pub fn canonicalizeTagsJson(alloc: std.mem.Allocator, tags_json: []const u8) ![]
     try iface.flush();
     if (adapter.err) |write_err| return write_err;
     return try buffer.toOwnedSlice();
+}
+
+fn isSimpleCanonicalStringObject(json: []const u8) bool {
+    if (json.len < 2 or json[0] != '{' or json[json.len - 1] != '}') return false;
+    if (json.len == 2) return true;
+
+    var offset: usize = 1;
+    var prev_key: ?[]const u8 = null;
+    while (offset < json.len - 1) {
+        const key = scanSimpleJsonString(json, &offset) orelse return false;
+        if (offset >= json.len - 1 or json[offset] != ':') return false;
+        offset += 1;
+        _ = scanSimpleJsonString(json, &offset) orelse return false;
+
+        if (prev_key) |prev| {
+            if (!std.mem.lessThan(u8, prev, key)) return false;
+        }
+        prev_key = key;
+
+        if (offset == json.len - 1) break;
+        if (json[offset] != ',') return false;
+        offset += 1;
+    }
+    return offset == json.len - 1;
+}
+
+fn scanSimpleJsonString(json: []const u8, offset: *usize) ?[]const u8 {
+    if (offset.* >= json.len or json[offset.*] != '"') return null;
+    offset.* += 1;
+    const start = offset.*;
+    while (offset.* < json.len) : (offset.* += 1) {
+        const ch = json[offset.*];
+        switch (ch) {
+            '"' => {
+                const value = json[start..offset.*];
+                offset.* += 1;
+                return value;
+            },
+            '\\' => return null,
+            0...31 => return null,
+            else => {},
+        }
+    }
+    return null;
 }
 
 fn writeCanonicalValue(alloc: std.mem.Allocator, value: std.json.Value, jw: *std.json.Stringify) !void {

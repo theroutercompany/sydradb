@@ -12,6 +12,15 @@ pub const Entry = struct {
     path: []u8,
 };
 
+pub const AddInput = struct {
+    series_id: types.SeriesId,
+    hour_bucket: i64,
+    start_ts: i64,
+    end_ts: i64,
+    count: u32,
+    path: []const u8,
+};
+
 pub const Manifest = struct {
     alloc: std.mem.Allocator,
     // Use Unmanaged to be stable across Zig versions; pass allocator on mutation
@@ -113,6 +122,50 @@ pub const Manifest = struct {
             .count = count,
             .path = try self.alloc.dupe(u8, segment_path),
         });
+    }
+
+    pub fn addBatch(self: *Manifest, data_dir: std.fs.Dir, additions: []const AddInput) !void {
+        if (additions.len == 0) return;
+
+        const OpenFlags = std.fs.File.OpenFlags;
+        const open_opts: OpenFlags = if (@hasField(OpenFlags, "write"))
+            OpenFlags{ .write = true, .read = true }
+        else
+            OpenFlags{ .mode = .read_write };
+        var file = data_dir.openFile(manifest_path, open_opts) catch |err| switch (err) {
+            error.FileNotFound => try data_dir.createFile(manifest_path, .{ .read = true }),
+            else => return err,
+        };
+        defer file.close();
+        try file.seekFromEnd(0);
+
+        var write_buf: [4096]u8 = undefined;
+        var writer_state = file.writer(&write_buf);
+        var writer = anyWriter(&writer_state.interface);
+        try self.entries.ensureUnusedCapacity(self.alloc, additions.len);
+
+        for (additions) |addition| {
+            try writeEntry(&writer, .{
+                .series_id = addition.series_id,
+                .hour_bucket = addition.hour_bucket,
+                .start_ts = addition.start_ts,
+                .end_ts = addition.end_ts,
+                .count = addition.count,
+                .path = @constCast(addition.path),
+            });
+        }
+        try writer_state.end();
+
+        for (additions) |addition| {
+            try self.entries.append(self.alloc, .{
+                .series_id = addition.series_id,
+                .hour_bucket = addition.hour_bucket,
+                .start_ts = addition.start_ts,
+                .end_ts = addition.end_ts,
+                .count = addition.count,
+                .path = try self.alloc.dupe(u8, addition.path),
+            });
+        }
     }
 
     pub fn rewriteCheckpoint(self: *Manifest, data_dir: std.fs.Dir) !void {

@@ -58,6 +58,7 @@ pub const ClientDeclareInput = struct {
     name: []const u8,
     tags_json: []const u8,
     descriptor: ?metric_catalog_mod.DescriptorInput = null,
+    tags_are_canonical: bool = false,
 };
 
 pub const ClientDeclaration = struct {
@@ -87,11 +88,11 @@ const PendingDeclare = struct {
     client_decl_id: u32,
     input: ClientDeclareInput,
     canonical_tags: []u8,
-    signature: []u8,
+    signature: ?[]u8 = null,
 
     fn deinit(self: *PendingDeclare, alloc: std.mem.Allocator) void {
         alloc.free(self.canonical_tags);
-        alloc.free(self.signature);
+        if (self.signature) |signature| alloc.free(signature);
         self.* = undefined;
     }
 };
@@ -239,40 +240,85 @@ pub const Client = struct {
         var pending = std.array_list.Managed(PendingDeclare).init(self.alloc);
         var pending_aliases = std.array_list.Managed(PendingAlias).init(self.alloc);
         var pending_by_signature = std.StringHashMap(usize).init(self.alloc);
+        var pending_by_series_id = std.AutoHashMap(types.SeriesId, usize).init(self.alloc);
         defer {
             for (pending.items) |*item| item.deinit(self.alloc);
             pending.deinit();
             pending_aliases.deinit();
             pending_by_signature.deinit();
+            pending_by_series_id.deinit();
         }
 
         for (inputs, 0..) |input, idx| {
-            const canonical_tags = try service.canonicalizeTagsJson(self.alloc, input.tags_json);
+            const canonical_tags = if (input.tags_are_canonical)
+                try self.alloc.dupe(u8, input.tags_json)
+            else
+                try service.canonicalizeTagsJson(self.alloc, input.tags_json);
             errdefer self.alloc.free(canonical_tags);
-            const signature = try buildDeclarationSignature(self.alloc, input.decl_kind, input.name, canonical_tags, input.descriptor);
-            errdefer self.alloc.free(signature);
+            const use_series_fast_path =
+                self.cache.count() == 0 and
+                input.decl_kind == .series and
+                input.descriptor == null;
 
-            if (self.cache.get(signature)) |entry| {
-                self.stats.cache_hits_total += 1;
-                results[idx] = .{
-                    .client_decl_id = entry.client_decl_id,
-                    .series_id = entry.series_id,
-                };
-                self.alloc.free(canonical_tags);
-                self.alloc.free(signature);
-                continue;
-            }
-            self.stats.cache_misses_total += 1;
+            var signature: ?[]u8 = null;
+            var miss_counted = false;
+            if (!use_series_fast_path) {
+                signature = try buildDeclarationSignature(self.alloc, input.decl_kind, input.name, canonical_tags, input.descriptor);
+                errdefer if (signature) |owned| self.alloc.free(owned);
 
-            if (pending_by_signature.get(signature)) |pending_index| {
-                try pending_aliases.append(.{
-                    .result_index = idx,
-                    .pending_index = pending_index,
-                });
-                self.alloc.free(canonical_tags);
-                self.alloc.free(signature);
-                continue;
+                if (self.cache.get(signature.?)) |entry| {
+                    self.stats.cache_hits_total += 1;
+                    results[idx] = .{
+                        .client_decl_id = entry.client_decl_id,
+                        .series_id = entry.series_id,
+                    };
+                    self.alloc.free(canonical_tags);
+                    self.alloc.free(signature.?);
+                    continue;
+                }
+
+                if (pending_by_signature.get(signature.?)) |pending_index| {
+                    self.stats.cache_misses_total += 1;
+                    miss_counted = true;
+                    try pending_aliases.append(.{
+                        .result_index = idx,
+                        .pending_index = pending_index,
+                    });
+                    self.alloc.free(canonical_tags);
+                    self.alloc.free(signature.?);
+                    continue;
+                }
+            } else {
+                const series_id = types.seriesIdFrom(input.name, canonical_tags);
+                if (pending_by_series_id.get(series_id)) |pending_index| {
+                    self.stats.cache_misses_total += 1;
+                    miss_counted = true;
+                    const existing = pending.items[pending_index];
+                    if (std.mem.eql(u8, existing.input.name, input.name) and
+                        std.mem.eql(u8, existing.canonical_tags, canonical_tags))
+                    {
+                        try pending_aliases.append(.{
+                            .result_index = idx,
+                            .pending_index = pending_index,
+                        });
+                        self.alloc.free(canonical_tags);
+                        continue;
+                    }
+
+                    signature = try buildDeclarationSignature(self.alloc, input.decl_kind, input.name, canonical_tags, input.descriptor);
+                    errdefer if (signature) |owned| self.alloc.free(owned);
+                    if (pending_by_signature.get(signature.?)) |sig_pending_index| {
+                        try pending_aliases.append(.{
+                            .result_index = idx,
+                            .pending_index = sig_pending_index,
+                        });
+                        self.alloc.free(canonical_tags);
+                        self.alloc.free(signature.?);
+                        continue;
+                    }
+                }
             }
+            if (!miss_counted) self.stats.cache_misses_total += 1;
 
             const client_decl_id = self.next_client_decl_id;
             self.next_client_decl_id += 1;
@@ -283,7 +329,11 @@ pub const Client = struct {
                 .canonical_tags = canonical_tags,
                 .signature = signature,
             });
-            try pending_by_signature.put(signature, pending.items.len - 1);
+            if (signature) |owned_signature| {
+                try pending_by_signature.put(owned_signature, pending.items.len - 1);
+            } else if (use_series_fast_path) {
+                try pending_by_series_id.put(types.seriesIdFrom(input.name, canonical_tags), pending.items.len - 1);
+            }
         }
 
         if (pending.items.len == 0) return results;
@@ -322,7 +372,7 @@ pub const Client = struct {
             var offset: usize = 0;
             const ack_count = try takeInt(u32, frame.payload, &offset);
             if (ack_count != chunk_count) return error.InvalidResponse;
-            for (pending.items[pending_start..pending_end], pending_start..) |item, idx| {
+            for (pending.items[pending_start..pending_end], pending_start..) |*item, idx| {
                 const ack_decl_id = try takeInt(u32, frame.payload, &offset);
                 const ack_status = try takeEnum(DeclareStatus, u16, frame.payload, &offset);
                 const ack_code = try takeEnum(ErrorCode, u16, frame.payload, &offset);
@@ -331,11 +381,14 @@ pub const Client = struct {
                 if (ack_decl_id != item.client_decl_id) return error.InvalidResponse;
                 if (ack_status != .ok) return errorForCode(ack_code);
 
+                if (item.signature == null) {
+                    item.signature = try buildDeclarationSignature(self.alloc, item.input.decl_kind, item.input.name, item.canonical_tags, item.input.descriptor);
+                }
                 const entry = ClientCacheEntry{
                     .client_decl_id = item.client_decl_id,
                     .series_id = series_id,
                 };
-                try self.cache.put(try self.alloc.dupe(u8, item.signature), entry);
+                try self.cache.put(try self.alloc.dupe(u8, item.signature.?), entry);
                 results[item.result_index] = .{
                     .client_decl_id = item.client_decl_id,
                     .series_id = series_id,
@@ -597,12 +650,9 @@ const PendingServerDeclare = struct {
     response_index: usize,
     entry: BorrowedDeclareEntry,
     canonical_tags: []u8,
-    signature: []u8,
-    stored_signature: bool = false,
 
     fn deinit(self: *PendingServerDeclare, alloc: std.mem.Allocator) void {
         alloc.free(self.canonical_tags);
-        if (!self.stored_signature) alloc.free(self.signature);
         self.* = undefined;
     }
 };
@@ -788,10 +838,9 @@ fn handleDeclareBatch(eng: *Engine, session: *SessionState, payload: []const u8,
         };
         errdefer eng.alloc.free(canonical_tags);
 
-        const signature = try buildDeclarationSignature(eng.alloc, entry.decl_kind, entry.name, canonical_tags, entry.descriptor);
-        errdefer eng.alloc.free(signature);
-
         if (session.declarations.get(entry.client_decl_id)) |existing| {
+            const signature = try buildDeclarationSignature(eng.alloc, entry.decl_kind, entry.name, canonical_tags, entry.descriptor);
+            defer eng.alloc.free(signature);
             ack_outcomes[idx] = .{
                 .client_decl_id = entry.client_decl_id,
                 .status = if (std.mem.eql(u8, existing.signature, signature)) .ok else .rejected,
@@ -808,7 +857,7 @@ fn handleDeclareBatch(eng: *Engine, session: *SessionState, payload: []const u8,
 
         if (pending_decl_ids.get(entry.client_decl_id)) |pending_index| {
             const existing = pending.items[pending_index];
-            if (std.mem.eql(u8, existing.signature, signature)) {
+            if (borrowedDeclareEquivalent(existing.entry, existing.canonical_tags, entry, canonical_tags)) {
                 try pending_aliases.append(.{
                     .response_index = idx,
                     .pending_index = pending_index,
@@ -823,7 +872,6 @@ fn handleDeclareBatch(eng: *Engine, session: *SessionState, payload: []const u8,
                 };
             }
             eng.alloc.free(canonical_tags);
-            eng.alloc.free(signature);
             continue;
         }
 
@@ -831,7 +879,6 @@ fn handleDeclareBatch(eng: *Engine, session: *SessionState, payload: []const u8,
             .response_index = idx,
             .entry = entry,
             .canonical_tags = canonical_tags,
-            .signature = signature,
         });
         try pending_decl_ids.put(entry.client_decl_id, pending.items.len - 1);
     }
@@ -856,11 +903,11 @@ fn handleDeclareBatch(eng: *Engine, session: *SessionState, payload: []const u8,
             const outcome = switch (result.status) {
                 .ok => blk: {
                     const series_id = result.series_id.?;
+                    const signature = try buildDeclarationSignature(eng.alloc, item.entry.decl_kind, item.entry.name, item.canonical_tags, item.entry.descriptor);
                     try session.declarations.put(item.entry.client_decl_id, .{
-                        .signature = item.signature,
+                        .signature = signature,
                         .series_id = series_id,
                     });
-                    item.stored_signature = true;
                     _ = eng.metrics.local_ingest_declare_total.fetchAdd(1, .monotonic);
                     break :blk DeclareAckOutcome{
                         .client_decl_id = item.entry.client_decl_id,
@@ -907,6 +954,55 @@ fn handleDeclareBatch(eng: *Engine, session: *SessionState, payload: []const u8,
     _ = eng.metrics.local_ingest_declare_batches_total.fetchAdd(1, .monotonic);
     _ = eng.metrics.local_ingest_declare_ns_total.fetchAdd(@intCast(elapsed_ns), .monotonic);
     try writeFrame(writer, .declare_ack, 0, response.items);
+}
+
+fn borrowedDeclareEquivalent(
+    lhs: BorrowedDeclareEntry,
+    lhs_canonical_tags: []const u8,
+    rhs: BorrowedDeclareEntry,
+    rhs_canonical_tags: []const u8,
+) bool {
+    return lhs.decl_kind == rhs.decl_kind and
+        std.mem.eql(u8, lhs.name, rhs.name) and
+        std.mem.eql(u8, lhs_canonical_tags, rhs_canonical_tags) and
+        optionalDescriptorEquivalent(lhs.descriptor, rhs.descriptor);
+}
+
+fn optionalDescriptorEquivalent(
+    lhs: ?metric_catalog_mod.DescriptorInput,
+    rhs: ?metric_catalog_mod.DescriptorInput,
+) bool {
+    if (lhs == null and rhs == null) return true;
+    if (lhs == null or rhs == null) return false;
+    return descriptorInputsEquivalent(lhs.?, rhs.?);
+}
+
+fn descriptorInputsEquivalent(
+    lhs: metric_catalog_mod.DescriptorInput,
+    rhs: metric_catalog_mod.DescriptorInput,
+) bool {
+    return lhs.kind == rhs.kind and
+        std.mem.eql(u8, lhs.metric, rhs.metric) and
+        optionalBytesEqualNormalized(lhs.unit, rhs.unit) and
+        optionalBytesEqualNormalized(lhs.description, rhs.description) and
+        optionalBytesEqualNormalized(lhs.source_metric, rhs.source_metric) and
+        optionalBytesEqualNormalized(lhs.source_field, rhs.source_field);
+}
+
+fn optionalBytesEqualNormalized(lhs: ?[]const u8, rhs: ?[]const u8) bool {
+    const lhs_norm = optionalBytesNormalized(lhs);
+    const rhs_norm = optionalBytesNormalized(rhs);
+    if (lhs_norm == null and rhs_norm == null) return true;
+    if (lhs_norm == null or rhs_norm == null) return false;
+    return std.mem.eql(u8, lhs_norm.?, rhs_norm.?);
+}
+
+fn optionalBytesNormalized(value: ?[]const u8) ?[]const u8 {
+    if (value) |slice| {
+        const trimmed = std.mem.trim(u8, slice, " \t\r\n");
+        if (trimmed.len != 0) return trimmed;
+    }
+    return null;
 }
 
 fn handleAppendBatch(eng: *Engine, session: *SessionState, payload: []const u8, writer: *std.Io.Writer) !void {

@@ -7,6 +7,25 @@ const series_catalog_mod = @import("../storage/series_catalog.zig");
 
 const default_tags_json = "{}";
 
+pub const ExactSeriesDeclareBatchOperation = struct {
+    inputs: []const Engine.ExactSeriesCanonicalDeclarationInput,
+};
+
+pub const ExactSeriesAppendBatchOperation = struct {
+    points: []const Engine.ResolvedIngestPoint,
+};
+
+pub const MarketFamilyMetadataPlaceholderOperation = struct {
+    family: []const u8,
+    metadata_json: []const u8 = "{}",
+};
+
+pub const IngestOperation = union(enum) {
+    exact_series_declare_batch: ExactSeriesDeclareBatchOperation,
+    exact_series_append_batch: ExactSeriesAppendBatchOperation,
+    market_family_metadata_placeholder: MarketFamilyMetadataPlaceholderOperation,
+};
+
 const ParsedIngestMetric = struct {
     series: []u8,
     value: f64,

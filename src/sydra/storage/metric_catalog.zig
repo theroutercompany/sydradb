@@ -164,6 +164,8 @@ pub const MetricCatalog = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
+        try self.entries.ensureUnusedCapacity(self.alloc, inputs.len);
+
         var changed = false;
         for (inputs, 0..) |input, idx| {
             if (self.index.get(input.metric)) |entry_idx| {
@@ -183,13 +185,17 @@ pub const MetricCatalog = struct {
                 continue;
             }
 
+            const unit = normalizeOptional(input.unit);
+            const description = normalizeOptional(input.description);
+            const source_metric = normalizeOptional(input.source_metric);
+            const source_field = normalizeOptional(input.source_field);
             var descriptor = Descriptor{
                 .metric = try self.alloc.dupe(u8, input.metric),
                 .kind = input.kind,
-                .unit = try dupeOptional(self.alloc, normalizeOptional(input.unit)),
-                .description = try dupeOptional(self.alloc, normalizeOptional(input.description)),
-                .source_metric = try dupeOptional(self.alloc, normalizeOptional(input.source_metric)),
-                .source_field = try dupeOptional(self.alloc, normalizeOptional(input.source_field)),
+                .unit = try dupeOptional(self.alloc, unit),
+                .description = try dupeOptional(self.alloc, description),
+                .source_metric = try dupeOptional(self.alloc, source_metric),
+                .source_field = try dupeOptional(self.alloc, source_field),
             };
             errdefer descriptor.deinit(self.alloc);
 
