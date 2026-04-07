@@ -151,6 +151,7 @@ Scenario definitions live under [`benchmarks/README.md`](/Users/rexliu/sydradb/b
 Checked-in sample runs are published in [`benchmarks/v0.4.0-summary.md`](/Users/rexliu/sydradb/benchmarks/v0.4.0-summary.md) and [`benchmarks/v0.4.0-ingest-transport-summary.md`](/Users/rexliu/sydradb/benchmarks/v0.4.0-ingest-transport-summary.md).
 The current preview promotion checklist for local exact-series ingest lives in [`benchmarks/local-ingest-preview-checklist.md`](/Users/rexliu/sydradb/benchmarks/local-ingest-preview-checklist.md).
 The repo-local promotion gate evaluator now runs as `zig build bench-preview-gates`.
+Current local-ingest gate status: transport-bound scenarios pass, `warm_declared_10k` passes, and `cold_declare_10k` remains the only preview blocker.
 
 ## Demos
 

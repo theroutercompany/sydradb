@@ -22,6 +22,7 @@ Current recommendation:
 - prefer the socket for same-host exact-series writers
 - keep HTTP as the supported remote/operator ingest API
 - keep market-row ingest on HTTP
+- current preview gate status: transport-bound workloads pass, `warm_declared_10k` passes, `cold_declare_10k` is still the remaining blocker
 
 The current implementation uses the shared ingest service under [`src/sydra/ingest/service.zig`](./source/sydra/ingest/service.md) and the socket transport in [`src/sydra/ingest/socket.zig`](./source/sydra/ingest/socket.md).
 
@@ -107,6 +108,14 @@ Behavior:
 - `runtime.tag_index_dirty`
 - `runtime.tag_index_save_total`
 - `runtime.tag_index_save_skipped_total`
+- `runtime.exact_series_declare_metric_catalog_seconds_total`
+- `runtime.exact_series_declare_series_catalog_seconds_total`
+- `runtime.exact_series_declare_wal_registration_seconds_total`
+- `runtime.exact_series_declare_tag_index_seconds_total`
+- `runtime.exact_series_declare_inserted_total`
+- `runtime.exact_series_declare_unchanged_total`
+- `runtime.exact_series_declare_descriptor_conflict_total`
+- `runtime.exact_series_declare_series_conflict_total`
 
 `GET /metrics` adds counters and gauges such as:
 
@@ -124,6 +133,14 @@ Behavior:
 - `sydradb_tag_index_save_total`
 - `sydradb_tag_index_save_skipped_total`
 - `sydradb_tag_index_save_seconds_total`
+- `sydradb_exact_series_declare_metric_catalog_seconds_total`
+- `sydradb_exact_series_declare_series_catalog_seconds_total`
+- `sydradb_exact_series_declare_wal_registration_seconds_total`
+- `sydradb_exact_series_declare_tag_index_seconds_total`
+- `sydradb_exact_series_declare_inserted_total`
+- `sydradb_exact_series_declare_unchanged_total`
+- `sydradb_exact_series_declare_descriptor_conflict_total`
+- `sydradb_exact_series_declare_series_conflict_total`
 
 ## macOS Note
 

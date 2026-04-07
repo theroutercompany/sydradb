@@ -2,6 +2,14 @@
 
 Use this checklist before calling the exact-series local ingest socket preview-ready.
 
+## Current Gate Status
+
+Reference state from the latest `zig build bench-preview-gates` run on April 6, 2026:
+
+- transport-bound scenarios pass
+- `warm_declared_10k` passes
+- `cold_declare_10k` remains the only failing preview gate
+
 ## Required Verification
 
 - `nix develop -c zig build test -Doptimize=ReleaseSafe`
