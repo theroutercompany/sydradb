@@ -3,6 +3,12 @@ const types = @import("../types.zig");
 
 pub const path = "tags.json";
 
+pub const BatchAddInput = struct {
+    label: []const u8,
+    value: []const u8,
+    series_id: types.SeriesId,
+};
+
 pub const TagIndex = struct {
     alloc: std.mem.Allocator,
     map: std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)),
@@ -58,6 +64,64 @@ pub const TagIndex = struct {
         const inserted = self.map.getPtr(owned_key).?;
         try inserted.append(self.alloc, series_id);
         return true;
+    }
+
+    pub fn addBatch(self: *TagIndex, inputs: []const BatchAddInput) !u64 {
+        if (inputs.len == 0) return 0;
+
+        var scratch = std.array_list.Managed(u8).init(self.alloc);
+        defer scratch.deinit();
+
+        var inserted_total: u64 = 0;
+        var start: usize = 0;
+        while (start < inputs.len) {
+            const first = inputs[start];
+            var end = start + 1;
+            while (end < inputs.len and
+                std.mem.eql(u8, inputs[end].label, first.label) and
+                std.mem.eql(u8, inputs[end].value, first.value)) : (end += 1)
+            {}
+
+            scratch.clearRetainingCapacity();
+            try scratch.ensureTotalCapacity(first.label.len + 1 + first.value.len);
+            try scratch.appendSlice(first.label);
+            try scratch.append('=');
+            try scratch.appendSlice(first.value);
+
+            if (self.map.getPtr(scratch.items)) |existing| {
+                try existing.ensureUnusedCapacity(self.alloc, end - start);
+                for (inputs[start..end]) |input| {
+                    var duplicate = false;
+                    for (existing.items) |sid| {
+                        if (sid == input.series_id) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if (duplicate) continue;
+                    existing.appendAssumeCapacity(input.series_id);
+                    inserted_total += 1;
+                }
+            } else {
+                const owned_key = try self.alloc.dupe(u8, scratch.items);
+                errdefer self.alloc.free(owned_key);
+                try self.map.put(owned_key, .{});
+                const inserted = self.map.getPtr(owned_key).?;
+                try inserted.ensureUnusedCapacity(self.alloc, end - start);
+
+                var last_series_id: ?types.SeriesId = null;
+                for (inputs[start..end]) |input| {
+                    if (last_series_id != null and last_series_id.? == input.series_id) continue;
+                    inserted.appendAssumeCapacity(input.series_id);
+                    inserted_total += 1;
+                    last_series_id = input.series_id;
+                }
+            }
+
+            start = end;
+        }
+
+        return inserted_total;
     }
 
     pub fn get(self: *TagIndex, key: []const u8) []const types.SeriesId {

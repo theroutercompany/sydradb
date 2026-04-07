@@ -26,6 +26,35 @@ pub const IngestOperation = union(enum) {
     market_family_metadata_placeholder: MarketFamilyMetadataPlaceholderOperation,
 };
 
+pub fn executeExactSeriesDeclareBatch(
+    eng: *Engine,
+    inputs: []const Engine.ExactSeriesCanonicalDeclarationInput,
+    results: []Engine.ExactSeriesBatchDeclarationResult,
+) !void {
+    return try eng.declareExactSeriesCanonicalBatch(inputs, results);
+}
+
+pub fn executeExactSeriesAppendBatch(
+    eng: *Engine,
+    points: []const Engine.ResolvedIngestPoint,
+) !Engine.AppendBatchReceipt {
+    return try eng.appendResolvedBatch(points);
+}
+
+pub fn executeOperation(eng: *Engine, operation: IngestOperation) !void {
+    switch (operation) {
+        .exact_series_declare_batch => |declare| {
+            const results = try eng.alloc.alloc(Engine.ExactSeriesBatchDeclarationResult, declare.inputs.len);
+            defer eng.alloc.free(results);
+            try executeExactSeriesDeclareBatch(eng, declare.inputs, results);
+        },
+        .exact_series_append_batch => |append| {
+            _ = try executeExactSeriesAppendBatch(eng, append.points);
+        },
+        .market_family_metadata_placeholder => return error.UnsupportedOperation,
+    }
+}
+
 const ParsedIngestMetric = struct {
     series: []u8,
     value: f64,
@@ -180,7 +209,7 @@ pub fn applyParsedIngestLine(eng: *Engine, parsed: ParsedIngestLine) !types.Seri
             .descriptor = descriptorInput(&write),
         };
     }
-    try eng.declareExactSeriesCanonicalBatch(declarations, declaration_results);
+    try executeExactSeriesDeclareBatch(eng, declarations, declaration_results);
 
     var first_sid: ?types.SeriesId = null;
     for (parsed.writes, 0..) |write, idx| {
@@ -196,7 +225,7 @@ pub fn applyParsedIngestLine(eng: *Engine, parsed: ParsedIngestLine) !types.Seri
         };
         if (first_sid == null) first_sid = sid;
     }
-    _ = try eng.appendResolvedBatch(points);
+    _ = try executeExactSeriesAppendBatch(eng, points);
     return first_sid orelse 0;
 }
 

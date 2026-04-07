@@ -896,7 +896,7 @@ fn handleDeclareBatch(eng: *Engine, session: *SessionState, payload: []const u8,
                 .descriptor = item.entry.descriptor,
             };
         }
-        try eng.declareExactSeriesCanonicalBatch(declare_inputs, declare_results);
+        try service.executeExactSeriesDeclareBatch(eng, declare_inputs, declare_results);
 
         for (pending.items, 0..) |*item, pending_idx| {
             const result = declare_results[pending_idx];
@@ -1031,7 +1031,7 @@ fn handleAppendBatch(eng: *Engine, session: *SessionState, payload: []const u8, 
         };
     }
 
-    const receipt = eng.appendResolvedBatch(points) catch |err| switch (err) {
+    const receipt = service.executeExactSeriesAppendBatch(eng, points) catch |err| switch (err) {
         error.MemoryLimitExceeded => {
             _ = eng.metrics.local_ingest_rejected_total.fetchAdd(1, .monotonic);
             try sendErrorFrame(writer, .memory_limit_exceeded, "ingest backpressure: memory limit exceeded");

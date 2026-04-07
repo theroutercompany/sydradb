@@ -56,6 +56,13 @@ pub const CanonicalRegisterInput = struct {
     series_id: types.SeriesId,
 };
 
+pub const PreparedCanonicalRegisterInput = struct {
+    series: []const u8,
+    canonical_tags: []const u8,
+    selector_key: []const u8,
+    series_id: types.SeriesId,
+};
+
 pub const RegisterBatchResult = enum {
     unchanged,
     inserted,
@@ -150,7 +157,7 @@ pub const SeriesCatalog = struct {
         const canonical_tags = try canonicalizeTagsJson(self.alloc, tags_json);
         errdefer self.alloc.free(canonical_tags);
 
-        const selector_key = try buildSelectorKey(self.alloc, owned_series, canonical_tags);
+        const selector_key = try buildSelectorKeyOwned(self.alloc, owned_series, canonical_tags);
         errdefer self.alloc.free(selector_key);
 
         self.mutex.lock();
@@ -166,6 +173,28 @@ pub const SeriesCatalog = struct {
     pub fn registerCanonicalBatch(
         self: *SeriesCatalog,
         inputs: []const CanonicalRegisterInput,
+        out: []RegisterBatchResult,
+        wal_registrations: *std.array_list.Managed(PendingWalRegistration),
+    ) !void {
+        var prepared = try self.alloc.alloc(PreparedCanonicalRegisterInput, inputs.len);
+        defer {
+            for (prepared) |input| self.alloc.free(@constCast(input.selector_key));
+            self.alloc.free(prepared);
+        }
+        for (inputs, 0..) |input, idx| {
+            prepared[idx] = .{
+                .series = input.series,
+                .canonical_tags = input.canonical_tags,
+                .selector_key = try buildSelectorKeyOwned(self.alloc, input.series, input.canonical_tags),
+                .series_id = input.series_id,
+            };
+        }
+        return try self.registerPreparedBatch(prepared, out, wal_registrations);
+    }
+
+    pub fn registerPreparedBatch(
+        self: *SeriesCatalog,
+        inputs: []const PreparedCanonicalRegisterInput,
         out: []RegisterBatchResult,
         wal_registrations: *std.array_list.Managed(PendingWalRegistration),
     ) !void {
@@ -195,7 +224,7 @@ pub const SeriesCatalog = struct {
             const owned_tags = try self.alloc.dupe(u8, input.canonical_tags);
             errdefer self.alloc.free(owned_tags);
 
-            const selector_key = try buildSelectorKey(self.alloc, owned_series, owned_tags);
+            const selector_key = try self.alloc.dupe(u8, input.selector_key);
             errdefer self.alloc.free(selector_key);
 
             const inserted = self.insertOwned(owned_series, owned_tags, selector_key, input.series_id) catch |err| switch (err) {
@@ -249,7 +278,7 @@ pub const SeriesCatalog = struct {
         const canonical_tags = try canonicalizeTagsJson(self.alloc, tags_json);
         defer self.alloc.free(canonical_tags);
 
-        const selector_key = try buildSelectorKey(self.alloc, series, canonical_tags);
+        const selector_key = try buildSelectorKeyOwned(self.alloc, series, canonical_tags);
         defer self.alloc.free(selector_key);
 
         self.mutex.lock();
@@ -337,7 +366,7 @@ pub const SeriesCatalog = struct {
         errdefer self.alloc.free(owned_series);
         const owned_tags = try self.alloc.dupe(u8, tags_val.string);
         errdefer self.alloc.free(owned_tags);
-        const selector_key = try buildSelectorKey(self.alloc, owned_series, owned_tags);
+        const selector_key = try buildSelectorKeyOwned(self.alloc, owned_series, owned_tags);
         errdefer self.alloc.free(selector_key);
 
         _ = try self.insertOwned(owned_series, owned_tags, selector_key, @intCast(try jsonSeriesId(series_id_val)));
@@ -604,7 +633,7 @@ fn containsSid(values: []const types.SeriesId, series_id: types.SeriesId) bool {
     return false;
 }
 
-fn buildSelectorKey(alloc: std.mem.Allocator, series: []const u8, canonical_tags: []const u8) ![]u8 {
+pub fn buildSelectorKeyOwned(alloc: std.mem.Allocator, series: []const u8, canonical_tags: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "{s}\x1f{s}", .{ series, canonical_tags });
 }
 
