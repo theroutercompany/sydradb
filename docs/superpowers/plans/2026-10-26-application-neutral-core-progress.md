@@ -7,14 +7,18 @@ Persistent goal: active in this conversation; no deadline or token budget.
 ## Current checkpoint
 
 M1 / Task 2 is in progress. Storage checks passed. Focused publication and neutral
-HTTP checks passed after fixes. All five focused CAS mirror checks passed; the
-full native integration target is running. Task 4 schema extraction
+HTTP checks passed after fixes. All five focused CAS mirror checks passed. The
+full native integration target passed after pinning Python 3.13 in the shell.
+The restart soak exposed stale schema validation and a timing-bound mismatch.
+The schema 3 validator now passes 23 focused tests. An isolated worker owns the
+timing correction; the workload bound and process timeout must remain intact.
+Task 4 schema extraction
 passed storage checks; empty generic initialization is still pending.
 The current branch is `codex/native-market-storage` at `42fbd55`.
 
 | Milestone | State | Acceptance evidence |
 | --- | --- | --- |
-| M1: native-storage stabilization | In progress | Focused fixes pass; complete runtime and release gates pending |
+| M1: native-storage stabilization | In progress | Native integration passes; restart soak and complete release qualification remain open |
 | M2: application boundaries | Partial | Schema extraction: 210 storage checks; neutral routes: 4 focused checks |
 | M3: query limits | Planned | Query ownership review complete; no implementation evidence |
 | M4: general selection | Planned | No implementation evidence |
@@ -60,6 +64,12 @@ artifacts, not a replacement for the user's source tree or an external backup.
 | CAS mirror checks after duplicate removal | Compile failure: two unmutated `var` declarations; no tests ran | `cas-mirror-focused-v2.log`; terminal exit 1 |
 | Isolated native-storage foundation | PASS: 184/184 storage tests; terminal exit 0 | `native-foundation-storage.log` |
 | CAS retained-mirror regression and affected engine cases | PASS: 5/5; terminal exit 0 | `cas-worker-focused.log`, `cas-verified-fix-result.md` |
+| First full native integration run | 736/736 Zig tests passed; target failed because system Python 3.9 rejected `zip(strict=True)` | `native-market-ci-current.log`; terminal exit 1 |
+| Python evidence suite under 3.13.15 | PASS: 35 tests | `native-script-python313.log`; terminal exit 0 |
+| Native integration with the Python shell fix | PASS: 34/34 steps, 736 Zig tests, 35 Python tests; shell selected Python 3.13.7 | `native-market-ci-python313.log`; terminal exit 0 |
+| 60-second restart soak | FAIL acceptance: schema 3 versus validator 2; max operations 3 versus validator 2; elapsed 74 seconds versus 70-second bound | `native-soak-60s.log`, `native-soak-60s/soak-evidence.json`; terminal exit 1 |
+| Crash smoke, one iteration, fsync always | PASS: all seven crash points, exercise exit 86 and recovery exit 0 | `native-crash-smoke.log`; terminal exit 0 |
+| Schema 3 soak validator and bundle tests | PASS: 23 tests, repeated by controller under Python 3.13.15 | `soak-contract-result.md`; controller terminal exit 0 |
 
 The runtime build summary reports completed tests, but its terminal exit is 1.
 Do not count this as a passing runtime suite. The stack shows the producer in
@@ -203,21 +213,70 @@ The redundant validation error log was removed so the caller owns reporting.
 A worker now owns the remaining compile fixes and focused CAS verification in
 one task; see `cas-verified-fix-agent.jsonl` and `cas-worker-focused.log`.
 That task passed all five focused checks with terminal exit 0. The controller
-started `native-market-ci -Doptimize=ReleaseSafe -j2 --summary all`; see
-`native-market-ci-current.log`. Full integration remains pending.
+ran `native-market-ci -Doptimize=ReleaseSafe -j2 --summary all`. The first run
+failed only the Python 3.9 script step. The exact one-line dev-shell fix selected
+Python 3.13.7 and the full rerun passed. Migration evidence includes 64 checkpoint
+interruptions. Benchmark, demos, shadow comparison, storage, runtime, and wire
+checks passed. The separate crash smoke passed all seven points.
+
+The soak artifact has zero acknowledged-row loss, shadow mismatches, verification
+failures, and ingest errors. Its schema and maximum-operation count changed in
+the pre-existing driver work but the consumers still require the old contract.
+One worker owns strict producer-consumer reconciliation in the Python validators
+and fixtures. A read-only worker owns timing analysis; do not relax the elapsed
+bound merely to pass. Full soak acceptance remains open.
 
 Docs-link PR: https://github.com/theroutercompany/sydradb/pull/78.
 Signed local commit: `cbc2ed05ca3ca90682e52ae2dae8f4cdc6743b0e`.
 Published commit: `7c4fcbe2dc7469d45854dadd2c06115ec9825656`.
 Both commits have tree `28b83ffeada5038b100679720c6d82b86c91e625`.
 The one-line correction points to source files verified on remote main. The PR
-targets the formatting branch. Hosted docs verification is pending.
+targets the formatting branch. Hosted Docusaurus and Ubuntu checks passed. Its
+macOS check still has the separate SDK failure.
+
+Python dev-shell PR: https://github.com/theroutercompany/sydradb/pull/79.
+Signed local commit: `d34e8a1eb2530834e6a0c3d9a8b7ee889d4f205c`.
+Published commit: `fceb8a368a06d79f5a8908b58df37a5fc2970468`.
+Both commits have tree `b59043581358df159c3755c7e03e5290cb3628cc`.
+The same patch is integrated in the active native checkout and passed the full
+native integration target. The isolated PR retains the older base product code.
+
+macOS SDK PR: https://github.com/theroutercompany/sydradb/pull/80.
+Signed local commit: `49276e2082f856512e7c448e6b2f679724339756`.
+Published commit: `eea97dc696f5b6c50cde960d5c6b52dcbbc37229`.
+Both commits have tree `902e4fa079df86fb1b56347a94c2404300604b25`.
+The worker selected the installed Xcode 26.3 path for both macOS build jobs and
+added SDK identity output. YAML and whitespace checks passed. Hosted Ubuntu and
+macOS format, build, and test checks passed. macOS job `122009783147` in run
+`40449858255` reports Xcode 26.3 and SDK 26.2. PR 80 is ready for review. Release
+packaging jobs did not run on the PR; this is not release-package evidence.
 
 An isolated worker prepares Task 5 in `trading-policy-preparation/`. It owns only
 the engine validation facade and the new trading policy module. It must preserve
 the original validators' error precedence and signal fallback behavior. It cannot
 edit the active native-storage checkout or start a competing build. Its copied
 engine prerequisite is recorded in `trading-policy-baseline-engine.zig`.
+
+The schema 3 validator worker completed. It now requires concurrent and restart
+rollup progress, validates label counts against emissions and highwater progress,
+and rejects old or incomplete evidence. The controller repeated all 23 focused
+Python tests. The saved soak still fails only its unchanged elapsed bound.
+
+The isolated timing worker owns `soak-timing-preparation/`. It must record the
+workload boundary separately from completion through final verification, keep
+the existing workload bound and subprocess timeout, and update both producers
+and consumers. Its patch must apply to the current schema 3 validator.
+
+The isolated empty-catalog worker owns `empty-catalog-preparation/`. Generic
+load and snapshot paths must remain free of trading defaults. Recognized legacy
+market routes must initialize trading explicitly after authentication. Existing
+schemas, digests, and mappings must remain intact. No root source writes or
+competing builds are assigned to this worker.
+
+The next native PR is prepared in `native-derived-pr/`, based on the published
+foundation tree. It replays `ff5ccc0` cleanly and changes only `engine.zig`.
+Independent review and focused native derived-row and flush-publication tests
+are in progress. Historical commit-message checks are not current evidence.
 
 All delegation outputs live in the checkpoint directory.
 
