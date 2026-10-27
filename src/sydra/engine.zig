@@ -3822,9 +3822,7 @@ pub const Engine = struct {
             segment_write_ns_total += @intCast(std.time.nanoTimestamp() - write_start_ns);
             errdefer self.alloc.free(path);
 
-            const file_bytes = try self.data_dir.readFileAlloc(self.alloc, path, 128 * 1024 * 1024);
-            defer self.alloc.free(file_bytes);
-            const digest = market_manifest_mod.contentDigest(file_bytes);
+            const file_identity = try marketSegmentFileIdentity(self.data_dir, path);
             const block_rows: usize = @intCast(market_segment_mod.market_segment_block_rows);
             const block_count: u32 = @intCast((row_count + block_rows - 1) / block_rows);
             const column_names = try self.alloc.alloc([]u8, schema.ordered_columns.len);
@@ -3852,9 +3850,9 @@ pub const Engine = struct {
                 .row_count = @intCast(row_count),
                 .block_count = block_count,
                 .column_names = column_names,
-                .content_id = digest,
-                .file_hash = digest,
-                .file_size = @intCast(file_bytes.len),
+                .content_id = file_identity.digest,
+                .file_hash = file_identity.digest,
+                .file_size = file_identity.size,
             });
             rows_written += row_count;
             segments_written += 1;
@@ -3879,6 +3877,32 @@ pub const Engine = struct {
             _ = self.metrics.flush_hour_slices_total.fetchAdd(@intCast(segments_written), .monotonic);
         }
         return segments_written != 0;
+    }
+
+    fn marketSegmentFileIdentity(
+        data_dir: std.fs.Dir,
+        path: []const u8,
+    ) !struct {
+        digest: market_manifest_mod.ContentDigest,
+        size: u64,
+    } {
+        var file = try data_dir.openFile(path, .{});
+        defer file.close();
+        const stat = try file.stat();
+
+        var hasher = std.crypto.hash.Blake3.init(.{});
+        var buffer: [64 * 1024]u8 = undefined;
+        while (true) {
+            const bytes_read = try file.read(&buffer);
+            if (bytes_read == 0) break;
+            hasher.update(buffer[0..bytes_read]);
+        }
+        var digest: market_manifest_mod.ContentDigest = undefined;
+        hasher.final(digest[0..]);
+        return .{
+            .digest = digest,
+            .size = stat.size,
+        };
     }
 
     fn quarantineFailedIngest(self: *Engine, item: ResolvedIngestPoint, stage: []const u8, err_name: []const u8) void {
@@ -7330,6 +7354,26 @@ fn writeTestRepositoryFormatMarker(data_path: []const u8, version: u16) !void {
         .data = &bytes,
         .flags = .{},
     });
+}
+
+test "engine native market segment identity matches memory hash across chunks" {
+    const test_file_size = 2 * 64 * 1024 + 37;
+    var bytes: [test_file_size]u8 = undefined;
+    for (0..bytes.len) |index| {
+        bytes[index] = @truncate(index);
+    }
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{
+        .sub_path = "segment.bin",
+        .data = &bytes,
+        .flags = .{},
+    });
+
+    const file_identity = try Engine.marketSegmentFileIdentity(tmp.dir, "segment.bin");
+    try std.testing.expectEqual(market_manifest_mod.contentDigest(&bytes), file_identity.digest);
+    try std.testing.expectEqual(@as(u64, test_file_size), file_identity.size);
 }
 
 test "engine queue wraps around and preserves order" {
