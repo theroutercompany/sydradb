@@ -6,39 +6,38 @@ Persistent goal: active in this conversation; no deadline or token budget.
 
 ## Current checkpoint
 
-The latest combined native and empty-catalog target passed all 34 steps, 743 Zig
-tests, and 35 Python tests. A subsequent code review identified two migration
-maintenance gaps; causal tests are in preparation. M1 remains open. The earlier bounded
-restart soak, before the empty-catalog change, recovered
-all 15,604 acknowledged rows after five restarts, with all four error counters zero.
-Its workload took 61 seconds and the complete run took 76 seconds. Crash smoke
-previously passed all seven points. These are local and smoke results, not full
-release qualification.
+Checkpoint `14290b9` passed 794/794 ReleaseSafe tests on macOS: 216
+storage and 578 runtime tests. That result includes repair intent and native
+directory synchronization (`root-repair-native-durability-tests.log`). A prior
+integration passed 577 runtime and 27 wire tests. These results do not establish
+Linux acceptance for that earlier checkpoint: PR 93 then failed Ubuntu CI because
+a default Zig directory handle uses `O_PATH` and cannot be passed to `fsync`.
+The scalar-manifest correction now passes Ubuntu and macOS CI. Other durability
+corrections remain under review, so M1 remains open.
 
-The mixed-history regression failed because its flush restarted background
-processing before the manual assertions. The worker reordered the fixture and
-kept every expected count. The focused run changed from 2/3 to 3/3 passing tests,
-then the full combined target passed. Production behavior did not change in that
-fixture correction.
+The application boundary, empty generic catalog, neutral API routes, query
+limits, and general label selection have current-root test evidence. Trading
+schema and transform behavior lives under `applications/trading`; legacy routes
+and serialized identifiers remain compatible. Generic rollups remain design-only.
 
-The first native hardening checkpoint is signed after 210 storage tests passed.
-Its isolated two-file port passed all 185 storage tests on the published native
-stack and is open as PR 84. Empty generic initialization passed 507 runtime and
-211 storage tests before a refinement narrowed publication checks to requested
-schemas. That refinement passed 19 focused checks and all 508 isolated runtime
-tests, then was integrated. The combined target found two additional trading
-fixtures that lacked explicit initialization. Both passed focused checks after
-a two-line fixture repair; the combined target then passed. Limits and the
-selector/compiler integration have source changes but no passing test result yet.
-The neutral routes are open as PR 85 with six passing local checks.
-The current branch is `codex/native-market-storage` at `42fbd55`.
+PRs 89, 90, 91, 92, and 93 passed Ubuntu and macOS CI and are ready for review.
+PRs 94 and 95 are draft while their hosted checks run. All PRs remain
+unmerged. Local checkpoints are signed; published GitHub App commits have matching
+trees but are unsigned. No work is pushed directly to main.
+
+The current source branch remains `codex/native-market-storage` at `42fbd55`.
+Atomic checkpoints are maintained separately so that its unpublished ancestry
+does not enter scoped feature PRs. The earlier 60-second restart soak recovered
+15,604 acknowledged rows after five restarts, and crash smoke passed seven
+points. Those earlier results are smoke evidence, not release qualification or
+evidence for every later patch.
 
 | Milestone | State | Acceptance evidence |
 | --- | --- | --- |
-| M1: native-storage stabilization | In progress | Combined integration, crash smoke, and bounded restart soak pass; two maintenance gaps are under causal investigation |
-| M2: application boundaries | Partial | Root schema extraction and aliases passed; revised empty-catalog branch passes 19 focused checks |
-| M3: query limits | Prepared; fixes in progress | Independent ownership and accounting reviews found defects; no build or test result yet |
-| M4: general selection | Prepared | Parser and compiled-family changes integrated in an isolated tree; verification pending |
+| M1: native-storage stabilization | In progress | Local integration passes; scalar directory-handle fix passes both CI platforms; native-directory CI and CAS durability corrections remain open |
+| M2: application boundaries | Implemented locally; upstream delivery incomplete | Empty catalog, neutral routes, schema and transform extraction, and shared sensor/service/trading lifecycle tests pass |
+| M3: query limits | Implemented locally; upstream delivery incomplete | Accounting, exact-cap, overflow, cancellation, runtime, and wire checks pass; original test-first chronology is not established |
+| M4: general selection | Implemented locally; upstream delivery incomplete | Label filters, compiled families, ownership, and prepared-query lifecycle checks pass |
 | M5: generic rollups and final audit | Design review | Definition, bounded-read, and bucket-semantics contracts under review; no implementation |
 
 ## Starting work and preservation
@@ -1092,3 +1091,139 @@ lanes own those fixes: native catalog/manifest/migration and CAS/object-store.
 The local syscall diagnostic ran on Darwin (`uname -s`), correcting the audit
 report's mistaken reference to Linux. Current-root repair-intent integration is
 separate and still pending verification.
+
+### Streaming, recovery, and Linux durability checkpoint
+
+PR 90 completed Ubuntu and macOS CI in run `40484116520` and is ready for
+review. PR 92 publishes streaming WAL and snapshot capture on PR 90. Signed
+local commit `562ff7333743dac72c65a98c7a25ad3175b1f1c7` and App commit
+`e35b17dacc116397d8c992e09f9bcf1dc4ed0dc2` share tree
+`158be9a66f9485ccefb5511a7bc152687bcedeb6`. Its scoped local tree passed
+646/646 ReleaseSafe tests (197 storage and 449 runtime), then Ubuntu and macOS
+CI in run `40486168826`. PR 92 is ready for review. Streamed payloads no longer
+require the whole-file allocation; frame and extent indexes still grow with the
+number of entries.
+
+PR 93 publishes sequence filtering, torn-manifest restoration, and persisted
+repair intent on PR 92. Its three signed local checkpoints are
+`ec14229cfaaff2193f180ad915ec7c1e230fa10f`,
+`71a538831b6045b27903a2d20f87ae50e95b9b2b`, and
+`9bd8e096b6667565069c7ae8cb0e168974b42d46`. The initial App head
+`0b0486a2d41c38e90ce8e046b51466891d6a448e` shares final tree
+`231a7ef735d46e3e1b1130afc846aa19ebe604c7`. The original two-segment
+regression was restored unchanged. The independent interruption test expects
+three scalar segments and one native segment, checks values and retry, and
+reopens the database. That final integration passed 454/454 runtime tests;
+unchanged storage files had passed 199/199 before the test-only addition.
+See `native-recovery-preserved-regressions-runtime.log`.
+
+Ubuntu CI run `40486672616`, job `122130062215`, failed at the initial PR 93
+head. Zig reached unreachable code in `std.posix.fsync` from
+`manifest.zig:246`. The displayed test count is not a pass: the process aborted
+with signal 6 and the command exited 1. macOS CI was canceled. Pinned Zig
+`std/fs/Dir.zig:1551-1552` sets `O_PATH` when directory iteration is disabled.
+The repair helper passed that borrowed descriptor to `fsync`. Source inspection
+and the Ubuntu stack support this diagnosis; the earlier Darwin syscall probe
+could not detect it. PR 93 remains draft until the corrected head passes CI.
+The log is `native-recovery-ubuntu-ci-failure.txt`.
+
+A worker changed scalar-manifest sync to open a temporary iterable handle,
+close it with `defer`, and propagate errors. Its new public regression uses a
+default-opened directory and exercises repair intent, checkpoint rewrite, and
+intent removal. Root applied the worker patch mechanically. Signed local
+checkpoint `4428c94fbb62db3e998bc1eef125e814a3e9e3f0`, tree
+`0392de2377ead615bf12abe86bed67477341586c`, records that fix. Local verification
+and the PR 93 update are in progress. No sync failure is suppressed.
+
+Before that correction, current-root native repair and directory integration
+passed 794/794 ReleaseSafe tests: 216 storage and 578 runtime. The signed native
+directory checkpoint is `14290b9a051bc9f4b9741283ef77966c8d8df995`, tree
+`1258a9ba9a411fad8ca3f1b300b0d323ba54cd73`. The signed repair checkpoint is
+`22ee45e50af5e5ac7e9c5ffb6d1af4bd3b2d12e4`. These are macOS results;
+they do not establish Linux durability acceptance.
+
+The native-helper follow-up confirms that catalog constructors already use
+iterable directory handles. Migration uses borrowed and default-opened handles
+and needs the same correction. Native manifest callers are being checked
+separately. CAS/object-store changes are still isolated and have not entered
+current root. Their first storage run passed 216/216 on macOS, but independent
+review found ref-publication error paths, parent-sync ordering, new-root parent
+coverage, read-only quarantine-copy handling, and initialization descriptor
+cleanup that require correction or a narrower evidence claim. The worker must
+validate each finding against the actual transaction and initialization callers.
+See `cas-directory-durability-review-result.md`.
+
+### Soak contract checkpoint
+
+The remaining-file audit confirmed that six files form one schema-v3 contract:
+the soak driver, runner, RC assembler, two Python test modules, and release-gate
+documentation. The Python shell prerequisite is separate. No P2 staleness claim
+is inferred from patch size; its earlier byte comparison remains valid.
+
+Signed checkpoint `bf37e51afe0cfa2f32c8d454f8ca57f45d580d0c`, tree
+`7dd91b6cc1867f7974d31482ae71891055340165`, records the six-file contract.
+The Python 3.13 shell prerequisite is signed checkpoint `9ab0517`; that
+behavior is already published through PR 79.
+
+The first checkpoint test invocation selected system Python 3.9 because the
+shell prerequisite was not yet present. It ran 35 tests and failed with 53
+subtest errors from unsupported `zip(strict=True)`
+(`native-soak-checkpoint-python-tests.log`). After the separate prerequisite
+was added, all 35 tests passed in 8.933 seconds
+(`native-soak-checkpoint-python313-tests.log`). The pinned ReleaseSafe soak
+driver build passed all four steps
+(`native-soak-checkpoint-driver-build.log`). No new restart soak or four-hour
+release qualification was run for this checkpoint.
+
+Monotonic timing, mixed automatic storage mappings, and streaming native-segment
+hash ports are prepared in isolated worktrees. They are under review and are not
+published or accepted merely because their source patches exist. Timing changes
+are being split from unrelated socket fixes and acceptance tests before commit.
+
+### Corrected recovery acceptance and two scoped follow-ups
+
+PR 93 now passes Ubuntu and macOS CI in run `40489630192` at App head
+`6a38d176937951334f294026423fae0df48b08fa`. It is ready for review. Signed
+local checkpoint `69eb226dd248b03a6b7489f5cd7c1dd7e665c72b` shares tree
+`2962e2b3b3b444da91f40afaf83495f9dc02d3b9`. Its final local run passed
+655/655 ReleaseSafe tests: 200 storage and 455 runtime
+(`native-recovery-linux-handle-fix-local-tests.log`). The earlier Ubuntu
+failure remains the observed regression evidence.
+
+PR 94 contains only the three native metadata directory-sync files and is based
+on corrected PR 93. Its local tree passed 655/655 ReleaseSafe tests
+(`native-directory-sync-delivery-tests.log`). Signed local commit
+`1614af8cf483a2ad6b893f1f736276f57100228c` and App commit
+`981b64deec498f99a3c5107d06774d223f7927f4` share tree
+`4fed6a5ea55891825bfff7987ade79df23ee8b67`. The catalog keeps its already
+iterable owned handle. Native manifest and migration sync reopen borrowed handles
+with iteration enabled and close them after use. Existing default-directory
+lifecycle tests cover those paths. Root checkpoint
+`585cda2e9a680e0b47952f6ed0457f23b74ef185`, tree
+`f7d55b6ab001672abbfb83d3e99c8322ca1f0cc5`, records the handle follow-up.
+The manager's absolute-path formatter check passed for both corrected files.
+
+PR 95 contains only streaming native-segment identity hashing and its independent
+multi-chunk test. Its local tree passed 456/456 ReleaseSafe runtime tests
+(`native-segment-hash-port-runtime-tests.log`). Signed local commit
+`316e5022a4ea4ba9666352d28a953b83f3d6dfeb` and App commit
+`9addcdce4e64ea38f9298996332c66947167883a` share tree
+`636b9e30c54c0e78727997464c1a84e7dedfaf7c`. The hash step now uses a 64 KiB
+buffer instead of a whole-file allocation with a 128 MiB ceiling. This is not a
+measured throughput claim or a bound on the whole flush. PRs 94 and 95 await
+hosted checks and remain draft.
+
+Independent review found no confirmed correctness defect in the mixed-auto and
+segment-hash ports. It identified missing mixed-auto restart and injected-rollback
+acceptance checks. A worker is adding those tests with existing fault injection;
+later partial WAL I/O failure remains an explicit untested boundary. See
+`native-mixed-hash-review-result.md`.
+
+The timing worker split the port into monotonic timing, socket missing-path
+retry, socket signature ownership, and HTTP high-unsigned-ID acceptance patches.
+Manager review rejected an extra proposed timing-metric change: original
+`e3888c0` deliberately excludes condition-variable idle waits from mutex
+measurements and resets the timer on timeout. Restoring older samples would
+reverse that behavior. The same proposed block also shadowed a local name.
+A worker is restoring the original port behavior and regenerating its atomic
+patch hashes before tests. No such change entered root or a PR.
