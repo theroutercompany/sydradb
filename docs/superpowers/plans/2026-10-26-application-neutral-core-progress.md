@@ -6,8 +6,9 @@ Persistent goal: active in this conversation; no deadline or token budget.
 
 ## Current checkpoint
 
-The integrated native and empty-catalog source is green. The latest combined
-target passed all 34 steps, 743 Zig tests, and 35 Python tests. The earlier bounded
+The latest combined native and empty-catalog target passed all 34 steps, 743 Zig
+tests, and 35 Python tests. A subsequent code review identified two migration
+maintenance gaps; causal tests are in preparation. M1 remains open. The earlier bounded
 restart soak, before the empty-catalog change, recovered
 all 15,604 acknowledged rows after five restarts, with all four error counters zero.
 Its workload took 61 seconds and the complete run took 76 seconds. Crash smoke
@@ -34,7 +35,7 @@ The current branch is `codex/native-market-storage` at `42fbd55`.
 
 | Milestone | State | Acceptance evidence |
 | --- | --- | --- |
-| M1: native-storage stabilization | In progress | Combined integration, crash smoke, and bounded restart soak pass; full release qualification remains open |
+| M1: native-storage stabilization | In progress | Combined integration, crash smoke, and bounded restart soak pass; two maintenance gaps are under causal investigation |
 | M2: application boundaries | Partial | Root schema extraction and aliases passed; revised empty-catalog branch passes 19 focused checks |
 | M3: query limits | Prepared; fixes in progress | Independent ownership and accounting reviews found defects; no build or test result yet |
 | M4: general selection | Prepared | Parser and compiled-family changes integrated in an isolated tree; verification pending |
@@ -645,3 +646,105 @@ verification for PR 83. Its original draft checkpoint remains unchanged until th
 verification completes. The later native history and dirty runtime closure are
 being mapped into scoped PR dependencies; the 46 original branch commits have not
 all been published.
+
+## Migration checkpoints, current findings, and validation extraction
+
+The migration hardening branch passed 192/192 storage checks and 432/432 runtime
+checks. The new format-boundary fixture initially selected legacy format 1 because
+it created `series_catalog.jsonl` before the repository format probe. The worker
+now establishes and asserts a format-4 source and format-3 destination. Rejection
+and no-mutation assertions remain. Evidence:
+`native-migration-hardening-storage-fixed.log`,
+`native-migration-hardening-runtime.log`, and
+`native-migration-format-fixture-result.md`.
+
+The three signed atomic checkpoints are published on draft PR 83:
+
+| Scope | Signed local commit | Published commit | Shared tree |
+| --- | --- | --- | --- |
+| CAS format boundaries and checkpoints | `c310e6a0eb16b41bdd5f6520b4ecc83dc42f5c86` | `92943228356664075af288016537ebe2ee2ec9ac` | `8dbbdd853a2c99de9f8f2ad6d450fab7fa118e09` |
+| Migration, promotion, and resume | `bac951fcc2a77b3b8e804f3a10b970bf5342cc51` | `a3e9df3b43c99f4d5ff98a8b64edf457282eab2d` | `c634c36418bdf4afd6895fa976282e9a21f1ec6a` |
+| Pre-promotion reader compatibility | `c7f330171804143580ee2116bce7d3a134629e86` | `0d7c498ab219299e23ce4e917a121380e4f8ae2c` | `7525dc95b47d86ae4ee68634640fa89b7abfaf2e` |
+| Catalog dependency integration | `46c05a0d8d8525fc73102395b18ebb894eab0fd2` | `ef52924cca4327e5e95466c97803bdda687d229d` | `1e88f159e93dad5ee8d9f887ac3fee3c501848ac` |
+
+All local signatures were verified. The dependency merge passed 193/193 storage
+tests in `native-migration-catalog-merge-storage.log`. PR 83 now targets PR 84.
+No PR was merged and main was not updated. The worker is completing omitted CAS
+diff fields and publication-order reconstruction from the original hardening
+commits. These later changes are not yet tested or published.
+
+The current-root review closed the older PR's startup sequence concern: current
+recovery scans persisted segment sequences before accepting writes. It found two
+remaining gaps in the current code. `flushNow` resumes the derived producer before
+promotion finishes, so parity and cutover do not share one maintenance pause.
+The scalar writer also quarantines WAL failures without returning them through
+the migration barrier. These are code-review findings, not reproduced data-loss
+results. The isolated `native-maintenance-fix/` worktree now owns deterministic
+race and fault tests before production fixes. See
+`current-native-migration-review-result.md` and `native-maintenance-before/`.
+
+The pure trading-policy extraction passed all 516 runtime checks and four build
+steps in `trading-policy-runtime.log`. Root applied only the prepared two-file
+patch. Its engine and policy files match the verified worktree byte-for-byte:
+engine SHA-256 `616d7d68f5979c453f9ea50ea0c8d172fd080107e1306a655002cf7e8820fb0c`;
+policy SHA-256 `b9ecf791b0b25b49547a23c2f611203418a8eb82c2d783f1f4e052c4de25ea1c`.
+Stateful trading algorithms have not moved. The combined native target has not
+been rerun after this pure extraction.
+
+The full selector suite compiled but passed only 472/487 tests. The filtered run
+had omitted the new query regressions from Zig's lazy test graph and is not feature
+evidence. The worker restored exact binding for unique names, added prepared-name
+rebinding at execution boundaries, corrected generated selector construction, and
+added validator traversal for bracket filters. Existing single-series expectations
+remain. The revised patch awaits full runtime verification. Evidence:
+`selector-family-runtime.log`, `selector-family-runtime-diagnostics.log`, and
+`selector-family-regression-fix-result.md`.
+
+M3's first builds found binding-qualifier errors, then error-set and fixture-contract
+mismatches between the reviewed patches. No query-limit test pass is claimed. One
+integration worker now owns that worktree and the serial build slot, with authority
+to run runtime and wire checks after resolving those mismatches. Root will not run
+another build until that worker releases the slot.
+
+PR 85's current Ubuntu and macOS checks pass. Its MDX error is resolved; the docs
+job now reports only the two existing local-ingest links addressed by PR 78.
+The latest published plan checkpoint is local
+`073c653aedbe84f10b5ba26785c1572a446ea8e0`, remote
+`e81b9546dec62440229e44929215d86f46372b12`, shared tree
+`989f395338f2e69799785c270240d55c76e61be0`. This ledger has newer local entries.
+
+## Audited checkpoints and remaining native delivery
+
+The P2 artifact audit reconstructed the original patch on `e515072` and compared
+all three files. The bytes match the current worktree. The difference in diff
+counts is 382 added and removed Engine lines caused by the patch representation;
+it is not a source change. Patches 3 through 7 also reproduce all ten captured
+hashes. See `native-p2-artifact-audit-result.md`. The unchanged P2 result is now
+saved in signed local commit `d66e064f9290f1a54a7bb9b328980a01dbce842e`, tree
+`ac8f49e6a17dadc6d85ac29c6e99b3182ebe1c0f`. It is not published. Its older
+branch ancestry still requires the scoped upstream ports.
+
+The omitted migration hardening is saved in two signed local checkpoints:
+
+| Scope | Local commit | Tree |
+| --- | --- | --- |
+| CAS diff reports schema and series changes | `6ecc2b7446a24787a78b37740cf7f8e83f500f5a` | `8e4afd17a1e191b78f491c5d543567b2fba8a51a` |
+| Fanout reconstruction preserves correction order | `d928bf0d30062654fb0bbf9b73ccefd0e1b0e65a` | `906f40eabbf5e97f3dcfecf2120ff52d23db55fa` |
+
+Signatures were verified. Tests and publication for these two checkpoints are
+pending. The previous published PR 83 head `ef52924` passed Ubuntu and macOS
+checks in run `40464341499`; release jobs were skipped. Those results do not
+validate the two new local checkpoints.
+
+The compaction and crash-recovery worker is preparing the existing `fb0c346` and
+`d3c10b8` changes on an isolated branch based on `d928bf0`. It must preserve the
+newer migration and catalog changes and produce separate patches. It has no build
+slot. The native-maintenance regressions are under a separate test-cleanup review
+before their first RED run.
+
+M3 now compiles and runs 523 runtime tests. The latest full run passed 521 and
+failed two: cancellation during series-bound scanning, and a mixed native/scalar
+derived-bar fixture. Prepared statements again allow binding after
+`UnboundParameter`, and the catalog-budget fixture binds its parameter before
+checking the limit. No all-green M3 result is claimed. See
+`query-limits-integration-runtime-attempt3.log`.
