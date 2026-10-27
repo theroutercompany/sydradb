@@ -1461,10 +1461,11 @@ fn waitForFlushForTest(engine: *engine_mod.Engine, min_flushes: u64, timeout_ms:
     while (std.time.milliTimestamp() - start < timeout_ms) {
         if (engine.metrics.flush_total.load(.monotonic) >= min_flushes) {
             if (engine.config.cas_mode == .dual_write) {
-                engine.verifyCasState() catch {
-                    std.Thread.sleep(5 * std.time.ns_per_ms);
-                    continue;
-                };
+                const elapsed_ms: u64 = @intCast(std.time.milliTimestamp() - start);
+                const remaining_ms = timeout_ms -| elapsed_ms;
+                if (remaining_ms == 0) return error.Timeout;
+                _ = try engine.flushAndDrain(remaining_ms);
+                try engine.verifyCasState();
                 if (engine.cas) |*cas| {
                     engine.metadata.refreshCasIndexIfStale(cas) catch {
                         std.Thread.sleep(5 * std.time.ns_per_ms);
@@ -1481,6 +1482,122 @@ fn waitForFlushForTest(engine: *engine_mod.Engine, min_flushes: u64, timeout_ms:
         }
     }
     return error.Timeout;
+}
+
+test "waitForFlushForTest waits through CAS snapshot publication" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/wait-for-flush-cas-publication", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = std.math.maxInt(u32),
+        .memtable_max_bytes = std.math.maxInt(usize),
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .dual_write,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+    var engine = try engine_mod.Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const sid = try engine.declareExactSeriesCanonical("svc.flush_barrier", "{}", null);
+    _ = try engine.appendResolvedPoint(.{ .series_id = sid, .ts = 7, .value = 3.5 });
+    const ingest_deadline = std.time.nanoTimestamp() + std.time.ns_per_s;
+    while ((!engine.queue.isDrained() or engine.mem.bytes.load(.monotonic) == 0) and std.time.nanoTimestamp() < ingest_deadline) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(engine.queue.isDrained());
+    try std.testing.expect(engine.mem.bytes.load(.monotonic) > 0);
+
+    const TriggerContext = struct {
+        engine: *engine_mod.Engine,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        failure: ?anyerror = null,
+
+        fn run(ctx: *@This()) void {
+            _ = ctx.engine.flushAndDrain(5_000) catch |err| {
+                ctx.failure = err;
+                ctx.done.store(true, .release);
+                return;
+            };
+            ctx.done.store(true, .release);
+        }
+    };
+    const PollerContext = struct {
+        engine: *engine_mod.Engine,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        failure: ?anyerror = null,
+
+        fn run(ctx: *@This()) void {
+            waitForFlushForTest(ctx.engine, 1, 5_000) catch |err| {
+                ctx.failure = err;
+                ctx.done.store(true, .release);
+                return;
+            };
+            ctx.done.store(true, .release);
+        }
+    };
+
+    engine.wal.lockForSnapshot();
+    var gate_held = true;
+    var trigger_thread: ?std.Thread = null;
+    var poller_thread: ?std.Thread = null;
+    defer {
+        if (gate_held) engine.wal.unlockForSnapshot();
+        if (poller_thread) |thread| thread.join();
+        if (trigger_thread) |thread| thread.join();
+    }
+
+    var trigger_context = TriggerContext{ .engine = engine };
+    trigger_thread = try std.Thread.spawn(.{}, TriggerContext.run, .{&trigger_context});
+    const publication_deadline = std.time.nanoTimestamp() + std.time.ns_per_s;
+    while (engine.metrics.flush_total.load(.monotonic) == 0 and std.time.nanoTimestamp() < publication_deadline) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    try std.testing.expect(engine.metrics.flush_total.load(.monotonic) >= 1);
+
+    engine.drain_mu.lock();
+    const generation_before_poller = engine.drain_generation;
+    const writer_still_publishing = engine.flush_in_progress;
+    engine.drain_mu.unlock();
+    try std.testing.expect(writer_still_publishing);
+
+    var poller_context = PollerContext{ .engine = engine };
+    poller_thread = try std.Thread.spawn(.{}, PollerContext.run, .{&poller_context});
+    const barrier_deadline = std.time.nanoTimestamp() + std.time.ns_per_s;
+    var poller_barrier_observed = false;
+    while (!poller_barrier_observed and std.time.nanoTimestamp() < barrier_deadline) {
+        engine.drain_mu.lock();
+        poller_barrier_observed = engine.drain_generation != generation_before_poller;
+        engine.drain_mu.unlock();
+        if (!poller_barrier_observed) std.Thread.sleep(std.time.ns_per_ms);
+    }
+    const poller_stayed_blocked = !poller_context.done.load(.acquire);
+
+    engine.wal.unlockForSnapshot();
+    gate_held = false;
+    if (poller_thread) |thread| {
+        thread.join();
+        poller_thread = null;
+    }
+    if (trigger_thread) |thread| {
+        thread.join();
+        trigger_thread = null;
+    }
+
+    try std.testing.expect(poller_barrier_observed);
+    try std.testing.expect(poller_stayed_blocked);
+    try std.testing.expect(trigger_context.failure == null);
+    try std.testing.expect(poller_context.failure == null);
 }
 
 fn seedParityDataset(engine: *engine_mod.Engine) !void {
