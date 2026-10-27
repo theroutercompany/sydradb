@@ -162,6 +162,7 @@ pub const Client = struct {
                 error.ConnectionRefused,
                 error.ConnectionResetByPeer,
                 error.EndOfStream,
+                error.FileNotFound,
                 => {
                     if (attempt + 1 >= attempts) return err;
                     std.Thread.sleep(retry_delay_ms * std.time.ns_per_ms);
@@ -1862,6 +1863,84 @@ test "socket flush_drain reports timeout when the queue is not yet drained" {
     });
     try std.testing.expectError(error.Timeout, client.flushAndDrain(0));
 
+    client.deinit();
+    server_thread.join();
+}
+
+fn testDelayedOneShotServer(
+    eng: *Engine,
+    socket_path: []const u8,
+    max_frame_bytes: usize,
+    delay_ms: u64,
+    cancelled: *std.atomic.Value(bool),
+) !void {
+    var remaining_ns = delay_ms * std.time.ns_per_ms;
+    while (remaining_ns != 0) {
+        if (cancelled.load(.monotonic)) return;
+        const sleep_ns = @min(remaining_ns, std.time.ns_per_ms);
+        std.Thread.sleep(sleep_ns);
+        remaining_ns -= sleep_ns;
+    }
+    if (cancelled.load(.monotonic)) return;
+
+    try validateSocketListenPath(socket_path);
+    var address = try std.net.Address.initUnix(socket_path);
+    var server = try address.listen(.{ .force_nonblocking = true });
+    defer {
+        server.deinit();
+        cleanupSocketPath(socket_path);
+    }
+
+    bestEffortChmod0600(socket_path);
+    const accept_timeout_ns = 2 * std.time.ns_per_s;
+    var accept_timer = try std.time.Timer.start();
+    const connection = accept_loop: while (true) {
+        if (cancelled.load(.monotonic)) return;
+        break :accept_loop server.accept() catch |err| switch (err) {
+            error.WouldBlock => {
+                if (accept_timer.read() >= accept_timeout_ns) return error.Timeout;
+                std.Thread.sleep(std.time.ns_per_ms);
+                continue :accept_loop;
+            },
+            else => return err,
+        };
+    };
+    connectionWorker(eng, connection, max_frame_bytes);
+}
+
+test "socket connect retry bounds missing paths and connects after the path appears" {
+    if (!std.net.has_unix_sockets) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const missing_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/retry-missing.sock", .{tmp.sub_path});
+    defer alloc.free(missing_path);
+    try std.testing.expectError(error.FileNotFound, Client.connectWithRetry(alloc, missing_path, 3, 1));
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/retry-client", .{tmp.sub_path});
+    defer alloc.free(data_path);
+    const socket_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/retry-client.sock", .{tmp.sub_path});
+    defer alloc.free(socket_path);
+
+    var eng = try Engine.init(alloc, try testConfig(alloc, data_path));
+    defer eng.deinit();
+
+    var cancelled = std.atomic.Value(bool).init(false);
+    const server_thread = try std.Thread.spawn(.{}, testDelayedOneShotServer, .{
+        eng,
+        socket_path,
+        default_max_frame_bytes,
+        50,
+        &cancelled,
+    });
+
+    var client = Client.connectWithRetry(alloc, socket_path, 100, 10) catch |err| {
+        cancelled.store(true, .monotonic);
+        server_thread.join();
+        return err;
+    };
     client.deinit();
     server_thread.join();
 }
