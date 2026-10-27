@@ -7046,56 +7046,133 @@ pub fn buildLegacySnapshotWithNativeMarket(
 }
 
 pub fn verifyLegacySnapshot(live: LegacySnapshot, stored: Snapshot) !void {
-    if (live.segment_descriptors.len != stored.segment_descriptors.len) return error.CasVerificationFailed;
-    for (live.segment_descriptors, stored.segment_descriptors) |lhs, rhs| {
-        if (!lhs.eql(rhs)) return error.CasVerificationFailed;
+    if (live.segment_descriptors.len != stored.segment_descriptors.len) {
+        return casVerificationFailure(
+            "scalar segment count live={d} stored={d}",
+            .{ live.segment_descriptors.len, stored.segment_descriptors.len },
+        );
     }
-    if (live.market_segment_descriptors.len != stored.market_segment_descriptors.len) return error.CasVerificationFailed;
-    for (live.market_segment_descriptors, stored.market_segment_descriptors) |lhs, rhs| {
-        if (!lhs.eql(rhs)) return error.CasVerificationFailed;
+    for (live.segment_descriptors, stored.segment_descriptors, 0..) |lhs, rhs, index| {
+        if (!lhs.eql(rhs)) {
+            return casVerificationFailure("scalar segment descriptor index={d}", .{index});
+        }
+    }
+    if (live.market_segment_descriptors.len != stored.market_segment_descriptors.len) {
+        return casVerificationFailure(
+            "market segment count live={d} stored={d}",
+            .{ live.market_segment_descriptors.len, stored.market_segment_descriptors.len },
+        );
+    }
+    for (live.market_segment_descriptors, stored.market_segment_descriptors, 0..) |lhs, rhs, index| {
+        if (!lhs.eql(rhs)) {
+            return casVerificationFailure("market segment descriptor index={d}", .{index});
+        }
     }
 
-    if (live.tag_snapshot.entries.len != stored.tag_snapshot.entries.len) return error.CasVerificationFailed;
-    for (live.tag_snapshot.entries, stored.tag_snapshot.entries) |lhs, rhs| {
-        if (!lhs.eql(rhs)) return error.CasVerificationFailed;
+    if (live.tag_snapshot.entries.len != stored.tag_snapshot.entries.len) {
+        return casVerificationFailure(
+            "tag count live={d} stored={d}",
+            .{ live.tag_snapshot.entries.len, stored.tag_snapshot.entries.len },
+        );
+    }
+    for (live.tag_snapshot.entries, stored.tag_snapshot.entries, 0..) |lhs, rhs, index| {
+        if (!lhs.eql(rhs)) {
+            return casVerificationFailure("tag descriptor index={d}", .{index});
+        }
     }
 
-    if (live.series_catalog_snapshot.entries.len != stored.series_catalog_snapshot.entries.len) return error.CasVerificationFailed;
-    for (live.series_catalog_snapshot.entries, stored.series_catalog_snapshot.entries) |lhs, rhs| {
-        if (!lhs.eql(rhs)) return error.CasVerificationFailed;
+    if (live.series_catalog_snapshot.entries.len != stored.series_catalog_snapshot.entries.len) {
+        return casVerificationFailure(
+            "series catalog count live={d} stored={d}",
+            .{ live.series_catalog_snapshot.entries.len, stored.series_catalog_snapshot.entries.len },
+        );
+    }
+    for (live.series_catalog_snapshot.entries, stored.series_catalog_snapshot.entries, 0..) |lhs, rhs, index| {
+        if (!lhs.eql(rhs)) {
+            return casVerificationFailure("series catalog entry index={d}", .{index});
+        }
     }
 
-    if (live.metric_catalog_snapshot.entries.len != stored.metric_catalog_snapshot.entries.len) return error.CasVerificationFailed;
-    for (live.metric_catalog_snapshot.entries, stored.metric_catalog_snapshot.entries) |lhs, rhs| {
-        if (!lhs.eql(rhs)) return error.CasVerificationFailed;
+    if (live.metric_catalog_snapshot.entries.len != stored.metric_catalog_snapshot.entries.len) {
+        return casVerificationFailure(
+            "metric catalog count live={d} stored={d}",
+            .{ live.metric_catalog_snapshot.entries.len, stored.metric_catalog_snapshot.entries.len },
+        );
+    }
+    for (live.metric_catalog_snapshot.entries, stored.metric_catalog_snapshot.entries, 0..) |lhs, rhs, index| {
+        if (!lhs.eql(rhs)) {
+            return casVerificationFailure("metric catalog entry index={d}", .{index});
+        }
     }
 
-    if ((live.market_catalog_snapshot == null) != (stored.market_catalog_snapshot == null)) return error.CasVerificationFailed;
+    if ((live.market_catalog_snapshot == null) != (stored.market_catalog_snapshot == null)) {
+        return casVerificationFailure("market catalog presence", .{});
+    }
     if (live.market_catalog_snapshot) |live_market| {
         const stored_market = stored.market_catalog_snapshot.?;
-        if (live_market.schemas.len != stored_market.schemas.len) return error.CasVerificationFailed;
-        for (live_market.schemas, stored_market.schemas) |lhs, rhs| {
-            if (!lhs.eql(rhs)) return error.CasVerificationFailed;
+        if (live_market.schemas.len != stored_market.schemas.len) {
+            return casVerificationFailure(
+                "market schema count live={d} stored={d}",
+                .{ live_market.schemas.len, stored_market.schemas.len },
+            );
+        }
+        for (live_market.schemas, stored_market.schemas, 0..) |lhs, rhs, index| {
+            if (!lhs.eql(rhs)) {
+                return casVerificationFailure("market schema index={d}", .{index});
+            }
         }
         const live_series = live_market.market_series orelse &[_]market_catalog_mod.MarketSeriesIdentity{};
         const stored_series = stored_market.market_series orelse &[_]market_catalog_mod.MarketSeriesIdentity{};
-        if (live_series.len != stored_series.len) return error.CasVerificationFailed;
-        for (live_series, stored_series) |lhs, rhs| {
-            if (!marketSeriesEntryEql(lhs, rhs)) return error.CasVerificationFailed;
+        if (live_series.len != stored_series.len) {
+            return casVerificationFailure(
+                "market series count live={d} stored={d}",
+                .{ live_series.len, stored_series.len },
+            );
         }
-        if (live_market.bar_policies.len != stored_market.bar_policies.len) return error.CasVerificationFailed;
-        for (live_market.bar_policies, stored_market.bar_policies) |lhs, rhs| {
-            if (!std.mem.eql(u8, lhs.id, rhs.id) or lhs.version != rhs.version or !std.mem.eql(u8, lhs.source_metric, rhs.source_metric) or lhs.interval_ns != rhs.interval_ns or !std.mem.eql(u8, lhs.session_rule, rhs.session_rule) or !std.mem.eql(u8, lhs.no_trade_rule, rhs.no_trade_rule) or !std.mem.eql(u8, lhs.halt_rule, rhs.halt_rule) or !std.mem.eql(u8, lhs.correction_policy, rhs.correction_policy) or !optionalStringEql(lhs.trade_filter, rhs.trade_filter)) return error.CasVerificationFailed;
+        for (live_series, stored_series, 0..) |lhs, rhs, index| {
+            if (!marketSeriesEntryEql(lhs, rhs)) {
+                return casVerificationFailure("market series index={d}", .{index});
+            }
         }
-        if (live_market.rollups.len != stored_market.rollups.len) return error.CasVerificationFailed;
-        for (live_market.rollups, stored_market.rollups) |lhs, rhs| {
-            if (!std.mem.eql(u8, lhs.id, rhs.id) or lhs.version != rhs.version or !std.mem.eql(u8, lhs.source_metric, rhs.source_metric) or !std.mem.eql(u8, lhs.target_metric, rhs.target_metric) or !std.mem.eql(u8, lhs.policy_id, rhs.policy_id) or lhs.transform_kind != rhs.transform_kind) return error.CasVerificationFailed;
+        if (live_market.bar_policies.len != stored_market.bar_policies.len) {
+            return casVerificationFailure(
+                "bar policy count live={d} stored={d}",
+                .{ live_market.bar_policies.len, stored_market.bar_policies.len },
+            );
         }
-        if (live_market.signals.len != stored_market.signals.len) return error.CasVerificationFailed;
-        for (live_market.signals, stored_market.signals) |lhs, rhs| {
-            if (!std.mem.eql(u8, lhs.id, rhs.id) or lhs.version != rhs.version or !std.mem.eql(u8, lhs.input_metric, rhs.input_metric) or !optionalStringEql(lhs.policy_id, rhs.policy_id) or lhs.expression_kind != rhs.expression_kind or !std.mem.eql(u8, lhs.params_json, rhs.params_json) or !std.mem.eql(u8, lhs.emit_rule, rhs.emit_rule)) return error.CasVerificationFailed;
+        for (live_market.bar_policies, stored_market.bar_policies, 0..) |lhs, rhs, index| {
+            if (!std.mem.eql(u8, lhs.id, rhs.id) or lhs.version != rhs.version or !std.mem.eql(u8, lhs.source_metric, rhs.source_metric) or lhs.interval_ns != rhs.interval_ns or !std.mem.eql(u8, lhs.session_rule, rhs.session_rule) or !std.mem.eql(u8, lhs.no_trade_rule, rhs.no_trade_rule) or !std.mem.eql(u8, lhs.halt_rule, rhs.halt_rule) or !std.mem.eql(u8, lhs.correction_policy, rhs.correction_policy) or !optionalStringEql(lhs.trade_filter, rhs.trade_filter)) {
+                return casVerificationFailure("bar policy index={d}", .{index});
+            }
+        }
+        if (live_market.rollups.len != stored_market.rollups.len) {
+            return casVerificationFailure(
+                "rollup count live={d} stored={d}",
+                .{ live_market.rollups.len, stored_market.rollups.len },
+            );
+        }
+        for (live_market.rollups, stored_market.rollups, 0..) |lhs, rhs, index| {
+            if (!std.mem.eql(u8, lhs.id, rhs.id) or lhs.version != rhs.version or !std.mem.eql(u8, lhs.source_metric, rhs.source_metric) or !std.mem.eql(u8, lhs.target_metric, rhs.target_metric) or !std.mem.eql(u8, lhs.policy_id, rhs.policy_id) or lhs.transform_kind != rhs.transform_kind) {
+                return casVerificationFailure("rollup index={d}", .{index});
+            }
+        }
+        if (live_market.signals.len != stored_market.signals.len) {
+            return casVerificationFailure(
+                "signal count live={d} stored={d}",
+                .{ live_market.signals.len, stored_market.signals.len },
+            );
+        }
+        for (live_market.signals, stored_market.signals, 0..) |lhs, rhs, index| {
+            if (!std.mem.eql(u8, lhs.id, rhs.id) or lhs.version != rhs.version or !std.mem.eql(u8, lhs.input_metric, rhs.input_metric) or !optionalStringEql(lhs.policy_id, rhs.policy_id) or lhs.expression_kind != rhs.expression_kind or !std.mem.eql(u8, lhs.params_json, rhs.params_json) or !std.mem.eql(u8, lhs.emit_rule, rhs.emit_rule)) {
+                return casVerificationFailure("signal index={d}", .{index});
+            }
         }
     }
+}
+
+fn casVerificationFailure(comptime detail: []const u8, args: anytype) error{CasVerificationFailed} {
+    std.log.err("CAS verification failed: " ++ detail, args);
+    return error.CasVerificationFailed;
 }
 
 fn buildTagSnapshot(alloc: std.mem.Allocator, tags: *const tags_mod.TagIndex) !TagSnapshot {
