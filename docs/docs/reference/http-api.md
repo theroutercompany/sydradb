@@ -175,7 +175,9 @@ Send a JSON object with these fields to either schema registration route:
 
 Example:
 
-    {"metric":"sensor.environment","ordered_columns":["temperature_c","humidity_pct"],"required_labels":["device_id"]}
+```json
+{"metric":"sensor.environment","ordered_columns":["temperature_c","humidity_pct"],"required_labels":["device_id"]}
+```
 
 Registration returns `201 Created`. The list route returns a JSON array. The detail route returns one schema object.
 
@@ -185,7 +187,9 @@ Send newline-delimited JSON to either row ingest route. Each line must include `
 
 Example:
 
-    {"metric":"sensor.environment","ts_ns":1000,"labels":{"device_id":"sensor-17"},"columns":{"temperature_c":21.5,"humidity_pct":36}}
+```json
+{"metric":"sensor.environment","ts_ns":1000,"labels":{"device_id":"sensor-17"},"columns":{"temperature_c":21.5,"humidity_pct":36}}
+```
 
 The final record may end at the end of the request body without a newline. A successful response includes `rows` and `writes` counts.
 
@@ -193,7 +197,9 @@ The final record may end at the end of the request body without a newline. A suc
 
 Send a JSON object to either row query route. The request requires `metric`, a `labels` object, integer `start_ts_ns`, and integer `end_ts_ns`. The optional `columns` array selects columns. If omitted, the query returns all registered columns.
 
-    {"metric":"sensor.environment","labels":{"device_id":"sensor-17"},"start_ts_ns":0,"end_ts_ns":2000,"columns":["temperature_c"]}
+```json
+{"metric":"sensor.environment","labels":{"device_id":"sensor-17"},"start_ts_ns":0,"end_ts_ns":2000,"columns":["temperature_c"]}
+```
 
 The response contains the metric name, a data revision, and a `rows` array. Each row contains `ts_ns`, selected `columns`, `labels`, and `data_revision`. The time fields use nanoseconds.
 
