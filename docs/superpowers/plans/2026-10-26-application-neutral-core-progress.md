@@ -6,33 +6,39 @@ Persistent goal: active in this conversation; no deadline or token budget.
 
 ## Current checkpoint
 
-M1 / Task 2 is in progress. Native integration, crash smoke, and the bounded
-restart soak passed. The integrated driver build passed all four steps. The
-latest soak recovered all 15,604 acknowledged rows after five restarts. It
-reported zero row-loss, shadow-mismatch, verification, and ingest errors. The
-workload took 61 seconds; the complete run took 76 seconds. The unchanged
-workload bound is 60 to 70 seconds. All 35 Python evidence tests passed.
+The integrated native and empty-catalog source is green. The latest combined
+target passed all 34 steps, 743 Zig tests, and 35 Python tests. The earlier bounded
+restart soak, before the empty-catalog change, recovered
+all 15,604 acknowledged rows after five restarts, with all four error counters zero.
+Its workload took 61 seconds and the complete run took 76 seconds. Crash smoke
+previously passed all seven points. These are local and smoke results, not full
+release qualification.
 
-The causal Engine test proved that raw timestamp bounds omitted emitted bucket
-rows. It failed with 4 of 6 rows before the fix and passed after the fix. Its
-second batch proves that progress counting includes later output beyond a
-captured raw timestamp. The mixed native/scalar derived-history fix is also
-integrated. The complete native suite still needs a rerun on this combined tree.
+The mixed-history regression failed because its flush restarted background
+processing before the manual assertions. The worker reordered the fixture and
+kept every expected count. The focused run changed from 2/3 to 3/3 passing tests,
+then the full combined target passed. Production behavior did not change in that
+fixture correction.
 
-Task 4 schema extraction passed storage checks. Empty generic initialization
-is under compiler and regression verification in an isolated worktree. Query
-resource limits and selector parsing have separate implementation workers.
-The atomic checkpoint split failed twice on engine dependencies. A worker must
-prove the full dependency boundary before the next compile attempt.
+The first native hardening checkpoint is signed after 210 storage tests passed.
+Its isolated two-file port passed all 185 storage tests on the published native
+stack and is open as PR 84. Empty generic initialization passed 507 runtime and
+211 storage tests before a refinement narrowed publication checks to requested
+schemas. That refinement passed 19 focused checks and all 508 isolated runtime
+tests, then was integrated. The combined target found two additional trading
+fixtures that lacked explicit initialization. Both passed focused checks after
+a two-line fixture repair; the combined target then passed. Limits and the
+selector/compiler integration have source changes but no passing test result yet.
+The neutral routes are open as PR 85 with six passing local checks.
 The current branch is `codex/native-market-storage` at `42fbd55`.
 
 | Milestone | State | Acceptance evidence |
 | --- | --- | --- |
-| M1: native-storage stabilization | In progress | Native integration, crash smoke, and bounded restart soak pass; combined-suite rerun and release qualification remain open |
-| M2: application boundaries | Partial | Schema extraction: 210 storage checks; neutral routes: 4 focused checks |
-| M3: query limits | Planned | Query ownership review complete; no implementation evidence |
-| M4: general selection | Planned | No implementation evidence |
-| M5: generic rollups and final audit | Planned | No implementation evidence |
+| M1: native-storage stabilization | In progress | Combined integration, crash smoke, and bounded restart soak pass; full release qualification remains open |
+| M2: application boundaries | Partial | Root schema extraction and aliases passed; revised empty-catalog branch passes 19 focused checks |
+| M3: query limits | Prepared; fixes in progress | Independent ownership and accounting reviews found defects; no build or test result yet |
+| M4: general selection | Prepared | Parser and compiled-family changes integrated in an isolated tree; verification pending |
+| M5: generic rollups and final audit | Design review | Definition, bounded-read, and bucket-semantics contracts under review; no implementation |
 
 ## Starting work and preservation
 
@@ -428,3 +434,214 @@ All implementation workers use GPT-6 Luna with max reasoning. The controller
 reviews and integrates patches, runs checks, and signs and publishes checkpoints.
 The controller does not write source or test code. No direct main update or merge
 is authorized. Longer soak and platform release qualification remain open.
+
+## Subsequent isolated verification and PR dependencies
+
+The empty-catalog branch passed 18 focused runtime checks, all 507 runtime tests,
+and all 211 storage tests. The verification worker corrected the injected CAS
+fault lifecycle and a positional comparison between live and CAS series order.
+These results do not close the independent concurrent-publication finding. The
+initializer still compares unrelated catalog changes after releasing the lock for
+publication. Keep Task 6 isolated until that finding has a causal test and fix.
+Evidence: `empty-catalog-verified-focused.log`,
+`empty-catalog-verified-runtime.log`, and `empty-catalog-verified-storage.log`.
+
+The combined root source completed `native-market-ci` with exit 1: 30 of 34
+steps succeeded and 737 of 738 Zig checks passed. The mixed-history regression
+expected four processed rows and observed two. The worker owns a focused causal
+investigation of fixture scheduling versus product behavior. No assertion is
+reduced. See `native-market-ci-combined.log`.
+
+The checkpoint worker proved reciprocal dependencies across the former engine
+patches. The new first checkpoint contains only the catalog and reader. The next
+checkpoint keeps the existing engine/runtime/CAS dependency closure together.
+All seven patches apply in order and reproduce the captured source hashes.
+Compiler verification remains pending. The original nine patches are preserved
+in `native-checkpoints/old9patches/`.
+
+The native foundation and derived-row branches now include PR 80's SDK fix.
+Both hosted Ubuntu and macOS checks passed for these updated heads. The foundation
+docs job still reports the previously identified local-ingest links from PR 78.
+Release jobs were skipped. The local dependency merges are signed, and the remote
+file trees match them. These are branch integrations, not PR merges or main updates.
+
+| PR | Signed local checkpoint | Published commit | Shared tree |
+| --- | --- | --- | --- |
+| 74, passing-soak ledger | `5dda3fcc3f30891545687fd1a2218abd0be732cb` | `6e7fa6a336d53bb74eb7d5b7462f836e74f9075b` | `371852dc49e465766e22fe2796310b687b46b060` |
+| 77, SDK dependency | `cb5d15fea63150f7a498ccbde350a164d4e7dbbc` | `eb16d6fa5702a4bd097bee76b226f5e5ee794c74` | `079eaa35065af94dce6f0c63b0d9a608a764535f` |
+| 82, foundation dependency | `7b8584eaf7bc3d1b45606e85f726c795be8c3f7a` | `13e541023d2f3459ef529cd72804c5786b8e3287` | `53512986b190e78c009723992e1f21a069a3b319` |
+| 83, initial migration | `869cd459def553378e1c446148e0aaec4771d6b5` | `64b2c8795a8fd4b68e67dae1830ae1303aee7fe7` | `0650d9843ffe978967c8404dfd68b34e3969161f` |
+| 75, CI dependencies | `f241aae14e9f2dee3d853842596725e327f7ce2a` | `4cd44aeabacd9c9fcafa360906089eac754ff091` | `043181cd899770337c0228b42f13b393fad10844` |
+
+PR 77 now targets PR 80. PR 82 still targets PR 77. PR 75 now targets PR 80.
+PR 83 targets PR 82: https://github.com/theroutercompany/sydradb/pull/83.
+It remains a draft. Its initial migration checkpoint has no isolated compiler or
+runtime evidence. The worker is porting the existing acknowledged-tail,
+crash-consistency, repeat-resume, pre-promotion read/validation, and sequence
+correction fixes before readiness. See `native-migration-preparation-result.md`.
+
+A separate `neutral-row-api-pr/` worktree ports the approved aliases onto PR 75.
+Its fixtures use that branch's existing scalar-fanout APIs. It does not replace
+or weaken the native fixtures in the combined root source.
+
+The selector worker found that the historical bracket notation was not a literal
+public syntax contract. The controller asked an optional preference question and
+stated the working assumption: `FROM sensor.temperature[label.site = 'west']`,
+using existing string escapes and WHERE semantics. The worker now owns parser
+and frontend support. A separate compiler worker owns family selection through
+existing WHERE predicates. Neither task has test evidence yet.
+
+## Open verification after the combined target
+
+- The mixed-history worker owns the serial build slot. Its isolated engine file
+  matched the root engine SHA-256 before investigation:
+  `42bc7384274873479b8d6490664afc85310c1ced8a4a0387ffe36e858758eca1`.
+- The Task 6 worker will narrow the CAS postcondition to the requested schemas.
+  Unrelated series and definitions must not cause initialization failure. This
+  replaces the overbroad catalog comparison; verification is pending.
+- Source preparation continues for limits, selectors, compiled families, neutral
+  API isolation, and migration correctness. No untested patch is integrated.
+- A read-only worker is mapping the generic persisted-rollup implementation to
+  existing aggregate, retry, checkpoint, and publication code.
+
+The root controller continues to write documentation only. Source and test edits
+remain delegated. The persistent goal is active.
+
+## Green combined native baseline
+
+`native-mixed-parent-red.log` records the focused failure with unchanged counts.
+`native-mixed-parent-green.log` records 3/3 passing checks after fixture reordering.
+`native-market-ci-combined-fixed.log` records terminal exit 0, 34/34 successful
+steps, 738/738 Zig tests, and 35 Python tests. The original failed run remains in
+`native-market-ci-combined.log`.
+
+The worker found that `flushNow` resumes the derived worker. The corrected fixture
+flushes input before it stops that worker and registers definitions. This prevents
+background processing from advancing the same highwater before manual processing.
+Expected row and emission counts remain unchanged. See `native-mixed-fixture-result.md`.
+
+First native hardening checkpoint: `e515072a4cdc952e3187005947b7075b5b837350`,
+tree `854cd24227d50523a643b3ed998e76687b6e5525`. Local signature verification passed.
+The isolated checkpoint passed 210/210 storage tests and all three build steps:
+`native-checkpoint-1-final-storage.log`. A worker is preparing the same narrow
+catalog/reader change for a scoped upstream PR on the published native stack.
+
+The neutral-route worktree now has formatted source and an unchanged copy of the
+existing HTTP test-root artifact. That artifact remains untracked. The controller
+is running focused alias, auth, validation, and final-record checks in
+`neutral-row-api-focused.log`.
+
+## Review findings and isolated verification queue
+
+The first neutral-route test run hung in the old one-shot HTTP helper. A sampled
+client waited in `readv` while the server waited in `receiveHead`. The worker
+ported the existing helper that handles one request, flushes, and closes. The
+second run finished with four of five checks passing. The custom-schema parity
+test returned `SyntaxError`; the worker is checking the old test client's response
+framing. Neither run is recorded as a passing API checkpoint. Evidence:
+`neutral-row-api-hang-sample.txt`, `neutral-row-api-focused-fixed.log`, and
+`neutral-row-api-helper-result.md`.
+
+The native catalog/reader port contains the same two-file change as signed
+checkpoint `e515072a4cdc952e3187005947b7075b5b837350`. It is isolated on the
+published derived-row branch. The first test command named an absent target,
+`test-storage`; no tests ran. `build.zig` declares `storage-test`, which the
+controller is now running. See `native-metric-catalog-storage-fixed.log`.
+
+The Task 6 worker replaced the whole-catalog CAS comparison with a comparison of
+the requested schemas. It added a gated unrelated-definition regression and
+retained failed-publication recovery checks for shadow and primary reads. Both
+the empty-catalog and selector patches pass formatting and patch dry-run checks.
+The revised Task 6 behavior has not yet run through the compiler or tests.
+
+| Review finding | Assigned change | Evidence |
+| --- | --- | --- |
+| Query allocation failure can leak a sort row or aggregate group allocations | Keep local ownership until list insertion succeeds; test allocation failures | `query-limits-ownership-review-result.md` and inspected operator code |
+| Prepared VM initialization can fail after compiled-state ownership transfers | Delay ownership transfer until initialization succeeds; test reset and cleanup | Same review and `PreparedStmt.ensureCompiled` |
+| A prior quota refusal can misclassify a later backing-allocator OOM | Report the cause of the current allocation failure | Same review and `QueryExecutionContext.allocationError` |
+| Compiled names, label-case filtering, and ambiguity errors differed from existing behavior | Keep named families dynamic, preserve case parity and error contracts | `compiled-family-refined-result.md`; tests are prepared, not run |
+| Migration retry and promotion require existing durability followups | Port acknowledged-tail flush, deterministic checkpoints, resume, digest and sequence fixes | `native-migration-hardening-result.md`; compilation and tests remain pending |
+
+The selector/compiler worker now owns their integration. The generic rollup design
+review is correcting three open assumptions: no pageable native row visitor exists
+in M3; changed output keys require an explicit definition/target contract; exact
+integer bucket arithmetic must not silently change existing query semantics.
+No rollup implementation has started. The controller remains the reviewer and
+orchestrator; implementation workers own source and test edits.
+
+PR 84 is open at https://github.com/theroutercompany/sydradb/pull/84 and targets
+the derived-row branch. Its signed local commit is
+`a283c1aa3dbe0ca67dd4f804349b3e4b1cde6e9a`; published commit
+`06bda7a14f85e43eae6187d93c2f9ea48b986439` has the same tree,
+`7e2fc6a3054717c6e64559400a38c235435031cd`. Local signature verification passed.
+`native-metric-catalog-storage-fixed.log` records 185/185 tests and 3/3 steps.
+
+The revised empty-catalog focused run passed all 19 checks. Evidence:
+`empty-catalog-schema-postcondition-focused.log`. The broader runtime run is in
+`empty-catalog-schema-postcondition-runtime.log`; its result is not yet known.
+
+The accounting review found a packed-index allocation bypass, uncounted CAS
+name-resolution work, an extended-protocol error-cycle gap, and late output error
+mapping gaps. Bounded workers own the packed-reader and protocol fixes. The
+metadata/preparation cancellation gap remains open. The reported DELETE flush
+changes physical storage before quota rejection but does not delete logical rows;
+do not describe it as data loss or promise unchanged physical layout after an error.
+The PostgreSQL error-cycle rule was checked against the official
+[message-flow contract](https://www.postgresql.org/docs/17/protocol-flow.html).
+Evidence: `query-limits-accounting-review-result.md` and inspected call sites.
+
+## Published neutral API and integrated empty catalogs
+
+PR 85 is open at https://github.com/theroutercompany/sydradb/pull/85 and targets
+the HTTP final-record branch. The first signed checkpoint is
+`47e73e46830f84437bd4825a00a3971397f523dc`; published commit
+`3c13e43d041f268e01edb7b8ac948490c471ce6e` shares tree
+`9a344e0460bfd60620304465c1b7b2eef0b601aa`. All six focused checks passed in
+`neutral-row-api-focused-framing.log`. The test client now handles one response
+and decodes chunk framing; production transport is unchanged.
+
+Hosted Ubuntu and macOS checks passed for PR 84 and the first PR 85 checkpoint.
+PR 85's docs job found three indented JSON examples that MDX parsed as expressions.
+The worker changed only their Markdown fences. Signed fix
+`c3467cbb02c52a23b774f7f11959b80bc1455ddd` is published as
+`47097a56a6cd981bf17479a6c0fe64d1e4bd48b0`, with shared tree
+`3102228a87c63d9d75e9275f98fdae5e93070e0e`. Its hosted checks are pending.
+The root API examples already use fenced shell blocks, so this patch does not
+apply there and no root docs change was required. The existing local-ingest
+source-link failures remain covered by separate PR 78.
+
+The refined empty-catalog branch passed 508/508 runtime checks and four build
+steps in `empty-catalog-schema-postcondition-runtime.log`. Its seven-file patch
+applied cleanly to root after the prior files and hashes were saved in
+`empty-catalog-root-before/`. The first combined run then passed 741/743 Zig
+tests; two newer mixed-history fixtures were absent from the isolated baseline.
+They failed with `UnknownMarketSchema` and `InvalidBarPolicySource`. Both omitted
+the explicit trading initializer. The worker added exactly one initializer call
+per fixture, after the engine cleanup defer. The focused run changed from 1/3
+to 3/3 passing checks, with assertions unchanged. Evidence:
+`empty-catalog-mixed-fixtures-red.log`, `empty-catalog-mixed-fixtures-green.log`,
+and `empty-catalog-mixed-fixtures-own.patch`. The combined rerun is recorded in
+`native-market-ci-empty-catalog-fixed.log`; do not claim its result before exit.
+
+The initial selector/compiler build found a local `predicate` name shadowing
+another binding. The worker renamed that local without changing the expression.
+`selector-family-focused.log` retains the compiler error; a fresh run is pending.
+
+The pure trading-policy extraction is rebased onto the empty-catalog source in
+an isolated tree. Its precedence fixture explicitly registers the required schema
+with fanout storage because its configuration disables CAS. The two-file patch is
+prepared and formatted; it has not run through tests. See
+`trading-policy-current-result.md`.
+
+`native-market-ci-empty-catalog-fixed.log` now records terminal exit 0: 34/34 build
+steps, 743/743 Zig tests (510 runtime, 211 storage, 22 wire), and 35 Python tests.
+The target also passed the benchmark smoke, migration smoke, all demo steps, and
+shadow parity with 256 generated records, 372 queried records, two restarts, and
+two revisions. The root source is verified with empty generic initialization and
+explicit application setup. Full release-scale qualification remains open.
+
+The migration hardening patch is now under independent review and isolated storage
+verification for PR 83. Its original draft checkpoint remains unchanged until that
+verification completes. The later native history and dirty runtime closure are
+being mapped into scoped PR dependencies; the 46 original branch commits have not
+all been published.

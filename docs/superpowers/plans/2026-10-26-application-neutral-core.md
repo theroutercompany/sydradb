@@ -148,11 +148,11 @@ affected demo seeds, HTTP fixtures, and API documentation.
 registration. Preserve old market routes as compatibility entrypoints. Neutral
 routes delegate to the same schema/ingest/query handlers.
 
-- [ ] Add a fresh-catalog test that requires no trading schemas.
-- [ ] Add compatibility tests for old catalogs and market API entrypoints.
-- [ ] Move default registration to explicit application initialization.
+- [x] Add a fresh-catalog test that requires no trading schemas.
+- [x] Add compatibility tests for old catalogs and market API entrypoints.
+- [x] Move default registration to explicit application initialization.
 - [x] Add neutral schema and row routes without duplicating validation or storage.
-- [ ] Update fixtures and demos to register their required application schemas.
+- [x] Update fixtures and demos to register their required application schemas.
 
 The exact public route names must be written into the ledger before implementation
 and tested for parity with the compatibility routes. Existing catalog data must
