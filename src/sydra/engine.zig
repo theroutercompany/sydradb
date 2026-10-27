@@ -2012,7 +2012,6 @@ pub const Engine = struct {
                     std.log.warn("memtable flush failed: {s}", .{@errorName(err)});
                     break :blk false;
                 };
-                self.endFlush();
                 _ = self.takeFlushRequested();
                 last_flush = now;
                 // apply retention best-effort after flush
@@ -2037,6 +2036,10 @@ pub const Engine = struct {
                     };
                     self.scheduleDerivedRefresh();
                 }
+                // A configured CAS snapshot is part of the flush publication
+                // boundary. Drain waiters must not verify the repository while
+                // that snapshot and its in-memory index are still advancing.
+                self.endFlush();
                 self.noteQueueMaybeEmpty();
             }
             // fsync policy: interval
@@ -2053,13 +2056,13 @@ pub const Engine = struct {
             std.log.warn("final memtable flush failed: {s}", .{@errorName(err)});
             break :blk false;
         };
-        self.endFlush();
-        self.noteQueueMaybeEmpty();
         if (flushed) {
             self.syncCasSnapshot("shutdown-flush") catch |err| {
                 std.log.warn("cas sync failed: {s}", .{@errorName(err)});
             };
         }
+        self.endFlush();
+        self.noteQueueMaybeEmpty();
     }
 
     fn processQueuedMarketBatch(self: *Engine, batch: *const QueuedMarketBatch) !void {
@@ -2470,7 +2473,8 @@ pub const Engine = struct {
     fn processTradeToBar(self: *Engine, rollup: market_catalog_mod.RollupDefinition, labels_filter: ?[]const u8) !market_runtime_mod.ProcessingReport {
         var policy = self.latestBarPolicy(rollup.policy_id) orelse return .{};
         defer policy.deinit(self.alloc);
-        const groups = try self.collectMetricSeriesGroups(rollup.source_metric, &.{ "price", "size" });
+        const requested_columns = &.{ "price", "size" };
+        const groups = try self.collectDerivedSeriesGroups(rollup.source_metric, requested_columns);
         defer self.freeMetricSeriesGroups(groups);
         if (groups.len == 0) return .{};
 
@@ -2491,11 +2495,15 @@ pub const Engine = struct {
             }
             const checkpoint = self.market_runtime.getHighwater("rollup", rollup.id, rollup.version, group.labels_json) orelse std.math.minInt(i64);
             const start_ts = if (checkpoint == std.math.minInt(i64)) checkpoint else checkpoint + 1;
-            const price_points = try self.querySeriesPoints(group.series_ids[0], start_ts, std.math.maxInt(i64));
-            defer self.alloc.free(price_points);
-            const size_points = try self.querySeriesPoints(group.series_ids[1], start_ts, std.math.maxInt(i64));
-            defer self.alloc.free(size_points);
-            const trades = try alignTradeSamples(self.alloc, price_points, size_points);
+            const source_columns = try self.queryDerivedColumns(
+                rollup.source_metric,
+                group,
+                requested_columns,
+                start_ts,
+                std.math.maxInt(i64),
+            );
+            defer self.freePointColumns(source_columns);
+            const trades = try alignTradeSamples(self.alloc, source_columns[0], source_columns[1]);
             defer self.alloc.free(trades);
             if (trades.len < 2) continue;
             rows_processed += @intCast(trades.len);
@@ -2561,7 +2569,8 @@ pub const Engine = struct {
     }
 
     fn processQuoteToSpreadMid(self: *Engine, rollup: market_catalog_mod.RollupDefinition, labels_filter: ?[]const u8) !market_runtime_mod.ProcessingReport {
-        const groups = try self.collectMetricSeriesGroups(rollup.source_metric, &.{ "bid", "ask", "bid_size", "ask_size" });
+        const requested_columns = &.{ "bid", "ask", "bid_size", "ask_size" };
+        const groups = try self.collectDerivedSeriesGroups(rollup.source_metric, requested_columns);
         defer self.freeMetricSeriesGroups(groups);
         if (groups.len == 0) return .{};
 
@@ -2580,15 +2589,21 @@ pub const Engine = struct {
             }
             const checkpoint = self.market_runtime.getHighwater("rollup", rollup.id, rollup.version, group.labels_json) orelse std.math.minInt(i64);
             const start_ts = if (checkpoint == std.math.minInt(i64)) checkpoint else checkpoint + 1;
-            const bid_points = try self.querySeriesPoints(group.series_ids[0], start_ts, std.math.maxInt(i64));
-            defer self.alloc.free(bid_points);
-            const ask_points = try self.querySeriesPoints(group.series_ids[1], start_ts, std.math.maxInt(i64));
-            defer self.alloc.free(ask_points);
-            const bid_size_points = try self.querySeriesPoints(group.series_ids[2], start_ts, std.math.maxInt(i64));
-            defer self.alloc.free(bid_size_points);
-            const ask_size_points = try self.querySeriesPoints(group.series_ids[3], start_ts, std.math.maxInt(i64));
-            defer self.alloc.free(ask_size_points);
-            const quotes = try alignQuoteSamples(self.alloc, bid_points, ask_points, bid_size_points, ask_size_points);
+            const source_columns = try self.queryDerivedColumns(
+                rollup.source_metric,
+                group,
+                requested_columns,
+                start_ts,
+                std.math.maxInt(i64),
+            );
+            defer self.freePointColumns(source_columns);
+            const quotes = try alignQuoteSamples(
+                self.alloc,
+                source_columns[0],
+                source_columns[1],
+                source_columns[2],
+                source_columns[3],
+            );
             defer self.alloc.free(quotes);
             if (quotes.len == 0) continue;
             rows_processed += @intCast(quotes.len);
@@ -2621,7 +2636,8 @@ pub const Engine = struct {
     fn processBarToBar(self: *Engine, rollup: market_catalog_mod.RollupDefinition, labels_filter: ?[]const u8) !market_runtime_mod.ProcessingReport {
         var policy = self.latestBarPolicy(rollup.policy_id) orelse return .{};
         defer policy.deinit(self.alloc);
-        const groups = try self.collectMetricSeriesGroups(rollup.source_metric, &.{ "open", "high", "low", "close", "volume", "vwap" });
+        const requested_columns = &.{ "open", "high", "low", "close", "volume", "vwap" };
+        const groups = try self.collectDerivedSeriesGroups(rollup.source_metric, requested_columns);
         defer self.freeMetricSeriesGroups(groups);
         if (groups.len == 0) return .{};
 
@@ -2647,7 +2663,15 @@ pub const Engine = struct {
             if (policy.interval_ns <= source_interval_ns or @mod(policy.interval_ns, source_interval_ns) != 0) continue;
             const checkpoint = self.market_runtime.getHighwater("rollup", rollup.id, rollup.version, group.labels_json) orelse std.math.minInt(i64);
             const start_ts = if (checkpoint == std.math.minInt(i64)) checkpoint else checkpoint + 1;
-            const bars = try self.queryBarSamples(group.series_ids, start_ts);
+            const source_columns = try self.queryDerivedColumns(
+                rollup.source_metric,
+                group,
+                requested_columns,
+                start_ts,
+                std.math.maxInt(i64),
+            );
+            defer self.freePointColumns(source_columns);
+            const bars = try alignBarSamples(self.alloc, source_columns);
             defer self.alloc.free(bars);
             if (bars.len < 2) continue;
             rows_processed += @intCast(bars.len);
@@ -2722,7 +2746,7 @@ pub const Engine = struct {
             try self.alloc.dupe([]const u8, &.{signal_column.primary});
         defer self.alloc.free(columns);
 
-        const groups = try self.collectMetricSeriesGroups(signal.input_metric, columns);
+        const groups = try self.collectDerivedSeriesGroups(signal.input_metric, columns);
         defer self.freeMetricSeriesGroups(groups);
         if (groups.len == 0) return .{};
 
@@ -2740,14 +2764,20 @@ pub const Engine = struct {
                 if (!std.mem.eql(u8, group.labels_json, filter)) continue;
             }
             const checkpoint = self.market_runtime.getHighwater("signal", signal.id, signal.version, group.labels_json) orelse std.math.minInt(i64);
-            const primary_points = try self.querySeriesPoints(group.series_ids[0], std.math.minInt(i64), std.math.maxInt(i64));
-            defer self.alloc.free(primary_points);
+            const source_columns = try self.queryDerivedColumns(
+                signal.input_metric,
+                group,
+                columns,
+                std.math.minInt(i64),
+                std.math.maxInt(i64),
+            );
+            defer self.freePointColumns(source_columns);
+            const primary_points = source_columns[0];
             rows_processed += @intCast(primary_points.len);
-            const secondary_points = if (group.series_ids.len > 1)
-                try self.querySeriesPoints(group.series_ids[1], std.math.minInt(i64), std.math.maxInt(i64))
+            const secondary_points: []const types.Point = if (source_columns.len > 1)
+                source_columns[1]
             else
-                try self.alloc.alloc(types.Point, 0);
-            defer self.alloc.free(secondary_points);
+                &.{};
 
             const output_labels = try mergeLabelsJson(self.alloc, group.labels_json, &.{
                 .{ .key = "data_revision", .value = revision },
@@ -2946,24 +2976,33 @@ pub const Engine = struct {
         vwap: f64,
         source_metric: []const u8,
     ) !void {
-        const open_metric = try std.fmt.allocPrint(self.alloc, "{s}.open", .{family_metric});
-        defer self.alloc.free(open_metric);
-        try self.emitDerivedMetric(open_metric, labels_json, ts, open, source_metric, "open");
-        const high_metric = try std.fmt.allocPrint(self.alloc, "{s}.high", .{family_metric});
-        defer self.alloc.free(high_metric);
-        try self.emitDerivedMetric(high_metric, labels_json, ts, high, source_metric, "high");
-        const low_metric = try std.fmt.allocPrint(self.alloc, "{s}.low", .{family_metric});
-        defer self.alloc.free(low_metric);
-        try self.emitDerivedMetric(low_metric, labels_json, ts, low, source_metric, "low");
-        const close_metric = try std.fmt.allocPrint(self.alloc, "{s}.close", .{family_metric});
-        defer self.alloc.free(close_metric);
-        try self.emitDerivedMetric(close_metric, labels_json, ts, close, source_metric, "close");
-        const volume_metric = try std.fmt.allocPrint(self.alloc, "{s}.volume", .{family_metric});
-        defer self.alloc.free(volume_metric);
-        try self.emitDerivedMetric(volume_metric, labels_json, ts, volume, source_metric, "volume");
-        const vwap_metric = try std.fmt.allocPrint(self.alloc, "{s}.vwap", .{family_metric});
-        defer self.alloc.free(vwap_metric);
-        try self.emitDerivedMetric(vwap_metric, labels_json, ts, vwap, source_metric, "vwap");
+        var schema = self.marketSchema(family_metric) orelse return error.UnknownMarketSchema;
+        defer schema.deinit(self.alloc);
+        if (schema.storage_mapping == .fanout_v1) {
+            const values = [_]f64{ open, high, low, close, volume, vwap };
+            const fields = [_][]const u8{ "open", "high", "low", "close", "volume", "vwap" };
+            for (values, fields) |value, field| {
+                const metric = try std.fmt.allocPrint(self.alloc, "{s}.{s}", .{ family_metric, field });
+                defer self.alloc.free(metric);
+                try self.emitDerivedMetric(
+                    metric,
+                    labels_json,
+                    ts,
+                    value,
+                    source_metric,
+                    field,
+                );
+            }
+            return;
+        }
+
+        const values = [_]f64{ open, high, low, close, volume, vwap };
+        _ = try self.appendMarketRows(&.{.{
+            .metric = family_metric,
+            .labels_json = labels_json,
+            .ts_ns = ts,
+            .values = &values,
+        }});
     }
 
     fn emitDerivedMetric(
@@ -2990,16 +3029,120 @@ pub const Engine = struct {
         return try self.alloc.dupe(types.Point, points.items);
     }
 
-    fn queryBarSamples(self: *Engine, series_ids: []types.SeriesId, start_ts: i64) ![]BarSample {
-        var columns = try self.alloc.alloc([]types.Point, series_ids.len);
-        defer self.alloc.free(columns);
-        for (series_ids, 0..) |series_id, idx| {
-            columns[idx] = try self.querySeriesPoints(series_id, start_ts, std.math.maxInt(i64));
+    fn collectDerivedSeriesGroups(
+        self: *Engine,
+        family_metric: []const u8,
+        columns: []const []const u8,
+    ) ![]MetricSeriesGroup {
+        if (self.marketSchema(family_metric)) |owned_schema| {
+            var schema = owned_schema;
+            defer schema.deinit(self.alloc);
+
+            const identities = try self.metadata.market_catalog.listMarketSeries();
+            defer {
+                for (identities) |*identity| identity.deinit(self.alloc);
+                self.alloc.free(identities);
+            }
+
+            var groups = std.array_list.Managed(MetricSeriesGroup).init(self.alloc);
+            errdefer {
+                for (groups.items) |*group| group.deinit(self.alloc);
+                groups.deinit();
+            }
+            for (identities) |identity| {
+                if (!std.mem.eql(u8, identity.metric, family_metric)) continue;
+                var already_present = false;
+                for (groups.items) |group| {
+                    if (std.mem.eql(u8, group.labels_json, identity.canonical_labels)) {
+                        already_present = true;
+                        break;
+                    }
+                }
+                if (already_present) continue;
+                {
+                    const labels = try self.alloc.dupe(u8, identity.canonical_labels);
+                    errdefer self.alloc.free(labels);
+                    // An empty scalar-id set marks a logical market series.
+                    const series_ids = try self.alloc.alloc(types.SeriesId, 0);
+                    errdefer self.alloc.free(series_ids);
+                    try groups.append(.{
+                        .labels_json = labels,
+                        .series_ids = series_ids,
+                    });
+                }
+            }
+            if (groups.items.len != 0) return try groups.toOwnedSlice();
+            groups.deinit();
         }
-        defer {
-            for (columns) |points| self.alloc.free(points);
+
+        // Compatibility for custom and pre-native derived series that have no
+        // logical market-series registration.
+        return try self.collectMetricSeriesGroups(family_metric, columns);
+    }
+
+    fn queryDerivedColumns(
+        self: *Engine,
+        family_metric: []const u8,
+        group: MetricSeriesGroup,
+        columns: []const []const u8,
+        start_ts: i64,
+        end_ts: i64,
+    ) ![][]types.Point {
+        if (group.series_ids.len != 0) {
+            if (group.series_ids.len != columns.len) return error.IncompleteMarketRow;
+            const points_by_column = try self.alloc.alloc([]types.Point, columns.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (points_by_column[0..initialized]) |points| self.alloc.free(points);
+                self.alloc.free(points_by_column);
+            }
+            for (group.series_ids, 0..) |series_id, idx| {
+                points_by_column[idx] = try self.querySeriesPoints(series_id, start_ts, end_ts);
+                initialized += 1;
+            }
+            return points_by_column;
         }
-        return try alignBarSamples(self.alloc, columns);
+
+        var result = try self.queryMarket(.{
+            .metric = family_metric,
+            .label_filter_json = group.labels_json,
+            .start_ts_ns = start_ts,
+            .end_ts_ns = end_ts,
+            .requested_columns = columns,
+        });
+        defer result.deinit();
+
+        var exact_row_count: usize = 0;
+        for (result.rows) |row| {
+            if (std.mem.eql(u8, row.canonical_labels, group.labels_json)) exact_row_count += 1;
+        }
+
+        const points_by_column = try self.alloc.alloc([]types.Point, columns.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (points_by_column[0..initialized]) |points| self.alloc.free(points);
+            self.alloc.free(points_by_column);
+        }
+        for (points_by_column) |*points| {
+            points.* = try self.alloc.alloc(types.Point, exact_row_count);
+            initialized += 1;
+        }
+
+        var row_idx: usize = 0;
+        for (result.rows) |row| {
+            if (!std.mem.eql(u8, row.canonical_labels, group.labels_json)) continue;
+            if (row.values.len != columns.len) return error.IncompleteMarketRow;
+            for (points_by_column, row.values) |points, value| {
+                points[row_idx] = .{ .ts = row.ts_ns, .value = value };
+            }
+            row_idx += 1;
+        }
+        return points_by_column;
+    }
+
+    fn freePointColumns(self: *Engine, columns: [][]types.Point) void {
+        for (columns) |points| self.alloc.free(points);
+        self.alloc.free(columns);
     }
 
     fn collectMetricSeriesGroups(self: *Engine, family_metric: []const u8, columns: []const []const u8) ![]MetricSeriesGroup {
@@ -6764,6 +6907,63 @@ test "engine explicit native market mode rejects format3 before series registrat
     try std.testing.expectError(error.FileNotFound, root.access("wal", .{}));
 }
 
+test "engine native flush and drain includes CAS publication boundary" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(
+        talloc,
+        ".zig-cache/tmp/{s}/market-native-drain-cas-boundary",
+        .{tmp.sub_path},
+    );
+    defer talloc.free(data_path);
+
+    var config = try testConfig(talloc, data_path);
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .native_v1;
+    config.market_storage_read_mode = .native;
+    config.flush_interval_ms = 60_000;
+    config.memtable_max_bytes = 1024 * 1024;
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    var schema = try engine.registerMarketSchema(.{
+        .metric = "market.drain_boundary",
+        .ordered_columns = &.{ "price", "size" },
+        .required_labels = &.{"symbol"},
+        .storage_mapping = .native_v1,
+    });
+    defer schema.deinit(talloc);
+
+    const values = [_]f64{ 101.25, 10.0 };
+    const receipt = try engine.ingestMarketBatch(&.{.{
+        .metric = "market.drain_boundary",
+        .labels_json = "{\"symbol\":\"AAPL\"}",
+        .ts_ns = 1_000,
+        .values = &values,
+    }});
+    try std.testing.expectEqual(@as(usize, 1), receipt.native_rows);
+
+    try std.testing.expect(try engine.flushAndDrain(5_000));
+    try std.testing.expectEqual(
+        @as(u64, 0),
+        engine.metrics.cas_sync_failed_total.load(.monotonic),
+    );
+    try engine.verifyCasState();
+
+    var result = try engine.queryMarket(.{
+        .metric = "market.drain_boundary",
+        .start_ts_ns = 0,
+        .end_ts_ns = 2_000,
+        .requested_columns = &.{"price"},
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqual(@as(usize, 1), result.rows[0].values.len);
+    try std.testing.expectEqual(@as(f64, 101.25), result.rows[0].values[0]);
+}
+
 test "engine rejects future repository markers before WAL or catalog mutation with CAS off" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -9661,4 +9861,234 @@ test "engine market query revision returns historical native values" {
         @as(u64, @bitCast(@as(f64, 12.0))),
         @as(u64, @bitCast(current.rows[0].values[0])),
     );
+}
+
+test "engine native market rows drive rollups and signals without scalar fanout" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(
+        talloc,
+        ".zig-cache/tmp/{s}/native-derived-runtime",
+        .{tmp.sub_path},
+    );
+    defer talloc.free(data_path);
+    var config = try testConfig(talloc, data_path);
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .native_v1;
+    config.market_storage_read_mode = .auto;
+    config.flush_interval_ms = std.math.maxInt(u32);
+    config.memtable_max_bytes = std.math.maxInt(usize);
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    engine.stop_flag = true;
+    engine.derived_mu.lock();
+    engine.derived_pending = true;
+    engine.derived_mu.unlock();
+    engine.derived_cv.broadcast();
+    if (engine.derived_thread) |thread| {
+        thread.join();
+        engine.derived_thread = null;
+    }
+    engine.stop_flag = false;
+
+    var trade_policy = try engine.registerBarPolicy(.{
+        .id = "native-trade-1m",
+        .source_metric = "market.trade",
+        .interval_ns = 60 * std.time.ns_per_s,
+        .session_rule = "all_sessions",
+        .no_trade_rule = "skip_empty",
+        .halt_rule = "skip_halts",
+        .correction_policy = "append_only",
+        .trade_filter = null,
+    });
+    defer trade_policy.deinit(talloc);
+    var trade_rollup = try engine.registerRollup(.{
+        .id = "native-bars-1m",
+        .source_metric = "market.trade",
+        .target_metric = "market.bar",
+        .policy_id = trade_policy.id,
+        .transform_kind = .trade_to_bar,
+    });
+    defer trade_rollup.deinit(talloc);
+
+    const trade_values_0 = [_]f64{ 10.0, 1.0 };
+    const trade_values_1 = [_]f64{ 12.0, 2.0 };
+    const trade_values_2 = [_]f64{ 11.0, 3.0 };
+    _ = try engine.ingestMarketBatch(&.{
+        .{
+            .metric = "market.trade",
+            .labels_json = "{\"venue\":\"XNAS\",\"symbol\":\"AAPL\"}",
+            .ts_ns = 0,
+            .values = &trade_values_0,
+        },
+        .{
+            .metric = "market.trade",
+            .labels_json = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}",
+            .ts_ns = 30 * std.time.ns_per_s,
+            .values = &trade_values_1,
+        },
+        .{
+            .metric = "market.trade",
+            .labels_json = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}",
+            .ts_ns = 61 * std.time.ns_per_s,
+            .values = &trade_values_2,
+        },
+    });
+
+    const trade_labels = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}";
+    const trade_report = try engine.processRollupDefinitionFiltered(
+        trade_rollup,
+        trade_labels,
+    );
+    try std.testing.expectEqual(@as(u64, 3), trade_report.rows_processed);
+    try std.testing.expectEqual(@as(u64, 6), trade_report.emissions_total);
+
+    var bars = try engine.queryMarket(.{
+        .metric = "market.bar",
+        .label_filter_json = "{\"bar_policy_id\":\"native-trade-1m\",\"interval\":\"60000000000\",\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}",
+        .start_ts_ns = 0,
+        .end_ts_ns = 0,
+    });
+    defer bars.deinit();
+    try std.testing.expectEqualStrings("native", bars.stats.storage_mode);
+    try std.testing.expectEqual(@as(usize, 1), bars.rows.len);
+    try std.testing.expectEqual(@as(usize, 6), bars.rows[0].values.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 10.0), bars.rows[0].values[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 12.0), bars.rows[0].values[1], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 10.0), bars.rows[0].values[2], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 12.0), bars.rows[0].values[3], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.0), bars.rows[0].values[4], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 34.0 / 3.0), bars.rows[0].values[5], 1e-9);
+
+    var signal = try engine.registerSignal(.{
+        .id = "native-close-ema",
+        .input_metric = "market.bar",
+        .policy_id = trade_policy.id,
+        .expression_kind = .ema,
+        .params_json = "{\"column\":\"close\",\"period\":1}",
+        .emit_rule = "on_close",
+    });
+    defer signal.deinit(talloc);
+    const signal_report = try engine.processSignalDefinitionFiltered(
+        signal,
+        bars.rows[0].canonical_labels,
+    );
+    try std.testing.expectEqual(@as(u64, 1), signal_report.rows_processed);
+    try std.testing.expectEqual(@as(u64, 1), signal_report.emissions_total);
+
+    const signal_events = try engine.listSignalEvents(
+        signal.id,
+        signal.version,
+        null,
+        null,
+        null,
+        10,
+    );
+    defer {
+        for (signal_events) |*event| event.deinit(talloc);
+        talloc.free(signal_events);
+    }
+    try std.testing.expectEqual(@as(usize, 1), signal_events.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 12.0), signal_events[0].value, 1e-9);
+
+    var bar_policy = try engine.registerBarPolicy(.{
+        .id = "native-bar-5m",
+        .source_metric = "market.bar",
+        .interval_ns = 5 * 60 * std.time.ns_per_s,
+        .session_rule = "all_sessions",
+        .no_trade_rule = "skip_empty",
+        .halt_rule = "skip_halts",
+        .correction_policy = "append_only",
+        .trade_filter = null,
+    });
+    defer bar_policy.deinit(talloc);
+    var bar_rollup = try engine.registerRollup(.{
+        .id = "native-bars-5m",
+        .source_metric = "market.bar",
+        .target_metric = "market.bar",
+        .policy_id = bar_policy.id,
+        .transform_kind = .bar_to_bar,
+    });
+    defer bar_rollup.deinit(talloc);
+
+    const source_bar_values_0 = [_]f64{ 20.0, 22.0, 19.0, 21.0, 4.0, 20.5 };
+    const source_bar_values_1 = [_]f64{ 21.0, 24.0, 20.0, 23.0, 6.0, 22.5 };
+    const source_bar_values_2 = [_]f64{ 23.0, 25.0, 22.0, 24.0, 5.0, 23.5 };
+    const source_bar_labels = "{\"bar_policy_id\":\"native-trade-1m\",\"interval\":\"60000000000\",\"symbol\":\"MSFT\",\"venue\":\"XNAS\"}";
+    _ = try engine.ingestMarketBatch(&.{
+        .{
+            .metric = "market.bar",
+            .labels_json = source_bar_labels,
+            .ts_ns = 0,
+            .values = &source_bar_values_0,
+        },
+        .{
+            .metric = "market.bar",
+            .labels_json = source_bar_labels,
+            .ts_ns = 60 * std.time.ns_per_s,
+            .values = &source_bar_values_1,
+        },
+        .{
+            .metric = "market.bar",
+            .labels_json = source_bar_labels,
+            .ts_ns = 301 * std.time.ns_per_s,
+            .values = &source_bar_values_2,
+        },
+    });
+    const bar_report = try engine.processRollupDefinitionFiltered(
+        bar_rollup,
+        source_bar_labels,
+    );
+    try std.testing.expectEqual(@as(u64, 3), bar_report.rows_processed);
+    try std.testing.expectEqual(@as(u64, 6), bar_report.emissions_total);
+
+    var rolled_bars = try engine.queryMarket(.{
+        .metric = "market.bar",
+        .label_filter_json = "{\"bar_policy_id\":\"native-bar-5m\",\"interval\":\"300000000000\",\"symbol\":\"MSFT\",\"venue\":\"XNAS\"}",
+        .start_ts_ns = 0,
+        .end_ts_ns = 0,
+    });
+    defer rolled_bars.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rolled_bars.rows.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 20.0), rolled_bars.rows[0].values[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 24.0), rolled_bars.rows[0].values[1], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 19.0), rolled_bars.rows[0].values[2], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 23.0), rolled_bars.rows[0].values[3], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 10.0), rolled_bars.rows[0].values[4], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 21.7), rolled_bars.rows[0].values[5], 1e-9);
+
+    var quote_rollup = try engine.registerRollup(.{
+        .id = "native-spread-mid",
+        .source_metric = "market.quote",
+        .target_metric = "market.quote_derived",
+        .policy_id = trade_policy.id,
+        .transform_kind = .quote_to_spread_mid,
+    });
+    defer quote_rollup.deinit(talloc);
+    const quote_values_0 = [_]f64{ 100.0, 101.0, 5.0, 6.0 };
+    const quote_values_1 = [_]f64{ 101.0, 103.0, 7.0, 8.0 };
+    const quote_labels = "{\"symbol\":\"NVDA\",\"venue\":\"XNAS\"}";
+    _ = try engine.ingestMarketBatch(&.{
+        .{
+            .metric = "market.quote",
+            .labels_json = quote_labels,
+            .ts_ns = 10,
+            .values = &quote_values_0,
+        },
+        .{
+            .metric = "market.quote",
+            .labels_json = quote_labels,
+            .ts_ns = 20,
+            .values = &quote_values_1,
+        },
+    });
+    const quote_report = try engine.processRollupDefinitionFiltered(
+        quote_rollup,
+        quote_labels,
+    );
+    try std.testing.expectEqual(@as(u64, 2), quote_report.rows_processed);
+    try std.testing.expectEqual(@as(u64, 4), quote_report.emissions_total);
 }
