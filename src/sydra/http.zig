@@ -18,6 +18,7 @@ const query_executor = @import("query/executor.zig");
 const query_value = @import("query/value.zig");
 const query_functions = @import("query/functions.zig");
 const alloc_mod = @import("alloc.zig");
+const monotime = @import("time.zig");
 
 pub fn runHttp(handle: *alloc_mod.AllocatorHandle, eng: *Engine, port: u16) !void {
     var address = try std.net.Address.parseIp4("0.0.0.0", port);
@@ -347,7 +348,7 @@ fn handleSydraql(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
         return respondJsonError(alloc, req, .payload_too_large, "query_too_large", query_common.query_text_too_large_message);
     };
 
-    const start_time = std.time.microTimestamp();
+    var query_timer = monotime.startTimer();
     var cursor = query_exec.execute(alloc, eng, sydraql) catch |err| {
         return respondExecutionError(alloc, req, err);
     };
@@ -404,8 +405,7 @@ fn handleSydraql(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
         cursor.stats.selector_mode = selector_stats.mode;
         cursor.stats.selected_series_count = selector_stats.selected_series_count;
     }
-    const elapsed_us_signed = std.time.microTimestamp() - start_time;
-    const elapsed_us = @as(u64, @intCast(elapsed_us_signed));
+    const elapsed_us = query_timer.read() / std.time.ns_per_us;
     try writeStatsObject(&jw, row_count, elapsed_us, &cursor.stats, op_stats, cursor.columns);
     try jw.endObject();
     try response.end();
@@ -2771,7 +2771,7 @@ test "market ingest rejects malformed labels and columns before queueing rows" {
     try std.testing.expectEqual(@as(usize, 0), eng.queue.len());
 }
 
-test "market ingest rejects mixed resolved storage modes for one NDJSON request" {
+test "market ingest accepts mixed auto schema mappings in one NDJSON request" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -2806,13 +2806,41 @@ test "market ingest rejects mixed resolved storage modes for one NDJSON request"
         eng,
         "POST",
         "/api/v1/market/ingest",
-        "{\"metric\":\"market.http.mixed.fanout\",\"ts_ns\":1000,\"labels\":{\"symbol\":\"AAPL\"},\"columns\":{\"price\":10.5}}\n{\"metric\":\"market.http.mixed.native\",\"ts_ns\":1000,\"labels\":{\"symbol\":\"AAPL\"},\"columns\":{\"price\":10.5}}\n",
+        "{\"metric\":\"market.http.mixed.fanout\",\"ts_ns\":1000,\"labels\":{\"symbol\":\"AAPL\"},\"columns\":{\"price\":10.5}}\n{\"metric\":\"market.http.mixed.native\",\"ts_ns\":1000,\"labels\":{\"symbol\":\"AAPL\"},\"columns\":{\"price\":10.6}}\n",
     );
     defer response.deinit(talloc);
 
-    try std.testing.expectEqual(@as(u16, 409), response.status_code);
-    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"code\":\"mixed_market_storage_modes\"") != null);
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, talloc, response.body, .{});
+    defer parsed.deinit();
+    try expectJsonIntField(parsed.value.object, "rows", 2);
+    try expectJsonIntField(parsed.value.object, "writes", 1);
+    try expectJsonStringField(parsed.value.object, "storage_mode", "auto");
+    try expectJsonIntField(parsed.value.object, "native_rows", 1);
+    try expectJsonIntField(parsed.value.object, "fanout_writes", 1);
     try std.testing.expectEqual(@as(usize, 0), eng.queue.len());
+
+    var fanout = try eng.queryMarket(.{
+        .metric = "market.http.mixed.fanout",
+        .label_filter_json = "{\"symbol\":\"AAPL\"}",
+        .start_ts_ns = 0,
+        .end_ts_ns = 2_000,
+    });
+    defer fanout.deinit();
+    try std.testing.expectEqualStrings("fanout", fanout.stats.storage_mode);
+    try std.testing.expectEqual(@as(usize, 1), fanout.rows.len);
+    try std.testing.expectEqual(@as(f64, 10.5), fanout.rows[0].values[0]);
+
+    var native = try eng.queryMarket(.{
+        .metric = "market.http.mixed.native",
+        .label_filter_json = "{\"symbol\":\"AAPL\"}",
+        .start_ts_ns = 0,
+        .end_ts_ns = 2_000,
+    });
+    defer native.deinit();
+    try std.testing.expectEqualStrings("native", native.stats.storage_mode);
+    try std.testing.expectEqual(@as(usize, 1), native.rows.len);
+    try std.testing.expectEqual(@as(f64, 10.6), native.rows[0].values[0]);
 }
 
 fn handleQuery(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {

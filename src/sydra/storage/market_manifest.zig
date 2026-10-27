@@ -164,10 +164,9 @@ pub const Manifest = struct {
         file_open = false;
         try data_dir.rename(temp_path, manifest_path);
         should_delete_temp = false;
-        if (@hasDecl(std.fs.Dir, "sync")) {
-            var durable_dir = data_dir;
-            try durable_dir.sync();
-        }
+        var sync_dir = try data_dir.openDir(".", .{ .iterate = true });
+        defer sync_dir.close();
+        try std.posix.fsync(sync_dir.fd);
     }
 
     pub fn removeReplaced(self: *Manifest, data_dir: std.fs.Dir, replaced: []const ReplacementKey) !usize {
