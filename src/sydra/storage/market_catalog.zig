@@ -350,6 +350,7 @@ pub const Catalog = struct {
     mutex: std.Thread.Mutex = .{},
     schemas: std.array_list.Managed(MarketSchema),
     market_series: std.array_list.Managed(MarketSeriesIdentity),
+    market_series_by_metric: std.StringHashMap(std.ArrayListUnmanaged(usize)),
     bar_policies: std.array_list.Managed(BarPolicy),
     rollups: std.array_list.Managed(RollupDefinition),
     signals: std.array_list.Managed(SignalDefinition),
@@ -360,6 +361,7 @@ pub const Catalog = struct {
             .fsync = fsync,
             .schemas = std.array_list.Managed(MarketSchema).init(alloc),
             .market_series = std.array_list.Managed(MarketSeriesIdentity).init(alloc),
+            .market_series_by_metric = std.StringHashMap(std.ArrayListUnmanaged(usize)).init(alloc),
             .bar_policies = std.array_list.Managed(BarPolicy).init(alloc),
             .rollups = std.array_list.Managed(RollupDefinition).init(alloc),
             .signals = std.array_list.Managed(SignalDefinition).init(alloc),
@@ -452,7 +454,9 @@ pub const Catalog = struct {
                     entry.canonical_labels,
                     entry.schema_digest,
                 )) |_| return error.InvalidMarketCatalog;
+                const metric_indexes = try catalog.prepareMarketSeriesMetricIndexLocked(entry.metric, 1);
                 try catalog.market_series.append(try entry.clone(alloc));
+                metric_indexes.appendAssumeCapacity(catalog.market_series.items.len - 1);
             }
         }
         for (snapshot.bar_policies) |entry| try catalog.bar_policies.append(try entry.clone(alloc));
@@ -467,6 +471,12 @@ pub const Catalog = struct {
         self.schemas.deinit();
         for (self.market_series.items) |*entry| entry.deinit(self.alloc);
         self.market_series.deinit();
+        var metric_it = self.market_series_by_metric.iterator();
+        while (metric_it.next()) |entry| {
+            self.alloc.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(self.alloc);
+        }
+        self.market_series_by_metric.deinit();
         for (self.bar_policies.items) |*entry| entry.deinit(self.alloc);
         self.bar_policies.deinit();
         for (self.rollups.items) |*entry| entry.deinit(self.alloc);
@@ -622,9 +632,29 @@ pub const Catalog = struct {
         }
 
         try self.market_series.ensureUnusedCapacity(staged.items.len);
+        for (staged.items, 0..) |entry, staged_idx| {
+            var seen = false;
+            for (staged.items[0..staged_idx]) |prior| {
+                if (std.mem.eql(u8, prior.metric, entry.metric)) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (seen) continue;
+            var metric_count: usize = 0;
+            for (staged.items[staged_idx..]) |candidate| {
+                if (std.mem.eql(u8, candidate.metric, entry.metric)) {
+                    metric_count += 1;
+                }
+            }
+            _ = try self.prepareMarketSeriesMetricIndexLocked(entry.metric, metric_count);
+        }
         const appended_start = self.market_series.items.len;
         for (staged.items) |entry| {
             self.market_series.appendAssumeCapacity(entry);
+            self.market_series_by_metric.getPtr(entry.metric).?.appendAssumeCapacity(
+                self.market_series.items.len - 1,
+            );
         }
         staged.clearRetainingCapacity();
 
@@ -632,6 +662,9 @@ pub const Catalog = struct {
             self.rewriteLocked() catch |err| {
                 while (self.market_series.items.len > appended_start) {
                     var removed = self.market_series.pop().?;
+                    const indexes = self.market_series_by_metric.getPtr(removed.metric).?;
+                    std.debug.assert(indexes.items[indexes.items.len - 1] == self.market_series.items.len);
+                    _ = indexes.pop();
                     removed.deinit(self.alloc);
                 }
                 return err;
@@ -657,6 +690,43 @@ pub const Catalog = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         return try cloneEntrySlice(self.alloc, MarketSeriesIdentity, self.market_series.items);
+    }
+
+    pub fn listMarketSeriesForMetric(
+        self: *Catalog,
+        metric: []const u8,
+    ) ![]MarketSeriesIdentity {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const indexes = self.market_series_by_metric.get(metric) orelse
+            return try self.alloc.alloc(MarketSeriesIdentity, 0);
+        const entries = try self.alloc.alloc(MarketSeriesIdentity, indexes.items.len);
+        errdefer self.alloc.free(entries);
+        var initialized: usize = 0;
+        errdefer for (entries[0..initialized]) |*entry| entry.deinit(self.alloc);
+        for (indexes.items, 0..) |index, result_idx| {
+            entries[result_idx] = try self.market_series.items[index].clone(self.alloc);
+            initialized += 1;
+        }
+        return entries;
+    }
+
+    fn prepareMarketSeriesMetricIndexLocked(
+        self: *Catalog,
+        metric: []const u8,
+        additional: usize,
+    ) !*std.ArrayListUnmanaged(usize) {
+        if (self.market_series_by_metric.getPtr(metric)) |indexes| {
+            try indexes.ensureUnusedCapacity(self.alloc, additional);
+            return indexes;
+        }
+        const owned_metric = try self.alloc.dupe(u8, metric);
+        errdefer self.alloc.free(owned_metric);
+        var indexes: std.ArrayListUnmanaged(usize) = .{};
+        errdefer indexes.deinit(self.alloc);
+        try indexes.ensureUnusedCapacity(self.alloc, additional);
+        try self.market_series_by_metric.put(owned_metric, indexes);
+        return self.market_series_by_metric.getPtr(owned_metric).?;
     }
 
     pub fn listBarPolicies(self: *Catalog) ![]BarPolicy {
@@ -785,6 +855,7 @@ pub const Catalog = struct {
             candidate_owned = false;
             return existing.clone(self.alloc);
         }
+        const metric_indexes = try self.prepareMarketSeriesMetricIndexLocked(candidate.metric, 1);
         try self.market_series.append(candidate);
         candidate_owned = false;
         if (self.root != null) {
@@ -794,6 +865,7 @@ pub const Catalog = struct {
                 return err;
             };
         }
+        metric_indexes.appendAssumeCapacity(self.market_series.items.len - 1);
         return candidate.clone(self.alloc);
     }
 
@@ -895,7 +967,9 @@ pub const Catalog = struct {
                     entry.deinit(self.alloc);
                     continue;
                 }
+                const metric_indexes = try self.prepareMarketSeriesMetricIndexLocked(entry.metric, 1);
                 try self.market_series.append(entry);
+                metric_indexes.appendAssumeCapacity(self.market_series.items.len - 1);
             }
         }
         if (obj.get("bar_policies")) |value| {
@@ -1705,6 +1779,64 @@ test "market catalog batch registration is atomic on later identity validation f
         alloc.free(entries);
     }
     try std.testing.expectEqual(@as(usize, 0), entries.len);
+}
+
+test "market catalog metric index returns owned identities without unrelated series" {
+    const alloc = std.testing.allocator;
+    var catalog = Catalog.initEmpty(alloc, .none);
+    defer catalog.deinit();
+
+    var wanted_schema = try catalog.registerSchema(.{
+        .metric = "market.wanted",
+        .ordered_columns = &.{"value"},
+        .required_labels = &.{"symbol"},
+    });
+    defer wanted_schema.deinit(alloc);
+    var unrelated_schema = try catalog.registerSchema(.{
+        .metric = "market.unrelated",
+        .ordered_columns = &.{"value"},
+        .required_labels = &.{"symbol"},
+    });
+    defer unrelated_schema.deinit(alloc);
+
+    for (0..64) |idx| {
+        const labels = try std.fmt.allocPrint(alloc, "{{\"symbol\":\"U{d}\"}}", .{idx});
+        defer alloc.free(labels);
+        var identity = try catalog.registerMarketSeries("market.unrelated", labels);
+        identity.deinit(alloc);
+    }
+    for (0..2) |idx| {
+        const labels = try std.fmt.allocPrint(alloc, "{{\"symbol\":\"W{d}\"}}", .{idx});
+        defer alloc.free(labels);
+        var identity = try catalog.registerMarketSeries("market.wanted", labels);
+        identity.deinit(alloc);
+    }
+
+    try std.testing.expectEqual(
+        @as(usize, 2),
+        catalog.market_series_by_metric.get("market.wanted").?.items.len,
+    );
+    try std.testing.expectEqual(
+        @as(usize, 64),
+        catalog.market_series_by_metric.get("market.unrelated").?.items.len,
+    );
+    const wanted = try catalog.listMarketSeriesForMetric("market.wanted");
+    defer {
+        for (wanted) |*entry| entry.deinit(alloc);
+        alloc.free(wanted);
+    }
+    try std.testing.expectEqual(@as(usize, 2), wanted.len);
+    for (wanted) |entry| {
+        try std.testing.expectEqualStrings("market.wanted", entry.metric);
+    }
+    wanted[0].canonical_labels[0] = '[';
+    var stored = catalog.getMarketSeries(wanted[0].series_id).?;
+    defer stored.deinit(alloc);
+    try std.testing.expect(!std.mem.eql(
+        u8,
+        wanted[0].canonical_labels,
+        stored.canonical_labels,
+    ));
 }
 
 test "market catalog rejects malformed and duplicate persisted schemas" {
