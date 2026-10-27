@@ -45,9 +45,10 @@ runners, Nix, and the existing Docusaurus documentation site.
 | M4 | Selector filters and compiled family queries | M3 execution lifecycle | Query implementer and reviewer |
 | M5 | Generic persisted bucket aggregates and final evidence | M2, M3, M4 | Controller; independent correctness review |
 
-The controller owns shared engine edits. Workers may change disjoint modules
-only after the controller assigns exact files. Read-only design reviews can run
-in parallel. Do not run competing whole-repository builds or benchmarks.
+The controller assigns exact files and reviews, integrates, tests, and publishes
+the results. Workers own all source and test edits, including shared engine edits.
+Read-only design reviews can run in parallel. Do not run competing
+whole-repository builds or benchmarks.
 
 ## M1: Stabilize current native storage
 
@@ -60,11 +61,11 @@ in parallel. Do not run competing whole-repository builds or benchmarks.
 `compat-wire-test`, `native-market-ci`, and release-script targets. Preserve all
 existing public interfaces.
 
-- [ ] Record HEAD, dirty paths, file checksums, and a copy of the starting diff.
-- [ ] Run storage and runtime baselines with the pinned Zig environment.
-- [ ] Run the release-script suite with Python 3.13 and retain terminal results.
-- [ ] Classify failures as environment, harness, or product failures using logs.
-- [ ] Record exact commands and evidence paths in the ledger.
+- [x] Record HEAD, dirty paths, file checksums, and a copy of the starting diff.
+- [x] Run storage and runtime baselines with the pinned Zig environment.
+- [x] Run the release-script suite with Python 3.13 and retain terminal results.
+- [x] Classify failures as environment, harness, or product failures using logs.
+- [x] Record exact commands and evidence paths in the ledger.
 
 Expected: successful terminal exits, or a specific reproducible blocker with its
 affected scope. A started process or partial log does not count as a pass.
@@ -110,11 +111,11 @@ correctness passes. Hosted Linux/macOS release evidence requires separate author
 descriptions. The catalog retains ownership, cloning, serialization, and storage
 mapping. Preserve `MarketSchemaInput` field meanings and every digest input.
 
-- [ ] Pin current built-in columns, labels, mappings, and digest bytes in tests.
-- [ ] Move schema descriptions into the trading module without changing behavior.
-- [ ] Keep catalog insertion and allocation cleanup in the catalog.
-- [ ] Run built-in, identity, reload, migration, and snapshot tests.
-- [ ] Review the diff for changed serialized strings and accidental dependencies.
+- [x] Pin current built-in columns, labels, mappings, and digest bytes in tests.
+- [x] Move schema descriptions into the trading module without changing behavior.
+- [x] Keep catalog insertion and allocation cleanup in the catalog.
+- [x] Run built-in, identity, reload, migration, and snapshot tests.
+- [x] Review the diff for changed serialized strings and accidental dependencies.
 
 Expected: the same built-in schema bytes and digests, with application vocabulary
 owned outside the storage implementation.
@@ -150,7 +151,7 @@ routes delegate to the same schema/ingest/query handlers.
 - [ ] Add a fresh-catalog test that requires no trading schemas.
 - [ ] Add compatibility tests for old catalogs and market API entrypoints.
 - [ ] Move default registration to explicit application initialization.
-- [ ] Add neutral schema and row routes without duplicating validation or storage.
+- [x] Add neutral schema and row routes without duplicating validation or storage.
 - [ ] Update fixtures and demos to register their required application schemas.
 
 The exact public route names must be written into the ledger before implementation

@@ -6,18 +6,17 @@ Persistent goal: active in this conversation; no deadline or token budget.
 
 ## Current checkpoint
 
-M1 / Task 2 is in progress. The storage baseline passed. The runtime baseline
-hung in a publication wait cycle. The controller captured its stacks and stopped
-only the owned test process. Regression tests now precede the production fix.
-Task 4 is implemented and awaits controller verification. A separate worker owns
-the approved neutral HTTP routes and tests.
+M1 / Task 2 is in progress. Storage checks passed. Focused publication and neutral
+HTTP checks passed after fixes. All five focused CAS mirror checks passed; the
+full native integration target is running. Task 4 schema extraction
+passed storage checks; empty generic initialization is still pending.
 The current branch is `codex/native-market-storage` at `42fbd55`.
 
 | Milestone | State | Acceptance evidence |
 | --- | --- | --- |
-| M1: native-storage stabilization | In progress | Baseline checks started; see below |
-| M2: application boundaries | Planned | Read-only Luna review in progress |
-| M3: query limits | Planned | Read-only Luna review in progress |
+| M1: native-storage stabilization | In progress | Focused fixes pass; complete runtime and release gates pending |
+| M2: application boundaries | Partial | Schema extraction: 210 storage checks; neutral routes: 4 focused checks |
+| M3: query limits | Planned | Query ownership review complete; no implementation evidence |
 | M4: general selection | Planned | No implementation evidence |
 | M5: generic rollups and final audit | Planned | No implementation evidence |
 
@@ -56,6 +55,11 @@ artifacts, not a replacement for the user's source tree or an external backup.
 | Full runtime after first publication fix | FAIL: zero-timeout regression, three CAS mirror error logs, HTTP EOF panic | `runtime-after-publication.log`; terminal exit 1 |
 | Publication deadline and compatibility checks | PASS: 8/8 | `publication-deadline-green.log`; terminal exit 0 |
 | Neutral HTTP routes after EOF fix | PASS: 4/4 | `neutral-http-green.log`; terminal exit 0 |
+| Standalone HTTP EOF regression on remote main | FAIL before fix; PASS: 2/2 after fix | `http-main-red-memory.log`, `http-main-green.log` |
+| CAS mirror checks after refinement | Compile failure: duplicate `loadTreeObjectFromStore`; no tests ran | `cas-mirror-focused.log`; terminal exit 1 |
+| CAS mirror checks after duplicate removal | Compile failure: two unmutated `var` declarations; no tests ran | `cas-mirror-focused-v2.log`; terminal exit 1 |
+| Isolated native-storage foundation | PASS: 184/184 storage tests; terminal exit 0 | `native-foundation-storage.log` |
+| CAS retained-mirror regression and affected engine cases | PASS: 5/5; terminal exit 0 | `cas-worker-focused.log`, `cas-verified-fix-result.md` |
 
 The runtime build summary reports completed tests, but its terminal exit is 1.
 Do not count this as a passing runtime suite. The stack shows the producer in
@@ -133,8 +137,87 @@ Independent checkpoint worktrees use remote main as their base:
 - `plan-pr/`: project design, implementation plan, and evidence ledger.
 - `http-eof-pr/`: standalone HTTP final-record fix and its causal test.
 
-These directories are under the checkpoint artifact directory. No commit or pull
-request was complete at this ledger snapshot.
+These directories are under the checkpoint artifact directory.
+
+## Published checkpoints
+
+Planning PR: https://github.com/theroutercompany/sydradb/pull/74.
+Signed local commit: `5affff8d60c3b4daf584948369111737bcd145bf`.
+Published commit: `d2e88931429106ff63d3ba915676f1924fbf8e1b`.
+Both commits have tree `c54d4f0771cbee65bccb9f8886b38a64f280f3ae`.
+The local signature passed `git verify-commit` with `/opt/homebrew/bin/gpg`.
+
+The normal Git push returned HTTP 403 for the local account. The connected
+GitHub app published the same reviewed tree and created the feature-branch PR.
+No direct push or update to main occurred. The remote commit has a different
+identity from the signed local checkpoint; do not claim they have the same SHA.
+
+The standalone HTTP worktree first exposed an old one-shot transport harness
+hang. The controller captured its stacks and stopped only that owned process.
+An in-memory HTTP request now isolates the EOF behavior: it reproduced the panic
+on remote main before the fix. Both selected checks passed after the fix. The
+independent review found no blockers; see `http-pr-review-result.md`.
+
+HTTP fix PR: https://github.com/theroutercompany/sydradb/pull/75.
+Signed local commit: `5d91182c76dc29e36f2b600935f6cc3aa38c8232`.
+Published commit: `d8c8ddf33b27d287eceb4097161a6b532f082aa4`.
+Both commits have tree `82ebc1671550988a2a52667b2430cafc1c1fdced`.
+The local signature, changed-file format, and diff whitespace checks passed.
+The isolated branch does not have full-suite or keep-alive test evidence.
+
+PR 75 hosted CI job `121999726538` passed `zig build` and `zig test`, but failed
+the repository formatting hooks. The EOF hook changed base documentation and
+workflow files. Zig format reported unchanged `engine.zig` and `storage/cas.zig`.
+The macOS matrix job was cancelled after the Ubuntu failure. See
+`http-pr-ci-summary.log`. A separate worker owns the mechanical base cleanup in
+`ci-format-pr/`; keep it outside the HTTP patch. Hosted `zig test` uses the base
+test graph and does not replace the focused HTTP regression evidence.
+
+Formatting PR: https://github.com/theroutercompany/sydradb/pull/76.
+Signed local commit: `80f4dc276a6456958c86206de3cc5f70aca3d79b`.
+Published commit: `b15229b1d36030353814ce17cbc4daf7fba55259`.
+Both commits have tree `c36b8e61c9c4fb171a1521cd0370dbd6e766c7e1`.
+The worker removed exactly one LF from 70 text files and formatted the two Zig
+files reported by CI. The controller repeated the format and whitespace checks
+and verified the local signature. Hosted Ubuntu checks passed. Hosted macOS
+format checks passed, but its Zig build driver failed to link system symbols.
+The docs build found two pre-existing links to absent generated ingest pages.
+See `format-ci-macos-excerpt.log` and `format-ci-docs-excerpt.log`. Separate
+workers own the toolchain diagnosis and the two-link docs correction.
+
+The dependency review is complete: `native-pr-scope-review-result.md`. A draft
+foundation worktree at `native-foundation-pr/` contains a clean replay of
+`4cd4c8d` on the formatting checkpoint. It excludes the earlier ingest and CI
+changes. It passed 184 storage tests and is published as draft PR 77:
+https://github.com/theroutercompany/sydradb/pull/77.
+Signed local commit: `da6fa3dd63dcd5968067bb6fccab8b062b9a88ad`.
+Published commit: `3528ec00b564a916e46ba0fb1938e7799e9054a1`.
+Both commits have tree `8dae61579f03625a9c32e6d79145aa7bca3d58ac`.
+The PR targets the formatting branch. Runtime and later hardening checks remain
+open. Later native fixes and the current dirty implementation remain in the
+original working branch.
+
+The CAS build worker removed the duplicate loader and added ownership cleanup
+plus allocation-failure coverage. The controller's pinned format check passed.
+The redundant validation error log was removed so the caller owns reporting.
+A worker now owns the remaining compile fixes and focused CAS verification in
+one task; see `cas-verified-fix-agent.jsonl` and `cas-worker-focused.log`.
+That task passed all five focused checks with terminal exit 0. The controller
+started `native-market-ci -Doptimize=ReleaseSafe -j2 --summary all`; see
+`native-market-ci-current.log`. Full integration remains pending.
+
+Docs-link PR: https://github.com/theroutercompany/sydradb/pull/78.
+Signed local commit: `cbc2ed05ca3ca90682e52ae2dae8f4cdc6743b0e`.
+Published commit: `7c4fcbe2dc7469d45854dadd2c06115ec9825656`.
+Both commits have tree `28b83ffeada5038b100679720c6d82b86c91e625`.
+The one-line correction points to source files verified on remote main. The PR
+targets the formatting branch. Hosted docs verification is pending.
+
+An isolated worker prepares Task 5 in `trading-policy-preparation/`. It owns only
+the engine validation facade and the new trading policy module. It must preserve
+the original validators' error precedence and signal fallback behavior. It cannot
+edit the active native-storage checkout or start a competing build. Its copied
+engine prerequisite is recorded in `trading-policy-baseline-engine.zig`.
 
 All delegation outputs live in the checkpoint directory.
 
@@ -167,10 +250,16 @@ All delegation outputs live in the checkpoint directory.
    commits, including native-storage dependencies. No open pull requests existed
    at the remote check. Prepare independent fixes from remote main when possible,
    and use explicit dependency branches for the native-storage changes.
+10. The user directed the parent to act only as manager, orchestrator, and team
+    lead. From that instruction onward, delegate all source-code and test edits.
+    The parent owns review, verification, integration, documentation, and delivery.
+    Worker assignments and results are recorded above. Their logs use the same
+    task-name prefixes.
 
 ## Resume instructions
 
 Read the spec and plan. Check `git status --short`. Inspect the current owned
-process handles and logs before repeating any test. Finish the baseline, collect
-the two reviews, and start the smallest verified application-policy extraction.
-Do not mark M1 complete based only on the Python runner tests.
+process handles and logs before repeating any test. Collect the native integration
+result and the active worker reports. Verify prepared policy changes before
+integration. Continue the native PR dependency sequence without rewriting the
+original local history. Do not mark M1 complete from focused tests alone.
