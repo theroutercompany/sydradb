@@ -101,9 +101,10 @@ pub const Manifest = struct {
             else => return err,
         };
         defer file.close();
-        try file.seekFromEnd(0);
+        const end_pos = try file.getEndPos();
         var write_buf: [4096]u8 = undefined;
         var writer_state = file.writer(&write_buf);
+        try writer_state.seekTo(end_pos);
         var writer = anyWriter(&writer_state.interface);
         try writeEntry(&writer, .{
             .series_id = sid,
@@ -137,10 +138,11 @@ pub const Manifest = struct {
             else => return err,
         };
         defer file.close();
-        try file.seekFromEnd(0);
+        const end_pos = try file.getEndPos();
 
         var write_buf: [4096]u8 = undefined;
         var writer_state = file.writer(&write_buf);
+        try writer_state.seekTo(end_pos);
         var writer = anyWriter(&writer_state.interface);
         try self.entries.ensureUnusedCapacity(self.alloc, additions.len);
 
@@ -227,4 +229,44 @@ fn jsonSeriesId(value: std.json.Value) !types.SeriesId {
         .number_string => |digits| try std.fmt.parseInt(types.SeriesId, digits, 10),
         else => error.InvalidCharacter,
     };
+}
+
+test "single and batched additions append without overwriting prior entries" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var manifest = try Manifest.loadOrInit(talloc, tmp.dir);
+    defer manifest.deinit();
+
+    try manifest.add(tmp.dir, 1, 10, 100, 101, 2, "segments/first.seg");
+    try manifest.addBatch(tmp.dir, &.{
+        .{
+            .series_id = 2,
+            .hour_bucket = 20,
+            .start_ts = 200,
+            .end_ts = 202,
+            .count = 3,
+            .path = "segments/second.seg",
+        },
+        .{
+            .series_id = 3,
+            .hour_bucket = 30,
+            .start_ts = 300,
+            .end_ts = 303,
+            .count = 4,
+            .path = "segments/third.seg",
+        },
+    });
+    try std.testing.expectEqual(@as(usize, 3), manifest.entries.items.len);
+
+    var reloaded = try Manifest.loadOrInit(talloc, tmp.dir);
+    defer reloaded.deinit();
+    try std.testing.expectEqual(@as(usize, 3), reloaded.entries.items.len);
+    try std.testing.expectEqual(@as(types.SeriesId, 1), reloaded.entries.items[0].series_id);
+    try std.testing.expectEqualStrings("segments/first.seg", reloaded.entries.items[0].path);
+    try std.testing.expectEqual(@as(types.SeriesId, 2), reloaded.entries.items[1].series_id);
+    try std.testing.expectEqualStrings("segments/second.seg", reloaded.entries.items[1].path);
+    try std.testing.expectEqual(@as(types.SeriesId, 3), reloaded.entries.items[2].series_id);
+    try std.testing.expectEqualStrings("segments/third.seg", reloaded.entries.items[2].path);
 }

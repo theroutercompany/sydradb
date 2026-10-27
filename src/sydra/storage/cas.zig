@@ -1120,12 +1120,13 @@ pub const RefStore = struct {
             else => return err,
         };
         defer file.close();
-        try file.seekFromEnd(0);
+        const end_pos = try file.getEndPos();
 
         const old_hex = if (old_id) |id| id.toHex() else [_]u8{'0'} ** 64;
         const new_hex = new_id.toHex();
         var write_buf: [256]u8 = undefined;
         var writer_state = file.writer(&write_buf);
+        try writer_state.seekTo(end_pos);
         const writer = &writer_state.interface;
         try writer.print("{d} {s} {s} {s}\n", .{
             std.time.milliTimestamp(),
@@ -12431,6 +12432,7 @@ test "ref transactions enforce compare-and-swap and append reflogs" {
 
     const reflog = try refs.root.readFileAlloc(std.testing.allocator, "logs/refs/heads/main", 4096);
     defer std.testing.allocator.free(reflog);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, reflog, "\n"));
     try std.testing.expect(std.mem.indexOf(u8, reflog, "advance-main") != null);
 }
 
