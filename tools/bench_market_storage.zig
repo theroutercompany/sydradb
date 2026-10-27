@@ -15,6 +15,10 @@ const label_sets = [_][]const u8{
     "{\"symbol\":\"AMD\",\"venue\":\"XNAS\"}",
 };
 
+fn startTimer() std.time.Timer {
+    return std.time.Timer.start() catch unreachable;
+}
+
 const trade_columns = [_][]const u8{ "price", "size" };
 const trade_selected_columns = [_][]const u8{"price"};
 const quote_columns = [_][]const u8{ "bid", "ask", "bid_size", "ask_size" };
@@ -236,7 +240,7 @@ fn ingestFanoutRows(
     const batch = try alloc.alloc(Engine.IngestItem, max_batch_points);
     defer alloc.free(batch);
 
-    const start_ns = std.time.nanoTimestamp();
+    var timer = startTimer();
     var batch_len: usize = 0;
     for (0..rows) |row_idx| {
         const label_idx = row_idx % label_sets.len;
@@ -257,14 +261,13 @@ fn ingestFanoutRows(
         }
     }
     if (batch_len != 0) try engine.ingestBatch(batch[0..batch_len]);
-    const enqueue_end_ns = std.time.nanoTimestamp();
+    const enqueue_elapsed_ns = timer.read();
 
     _ = try engine.flushAndDrain(120_000);
     try engine.waitForDrained(120_000);
-    const ingest_or_drain_end_ns = std.time.nanoTimestamp();
     return .{
-        .enqueue_elapsed_ns = @intCast(enqueue_end_ns - start_ns),
-        .ingest_or_drain_elapsed_ns = @intCast(ingest_or_drain_end_ns - start_ns),
+        .enqueue_elapsed_ns = enqueue_elapsed_ns,
+        .ingest_or_drain_elapsed_ns = timer.read(),
     };
 }
 
@@ -325,9 +328,9 @@ fn measureQueries(
     defer alloc.free(latencies);
     var returned_points: u64 = 0;
     for (latencies) |*latency| {
-        const start_ns = std.time.nanoTimestamp();
+        var timer = startTimer();
         returned_points = try runProjectedQuery(alloc, engine, scenario, series_ids);
-        latency.* = @intCast(std.time.nanoTimestamp() - start_ns);
+        latency.* = timer.read();
         if (returned_points != expected_points) return error.BenchmarkQueryMismatch;
     }
     std.sort.block(u64, latencies, {}, std.sort.asc(u64));

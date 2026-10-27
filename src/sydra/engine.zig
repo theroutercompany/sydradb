@@ -25,6 +25,7 @@ const cas_mod = @import("storage/cas.zig");
 const query_ast = @import("query/ast.zig");
 const query_expression = @import("query/expression.zig");
 const query_plan = @import("query/plan.zig");
+const monotime = @import("time.zig");
 
 fn sleepMs(ms: u64) void {
     if (@hasDecl(std.time, "sleep")) {
@@ -87,6 +88,7 @@ pub const Engine = struct {
     exact_series_declare_mu: std.Thread.Mutex = .{},
     derived_mu: std.Thread.Mutex = .{},
     derived_cv: std.Thread.Condition = .{},
+    derived_lag_timer: std.time.Timer,
     derived_pending: bool = false,
     derived_full_refresh: bool = false,
     derived_dirty: std.array_list.Managed(DirtyDefinitionWork),
@@ -153,7 +155,7 @@ pub const Engine = struct {
         definition_id: []u8,
         definition_version: u32,
         labels_json: []u8,
-        queued_at_ns: i64,
+        queued_monotonic_ns: u64,
 
         fn deinit(self: *DirtyDefinitionWork, alloc: std.mem.Allocator) void {
             alloc.free(self.namespace);
@@ -877,7 +879,11 @@ pub const Engine = struct {
         closed: bool = false,
         wake_requested: bool = false,
         metrics: *Metrics,
-        const lock_wait_threshold_ns: i64 = 1_000;
+        const lock_wait_threshold_ns: u64 = 1_000;
+
+        pub const PushReservation = struct {
+            hold_timer: std.time.Timer,
+        };
 
         pub fn init(alloc: std.mem.Allocator, metrics: *Metrics) !*Queue {
             const q = try alloc.create(Queue);
@@ -919,18 +925,58 @@ pub const Engine = struct {
                 .bytes = bytes,
             });
         }
-        fn beginMarketPushReservation(self: *Queue, row_count: usize, bytes: usize) !void {
+        fn recordPushLockAcquired(self: *Queue, wait_ns: u64) void {
+            _ = self.metrics.queue_push_lock_acquisitions.fetchAdd(1, .monotonic);
+            if (wait_ns > lock_wait_threshold_ns) {
+                _ = self.metrics.queue_push_lock_wait_ns_total.fetchAdd(wait_ns, .monotonic);
+                _ = self.metrics.queue_push_lock_contention.fetchAdd(1, .monotonic);
+            }
+        }
+
+        fn recordPushLockHold(self: *Queue, hold_ns: u64) void {
+            _ = self.metrics.queue_push_lock_hold_ns_total.fetchAdd(hold_ns, .monotonic);
+        }
+
+        fn lockBefore(self: *Queue, timer: *std.time.Timer, timeout_ns: u64) bool {
+            while (true) {
+                if (self.mu.tryLock()) {
+                    if (timeout_ns == 0) return true;
+                    if (timer.read() < timeout_ns) return true;
+                    self.mu.unlock();
+                    return false;
+                }
+                const elapsed_ns = timer.read();
+                if (elapsed_ns >= timeout_ns) return false;
+                std.Thread.yield() catch {};
+                const after_yield_ns = timer.read();
+                if (after_yield_ns >= timeout_ns) return false;
+                const remaining_ns = timeout_ns - after_yield_ns;
+                std.Thread.sleep(@min(remaining_ns, 50 * std.time.ns_per_us));
+            }
+        }
+
+        fn beginMarketPushReservation(self: *Queue, row_count: usize, bytes: usize) !PushReservation {
+            var lock_timer = monotime.startTimer();
             self.mu.lock();
-            errdefer self.mu.unlock();
+            const wait_ns = lock_timer.read();
+            self.recordPushLockAcquired(wait_ns);
+            lock_timer.reset();
+            errdefer {
+                self.recordPushLockHold(lock_timer.read());
+                self.mu.unlock();
+            }
             if (self.closed) return error.Closed;
             try self.ensureCapacity(self.count + 1);
             _ = std.math.add(usize, self.pending_points, row_count) catch return error.ResidentByteOverflow;
             _ = std.math.add(usize, self.pending_bytes, bytes) catch return error.ResidentByteOverflow;
+            return .{ .hold_timer = lock_timer };
         }
-        fn cancelMarketPushReservation(self: *Queue) void {
+        fn cancelMarketPushReservation(self: *Queue, reservation: *PushReservation) void {
+            self.recordPushLockHold(reservation.hold_timer.read());
             self.mu.unlock();
+            reservation.* = undefined;
         }
-        fn commitMarketPushReservation(self: *Queue, batch: QueuedMarketBatch, bytes: usize) void {
+        fn commitMarketPushReservation(self: *Queue, reservation: *PushReservation, batch: QueuedMarketBatch, bytes: usize) void {
             std.debug.assert(!self.closed);
             std.debug.assert(self.count < self.buf.len);
             const insert_idx = (self.head + self.count) % self.buf.len;
@@ -942,7 +988,9 @@ pub const Engine = struct {
             self.pending_points += batch.rows.len;
             self.pending_bytes += bytes;
             self.cv.signal();
+            self.recordPushLockHold(reservation.hold_timer.read());
             self.mu.unlock();
+            reservation.* = undefined;
         }
         fn reserveOne(self: *Queue) !void {
             self.mu.lock();
@@ -951,19 +999,13 @@ pub const Engine = struct {
             try self.ensureCapacity(self.count + 1);
         }
         fn pushOwned(self: *Queue, batch: QueuedBatch) !void {
-            const wait_start = std.time.nanoTimestamp();
+            var lock_timer = monotime.startTimer();
             self.mu.lock();
-            const acquired_ns = std.time.nanoTimestamp();
-            const wait_ns = acquired_ns - wait_start;
-            _ = self.metrics.queue_push_lock_acquisitions.fetchAdd(1, .monotonic);
-            if (wait_ns > lock_wait_threshold_ns) {
-                _ = self.metrics.queue_push_lock_wait_ns_total.fetchAdd(@as(u64, @intCast(wait_ns)), .monotonic);
-                _ = self.metrics.queue_push_lock_contention.fetchAdd(1, .monotonic);
-            }
+            const wait_ns = lock_timer.read();
+            self.recordPushLockAcquired(wait_ns);
+            lock_timer.reset();
             defer {
-                const release_ns = std.time.nanoTimestamp();
-                const hold_ns = release_ns - acquired_ns;
-                _ = self.metrics.queue_push_lock_hold_ns_total.fetchAdd(@as(u64, @intCast(hold_ns)), .monotonic);
+                self.recordPushLockHold(lock_timer.read());
                 self.mu.unlock();
             }
             if (self.closed) {
@@ -982,34 +1024,26 @@ pub const Engine = struct {
             self.cv.signal();
         }
         pub fn pop(self: *Queue) ?QueuedBatch {
-            const lock_begin = std.time.nanoTimestamp();
+            var lock_timer = monotime.startTimer();
             self.mu.lock();
-            var acquired_ns = std.time.nanoTimestamp();
-            var wait_ns = acquired_ns - lock_begin;
+            const wait_ns = lock_timer.read();
             _ = self.metrics.queue_pop_lock_acquisitions.fetchAdd(1, .monotonic);
             if (wait_ns > lock_wait_threshold_ns) {
-                _ = self.metrics.queue_pop_lock_wait_ns_total.fetchAdd(@as(u64, @intCast(wait_ns)), .monotonic);
+                _ = self.metrics.queue_pop_lock_wait_ns_total.fetchAdd(wait_ns, .monotonic);
                 _ = self.metrics.queue_pop_lock_contention.fetchAdd(1, .monotonic);
             }
-            var hold_start_ns = acquired_ns;
+            lock_timer.reset();
             while (self.count == 0 and !self.closed and !self.wake_requested) {
-                const before_wait_ns = std.time.nanoTimestamp();
-                const hold_ns = before_wait_ns - hold_start_ns;
-                _ = self.metrics.queue_pop_lock_hold_ns_total.fetchAdd(@as(u64, @intCast(hold_ns)), .monotonic);
-                self.cv.timedWait(&self.mu, std.time.ns_per_ms * 100) catch break;
-                acquired_ns = std.time.nanoTimestamp();
-                wait_ns = acquired_ns - before_wait_ns;
-                if (wait_ns > lock_wait_threshold_ns) {
-                    _ = self.metrics.queue_pop_lock_wait_ns_total.fetchAdd(@as(u64, @intCast(wait_ns)), .monotonic);
-                    _ = self.metrics.queue_pop_lock_contention.fetchAdd(1, .monotonic);
-                }
-                hold_start_ns = acquired_ns;
+                _ = self.metrics.queue_pop_lock_hold_ns_total.fetchAdd(lock_timer.read(), .monotonic);
+                self.cv.timedWait(&self.mu, std.time.ns_per_ms * 100) catch {
+                    lock_timer.reset();
+                    break;
+                };
+                lock_timer.reset();
             }
             if (self.count == 0) {
                 self.wake_requested = false;
-                const release_ns = std.time.nanoTimestamp();
-                const hold_ns = release_ns - hold_start_ns;
-                _ = self.metrics.queue_pop_lock_hold_ns_total.fetchAdd(@as(u64, @intCast(hold_ns)), .monotonic);
+                _ = self.metrics.queue_pop_lock_hold_ns_total.fetchAdd(lock_timer.read(), .monotonic);
                 self.mu.unlock();
                 return null;
             }
@@ -1021,9 +1055,7 @@ pub const Engine = struct {
             self.in_flight_batches += 1;
             self.wake_requested = false;
             if (self.count == 0) self.head = 0;
-            const release_ns = std.time.nanoTimestamp();
-            const hold_ns = release_ns - hold_start_ns;
-            _ = self.metrics.queue_pop_lock_hold_ns_total.fetchAdd(@as(u64, @intCast(hold_ns)), .monotonic);
+            _ = self.metrics.queue_pop_lock_hold_ns_total.fetchAdd(lock_timer.read(), .monotonic);
             self.mu.unlock();
             return batch;
         }
@@ -1055,6 +1087,18 @@ pub const Engine = struct {
             self.wake_requested = true;
             self.cv.signal();
             self.mu.unlock();
+        }
+        fn wakeBefore(self: *Queue, timer: *std.time.Timer, timeout_ns: u64) bool {
+            if (!self.lockBefore(timer, timeout_ns)) return false;
+            self.wake_requested = true;
+            self.cv.signal();
+            self.mu.unlock();
+            return true;
+        }
+        fn isDrainedBefore(self: *Queue, timer: *std.time.Timer, timeout_ns: u64) ?bool {
+            if (!self.lockBefore(timer, timeout_ns)) return null;
+            defer self.mu.unlock();
+            return self.pending_points == 0 and self.in_flight_batches == 0;
         }
         pub fn len(self: *Queue) usize {
             self.mu.lock();
@@ -1318,6 +1362,7 @@ pub const Engine = struct {
             .cas = cas_manager,
             .market_runtime = undefined,
             .signal_events = undefined,
+            .derived_lag_timer = monotime.startTimer(),
             .derived_dirty = std.array_list.Managed(DirtyDefinitionWork).init(alloc),
         };
         metadata_transferred = true;
@@ -1767,11 +1812,10 @@ pub const Engine = struct {
         else
             try MarketBatchCompletion.create(self.alloc);
         defer if (completion) |pending| pending.release();
-        var market_queue_reserved = false;
-        defer if (market_queue_reserved) self.queue.cancelMarketPushReservation();
+        var market_queue_reservation: ?Queue.PushReservation = null;
+        defer if (market_queue_reservation) |*reservation| self.queue.cancelMarketPushReservation(reservation);
         if (mode != .fanout_v1) {
-            try self.queue.beginMarketPushReservation(rows.len, batch_queued_bytes);
-            market_queue_reserved = true;
+            market_queue_reservation = try self.queue.beginMarketPushReservation(rows.len, batch_queued_bytes);
         }
 
         const market_identities = try self.metadata.market_catalog.registerCanonicalMarketSeriesBatch(preflight_market_registrations);
@@ -1857,8 +1901,9 @@ pub const Engine = struct {
         fanout_series_ids_owned = false;
         fanout_values_initialized = 0;
         fanout_values_owned = false;
-        self.queue.commitMarketPushReservation(batch, batch_queued_bytes);
-        market_queue_reserved = false;
+        var reservation = market_queue_reservation.?;
+        self.queue.commitMarketPushReservation(&reservation, batch, batch_queued_bytes);
+        market_queue_reservation = null;
         self.noteQueueBecameNonEmpty();
         self.recordQueueSample();
         try completion.?.wait();
@@ -2107,22 +2152,19 @@ pub const Engine = struct {
     }
 
     fn writerLoop(self: *Engine) void {
-        var last_flush = std.time.milliTimestamp();
-        var last_sync = last_flush;
-        var last_pop_ns = std.time.nanoTimestamp();
+        var flush_deadline = monotime.IntervalDeadline.start(self.flush_timer_ms);
+        var sync_deadline = monotime.IntervalDeadline.start(self.flush_timer_ms);
+        var pop_wait_timer = monotime.startTimer();
         while (true) {
             if (self.queue.pop()) |batch| {
                 defer {
                     var cleanup = batch;
                     cleanup.deinit(self.alloc);
                 }
-                const now_ns = std.time.nanoTimestamp();
-                const wait_delta = now_ns - last_pop_ns;
+                const wait_delta = pop_wait_timer.read();
                 _ = self.metrics.queue_pop_total.fetchAdd(@intCast(batch.payload.len()), .monotonic);
-                if (wait_delta > 0) {
-                    _ = self.metrics.queue_wait_ns_total.fetchAdd(@as(u64, @intCast(wait_delta)), .monotonic);
-                }
-                last_pop_ns = now_ns;
+                if (wait_delta > 0) _ = self.metrics.queue_wait_ns_total.fetchAdd(wait_delta, .monotonic);
+                pop_wait_timer.reset();
                 {
                     defer {
                         self.queue.completeBatch();
@@ -2130,7 +2172,7 @@ pub const Engine = struct {
                     }
                     switch (batch.payload) {
                         .scalar => |points| {
-                            const wal_start_ns = std.time.nanoTimestamp();
+                            var wal_timer = monotime.startTimer();
                             const wal_bytes = self.wal.appendBatch(points) catch |err| blk: {
                                 _ = self.metrics.wal_append_failed_total.fetchAdd(@intCast(points.len), .monotonic);
                                 for (points) |point| {
@@ -2139,18 +2181,17 @@ pub const Engine = struct {
                                 std.log.warn("wal batch append failed: {s}", .{@errorName(err)});
                                 break :blk 0;
                             };
-                            const wal_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - wal_start_ns);
+                            const wal_elapsed_ns = wal_timer.read();
                             if (wal_bytes != 0) {
                                 _ = self.metrics.wal_append_total.fetchAdd(@intCast(points.len), .monotonic);
                                 _ = self.metrics.wal_append_ns_total.fetchAdd(wal_elapsed_ns, .monotonic);
                                 _ = self.metrics.wal_bytes_total.fetchAdd(wal_bytes, .monotonic);
 
-                                const memtable_start_ns = std.time.nanoTimestamp();
+                                var memtable_timer = monotime.startTimer();
                                 self.market_data_mu.lock();
                                 defer self.market_data_mu.unlock();
                                 if (self.appendMemtableBatchGrouped(points)) |_| {
-                                    const memtable_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - memtable_start_ns);
-                                    _ = self.metrics.memtable_append_ns_total.fetchAdd(memtable_elapsed_ns, .monotonic);
+                                    _ = self.metrics.memtable_append_ns_total.fetchAdd(memtable_timer.read(), .monotonic);
                                     _ = self.metrics.ingest_total.fetchAdd(@intCast(points.len), .monotonic);
                                     self.noteDrainStateChange();
                                 } else |err| {
@@ -2178,15 +2219,15 @@ pub const Engine = struct {
                 self.noteQueueMaybeEmpty();
             }
 
-            const now = std.time.milliTimestamp();
             const mem_usage = self.liveMemtableBytes();
             const queue_idle = self.queue.isDrained();
             const force_flush = self.flushRequested();
+            const flush_interval_due = flush_deadline.due();
             if (queue_idle and mem_usage == 0 and force_flush) {
                 _ = self.takeFlushRequested();
                 self.noteDrainStateChange();
             }
-            if (mem_usage >= self.config.memtable_max_bytes or (mem_usage != 0 and queue_idle and ((now - last_flush) >= self.flush_timer_ms or force_flush))) {
+            if (mem_usage >= self.config.memtable_max_bytes or (mem_usage != 0 and queue_idle and (flush_interval_due or force_flush))) {
                 self.beginFlush();
                 const flushed = flushMemtable(self) catch |err| blk: {
                     self.recordFlushPublicationError(err);
@@ -2194,7 +2235,7 @@ pub const Engine = struct {
                     break :blk false;
                 };
                 _ = self.takeFlushRequested();
-                last_flush = now;
+                flush_deadline.scheduleFromNow();
                 // apply retention best-effort after flush
                 const retention_changed = retention.applyWithResult(self.data_dir, &self.metadata.manifest, self.config.retention_days) catch |err| blk: {
                     std.log.warn("retention apply failed: {s}", .{@errorName(err)});
@@ -2225,11 +2266,11 @@ pub const Engine = struct {
                 self.noteQueueMaybeEmpty();
             }
             // fsync policy: interval
-            if (self.config.fsync == .interval and (now - last_sync) >= self.flush_timer_ms) {
+            if (self.config.fsync == .interval and sync_deadline.due()) {
                 self.wal.sync() catch |err| {
                     std.log.warn("wal sync failed: {s}", .{@errorName(err)});
                 };
-                last_sync = now;
+                sync_deadline.scheduleFromNow();
             }
         }
         // final flush
@@ -2312,19 +2353,18 @@ pub const Engine = struct {
         }
 
         if (self.market_writer_fault == .wal_append) return error.InjectedMarketWalAppendFailure;
-        const wal_start_ns = std.time.nanoTimestamp();
+        var wal_timer = monotime.startTimer();
         const registration_bytes = try self.wal.appendMarketSeriesRegistrationBatch(
             registrations[0..registration_count],
         );
         crash_injection.hit(.after_registration);
         const row_bytes = try self.wal.appendMarketRowBatch(wal_rows);
         crash_injection.hit(.after_wal_append);
-        const wal_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - wal_start_ns);
         _ = self.metrics.wal_append_total.fetchAdd(@intCast(batch.rows.len), .monotonic);
-        _ = self.metrics.wal_append_ns_total.fetchAdd(wal_elapsed_ns, .monotonic);
+        _ = self.metrics.wal_append_ns_total.fetchAdd(wal_timer.read(), .monotonic);
         _ = self.metrics.wal_bytes_total.fetchAdd(registration_bytes + row_bytes, .monotonic);
 
-        const memtable_start_ns = std.time.nanoTimestamp();
+        var memtable_timer = monotime.startTimer();
         self.market_data_mu.lock();
         defer self.market_data_mu.unlock();
         var fanout_applied = false;
@@ -2341,7 +2381,7 @@ pub const Engine = struct {
         fanout_applied = false;
         self.market_mem_allocated_bytes.store(self.market_mem.allocatedBytes(), .monotonic);
         self.market_mem_resident_bytes.store(self.market_mem.residentBytes(), .monotonic);
-        _ = self.metrics.memtable_append_ns_total.fetchAdd(@intCast(std.time.nanoTimestamp() - memtable_start_ns), .monotonic);
+        _ = self.metrics.memtable_append_ns_total.fetchAdd(memtable_timer.read(), .monotonic);
         _ = self.metrics.ingest_total.fetchAdd(@intCast(batch.rows.len), .monotonic);
 
         self.noteDrainStateChange();
@@ -2491,7 +2531,7 @@ pub const Engine = struct {
             .definition_id = try self.alloc.dupe(u8, definition_id),
             .definition_version = definition_version,
             .labels_json = try self.alloc.dupe(u8, labels_json),
-            .queued_at_ns = @intCast(std.time.nanoTimestamp()),
+            .queued_monotonic_ns = self.derived_lag_timer.read(),
         });
         self.market_runtime.setPending(namespace, definition_id, definition_version, labels_json, true) catch {};
         self.derived_pending = true;
@@ -3601,7 +3641,7 @@ pub const Engine = struct {
         self.market_data_mu.lock();
         defer self.market_data_mu.unlock();
 
-        const start_ns = std.time.nanoTimestamp();
+        var flush_timer = monotime.startTimer();
         var points_written: usize = 0;
         var segments_written: usize = 0;
         var series_buckets: usize = 0;
@@ -3639,16 +3679,16 @@ pub const Engine = struct {
                     }
                 }.lessThan);
             }
-            const selector_start_ns = std.time.nanoTimestamp();
+            var selector_timer = monotime.startTimer();
             const selector_metadata = try self.cachedFlushSelectorMetadata(&selector_cache, sid);
-            selector_metadata_ns_total += @intCast(std.time.nanoTimestamp() - selector_start_ns);
+            selector_metadata_ns_total += selector_timer.read();
             const first_hour = self.hourBucketForSeries(sid, buffer.points.items[0].ts);
             const last_hour = self.hourBucketForSeries(sid, buffer.points.items[buffer.points.items.len - 1].ts);
 
             if (buffer.points.items.len == 1 or first_hour == last_hour) {
-                const write_start_ns = std.time.nanoTimestamp();
+                var write_timer = monotime.startTimer();
                 const seg_path = try segment_mod.writeSegmentWithMetadata(self.alloc, self.data_dir, sid, first_hour, buffer.points.items, selector_metadata);
-                segment_write_ns_total += @intCast(std.time.nanoTimestamp() - write_start_ns);
+                segment_write_ns_total += write_timer.read();
                 try manifest_entries.append(.{
                     .series_id = sid,
                     .hour_bucket = first_hour,
@@ -3667,9 +3707,9 @@ pub const Engine = struct {
                     var end_idx = start_idx + 1;
                     while (end_idx < buffer.points.items.len and self.hourBucketForSeries(sid, buffer.points.items[end_idx].ts) == hour) : (end_idx += 1) {}
                     const slice = buffer.points.items[start_idx..end_idx];
-                    const write_start_ns = std.time.nanoTimestamp();
+                    var write_timer = monotime.startTimer();
                     const seg_path = try segment_mod.writeSegmentWithMetadata(self.alloc, self.data_dir, sid, hour, slice, selector_metadata);
-                    segment_write_ns_total += @intCast(std.time.nanoTimestamp() - write_start_ns);
+                    segment_write_ns_total += write_timer.read();
                     try manifest_entries.append(.{
                         .series_id = sid,
                         .hour_bucket = hour,
@@ -3686,13 +3726,12 @@ pub const Engine = struct {
             }
             buffer.clearRetainingCapacity();
         }
-        const manifest_start_ns = std.time.nanoTimestamp();
+        var manifest_timer = monotime.startTimer();
         try self.metadata.manifest.addBatch(self.data_dir, manifest_entries.items);
-        const manifest_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - manifest_start_ns);
+        const manifest_elapsed_ns = manifest_timer.read();
         self.mem.bytes.store(0, .monotonic);
         if (segments_written > 0) {
-            const duration_ns_i128 = std.time.nanoTimestamp() - start_ns;
-            const duration_ns: u64 = @intCast(duration_ns_i128);
+            const duration_ns = flush_timer.read();
             const points_u64: u64 = @intCast(points_written);
             _ = self.metrics.flush_total.fetchAdd(1, .monotonic);
             _ = self.metrics.flush_ns_total.fetchAdd(duration_ns, .monotonic);
@@ -3719,15 +3758,14 @@ pub const Engine = struct {
             std.log.warn("wal rotation failed: {s}", .{@errorName(err)});
         };
         if (self.tag_index_dirty.swap(false, .monotonic)) {
-            const tag_save_start_ns = std.time.nanoTimestamp();
+            var tag_save_timer = monotime.startTimer();
             self.metadata.tags.save(self.data_dir) catch |err| {
                 self.tag_index_dirty.store(true, .monotonic);
                 std.log.warn("tag index save failed: {s}", .{@errorName(err)});
                 return segments_written > 0 or native_flushed;
             };
-            const tag_save_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - tag_save_start_ns);
             _ = self.metrics.tag_index_save_total.fetchAdd(1, .monotonic);
-            _ = self.metrics.tag_index_save_ns_total.fetchAdd(tag_save_elapsed_ns, .monotonic);
+            _ = self.metrics.tag_index_save_ns_total.fetchAdd(tag_save_timer.read(), .monotonic);
         } else {
             _ = self.metrics.tag_index_save_skipped_total.fetchAdd(1, .monotonic);
         }
@@ -3737,7 +3775,7 @@ pub const Engine = struct {
     fn flushNativeMarketMemtable(self: *Engine) !bool {
         if (self.market_mem.seriesCount() == 0 or self.market_mem.residentBytes() == 0) return false;
 
-        const start_ns = std.time.nanoTimestamp();
+        var flush_timer = monotime.startTimer();
         var extraction = try self.market_mem.extractByHour(self.alloc);
         defer extraction.deinit();
         if (extraction.groups.len == 0) return false;
@@ -3795,7 +3833,7 @@ pub const Engine = struct {
                 };
             }
 
-            const write_start_ns = std.time.nanoTimestamp();
+            var write_timer = monotime.startTimer();
             const path = try market_segment_mod.write(self.alloc, self.data_dir, .{
                 .market_series_id = group.identity.series_id,
                 .schema_digest = group.schema_digest,
@@ -3805,7 +3843,7 @@ pub const Engine = struct {
                 .column_names = schema.ordered_columns,
             }, row_views);
             crash_injection.hit(.after_segment_creation);
-            segment_write_ns_total += @intCast(std.time.nanoTimestamp() - write_start_ns);
+            segment_write_ns_total += write_timer.read();
             errdefer self.alloc.free(path);
 
             const file_bytes = try self.data_dir.readFileAlloc(self.alloc, path, 128 * 1024 * 1024);
@@ -3846,17 +3884,17 @@ pub const Engine = struct {
             segments_written += 1;
         }
 
-        const manifest_start_ns = std.time.nanoTimestamp();
+        var manifest_timer = monotime.startTimer();
         try self.market_manifest.addBatch(self.data_dir, additions.items);
         crash_injection.hit(.after_manifest_update);
-        const manifest_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - manifest_start_ns);
+        const manifest_elapsed_ns = manifest_timer.read();
 
         self.market_mem.clearRetainingCapacity();
         self.market_mem_allocated_bytes.store(self.market_mem.allocatedBytes(), .monotonic);
         self.market_mem_resident_bytes.store(self.market_mem.residentBytes(), .monotonic);
         if (segments_written != 0) {
             _ = self.metrics.flush_total.fetchAdd(1, .monotonic);
-            _ = self.metrics.flush_ns_total.fetchAdd(@intCast(std.time.nanoTimestamp() - start_ns), .monotonic);
+            _ = self.metrics.flush_ns_total.fetchAdd(flush_timer.read(), .monotonic);
             _ = self.metrics.flush_points_total.fetchAdd(@intCast(rows_written), .monotonic);
             _ = self.metrics.flush_manifest_ns_total.fetchAdd(manifest_elapsed_ns, .monotonic);
             _ = self.metrics.flush_segment_write_ns_total.fetchAdd(segment_write_ns_total, .monotonic);
@@ -4856,13 +4894,14 @@ pub const Engine = struct {
         defer self.derived_mu.unlock();
         var pending_instances: usize = 0;
         var max_lag_ns: ?i64 = null;
-        const now_ts: i64 = @intCast(std.time.nanoTimestamp());
+        const now_ns = self.derived_lag_timer.read();
         for (self.derived_dirty.items) |entry| {
             if (!std.mem.eql(u8, entry.namespace, namespace)) continue;
             if (!std.mem.eql(u8, entry.definition_id, definition_id)) continue;
             if (entry.definition_version != definition_version) continue;
             pending_instances += 1;
-            const lag: i64 = now_ts - entry.queued_at_ns;
+            const lag_ns = now_ns - entry.queued_monotonic_ns;
+            const lag: i64 = @intCast(@min(lag_ns, @as(u64, @intCast(std.math.maxInt(i64)))));
             if (max_lag_ns == null or lag > max_lag_ns.?) max_lag_ns = lag;
         }
         return .{ .pending_instances = pending_instances, .max_lag_ns = max_lag_ns };
@@ -5476,9 +5515,14 @@ pub const Engine = struct {
     }
 
     pub fn flushAndDrain(self: *Engine, timeout_ms: u64) !bool {
+        var wait_timer = monotime.startTimer();
+        const timeout_ns = monotime.timeoutNanos(timeout_ms);
         const prior_flush_generation = self.requestFlush();
-        self.queue.wake();
-        const wait_result = try self.waitForDrainedState(timeout_ms, false, prior_flush_generation);
+        if (!self.queue.wakeBefore(&wait_timer, timeout_ns)) {
+            self.recordDrainTimeout(wait_timer.read());
+            return WaitError.Timeout;
+        }
+        const wait_result = try self.waitForDrainedStateWithTimer(&wait_timer, timeout_ns, false, prior_flush_generation);
         if (wait_result.publication_error) |err| return err;
         self.drain_mu.lock();
         defer self.drain_mu.unlock();
@@ -5486,21 +5530,26 @@ pub const Engine = struct {
     }
 
     pub fn waitForDrained(self: *Engine, timeout_ms: u64) WaitError!void {
-        _ = try self.waitForDrainedState(timeout_ms, true, null);
+        var wait_timer = monotime.startTimer();
+        _ = try self.waitForDrainedStateWithTimer(&wait_timer, monotime.timeoutNanos(timeout_ms), true, null);
     }
 
     const DrainWaitResult = struct {
         publication_error: ?anyerror = null,
     };
 
-    fn waitForDrainedState(
+    fn recordDrainTimeout(self: *Engine, elapsed_ns: u64) void {
+        _ = self.metrics.flush_queue_drain_wait_ns_total.fetchAdd(elapsed_ns, .monotonic);
+        _ = self.metrics.drain_timeout_total.fetchAdd(1, .monotonic);
+    }
+
+    fn waitForDrainedStateWithTimer(
         self: *Engine,
-        timeout_ms: u64,
+        wait_timer: *std.time.Timer,
+        timeout_ns: u64,
         verify_cas: bool,
         publication_error_after_flush: ?u64,
     ) WaitError!DrainWaitResult {
-        const wait_start_ns = std.time.nanoTimestamp();
-        const deadline_ns: i128 = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ms)) * std.time.ns_per_ms;
         while (true) {
             self.drain_mu.lock();
             const generation = self.drain_generation;
@@ -5512,39 +5561,39 @@ pub const Engine = struct {
             if (publication_error_after_flush) |baseline| {
                 if (flush_generation != baseline) {
                     if (publication_error) |err| {
-                        _ = self.metrics.flush_queue_drain_wait_ns_total.fetchAdd(@intCast(std.time.nanoTimestamp() - wait_start_ns), .monotonic);
+                        _ = self.metrics.flush_queue_drain_wait_ns_total.fetchAdd(wait_timer.read(), .monotonic);
                         return .{ .publication_error = err };
                     }
                 }
             }
 
-            if (self.queue.isDrained() and self.liveMemtableBytes() == 0 and !flush_in_progress) {
+            const queue_drained = self.queue.isDrainedBefore(wait_timer, timeout_ns) orelse break;
+            if (queue_drained and self.liveMemtableBytes() == 0 and !flush_in_progress) {
                 if (verify_cas and self.cas != null) {
                     self.verifyCasState() catch {
-                        const now_ns = std.time.nanoTimestamp();
-                        if (now_ns >= deadline_ns) break;
+                        const elapsed_ns = wait_timer.read();
+                        if (elapsed_ns >= timeout_ns) break;
                         self.drain_mu.lock();
-                        const remaining_ns: u64 = @intCast(deadline_ns - now_ns);
+                        const remaining_ns = timeout_ns - elapsed_ns;
                         self.drain_cv.timedWait(&self.drain_mu, remaining_ns) catch {};
                         self.drain_mu.unlock();
                         continue;
                     };
                 }
-                _ = self.metrics.flush_queue_drain_wait_ns_total.fetchAdd(@intCast(std.time.nanoTimestamp() - wait_start_ns), .monotonic);
+                _ = self.metrics.flush_queue_drain_wait_ns_total.fetchAdd(wait_timer.read(), .monotonic);
                 return .{};
             }
-            const now_ns = std.time.nanoTimestamp();
-            if (now_ns >= deadline_ns) break;
+            const elapsed_ns = wait_timer.read();
+            if (elapsed_ns >= timeout_ns) break;
 
             self.drain_mu.lock();
             if (generation == self.drain_generation) {
-                const remaining_ns: u64 = @intCast(deadline_ns - now_ns);
+                const remaining_ns = timeout_ns - elapsed_ns;
                 self.drain_cv.timedWait(&self.drain_mu, remaining_ns) catch {};
             }
             self.drain_mu.unlock();
         }
-        _ = self.metrics.flush_queue_drain_wait_ns_total.fetchAdd(@intCast(std.time.nanoTimestamp() - wait_start_ns), .monotonic);
-        _ = self.metrics.drain_timeout_total.fetchAdd(1, .monotonic);
+        self.recordDrainTimeout(wait_timer.read());
         return WaitError.Timeout;
     }
 
@@ -5555,8 +5604,9 @@ pub const Engine = struct {
         expected_count: usize,
         timeout_ms: u64,
     ) !void {
-        const deadline_ns = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ms)) * std.time.ns_per_ms;
-        while (std.time.nanoTimestamp() <= deadline_ns) {
+        var wait_timer = monotime.startTimer();
+        const timeout_ns = monotime.timeoutNanos(timeout_ms);
+        while (wait_timer.read() <= timeout_ns) {
             var points = std.array_list.Managed(types.Point).init(allocator);
             defer points.deinit();
 
@@ -5605,7 +5655,7 @@ pub const Engine = struct {
         self.wal.lockForSnapshot();
         defer self.wal.unlockForSnapshot();
         if (self.cas) |*cas| {
-            const start_ns = std.time.nanoTimestamp();
+            var timer = monotime.startTimer();
             errdefer _ = self.metrics.cas_sync_failed_total.fetchAdd(1, .monotonic);
             _ = try cas.syncLegacySnapshotWithNativeMarket(
                 self.data_dir,
@@ -5618,10 +5668,8 @@ pub const Engine = struct {
                 reason,
             );
             try self.metadata.refreshCasIndex(cas);
-            const elapsed_ns_i128 = std.time.nanoTimestamp() - start_ns;
-            const elapsed_ns: u64 = @intCast(elapsed_ns_i128);
             _ = self.metrics.cas_sync_total.fetchAdd(1, .monotonic);
-            _ = self.metrics.cas_sync_ns_total.fetchAdd(elapsed_ns, .monotonic);
+            _ = self.metrics.cas_sync_ns_total.fetchAdd(timer.read(), .monotonic);
         }
     }
 
@@ -5925,9 +5973,9 @@ pub const Engine = struct {
         var selector_key_ns_total: u64 = 0;
         var tag_pairs_total: u64 = 0;
         for (inputs, 0..) |input, idx| {
-            const selector_start_ns = std.time.nanoTimestamp();
+            var selector_timer = monotime.startTimer();
             const selector_key = try series_catalog_mod.buildSelectorKeyOwned(self.alloc, input.name, input.canonical_tags);
-            selector_key_ns_total += @intCast(std.time.nanoTimestamp() - selector_start_ns);
+            selector_key_ns_total += selector_timer.read();
             const parsed_tag_pairs = try self.parsePreparedStringTagPairs(input.canonical_tags);
             tag_pairs_total += @intCast(parsed_tag_pairs.pairs.len);
             prepared[idx] = .{
@@ -6028,7 +6076,7 @@ pub const Engine = struct {
             self.alloc.free(prepared_inputs);
         }
 
-        const descriptor_phase_start_ns = std.time.nanoTimestamp();
+        var descriptor_phase_timer = monotime.startTimer();
         const descriptor_slots = try self.alloc.alloc(?usize, inputs.len);
         defer self.alloc.free(descriptor_slots);
         @memset(descriptor_slots, null);
@@ -6071,11 +6119,11 @@ pub const Engine = struct {
             }
         }
         _ = self.metrics.exact_series_declare_metric_catalog_ns_total.fetchAdd(
-            @intCast(std.time.nanoTimestamp() - descriptor_phase_start_ns),
+            descriptor_phase_timer.read(),
             .monotonic,
         );
 
-        const series_phase_start_ns = std.time.nanoTimestamp();
+        var series_phase_timer = monotime.startTimer();
         const series_slots = try self.alloc.alloc(?usize, inputs.len);
         defer self.alloc.free(series_slots);
         @memset(series_slots, null);
@@ -6122,16 +6170,16 @@ pub const Engine = struct {
             try self.metadata.series_catalog.registerPreparedBatch(unique_series_inputs.items, series_results, &wal_registrations);
         }
         _ = self.metrics.exact_series_declare_series_catalog_ns_total.fetchAdd(
-            @intCast(std.time.nanoTimestamp() - series_phase_start_ns),
+            series_phase_timer.read(),
             .monotonic,
         );
 
-        const wal_phase_start_ns = std.time.nanoTimestamp();
+        var wal_phase_timer = monotime.startTimer();
         if (wal_registrations.items.len != 0) {
             _ = try self.wal.appendSeriesRegistrationBatch(wal_registrations.items);
         }
         _ = self.metrics.exact_series_declare_wal_registration_ns_total.fetchAdd(
-            @intCast(std.time.nanoTimestamp() - wal_phase_start_ns),
+            wal_phase_timer.read(),
             .monotonic,
         );
 
@@ -6160,10 +6208,10 @@ pub const Engine = struct {
             };
         }
 
-        const tag_phase_start_ns = std.time.nanoTimestamp();
+        var tag_phase_timer = monotime.startTimer();
         try self.noteTagsBatch(prepared_inputs, results);
         _ = self.metrics.exact_series_declare_tag_index_ns_total.fetchAdd(
-            @intCast(std.time.nanoTimestamp() - tag_phase_start_ns),
+            tag_phase_timer.read(),
             .monotonic,
         );
 
@@ -7029,32 +7077,34 @@ const waitError = error{Timeout};
 pub const WaitError = waitError;
 
 fn waitForFlush(engine: *Engine, expected_entries: usize, timeout_ms: u64) !void {
-    const deadline: i64 = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
+    var wait_timer = monotime.startTimer();
+    const timeout_ns = monotime.timeoutNanos(timeout_ms);
     while (true) {
         if (engine.metadata.manifest.entries.items.len >= expected_entries and engine.liveMemtableBytes() == 0 and engine.queue.isDrained()) {
-            const now = std.time.milliTimestamp();
-            if (now >= deadline) break;
-            const remaining_ms: u64 = @intCast(deadline - now);
+            const elapsed_ns = wait_timer.read();
+            if (elapsed_ns >= timeout_ns) break;
+            const remaining_ms = (timeout_ns - elapsed_ns) / std.time.ns_per_ms;
             _ = try engine.flushAndDrain(remaining_ms);
             if (engine.cas != null) {
                 try engine.verifyCasState();
             }
             return;
         }
-        if (std.time.milliTimestamp() >= deadline) break;
+        if (wait_timer.read() >= timeout_ns) break;
         sleepMs(10);
     }
     return waitError.Timeout;
 }
 
 fn waitForQueueEmpty(engine: *Engine, timeout_ms: u64) waitError!void {
-    const deadline_ns: i128 = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ms)) * std.time.ns_per_ms;
+    var wait_timer = monotime.startTimer();
+    const timeout_ns = monotime.timeoutNanos(timeout_ms);
     while (true) {
         if (engine.queue.isDrained()) return;
-        const now_ns = std.time.nanoTimestamp();
-        if (now_ns >= deadline_ns) break;
+        const elapsed_ns = wait_timer.read();
+        if (elapsed_ns >= timeout_ns) break;
         engine.drain_mu.lock();
-        const remaining_ns: u64 = @intCast(deadline_ns - now_ns);
+        const remaining_ns = timeout_ns - elapsed_ns;
         engine.drain_cv.timedWait(&engine.drain_mu, remaining_ns) catch {};
         engine.drain_mu.unlock();
     }
@@ -7312,6 +7362,31 @@ test "engine queue preserves a maintenance wake until an idle pop observes it" {
     try std.testing.expect(!queue.wake_requested);
 }
 
+test "engine queue lockBefore rejects a lock released after deadline" {
+    const talloc = std.testing.allocator;
+    var metrics = Engine.Metrics.init();
+    const queue = try Engine.Queue.init(talloc, &metrics);
+    defer {
+        queue.deinit();
+        talloc.destroy(queue);
+    }
+
+    const timeout_ns = std.time.ns_per_ms;
+    queue.mu.lock();
+    var timer = monotime.startTimer();
+    std.Thread.sleep(2 * timeout_ns);
+    queue.mu.unlock();
+
+    const accepted_after_deadline = queue.lockBefore(&timer, timeout_ns);
+    defer if (accepted_after_deadline) queue.mu.unlock();
+    try std.testing.expect(!accepted_after_deadline);
+
+    var zero_timer = monotime.startTimer();
+    const accepted_zero_timeout = queue.lockBefore(&zero_timer, 0);
+    defer if (accepted_zero_timeout) queue.mu.unlock();
+    try std.testing.expect(accepted_zero_timeout);
+}
+
 test "engine market queue owns native batch payloads" {
     const talloc = std.testing.allocator;
     var metrics = Engine.Metrics.init();
@@ -7441,8 +7516,8 @@ test "engine native market ingest does not acknowledge before the ordered writer
         ingest_thread.join();
     };
 
-    const deadline = std.time.nanoTimestamp() + 2 * std.time.ns_per_s;
-    while (engine.queue.len() == 0 and std.time.nanoTimestamp() < deadline) sleepMs(1);
+    var queue_wait_timer = monotime.startTimer();
+    while (engine.queue.len() == 0 and queue_wait_timer.read() < 2 * std.time.ns_per_s) sleepMs(1);
     try std.testing.expectEqual(@as(usize, 1), engine.queue.len());
     try std.testing.expect(!context.done.load(.acquire));
 
@@ -8579,6 +8654,48 @@ test "engine flushAndDrain is a queryable barrier and zero timeout succeeds when
     try std.testing.expectApproxEqAbs(@as(f64, 3.5), results.items[0].value, 1e-9);
 }
 
+test "engine flushAndDrain bounds queue mutex wake timeout and later drain completes" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/flush-drain-queue-mutex-timeout", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var config = try testConfig(talloc, data_path);
+    config.flush_interval_ms = std.math.maxInt(u32);
+    config.memtable_max_bytes = std.math.maxInt(usize);
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const sid = try engine.declareExactSeriesCanonical("svc.flush.mutex", "{}", null);
+    _ = try engine.appendResolvedPoint(.{ .series_id = sid, .ts = 11, .value = 4.5 });
+    try waitForQueueEmpty(engine, 1_000);
+    const flush_before = engine.metrics.flush_total.load(.monotonic);
+    const timeout_before = engine.metrics.drain_timeout_total.load(.monotonic);
+
+    engine.queue.mu.lock();
+    var queue_locked = true;
+    defer if (queue_locked) engine.queue.mu.unlock();
+
+    try std.testing.expectError(error.Timeout, engine.flushAndDrain(1));
+    try std.testing.expectEqual(flush_before, engine.metrics.flush_total.load(.monotonic));
+    try std.testing.expect(engine.metrics.drain_timeout_total.load(.monotonic) > timeout_before);
+
+    engine.queue.mu.unlock();
+    queue_locked = false;
+
+    _ = try engine.flushAndDrain(5_000);
+    try std.testing.expect(engine.metrics.flush_total.load(.monotonic) > flush_before);
+
+    var results = std.array_list.Managed(types.Point).init(talloc);
+    defer results.deinit();
+    try engine.queryRange(sid, 0, 20, &results);
+    try std.testing.expectEqual(@as(usize, 1), results.items.len);
+    try std.testing.expectEqual(@as(i64, 11), results.items[0].ts);
+    try std.testing.expectApproxEqAbs(@as(f64, 4.5), results.items[0].value, 1e-9);
+}
+
 test "engine flushAndDrain returns segment publication error and retains buffered input" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -9477,8 +9594,8 @@ test "engine records CAS sync metrics after dual-write flush" {
     try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.0, .tags_json = "{}" });
     try waitForFlush(engine, 1, 1_000);
 
-    const cas_sync_deadline = std.time.milliTimestamp() + 1_000;
-    while (engine.metrics.cas_sync_total.load(.monotonic) == 0 and std.time.milliTimestamp() < cas_sync_deadline) {
+    var cas_sync_wait_timer = monotime.startTimer();
+    while (engine.metrics.cas_sync_total.load(.monotonic) == 0 and cas_sync_wait_timer.read() < monotime.timeoutNanos(1_000)) {
         sleepMs(10);
     }
     try std.testing.expect(engine.metrics.cas_sync_total.load(.monotonic) > 0);
