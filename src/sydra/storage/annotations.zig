@@ -68,10 +68,11 @@ pub fn append(alloc: std.mem.Allocator, data_dir: std.fs.Dir, input: WriteInput)
         else => return err,
     };
     defer file.close();
-    try file.seekFromEnd(0);
+    const end_pos = try file.getEndPos();
 
     var write_buf: [1024]u8 = undefined;
     var writer_state = file.writer(&write_buf);
+    try writer_state.seekTo(end_pos);
     const writer = &writer_state.interface;
     var jw = std.json.Stringify{ .writer = writer };
     try writeEntry(&jw, entry);
@@ -163,6 +164,38 @@ fn writeEntry(jw: *std.json.Stringify, entry: Entry) !void {
     try jw.objectField("labels_json");
     try jw.write(entry.labels_json);
     try jw.endObject();
+}
+
+test "append preserves prior annotation records" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var first = try append(alloc, tmp.dir, .{
+        .kind = "note",
+        .title = "first",
+        .start_ts = 10,
+        .end_ts = 11,
+    });
+    defer first.deinit(alloc);
+    var second = try append(alloc, tmp.dir, .{
+        .kind = "note",
+        .title = "second",
+        .start_ts = 20,
+        .end_ts = 21,
+    });
+    defer second.deinit(alloc);
+
+    const entries = try query(alloc, tmp.dir, .{});
+    defer {
+        for (entries) |*entry| entry.deinit(alloc);
+        alloc.free(entries);
+    }
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqual(@as(u64, 1), entries[0].id);
+    try std.testing.expectEqualStrings("first", entries[0].title);
+    try std.testing.expectEqual(@as(u64, 2), entries[1].id);
+    try std.testing.expectEqualStrings("second", entries[1].title);
 }
 
 fn parseEntry(alloc: std.mem.Allocator, line: []const u8) !Entry {

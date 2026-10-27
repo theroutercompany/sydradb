@@ -165,6 +165,47 @@ pub fn writeAll(
     };
 }
 
+pub fn writeFile(
+    alloc: std.mem.Allocator,
+    store: *object_store.ObjectStore,
+    data_dir: std.fs.Dir,
+    path: []const u8,
+    chunk_bytes: u32,
+) !WriteResult {
+    const effective_chunk_bytes = if (chunk_bytes == 0) DefaultChunkBytes else chunk_bytes;
+    var file = try data_dir.openFile(path, .{});
+    defer file.close();
+    const stat = try file.stat();
+
+    var entries = std.array_list.Managed(TreeEntry).init(alloc);
+    defer {
+        for (entries.items) |*entry| entry.deinit(alloc);
+        entries.deinit();
+    }
+    const chunk = try alloc.alloc(u8, effective_chunk_bytes);
+    defer alloc.free(chunk);
+
+    var index: usize = 0;
+    while (true) : (index += 1) {
+        const bytes_read = try file.readAll(chunk);
+        if (bytes_read == 0) break;
+        const chunk_id = try store.put(.blob, chunk[0..bytes_read]);
+        try entries.append(.{
+            .name = try std.fmt.allocPrint(alloc, "{d:0>16}", .{index}),
+            .object_type = .blob,
+            .object_id = chunk_id,
+        });
+    }
+
+    const payload = try encodeTree(alloc, entries.items);
+    defer alloc.free(payload);
+    return .{
+        .root_id = try store.put(.tree, payload),
+        .size_bytes = stat.size,
+        .chunk_bytes = effective_chunk_bytes,
+    };
+}
+
 pub fn readAll(
     alloc: std.mem.Allocator,
     store: *object_store.ObjectStore,
@@ -324,10 +365,24 @@ test "extent trees round-trip chunked content" {
 
     const payload = "abcdefghijklmnopqrstuvwxyz0123456789";
     const written = try writeAll(std.testing.allocator, &store, payload, 8);
+    try tmp_dir.dir.writeFile(.{
+        .sub_path = "extent-input.bin",
+        .data = payload,
+        .flags = .{},
+    });
+    const streamed = try writeFile(
+        std.testing.allocator,
+        &store,
+        tmp_dir.dir,
+        "extent-input.bin",
+        8,
+    );
     const restored = try readAll(std.testing.allocator, &store, written);
     defer std.testing.allocator.free(restored);
 
     try std.testing.expectEqualStrings(payload, restored);
+    try std.testing.expect(written.root_id.eql(streamed.root_id));
+    try std.testing.expectEqual(written.size_bytes, streamed.size_bytes);
     try std.testing.expectEqual(@as(u64, payload.len), written.size_bytes);
     try std.testing.expectEqual(@as(u32, 8), written.chunk_bytes);
 }

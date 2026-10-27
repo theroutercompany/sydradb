@@ -341,6 +341,45 @@ pub fn build(b: *std.Build) void {
         if (os_tag == .linux) bench_market_storage_exe.linkSystemLibrary("pthread");
     }
 
+    const native_market_crash_driver = if (is015) blk_market_crash_driver: {
+        const root_mod = b.createModule(.{ .root_source_file = b.path("tools/native_market_crash_driver.zig"), .target = target, .optimize = optimize });
+        root_mod.addImport("sydra_tooling", tooling_module);
+        if (use_mimalloc) {
+            root_mod.addIncludePath(mimalloc_include);
+            root_mod.addIncludePath(mimalloc_src_dir);
+        }
+        break :blk_market_crash_driver b.addExecutable(.{ .name = "native-market-crash-driver", .root_module = root_mod });
+    } else blk_market_crash_driver: {
+        const exe_inner = b.addExecutable(.{ .name = "native-market-crash-driver", .root_source_file = b.path("tools/native_market_crash_driver.zig"), .target = target, .optimize = optimize });
+        exe_inner.root_module.addImport("sydra_tooling", tooling_module);
+        if (use_mimalloc) {
+            exe_inner.addIncludePath(mimalloc_include);
+            exe_inner.addIncludePath(mimalloc_src_dir);
+            exe_inner.addCSourceFile(.{ .file = mimalloc_c_file, .flags = mimalloc_flags });
+            exe_inner.linkLibC();
+            exe_inner.linkSystemLibrary("pthread");
+        }
+        break :blk_market_crash_driver exe_inner;
+    };
+
+    if (use_mimalloc and is015) {
+        native_market_crash_driver.addCSourceFile(.{ .file = mimalloc_c_file, .flags = mimalloc_flags });
+        native_market_crash_driver.linkLibC();
+        native_market_crash_driver.linkSystemLibrary("pthread");
+    } else if (!use_mimalloc) {
+        native_market_crash_driver.linkLibC();
+        if (os_tag == .linux) native_market_crash_driver.linkSystemLibrary("pthread");
+    }
+    const install_native_market_crash_driver = b.addInstallArtifact(
+        native_market_crash_driver,
+        .{},
+    );
+    b.getInstallStep().dependOn(&install_native_market_crash_driver.step);
+    b.step(
+        "native-market-crash-driver",
+        "Build the native-market crash and recovery driver",
+    ).dependOn(&install_native_market_crash_driver.step);
+
     const bench_market_storage_run = b.addRunArtifact(bench_market_storage_exe);
     if (b.args) |args| bench_market_storage_run.addArgs(args);
     b.step("bench-market-storage", "Run native market storage comparison scenarios").dependOn(&bench_market_storage_run.step);

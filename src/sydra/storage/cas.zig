@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const crash_injection = @import("crash_injection.zig");
 const cfg = @import("../config.zig");
 const types = @import("../types.zig");
 const manifest_mod = @import("manifest.zig");
@@ -739,10 +741,22 @@ pub const RefStore = struct {
         stale: usize,
     };
 
+    const PreparedDirectorySyncPaths = struct {
+        alloc: std.mem.Allocator,
+        paths: std.array_list.Managed([]const u8),
+
+        fn deinit(self: *PreparedDirectorySyncPaths) void {
+            for (self.paths.items) |path| self.alloc.free(path);
+            self.paths.deinit();
+        }
+    };
+
     pub fn init(alloc: std.mem.Allocator, path: []const u8, fsync: cfg.FsyncPolicy) !RefStore {
         var cwd = std.fs.cwd();
-        try cwd.makePath(path);
-        const root = try cwd.openDir(path, .{ .iterate = true });
+        const existing_parent = if (fsync != .none) try nearestExistingParent(cwd, path) else null;
+        const path_status = try cwd.makePathStatus(path);
+        var root = try cwd.openDir(path, .{ .iterate = true });
+        errdefer root.close();
         try root.makePath("refs");
         try root.makePath("refs/heads");
         try root.makePath("logs/refs");
@@ -751,6 +765,16 @@ pub const RefStore = struct {
         try root.makePath("reftable");
         try root.makePath("reftable/info");
         try root.makePath("symrefs");
+        if (fsync != .none) {
+            try syncParentDirs(root, "refs/heads");
+            try syncParentDirs(root, "refs/txn");
+            try syncParentDirs(root, "logs/refs/heads");
+            try syncParentDirs(root, "reftable/info");
+            try syncParentDirs(root, "symrefs");
+            if (path_status == .created) {
+                try syncCreatedPathParents(cwd, path, existing_parent.?);
+            }
+        }
         return .{ .alloc = alloc, .root = root, .fsync = fsync };
     }
 
@@ -797,7 +821,7 @@ pub const RefStore = struct {
             else => return err,
         };
         if (self.fsync != .none) {
-            try syncDir(&self.root);
+            try syncParentDirs(self.root, path);
         }
     }
 
@@ -873,8 +897,18 @@ pub const RefStore = struct {
             return;
         }
 
-        try self.deleteRefFile(ref_name);
-        try self.appendReflog(ref_name, current, current, reason);
+        var sync_paths = try self.prepareRefAndReflogSyncPaths(&.{ref_name});
+        defer sync_paths.deinit();
+
+        self.deleteRefFile(ref_name) catch |err| {
+            self.syncRefAndReflogDirectories(&sync_paths) catch {};
+            return err;
+        };
+        self.appendReflog(ref_name, current, current, reason) catch |err| {
+            self.syncRefAndReflogDirectories(&sync_paths) catch {};
+            return err;
+        };
+        try self.syncRefAndReflogDirectories(&sync_paths);
     }
 
     pub fn renameRef(self: *RefStore, old_ref_name: []const u8, new_ref_name: []const u8, reason: []const u8) !void {
@@ -919,10 +953,26 @@ pub const RefStore = struct {
             return;
         }
 
-        try self.writeRefFileAtomic(new_ref_name, current);
-        try self.deleteRefFile(old_ref_name);
-        try self.appendReflog(old_ref_name, current, current, reason);
-        try self.appendReflog(new_ref_name, null, current, reason);
+        var sync_paths = try self.prepareRefAndReflogSyncPaths(&.{ old_ref_name, new_ref_name });
+        defer sync_paths.deinit();
+
+        self.writeRefFileAtomic(new_ref_name, current) catch |err| {
+            self.syncRefAndReflogDirectories(&sync_paths) catch {};
+            return err;
+        };
+        self.deleteRefFile(old_ref_name) catch |err| {
+            self.syncRefAndReflogDirectories(&sync_paths) catch {};
+            return err;
+        };
+        self.appendReflog(old_ref_name, current, current, reason) catch |err| {
+            self.syncRefAndReflogDirectories(&sync_paths) catch {};
+            return err;
+        };
+        self.appendReflog(new_ref_name, null, current, reason) catch |err| {
+            self.syncRefAndReflogDirectories(&sync_paths) catch {};
+            return err;
+        };
+        try self.syncRefAndReflogDirectories(&sync_paths);
     }
 
     pub fn loadReflog(self: *RefStore, alloc: std.mem.Allocator, ref_name: []const u8, max_entries: usize) ![]ReflogEntry {
@@ -986,9 +1036,42 @@ pub const RefStore = struct {
         }
 
         for (updates, 0..) |update, idx| {
-            try self.writeRefFileAtomic(update.ref_name, update.new_id);
-            try self.appendReflog(update.ref_name, old_ids[idx], update.new_id, reason);
+            var sync_paths = try self.prepareRefAndReflogSyncPaths(&.{update.ref_name});
+            defer sync_paths.deinit();
+
+            self.writeRefFileAtomic(update.ref_name, update.new_id) catch |err| {
+                self.syncRefAndReflogDirectories(&sync_paths) catch {};
+                return err;
+            };
+            self.appendReflog(update.ref_name, old_ids[idx], update.new_id, reason) catch |err| {
+                self.syncRefAndReflogDirectories(&sync_paths) catch {};
+                return err;
+            };
+            try self.syncRefAndReflogDirectories(&sync_paths);
         }
+    }
+
+    fn prepareRefAndReflogSyncPaths(self: *RefStore, ref_names: []const []const u8) !PreparedDirectorySyncPaths {
+        var prepared = PreparedDirectorySyncPaths{
+            .alloc = self.alloc,
+            .paths = std.array_list.Managed([]const u8).init(self.alloc),
+        };
+        errdefer prepared.deinit();
+        if (self.fsync == .none) return prepared;
+
+        try prepared.paths.ensureTotalCapacity(try std.math.mul(usize, ref_names.len, 2));
+        for (ref_names) |ref_name| {
+            const ref_path = try std.fmt.allocPrint(self.alloc, "refs/{s}", .{ref_name});
+            prepared.paths.appendAssumeCapacity(ref_path);
+            const log_path = try std.fmt.allocPrint(self.alloc, "logs/refs/{s}", .{ref_name});
+            prepared.paths.appendAssumeCapacity(log_path);
+        }
+        return prepared;
+    }
+
+    fn syncRefAndReflogDirectories(self: *RefStore, prepared: *const PreparedDirectorySyncPaths) !void {
+        if (self.fsync == .none) return;
+        try syncPublicationDirs(self.root, self.fsync, prepared.paths.items);
     }
 
     fn updateReftableRefTxn(self: *RefStore, updates: []const RefTxnUpdate, reason: []const u8) !void {
@@ -1065,9 +1148,6 @@ pub const RefStore = struct {
             },
             else => return err,
         };
-        if (self.fsync != .none) {
-            try syncDir(&self.root);
-        }
     }
 
     fn deleteRefFile(self: *RefStore, ref_name: []const u8) !void {
@@ -1077,9 +1157,6 @@ pub const RefStore = struct {
             error.FileNotFound => return error.RefNotFound,
             else => return err,
         };
-        if (self.fsync != .none) {
-            try syncDir(&self.root);
-        }
     }
 
     fn writeIntent(self: *RefStore, updates: []const RefTxnUpdate, reason: []const u8) ![]u8 {
@@ -1102,7 +1179,7 @@ pub const RefStore = struct {
         try writer_state.end();
         if (self.fsync != .none) {
             try file.sync();
-            try syncDir(&self.root);
+            try syncParentDirs(self.root, intent_path);
         }
         return intent_path;
     }
@@ -1119,12 +1196,13 @@ pub const RefStore = struct {
             else => return err,
         };
         defer file.close();
-        try file.seekFromEnd(0);
+        const end_pos = try file.getEndPos();
 
         const old_hex = if (old_id) |id| id.toHex() else [_]u8{'0'} ** 64;
         const new_hex = new_id.toHex();
         var write_buf: [256]u8 = undefined;
         var writer_state = file.writer(&write_buf);
+        try writer_state.seekTo(end_pos);
         const writer = &writer_state.interface;
         try writer.print("{d} {s} {s} {s}\n", .{
             std.time.milliTimestamp(),
@@ -1180,8 +1258,7 @@ pub const RefStore = struct {
             else => return err,
         };
         if (fsync != .none) {
-            var root_for_sync = root;
-            try syncDir(&root_for_sync);
+            try syncParentDirs(root, log_path);
         }
     }
 
@@ -1290,11 +1367,10 @@ pub const RefStore = struct {
 
         try self.root.makePath("reftable");
         try self.root.makePath("reftable/info");
-        try writeReftableTablesList(self.alloc, self.root, table_names, self.fsync);
         try writeReftableState(self.alloc, self.root, .{
             .next_update_index = try inferNextReftableUpdateIndexFromNames(table_names),
         }, self.fsync);
-        try rebuildReftableSummaryIndex(self.alloc, self.root, self.fsync);
+        try publishReftableTablesList(self.alloc, self.root, table_names, self.fsync);
         return .{
             .state_rebuilt = true,
             .tables_list_rebuilt = true,
@@ -1374,10 +1450,12 @@ pub const RefStore = struct {
             }
             if (!changed) continue;
             if (kept.items.len == 0) {
+                var deleted = true;
                 self.root.deleteFile(path) catch |err| switch (err) {
-                    error.FileNotFound => {},
+                    error.FileNotFound => deleted = false,
                     else => return err,
                 };
+                if (deleted and self.fsync != .none) try syncParentDirs(self.root, path);
                 continue;
             }
             try writeLooseReflogFile(self.alloc, self.root, path, kept.items, self.fsync);
@@ -1457,8 +1535,7 @@ pub const RefStore = struct {
         }
         for (tables) |name| try next.append(try self.alloc.dupe(u8, name));
         try next.append(try self.alloc.dupe(u8, table_name));
-        try writeReftableTablesList(self.alloc, self.root, next.items, self.fsync);
-        try rebuildReftableSummaryIndex(self.alloc, self.root, self.fsync);
+        try publishReftableTablesList(self.alloc, self.root, next.items, self.fsync);
     }
 
     fn writeReftableSnapshot(self: *RefStore, refs: []const RefEntry, reflogs: []const ReflogEntry) !void {
@@ -1487,8 +1564,7 @@ pub const RefStore = struct {
         defer self.alloc.free(table_name);
         try writeReftableTable(self.alloc, self.root, table_name, span, ref_records, reflogs, self.fsync);
         const names = [_][]const u8{table_name};
-        try writeReftableTablesList(self.alloc, self.root, names[0..], self.fsync);
-        try rebuildReftableSummaryIndex(self.alloc, self.root, self.fsync);
+        try publishReftableTablesList(self.alloc, self.root, names[0..], self.fsync);
     }
 
     fn replaceReftableSnapshot(self: *RefStore, refs: []const RefEntry, reflogs: []const ReflogEntry) !void {
@@ -1520,12 +1596,15 @@ pub const RefStore = struct {
         defer self.alloc.free(table_name);
         try writeReftableTable(self.alloc, self.root, table_name, span, ref_records, reflogs, self.fsync);
         const names = [_][]const u8{table_name};
-        try writeReftableTablesList(self.alloc, self.root, names[0..], self.fsync);
-        try rebuildReftableSummaryIndex(self.alloc, self.root, self.fsync);
+        try publishReftableTablesList(self.alloc, self.root, names[0..], self.fsync);
 
         for (existing_names) |name| {
             if (std.mem.eql(u8, name, table_name)) continue;
-            self.root.deleteFile(name) catch {};
+            var deleted = true;
+            self.root.deleteFile(name) catch {
+                deleted = false;
+            };
+            if (deleted and self.fsync != .none) try syncParentDirs(self.root, name);
         }
     }
 
@@ -1564,9 +1643,14 @@ pub const RefStore = struct {
         }
         for (table_names[0..start]) |name| try next.append(try self.alloc.dupe(u8, name));
         try next.append(try self.alloc.dupe(u8, merged_name));
-        try writeReftableTablesList(self.alloc, self.root, next.items, self.fsync);
-        try rebuildReftableSummaryIndex(self.alloc, self.root, self.fsync);
-        for (table_names[start..]) |name| self.root.deleteFile(name) catch {};
+        try publishReftableTablesList(self.alloc, self.root, next.items, self.fsync);
+        for (table_names[start..]) |name| {
+            var deleted = true;
+            self.root.deleteFile(name) catch {
+                deleted = false;
+            };
+            if (deleted and self.fsync != .none) try syncParentDirs(self.root, name);
+        }
     }
 
     fn hasReftableTables(self: *RefStore) !bool {
@@ -2293,6 +2377,8 @@ pub const SnapshotDiff = struct {
     segments_removed: usize,
     market_segments_added: usize = 0,
     market_segments_removed: usize = 0,
+    market_schemas_changed: usize = 0,
+    market_series_entries_changed: usize = 0,
     tags_changed: usize,
     series_entries_changed: usize,
     wal_chunks_added: usize,
@@ -2391,6 +2477,30 @@ const ObjectLogicalRole = enum(u8) {
     wal_index = 4,
     checkpoint_state = 5,
     market_segment_descriptor = 6,
+};
+
+const ReachabilityHint = enum(u8) {
+    generic = 0,
+    snapshot_root = 1,
+    metadata_tree = 2,
+    segment_tree = 3,
+    market_segment_tree = 4,
+    wal_tree = 5,
+    segment_descriptor = 6,
+    market_segment_descriptor = 7,
+    wal_index = 8,
+    checkpoint_state = 9,
+};
+
+const ReachabilityVisit = struct {
+    id: object_store.ObjectId,
+    hint: ReachabilityHint,
+    source: ?object_store.ObjectId = null,
+};
+
+const ReachabilityVisitKey = struct {
+    id: object_store.ObjectId,
+    hint: ReachabilityHint,
 };
 
 const ObjectRefsIndexRecord = struct {
@@ -2671,7 +2781,9 @@ pub const CasManager = struct {
         const parent = try self.refs.readHead(main_ref);
         var writer = CommitWriter{ .alloc = self.alloc, .store = &self.store, .extent_chunk_bytes = self.format.extent_chunk_bytes };
         const commit_id = try writer.writeSnapshotWithNativeMarket(data_dir, manifest, tags, series_catalog, metric_catalog, market_catalog, market_manifest, parent, reason);
+        crash_injection.hit(.after_cas_object_write);
         try self.refs.compareAndSwapRef(main_ref, parent, commit_id, reason);
+        crash_injection.hit(.after_ref_update);
         try self.refreshCommitGraph();
         return commit_id;
     }
@@ -2750,7 +2862,9 @@ pub const CasManager = struct {
         _ = try self.fsck(data_dir, .{});
         try self.refs.migrateLooseToReftable();
         self.format.ref_backend = .reftable;
-        self.format.version = current_repository_format_version;
+        if (self.format.version < primary_repository_format_version) {
+            self.format.version = primary_repository_format_version;
+        }
         try writeRepositoryFormat(self.alloc, self.store.root, self.format, self.store.fsync);
         self.refs.setBackend(.reftable);
         try self.ensureHeadSymRef();
@@ -2761,11 +2875,13 @@ pub const CasManager = struct {
         const fsck_before = try self.fsck(data_dir, .{});
 
         var migrated_reftable = false;
-        if (self.format.ref_backend != .reftable or self.format.version < current_repository_format_version) {
+        if (self.format.ref_backend != .reftable or self.format.version < primary_repository_format_version) {
             try self.refs.migrateLooseToReftable();
             self.refs.setBackend(.reftable);
             self.format.ref_backend = .reftable;
-            self.format.version = current_repository_format_version;
+            if (self.format.version < primary_repository_format_version) {
+                self.format.version = primary_repository_format_version;
+            }
             try writeRepositoryFormat(self.alloc, self.store.root, self.format, self.store.fsync);
             migrated_reftable = true;
         }
@@ -2784,6 +2900,39 @@ pub const CasManager = struct {
             .normalized_commits = normalized_commits,
             .compatibility_debt = if (normalized_commits == 0) fsck_before.compatibility_debt else fsck_after.compatibility_debt,
         };
+    }
+
+    /// Advance a format-3 reftable repository to format 4 after native-market
+    /// migration has completed. The migration state coordinates this marker
+    /// update with the catalog rewrite and final CAS snapshot.
+    pub fn promoteFormatForNativeMarket(self: *CasManager) !bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        if (self.format.version == current_repository_format_version) {
+            if (self.format.ref_backend != .reftable) {
+                return error.RepositoryFormatMismatch;
+            }
+            return false;
+        }
+        if (self.format.version != primary_repository_format_version or
+            self.format.ref_backend != .reftable)
+        {
+            return error.RepositoryFormatMismatch;
+        }
+
+        const previous = self.format;
+        self.format.version = current_repository_format_version;
+        writeRepositoryFormat(
+            self.alloc,
+            self.store.root,
+            self.format,
+            .always,
+        ) catch |err| {
+            self.format = previous;
+            return err;
+        };
+        return true;
     }
 
     pub fn readHeadSymRef(self: *CasManager) !?[]u8 {
@@ -3075,6 +3224,31 @@ pub const CasManager = struct {
         return ref_name;
     }
 
+    /// Create a checkpoint at a caller-selected ref. Repeating the operation
+    /// for the same head is a no-op. An existing ref to another commit is a
+    /// conflict and remains unchanged.
+    pub fn createCheckpointAtRef(self: *CasManager, ref_name: []const u8) !bool {
+        if (!std.mem.startsWith(u8, ref_name, "checkpoints/") or
+            ref_name.len == "checkpoints/".len)
+        {
+            return error.InvalidCheckpointRef;
+        }
+        const head = try self.refs.readHead(main_ref) orelse return error.MissingCasHead;
+        if (try self.refs.readRef(ref_name)) |existing| {
+            if (existing.eql(head)) return false;
+            return error.RefConflict;
+        }
+
+        self.refs.compareAndSwapRef(ref_name, null, head, "create-checkpoint") catch |err| {
+            if (err != error.RefConflict) return err;
+            const raced = try self.refs.readRef(ref_name) orelse return err;
+            if (raced.eql(head)) return false;
+            return err;
+        };
+        try self.refreshCommitGraph();
+        return true;
+    }
+
     pub fn rollbackMainTo(self: *CasManager, spec: []const u8) !void {
         const target = try self.resolveCommitSpec(spec);
         const current = try self.refs.readHead(main_ref);
@@ -3103,6 +3277,8 @@ pub const CasManager = struct {
                         .segments_removed = 0,
                         .market_segments_added = 0,
                         .market_segments_removed = 0,
+                        .market_schemas_changed = 0,
+                        .market_series_entries_changed = 0,
                         .tags_changed = 0,
                         .series_entries_changed = 0,
                         .wal_chunks_added = 0,
@@ -3128,6 +3304,8 @@ pub const CasManager = struct {
             .segments_removed = countDescriptorsNotIn(lhs.segment_descriptors, rhs.segment_descriptors),
             .market_segments_added = countMarketSegmentDescriptorsNotIn(rhs.market_segment_descriptors, lhs.market_segment_descriptors),
             .market_segments_removed = countMarketSegmentDescriptorsNotIn(lhs.market_segment_descriptors, rhs.market_segment_descriptors),
+            .market_schemas_changed = countMarketSchemasChanged(lhs.market_catalog_snapshot, rhs.market_catalog_snapshot),
+            .market_series_entries_changed = countMarketSeriesEntriesChanged(lhs.market_catalog_snapshot, rhs.market_catalog_snapshot),
             .tags_changed = countTagEntriesChanged(lhs.tag_snapshot.entries, rhs.tag_snapshot.entries),
             .series_entries_changed = countSeriesEntriesChanged(lhs.series_catalog_snapshot.entries, rhs.series_catalog_snapshot.entries),
             .wal_chunks_added = countWalChunksNotIn(rhs.wal_index.entries, lhs.wal_index.entries),
@@ -3142,6 +3320,12 @@ pub const CasManager = struct {
     pub fn exportSpecToLegacy(self: *CasManager, spec: []const u8, data_dir: std.fs.Dir) !void {
         var snapshot = try self.loadSnapshotForSpec(spec);
         defer snapshot.deinit(self.alloc);
+
+        if (self.format.version == primary_repository_format_version and
+            snapshotHasNativeMarket(snapshot))
+        {
+            return error.RepositoryFormatMismatch;
+        }
 
         try materializeSnapshotMirrors(self.alloc, data_dir, &self.store, snapshot);
         try writeManifestFile(self.alloc, data_dir, snapshot.segment_descriptors);
@@ -3193,7 +3377,7 @@ pub const CasManager = struct {
         if (!options.dry_run and unreachable_ids.items.len > 0) {
             const stamp_ms = now_ms;
             if (existing_pack_paths.len > 0) {
-                try quarantinePackFiles(self.alloc, self.store.root, existing_pack_paths, stamp_ms);
+                try quarantinePackFiles(self.alloc, self.store.root, existing_pack_paths, stamp_ms, self.store.fsync);
                 if (reachable.count() > 0) {
                     var reachable_ids = std.array_list.Managed(object_store.ObjectId).init(self.alloc);
                     defer reachable_ids.deinit();
@@ -3202,7 +3386,7 @@ pub const CasManager = struct {
                     var pack_write = try self.store.writePack(self.alloc, reachable_ids.items);
                     defer pack_write.deinit(self.alloc);
                 } else {
-                    try deleteActivePackFiles(self.store.root, existing_pack_paths);
+                    try deleteActivePackFiles(self.store.root, existing_pack_paths, self.store.fsync);
                 }
             }
 
@@ -3223,6 +3407,7 @@ pub const CasManager = struct {
         if (!options.dry_run) {
             for (prunable.entries) |entry| {
                 try self.store.root.deleteTree(entry.path);
+                if (self.store.fsync != .none) try syncParentDirs(self.store.root, entry.path);
                 pruned_count += entry.file_count;
                 pruned_bytes += entry.bytes;
             }
@@ -3324,7 +3509,28 @@ pub const CasManager = struct {
             const loaded = try self.store.get(self.alloc, id_ptr.*);
             defer self.alloc.free(loaded.payload);
             switch (loaded.obj_type) {
-                .commit => report.commit_objects += 1,
+                .commit => {
+                    report.commit_objects += 1;
+                    if (options.mode == .full) {
+                        var reader = CommitReader{
+                            .alloc = self.alloc,
+                            .store = &self.store,
+                            .refs = &self.refs,
+                        };
+                        var snapshot = try reader.loadSnapshot(id_ptr.*);
+                        defer snapshot.deinit(self.alloc);
+                        try validateNativeMarketSnapshotCatalog(snapshot);
+                        for (snapshot.market_segment_descriptors) |descriptor| {
+                            try validateMarketSegmentDescriptor(self.alloc, descriptor);
+                            try validateMarketSegmentRootMatchesDescriptor(
+                                self.alloc,
+                                &self.store,
+                                descriptor,
+                            );
+                            report.market_segment_contents_checked += 1;
+                        }
+                    }
+                },
                 .tree => report.tree_objects += 1,
                 .blob => {
                     report.blob_objects += 1;
@@ -3431,8 +3637,6 @@ pub const CasManager = struct {
             }
 
             for (snapshot.snapshot.market_segment_descriptors) |descriptor| {
-                try validateMarketSegmentRootMatchesDescriptor(self.alloc, &self.store, descriptor);
-                report.market_segment_contents_checked += 1;
                 if (descriptor.mirrorPath().len != 0) {
                     _ = data_dir.statFile(descriptor.mirrorPath()) catch |err| switch (err) {
                         error.FileNotFound => report.missing_market_segment_mirrors += 1,
@@ -3483,13 +3687,11 @@ pub const CasManager = struct {
     }
 
     pub fn pack(self: *CasManager) !PackResult {
-        const refs = try self.refs.listRefs(self.alloc);
-        defer {
-            for (refs) |*entry| entry.deinit(self.alloc);
-            self.alloc.free(refs);
-        }
-
-        var reachable = try self.collectReachable(refs);
+        var inputs = try self.collectReachabilityInputs(true);
+        defer inputs.deinit(self.alloc);
+        var direct_reachable = try self.collectReachable(inputs.refs);
+        defer direct_reachable.deinit();
+        var reachable = try self.collectReachableFromInputs(inputs);
         defer reachable.deinit();
 
         const all_ids = try self.store.listIds(self.alloc);
@@ -3544,11 +3746,7 @@ pub const CasManager = struct {
         defer self.alloc.free(reachable_ids);
         try writeReachabilityBitmap(self.alloc, self.store.root, refs, reachable_ids, self.store.fsync);
 
-        var refs_index = try buildObjectRefsIndex(
-            self.alloc,
-            &self.store,
-            self.format.version <= primary_repository_format_version,
-        );
+        var refs_index = try buildObjectRefsIndex(self.alloc, &self.store);
         defer refs_index.deinit(self.alloc);
         try writeObjectRefsIndex(self.alloc, self.store.root, refs_index, self.store.fsync);
     }
@@ -3612,8 +3810,10 @@ pub const CasManager = struct {
         var seen = std.AutoHashMap(object_store.ObjectId, void).init(self.alloc);
         errdefer seen.deinit();
 
-        var stack = std.array_list.Managed(object_store.ObjectId).init(self.alloc);
+        var stack = std.array_list.Managed(ReachabilityVisit).init(self.alloc);
         defer stack.deinit();
+        var visited = std.AutoHashMap(ReachabilityVisitKey, void).init(self.alloc);
+        defer visited.deinit();
 
         var refs_index = loadObjectRefsIndex(self.alloc, self.store.root) catch |err| switch (err) {
             error.FileNotFound, error.CorruptObjectRefsIndex, error.UnsupportedObjectRefsIndexVersion => null,
@@ -3622,25 +3822,42 @@ pub const CasManager = struct {
         defer if (refs_index) |*index| index.deinit(self.alloc);
 
         for (starts) |id| {
-            try stack.append(id);
+            try stack.append(.{ .id = id, .hint = .generic });
         }
 
-        while (stack.pop()) |id| {
-            const gop = try seen.getOrPut(id);
-            if (gop.found_existing) continue;
+        while (stack.pop()) |visit| {
+            const visit_gop = try visited.getOrPut(.{ .id = visit.id, .hint = visit.hint });
+            if (visit_gop.found_existing) continue;
+            try seen.put(visit.id, {});
 
             if (refs_index) |index| {
-                if (index.lookup(id)) |record| {
-                    for (record.children) |child| {
-                        try stack.append(child);
+                if (visit.hint == .generic) {
+                    if (index.lookup(visit.id)) |record| {
+                        if (record.obj_type != .commit) {
+                            for (record.children) |child| {
+                                try stack.append(.{ .id = child, .hint = .generic, .source = visit.id });
+                            }
+                            continue;
+                        }
                     }
-                    continue;
                 }
             }
 
-            const loaded = self.store.get(self.alloc, id) catch |err| {
-                const hex = id.toHex();
-                std.log.err("CAS reachability references missing object {s}", .{hex[0..]});
+            const loaded = self.store.get(self.alloc, visit.id) catch |err| {
+                const hex = visit.id.toHex();
+                if (visit.source) |source| {
+                    const source_hex = source.toHex();
+                    std.log.err("CAS reachability references missing object {s} role={s} source={s}", .{
+                        hex[0..],
+                        @tagName(visit.hint),
+                        source_hex[0..],
+                    });
+                } else {
+                    std.log.err("CAS reachability references missing object {s} role={s}", .{
+                        hex[0..],
+                        @tagName(visit.hint),
+                    });
+                }
                 return err;
             };
             defer self.alloc.free(loaded.payload);
@@ -3649,23 +3866,34 @@ pub const CasManager = struct {
                 .commit => {
                     var commit = try decodeCommit(self.alloc, loaded.payload);
                     defer commit.deinit(self.alloc);
-                    try stack.append(commit.root);
+                    try stack.append(.{ .id = commit.root, .hint = .snapshot_root, .source = visit.id });
                     for (commit.parents) |parent| {
-                        try stack.append(parent);
+                        try stack.append(.{ .id = parent, .hint = .generic, .source = visit.id });
                     }
                 },
                 .tree => {
                     var tree = try decodeTree(self.alloc, loaded.payload);
                     defer tree.deinit(self.alloc);
                     for (tree.entries) |entry| {
-                        try stack.append(entry.object_id);
+                        try stack.append(.{
+                            .id = entry.object_id,
+                            .hint = reachabilityHintForTreeEntry(visit.hint, entry),
+                            .source = visit.id,
+                        });
                     }
                 },
-                .blob => try appendReferencedBlobObjects(
-                    &stack,
-                    loaded.payload,
-                    self.format.version <= primary_repository_format_version,
-                ),
+                .blob => {
+                    var children = std.array_list.Managed(object_store.ObjectId).init(self.alloc);
+                    defer children.deinit();
+                    try appendReferencedBlobObjects(
+                        &children,
+                        loaded.payload,
+                        objectRoleForReachabilityHint(visit.hint),
+                    );
+                    for (children.items) |child| {
+                        try stack.append(.{ .id = child, .hint = .generic, .source = visit.id });
+                    }
+                },
                 else => return error.UnsupportedCasObjectType,
             }
         }
@@ -3882,12 +4110,58 @@ fn reachableMapToSortedIds(
     return ids;
 }
 
+fn reachabilityHintForTreeEntry(parent: ReachabilityHint, entry: TreeEntry) ReachabilityHint {
+    return switch (parent) {
+        .snapshot_root => if (entry.object_type == .tree and std.mem.eql(u8, entry.name, "metadata"))
+            .metadata_tree
+        else if (entry.object_type == .tree and std.mem.eql(u8, entry.name, "wal"))
+            .wal_tree
+        else
+            .generic,
+        .metadata_tree => if (entry.object_type == .tree and std.mem.eql(u8, entry.name, "segments"))
+            .segment_tree
+        else if (entry.object_type == .tree and std.mem.eql(u8, entry.name, "market_segments"))
+            .market_segment_tree
+        else
+            .generic,
+        .segment_tree => if (entry.object_type == .tree)
+            .segment_tree
+        else if (entry.object_type == .blob)
+            .segment_descriptor
+        else
+            .generic,
+        .market_segment_tree => if (entry.object_type == .tree)
+            .market_segment_tree
+        else if (entry.object_type == .blob)
+            .market_segment_descriptor
+        else
+            .generic,
+        .wal_tree => if (entry.object_type == .blob and std.mem.eql(u8, entry.name, "index"))
+            .wal_index
+        else if (entry.object_type == .blob and std.mem.eql(u8, entry.name, "checkpoint"))
+            .checkpoint_state
+        else
+            .generic,
+        else => .generic,
+    };
+}
+
+fn objectRoleForReachabilityHint(hint: ReachabilityHint) ?ObjectLogicalRole {
+    return switch (hint) {
+        .segment_descriptor => .segment_descriptor,
+        .market_segment_descriptor => .market_segment_descriptor,
+        .wal_index => .wal_index,
+        .checkpoint_state => .checkpoint_state,
+        else => null,
+    };
+}
+
 fn appendReferencedBlobObjects(
     stack: *std.array_list.Managed(object_store.ObjectId),
     payload: []const u8,
-    allow_legacy: bool,
+    legacy_role: ?ObjectLogicalRole,
 ) !void {
-    if (appendSegmentDescriptorBlob(stack, payload, allow_legacy) catch |err| switch (err) {
+    if (appendSegmentDescriptorBlob(stack, payload, legacy_role == .segment_descriptor) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => false,
     }) return;
@@ -3895,11 +4169,11 @@ fn appendReferencedBlobObjects(
         error.OutOfMemory => return err,
         else => false,
     }) return;
-    if (appendCheckpointStateBlob(stack, payload, allow_legacy) catch |err| switch (err) {
+    if (appendCheckpointStateBlob(stack, payload, legacy_role == .checkpoint_state) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => false,
     }) return;
-    _ = appendWalIndexBlob(stack, payload, allow_legacy) catch |err| switch (err) {
+    _ = appendWalIndexBlob(stack, payload, legacy_role == .wal_index) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => false,
     };
@@ -3908,7 +4182,6 @@ fn appendReferencedBlobObjects(
 fn buildObjectRefsIndex(
     alloc: std.mem.Allocator,
     store: *object_store.ObjectStore,
-    allow_legacy: bool,
 ) !ObjectRefsIndex {
     const ids = try store.listIds(alloc);
     defer alloc.free(ids);
@@ -3942,7 +4215,7 @@ fn buildObjectRefsIndex(
                 for (tree.entries) |entry| try children.append(entry.object_id);
             },
             .blob => {
-                if (appendSegmentDescriptorBlob(&children, loaded.payload, allow_legacy) catch |err| switch (err) {
+                if (appendSegmentDescriptorBlob(&children, loaded.payload, false) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => false,
                 }) {
@@ -3952,12 +4225,12 @@ fn buildObjectRefsIndex(
                     else => false,
                 }) {
                     role = .market_segment_descriptor;
-                } else if (appendCheckpointStateBlob(&children, loaded.payload, allow_legacy) catch |err| switch (err) {
+                } else if (appendCheckpointStateBlob(&children, loaded.payload, false) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => false,
                 }) {
                     role = .checkpoint_state;
-                } else if (appendWalIndexBlob(&children, loaded.payload, allow_legacy) catch |err| switch (err) {
+                } else if (appendWalIndexBlob(&children, loaded.payload, false) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => false,
                 }) {
@@ -4001,6 +4274,7 @@ fn writeObjectRefsIndex(alloc: std.mem.Allocator, root: std.fs.Dir, index: Objec
         },
         else => return err,
     };
+    if (fsync != .none) try syncParentDirs(root, object_refs_index_path);
 }
 
 fn loadObjectRefsIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !ObjectRefsIndex {
@@ -4018,7 +4292,7 @@ fn loadObjectRefsIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !ObjectRefsIn
 
     var cursor = Cursor{ .bytes = bytes[object_refs_magic.len..checksum_start] };
     const version = try cursor.readInt(u16);
-    if (version != 1) return error.UnsupportedObjectRefsIndexVersion;
+    if (version != 2) return error.UnsupportedObjectRefsIndexVersion;
     const record_count = try cursor.readInt(u64);
     var records = try alloc.alloc(ObjectRefsIndexRecord, @intCast(record_count));
     var loaded_records: usize = 0;
@@ -4050,7 +4324,7 @@ fn encodeObjectRefsIndex(alloc: std.mem.Allocator, index: ObjectRefsIndex) ![]u8
     errdefer bytes.deinit();
 
     try bytes.appendSlice(object_refs_magic[0..]);
-    try appendInt(&bytes, u16, 1);
+    try appendInt(&bytes, u16, 2);
     try appendInt(&bytes, u64, @intCast(index.records.len));
     for (index.records) |record| {
         try bytes.appendSlice(record.id.hash[0..]);
@@ -4144,7 +4418,8 @@ fn appendSegmentDescriptorBlob(
         else => unreachable,
     }
 
-    _ = try readStringAt(payload, &idx);
+    const mirror_path = try readStringAt(payload, &idx);
+    if (!std.mem.startsWith(u8, mirror_path, "segments/")) return false;
     idx += 32; // file hash
     _ = try readIntAt(payload, &idx, u64); // file_size
     _ = try readIntAt(payload, &idx, u64); // series_id
@@ -4684,6 +4959,9 @@ fn readBundleManifest(alloc: std.mem.Allocator, bundle_path: []const u8) !Bundle
         try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "repository_format_version")
     else
         legacy_repository_format_version;
+    if (repository_format_version > current_repository_format_version) {
+        return error.UnsupportedRepositoryFormatVersion;
+    }
     const ref_backend = if (format_version >= 2)
         std.meta.intToEnum(RefBackend, @as(u8, @intCast(try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "ref_backend")))) catch return error.InvalidBundle
     else
@@ -5132,6 +5410,7 @@ pub fn applyBundle(alloc: std.mem.Allocator, bundle_path: []const u8, dst_path: 
 
     const verify = try verifyBundle(alloc, bundle_path);
     _ = verify;
+    try rejectRepositoryFormatAdvance(dst_path, manifest.repository_format_version);
 
     var bundle_root = try std.fs.cwd().openDir(bundle_path, .{ .iterate = true });
     defer bundle_root.close();
@@ -5276,6 +5555,7 @@ pub fn cloneLocalRepositoryWithOptions(
     if (options.borrow) {
         var source = try CasManager.init(alloc, src_path, fsync);
         defer source.deinit();
+        try rejectRepositoryFormatAdvance(dst_path, source.format.version);
         var dest = try CasManager.init(alloc, dst_path, fsync);
         defer dest.deinit();
 
@@ -5403,6 +5683,7 @@ pub fn pushLocalRepositoryWithOptions(
 ) !LocalExchangeResult {
     var source = try CasManager.init(alloc, src_path, fsync);
     defer source.deinit();
+    try rejectRepositoryFormatAdvance(dst_path, source.format.version);
     var dest = try CasManager.init(alloc, dst_path, fsync);
     defer dest.deinit();
 
@@ -5427,6 +5708,26 @@ pub fn pushLocalRepositoryWithOptions(
         .ref_count = 1,
         .borrowed_repositories = dest.store.alternates.repo_paths.len,
     };
+}
+
+fn rejectRepositoryFormatAdvance(
+    dst_path: []const u8,
+    incoming_version: u16,
+) !void {
+    var root = std.fs.cwd().openDir(dst_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer root.close();
+    const existing = loadRepositoryFormat(root) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    if (incoming_version > existing.version and
+        existing.version >= primary_repository_format_version)
+    {
+        return error.RepositoryFormatMismatch;
+    }
 }
 
 fn mergeRepositoryPaths(alloc: std.mem.Allocator, existing: []const []const u8, additional: []const u8) ![][]u8 {
@@ -5770,7 +6071,13 @@ fn countProtectedObjects(reachable: *const std.AutoHashMap(object_store.ObjectId
     return protected;
 }
 
-fn quarantinePackFiles(alloc: std.mem.Allocator, root: std.fs.Dir, pack_paths: [][]u8, stamp_ms: i64) !void {
+fn quarantinePackFiles(
+    alloc: std.mem.Allocator,
+    root: std.fs.Dir,
+    pack_paths: [][]u8,
+    stamp_ms: i64,
+    fsync: cfg.FsyncPolicy,
+) !void {
     const dst_dir = try std.fmt.allocPrint(alloc, "objects/cruft/{d}/packs", .{stamp_ms});
     defer alloc.free(dst_dir);
     try root.makePath(dst_dir);
@@ -5779,17 +6086,77 @@ fn quarantinePackFiles(alloc: std.mem.Allocator, root: std.fs.Dir, pack_paths: [
         const base = std.fs.path.basename(path);
         const dst_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dst_dir, base });
         defer alloc.free(dst_path);
-        root.copyFile(path, root, dst_path, .{}) catch |err| switch (err) {
+        copyPackForQuarantine(root, path, dst_path, fsync) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
     }
+
+    if (fsync != .none) {
+        var destination_dir = try root.openDir(dst_dir, .{});
+        defer destination_dir.close();
+        try syncDir(destination_dir);
+        try syncParentDirs(root, dst_dir);
+    }
 }
 
-fn deleteActivePackFiles(root: std.fs.Dir, pack_paths: [][]u8) !void {
-    for (pack_paths) |path| {
-        root.deleteFile(path) catch {};
+fn copyPackForQuarantine(root: std.fs.Dir, src_path: []const u8, dst_path: []const u8, fsync: cfg.FsyncPolicy) !void {
+    var source_reader: std.fs.File.Reader = .init(try root.openFile(src_path, .{}), &.{});
+    defer source_reader.file.close();
+    const source_stat = try source_reader.file.stat();
+
+    var write_buffer: [1024]u8 = undefined;
+    var atomic_file = try root.atomicFile(dst_path, .{
+        .mode = source_stat.mode,
+        .write_buffer = &write_buffer,
+    });
+    defer atomic_file.deinit();
+
+    _ = atomic_file.file_writer.interface.sendFileAll(&source_reader, .unlimited) catch |err| switch (err) {
+        error.ReadFailed => return source_reader.err.?,
+        error.WriteFailed => return atomic_file.file_writer.err.?,
+    };
+    try atomic_file.file_writer.file.chmod(source_stat.mode);
+    if (fsync != .none) {
+        try atomic_file.flush();
+        try atomic_file.file_writer.file.sync();
     }
+    try atomic_file.finish();
+}
+
+fn deleteActivePackFiles(root: std.fs.Dir, pack_paths: [][]u8, fsync: cfg.FsyncPolicy) !void {
+    for (pack_paths) |path| {
+        var deleted = true;
+        root.deleteFile(path) catch {
+            deleted = false;
+        };
+        if (deleted and fsync != .none) try syncParentDirs(root, path);
+    }
+}
+
+test "gc quarantine preserves read-only pack modes while syncing the copy" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("objects/packs");
+    var source = try tmp.dir.createFile("objects/packs/read-only.pack", .{ .read = true });
+    defer source.close();
+    try source.writeAll("read-only pack contents");
+    try source.chmod(0o444);
+    const source_stat = try source.stat();
+
+    const source_path = try alloc.dupe(u8, "objects/packs/read-only.pack");
+    defer alloc.free(source_path);
+    var pack_paths = [_][]u8{source_path};
+    try quarantinePackFiles(alloc, tmp.dir, pack_paths[0..], 123, .always);
+
+    const destination_path = "objects/cruft/123/packs/read-only.pack";
+    const destination_stat = try tmp.dir.statFile(destination_path);
+    try std.testing.expectEqual(source_stat.mode, destination_stat.mode);
+    const copied = try tmp.dir.readFileAlloc(alloc, destination_path, 128);
+    defer alloc.free(copied);
+    try std.testing.expectEqualStrings("read-only pack contents", copied);
 }
 
 fn scanExpiredCruft(alloc: std.mem.Allocator, root: std.fs.Dir, now_ms: i64, grace_period_ms: i64) !CruftScan {
@@ -6206,6 +6573,7 @@ fn writeCommitGraph(alloc: std.mem.Allocator, root: std.fs.Dir, graph: CommitGra
         },
         else => return err,
     };
+    if (fsync != .none) try syncParentDirs(root, commit_graph_path);
 }
 
 fn loadCommitGraph(alloc: std.mem.Allocator, root: std.fs.Dir) !CommitGraph {
@@ -6327,8 +6695,7 @@ fn writeReachabilityBitmap(
         else => return err,
     };
     if (fsync != .none) {
-        var root_for_sync = root;
-        try syncDir(&root_for_sync);
+        try syncParentDirs(root, reachability_bitmap_path);
     }
 }
 
@@ -6397,13 +6764,18 @@ pub fn probeOrInitRepositoryFormatWithState(
 ) !RepositoryFormatProbe {
     try preflightRepositoryFormatVersion(path);
     var cwd = std.fs.cwd();
-    try cwd.makePath(path);
+    const existing_parent = if (fsync != .none) try nearestExistingParent(cwd, path) else null;
+    const path_status = try cwd.makePathStatus(path);
     var root = try cwd.openDir(path, .{ .iterate = true });
     defer root.close();
     const fresh_repository = !try hasRepositoryApplicationState(root);
     try root.makePath("objects/info");
+    const format = try loadOrInitRepositoryFormat(alloc, root, fsync);
+    if (fsync != .none and path_status == .created) {
+        try syncCreatedPathParents(cwd, path, existing_parent.?);
+    }
     return .{
-        .format = try loadOrInitRepositoryFormat(alloc, root, fsync),
+        .format = format,
         .fresh_repository = fresh_repository,
     };
 }
@@ -6618,8 +6990,7 @@ fn writeRepositoryFormat(alloc: std.mem.Allocator, root: std.fs.Dir, format: Rep
         else => return err,
     };
     if (fsync != .none) {
-        var mutable_root = root;
-        try syncDir(&mutable_root);
+        try syncParentDirs(root, store_format_path);
     }
 }
 
@@ -6699,16 +7070,34 @@ pub fn buildLegacySnapshotWithNativeMarket(
     }
 
     for (manifest.entries.items) |entry| {
-        var metadata = try segment_mod.inspectMetadata(alloc, data_dir, entry.path);
+        var metadata = segment_mod.inspectMetadata(alloc, data_dir, entry.path) catch |err| {
+            std.log.err("CAS snapshot scalar inspect failed path={s} error={s}", .{
+                entry.path,
+                @errorName(err),
+            });
+            return err;
+        };
         defer metadata.deinit(alloc);
         if (metadata.series_id != entry.series_id or metadata.hour_bucket != entry.hour_bucket or metadata.start_ts != entry.start_ts or metadata.end_ts != entry.end_ts or metadata.count != entry.count) {
             return error.ManifestSegmentMismatch;
         }
         const segment_root = if (store) |object_store_ref|
-            try segment_mod.writeSegmentRootForFile(alloc, data_dir, object_store_ref, entry.path, extent_chunk_bytes)
+            segment_mod.writeSegmentRootForFile(alloc, data_dir, object_store_ref, entry.path, extent_chunk_bytes) catch |err| {
+                std.log.err("CAS snapshot scalar root capture failed path={s} error={s}", .{
+                    entry.path,
+                    @errorName(err),
+                });
+                return err;
+            }
         else
             null;
-        const content = try ensureContentRefForFile(alloc, store, data_dir, entry.path, extent_chunk_bytes);
+        const content = ensureContentRefForFile(alloc, store, data_dir, entry.path, extent_chunk_bytes) catch |err| {
+            std.log.err("CAS snapshot scalar content capture failed path={s} error={s}", .{
+                entry.path,
+                @errorName(err),
+            });
+            return err;
+        };
         try descriptors.append(.{
             .path = try alloc.dupe(u8, entry.path),
             .mirror_path = &[_]u8{},
@@ -6739,11 +7128,23 @@ pub fn buildLegacySnapshotWithNativeMarket(
     }
     if (market_manifest) |native_manifest| {
         for (native_manifest.list()) |entry| {
-            var metadata = try market_segment_mod.inspect(alloc, data_dir, entry.path);
+            var metadata = market_segment_mod.inspect(alloc, data_dir, entry.path) catch |err| {
+                std.log.err("CAS snapshot market inspect failed path={s} error={s}", .{
+                    entry.path,
+                    @errorName(err),
+                });
+                return err;
+            };
             defer metadata.deinit(alloc);
             try validateMarketManifestDescriptorMatchesSegment(entry, &metadata);
             const market_root = if (store) |object_store_ref|
-                try market_segment_mod.writeSegmentRootForFile(alloc, data_dir, object_store_ref, entry.path, extent_chunk_bytes)
+                market_segment_mod.writeSegmentRootForFile(alloc, data_dir, object_store_ref, entry.path, extent_chunk_bytes) catch |err| {
+                    std.log.err("CAS snapshot market root capture failed path={s} error={s}", .{
+                        entry.path,
+                        @errorName(err),
+                    });
+                    return err;
+                }
             else
                 null;
             try market_descriptors.append(try cloneMarketSegmentDescriptorFromManifest(alloc, entry, market_root));
@@ -6799,56 +7200,133 @@ pub fn buildLegacySnapshotWithNativeMarket(
 }
 
 pub fn verifyLegacySnapshot(live: LegacySnapshot, stored: Snapshot) !void {
-    if (live.segment_descriptors.len != stored.segment_descriptors.len) return error.CasVerificationFailed;
-    for (live.segment_descriptors, stored.segment_descriptors) |lhs, rhs| {
-        if (!lhs.eql(rhs)) return error.CasVerificationFailed;
+    if (live.segment_descriptors.len != stored.segment_descriptors.len) {
+        return casVerificationFailure(
+            "scalar segment count live={d} stored={d}",
+            .{ live.segment_descriptors.len, stored.segment_descriptors.len },
+        );
     }
-    if (live.market_segment_descriptors.len != stored.market_segment_descriptors.len) return error.CasVerificationFailed;
-    for (live.market_segment_descriptors, stored.market_segment_descriptors) |lhs, rhs| {
-        if (!lhs.eql(rhs)) return error.CasVerificationFailed;
+    for (live.segment_descriptors, stored.segment_descriptors, 0..) |lhs, rhs, index| {
+        if (!lhs.eql(rhs)) {
+            return casVerificationFailure("scalar segment descriptor index={d}", .{index});
+        }
+    }
+    if (live.market_segment_descriptors.len != stored.market_segment_descriptors.len) {
+        return casVerificationFailure(
+            "market segment count live={d} stored={d}",
+            .{ live.market_segment_descriptors.len, stored.market_segment_descriptors.len },
+        );
+    }
+    for (live.market_segment_descriptors, stored.market_segment_descriptors, 0..) |lhs, rhs, index| {
+        if (!lhs.eql(rhs)) {
+            return casVerificationFailure("market segment descriptor index={d}", .{index});
+        }
     }
 
-    if (live.tag_snapshot.entries.len != stored.tag_snapshot.entries.len) return error.CasVerificationFailed;
-    for (live.tag_snapshot.entries, stored.tag_snapshot.entries) |lhs, rhs| {
-        if (!lhs.eql(rhs)) return error.CasVerificationFailed;
+    if (live.tag_snapshot.entries.len != stored.tag_snapshot.entries.len) {
+        return casVerificationFailure(
+            "tag count live={d} stored={d}",
+            .{ live.tag_snapshot.entries.len, stored.tag_snapshot.entries.len },
+        );
+    }
+    for (live.tag_snapshot.entries, stored.tag_snapshot.entries, 0..) |lhs, rhs, index| {
+        if (!lhs.eql(rhs)) {
+            return casVerificationFailure("tag descriptor index={d}", .{index});
+        }
     }
 
-    if (live.series_catalog_snapshot.entries.len != stored.series_catalog_snapshot.entries.len) return error.CasVerificationFailed;
-    for (live.series_catalog_snapshot.entries, stored.series_catalog_snapshot.entries) |lhs, rhs| {
-        if (!lhs.eql(rhs)) return error.CasVerificationFailed;
+    if (live.series_catalog_snapshot.entries.len != stored.series_catalog_snapshot.entries.len) {
+        return casVerificationFailure(
+            "series catalog count live={d} stored={d}",
+            .{ live.series_catalog_snapshot.entries.len, stored.series_catalog_snapshot.entries.len },
+        );
+    }
+    for (live.series_catalog_snapshot.entries, stored.series_catalog_snapshot.entries, 0..) |lhs, rhs, index| {
+        if (!lhs.eql(rhs)) {
+            return casVerificationFailure("series catalog entry index={d}", .{index});
+        }
     }
 
-    if (live.metric_catalog_snapshot.entries.len != stored.metric_catalog_snapshot.entries.len) return error.CasVerificationFailed;
-    for (live.metric_catalog_snapshot.entries, stored.metric_catalog_snapshot.entries) |lhs, rhs| {
-        if (!lhs.eql(rhs)) return error.CasVerificationFailed;
+    if (live.metric_catalog_snapshot.entries.len != stored.metric_catalog_snapshot.entries.len) {
+        return casVerificationFailure(
+            "metric catalog count live={d} stored={d}",
+            .{ live.metric_catalog_snapshot.entries.len, stored.metric_catalog_snapshot.entries.len },
+        );
+    }
+    for (live.metric_catalog_snapshot.entries, stored.metric_catalog_snapshot.entries, 0..) |lhs, rhs, index| {
+        if (!lhs.eql(rhs)) {
+            return casVerificationFailure("metric catalog entry index={d}", .{index});
+        }
     }
 
-    if ((live.market_catalog_snapshot == null) != (stored.market_catalog_snapshot == null)) return error.CasVerificationFailed;
+    if ((live.market_catalog_snapshot == null) != (stored.market_catalog_snapshot == null)) {
+        return casVerificationFailure("market catalog presence", .{});
+    }
     if (live.market_catalog_snapshot) |live_market| {
         const stored_market = stored.market_catalog_snapshot.?;
-        if (live_market.schemas.len != stored_market.schemas.len) return error.CasVerificationFailed;
-        for (live_market.schemas, stored_market.schemas) |lhs, rhs| {
-            if (!lhs.eql(rhs)) return error.CasVerificationFailed;
+        if (live_market.schemas.len != stored_market.schemas.len) {
+            return casVerificationFailure(
+                "market schema count live={d} stored={d}",
+                .{ live_market.schemas.len, stored_market.schemas.len },
+            );
+        }
+        for (live_market.schemas, stored_market.schemas, 0..) |lhs, rhs, index| {
+            if (!lhs.eql(rhs)) {
+                return casVerificationFailure("market schema index={d}", .{index});
+            }
         }
         const live_series = live_market.market_series orelse &[_]market_catalog_mod.MarketSeriesIdentity{};
         const stored_series = stored_market.market_series orelse &[_]market_catalog_mod.MarketSeriesIdentity{};
-        if (live_series.len != stored_series.len) return error.CasVerificationFailed;
-        for (live_series, stored_series) |lhs, rhs| {
-            if (!marketSeriesEntryEql(lhs, rhs)) return error.CasVerificationFailed;
+        if (live_series.len != stored_series.len) {
+            return casVerificationFailure(
+                "market series count live={d} stored={d}",
+                .{ live_series.len, stored_series.len },
+            );
         }
-        if (live_market.bar_policies.len != stored_market.bar_policies.len) return error.CasVerificationFailed;
-        for (live_market.bar_policies, stored_market.bar_policies) |lhs, rhs| {
-            if (!std.mem.eql(u8, lhs.id, rhs.id) or lhs.version != rhs.version or !std.mem.eql(u8, lhs.source_metric, rhs.source_metric) or lhs.interval_ns != rhs.interval_ns or !std.mem.eql(u8, lhs.session_rule, rhs.session_rule) or !std.mem.eql(u8, lhs.no_trade_rule, rhs.no_trade_rule) or !std.mem.eql(u8, lhs.halt_rule, rhs.halt_rule) or !std.mem.eql(u8, lhs.correction_policy, rhs.correction_policy) or !optionalStringEql(lhs.trade_filter, rhs.trade_filter)) return error.CasVerificationFailed;
+        for (live_series, stored_series, 0..) |lhs, rhs, index| {
+            if (!marketSeriesEntryEql(lhs, rhs)) {
+                return casVerificationFailure("market series index={d}", .{index});
+            }
         }
-        if (live_market.rollups.len != stored_market.rollups.len) return error.CasVerificationFailed;
-        for (live_market.rollups, stored_market.rollups) |lhs, rhs| {
-            if (!std.mem.eql(u8, lhs.id, rhs.id) or lhs.version != rhs.version or !std.mem.eql(u8, lhs.source_metric, rhs.source_metric) or !std.mem.eql(u8, lhs.target_metric, rhs.target_metric) or !std.mem.eql(u8, lhs.policy_id, rhs.policy_id) or lhs.transform_kind != rhs.transform_kind) return error.CasVerificationFailed;
+        if (live_market.bar_policies.len != stored_market.bar_policies.len) {
+            return casVerificationFailure(
+                "bar policy count live={d} stored={d}",
+                .{ live_market.bar_policies.len, stored_market.bar_policies.len },
+            );
         }
-        if (live_market.signals.len != stored_market.signals.len) return error.CasVerificationFailed;
-        for (live_market.signals, stored_market.signals) |lhs, rhs| {
-            if (!std.mem.eql(u8, lhs.id, rhs.id) or lhs.version != rhs.version or !std.mem.eql(u8, lhs.input_metric, rhs.input_metric) or !optionalStringEql(lhs.policy_id, rhs.policy_id) or lhs.expression_kind != rhs.expression_kind or !std.mem.eql(u8, lhs.params_json, rhs.params_json) or !std.mem.eql(u8, lhs.emit_rule, rhs.emit_rule)) return error.CasVerificationFailed;
+        for (live_market.bar_policies, stored_market.bar_policies, 0..) |lhs, rhs, index| {
+            if (!std.mem.eql(u8, lhs.id, rhs.id) or lhs.version != rhs.version or !std.mem.eql(u8, lhs.source_metric, rhs.source_metric) or lhs.interval_ns != rhs.interval_ns or !std.mem.eql(u8, lhs.session_rule, rhs.session_rule) or !std.mem.eql(u8, lhs.no_trade_rule, rhs.no_trade_rule) or !std.mem.eql(u8, lhs.halt_rule, rhs.halt_rule) or !std.mem.eql(u8, lhs.correction_policy, rhs.correction_policy) or !optionalStringEql(lhs.trade_filter, rhs.trade_filter)) {
+                return casVerificationFailure("bar policy index={d}", .{index});
+            }
+        }
+        if (live_market.rollups.len != stored_market.rollups.len) {
+            return casVerificationFailure(
+                "rollup count live={d} stored={d}",
+                .{ live_market.rollups.len, stored_market.rollups.len },
+            );
+        }
+        for (live_market.rollups, stored_market.rollups, 0..) |lhs, rhs, index| {
+            if (!std.mem.eql(u8, lhs.id, rhs.id) or lhs.version != rhs.version or !std.mem.eql(u8, lhs.source_metric, rhs.source_metric) or !std.mem.eql(u8, lhs.target_metric, rhs.target_metric) or !std.mem.eql(u8, lhs.policy_id, rhs.policy_id) or lhs.transform_kind != rhs.transform_kind) {
+                return casVerificationFailure("rollup index={d}", .{index});
+            }
+        }
+        if (live_market.signals.len != stored_market.signals.len) {
+            return casVerificationFailure(
+                "signal count live={d} stored={d}",
+                .{ live_market.signals.len, stored_market.signals.len },
+            );
+        }
+        for (live_market.signals, stored_market.signals, 0..) |lhs, rhs, index| {
+            if (!std.mem.eql(u8, lhs.id, rhs.id) or lhs.version != rhs.version or !std.mem.eql(u8, lhs.input_metric, rhs.input_metric) or !optionalStringEql(lhs.policy_id, rhs.policy_id) or lhs.expression_kind != rhs.expression_kind or !std.mem.eql(u8, lhs.params_json, rhs.params_json) or !std.mem.eql(u8, lhs.emit_rule, rhs.emit_rule)) {
+                return casVerificationFailure("signal index={d}", .{index});
+            }
         }
     }
+}
+
+fn casVerificationFailure(comptime detail: []const u8, args: anytype) error{CasVerificationFailed} {
+    std.log.err("CAS verification failed: " ++ detail, args);
+    return error.CasVerificationFailed;
 }
 
 fn buildTagSnapshot(alloc: std.mem.Allocator, tags: *const tags_mod.TagIndex) !TagSnapshot {
@@ -6937,7 +7415,10 @@ fn buildMetricCatalogSnapshot(alloc: std.mem.Allocator, metric_catalog: *const m
 }
 
 fn buildWalIndex(alloc: std.mem.Allocator, data_dir: std.fs.Dir, store: ?*object_store.ObjectStore, extent_chunk_bytes: u32) !WalIndex {
-    const infos = try wal_mod.collectWalFileInfos(alloc, data_dir);
+    const infos = wal_mod.collectWalFileInfos(alloc, data_dir) catch |err| {
+        std.log.err("CAS snapshot WAL inventory failed error={s}", .{@errorName(err)});
+        return err;
+    };
     defer wal_mod.freeWalFileInfos(alloc, infos);
 
     var entries = std.array_list.Managed(WalChunkDescriptor).init(alloc);
@@ -6948,7 +7429,13 @@ fn buildWalIndex(alloc: std.mem.Allocator, data_dir: std.fs.Dir, store: ?*object
 
     for (infos) |info| {
         const journal_root = if (store) |object_store_ref|
-            try wal_mod.writeJournalRootForWalFile(alloc, data_dir, object_store_ref, info.name)
+            wal_mod.writeJournalRootForWalFile(alloc, data_dir, object_store_ref, info.name) catch |err| {
+                std.log.err("CAS snapshot WAL journal capture failed path=wal/{s} error={s}", .{
+                    info.name,
+                    @errorName(err),
+                });
+                return err;
+            }
         else
             null;
         const content = try ensureContentRefForWalFile(alloc, store, data_dir, info.name, extent_chunk_bytes);
@@ -7114,16 +7601,22 @@ fn ensureContentRefForFile(
     path: []const u8,
     chunk_bytes: u32,
 ) !?ContentRef {
-    const bytes = try data_dir.readFileAlloc(alloc, path, 128 * 1024 * 1024);
-    defer alloc.free(bytes);
     if (store) |object_store_ref| {
-        const written = try extents.writeAll(alloc, object_store_ref, bytes, chunk_bytes);
+        const written = try extents.writeFile(
+            alloc,
+            object_store_ref,
+            data_dir,
+            path,
+            chunk_bytes,
+        );
         return ContentRef{ .extent_tree = .{
             .root_id = written.root_id,
             .size_bytes = written.size_bytes,
             .chunk_bytes = written.chunk_bytes,
         } };
     }
+    const bytes = try data_dir.readFileAlloc(alloc, path, 128 * 1024 * 1024);
+    defer alloc.free(bytes);
     const blob_id = object_store.computeId(.blob, bytes);
     return ContentRef{ .blob = blob_id };
 }
@@ -7944,6 +8437,68 @@ fn countMarketSegmentDescriptorsNotIn(lhs: []const MarketSegmentDescriptor, rhs:
     return count;
 }
 
+fn countMarketSchemasChanged(
+    lhs_snapshot: ?market_catalog_mod.Snapshot,
+    rhs_snapshot: ?market_catalog_mod.Snapshot,
+) usize {
+    const lhs = if (lhs_snapshot) |snapshot| snapshot.schemas else &[_]market_catalog_mod.MarketSchema{};
+    const rhs = if (rhs_snapshot) |snapshot| snapshot.schemas else &[_]market_catalog_mod.MarketSchema{};
+    var count: usize = 0;
+    for (lhs) |entry| {
+        var found = false;
+        for (rhs) |other| {
+            if (entry.eql(other)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) count += 1;
+    }
+    for (rhs) |entry| {
+        var found = false;
+        for (lhs) |other| {
+            if (entry.eql(other)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) count += 1;
+    }
+    return count;
+}
+
+fn countMarketSeriesEntriesChanged(
+    lhs_snapshot: ?market_catalog_mod.Snapshot,
+    rhs_snapshot: ?market_catalog_mod.Snapshot,
+) usize {
+    const lhs = if (lhs_snapshot) |snapshot|
+        snapshot.market_series orelse &[_]market_catalog_mod.MarketSeriesIdentity{}
+    else
+        &[_]market_catalog_mod.MarketSeriesIdentity{};
+    const rhs = if (rhs_snapshot) |snapshot|
+        snapshot.market_series orelse &[_]market_catalog_mod.MarketSeriesIdentity{}
+    else
+        &[_]market_catalog_mod.MarketSeriesIdentity{};
+    var count: usize = 0;
+    for (lhs) |entry| {
+        if (!containsMarketSeriesEntry(rhs, entry)) count += 1;
+    }
+    for (rhs) |entry| {
+        if (!containsMarketSeriesEntry(lhs, entry)) count += 1;
+    }
+    return count;
+}
+
+fn containsMarketSeriesEntry(
+    entries: []const market_catalog_mod.MarketSeriesIdentity,
+    needle: market_catalog_mod.MarketSeriesIdentity,
+) bool {
+    for (entries) |entry| {
+        if (marketSeriesEntryEql(entry, needle)) return true;
+    }
+    return false;
+}
+
 fn countWalChunksNotIn(lhs: []const WalChunkDescriptor, rhs: []const WalChunkDescriptor) usize {
     var count: usize = 0;
     for (lhs) |entry| {
@@ -7995,6 +8550,16 @@ fn containsSeriesEntry(entries: []const SeriesCatalogSnapshotEntry, needle: Seri
 fn containsObjectId(entries: []const object_store.ObjectId, needle: object_store.ObjectId) bool {
     for (entries) |entry| {
         if (entry.eql(needle)) return true;
+    }
+    return false;
+}
+
+fn snapshotHasNativeMarket(snapshot: Snapshot) bool {
+    if (snapshot.market_segment_descriptors.len != 0) return true;
+    if (snapshot.market_catalog_snapshot) |catalog| {
+        for (catalog.schemas) |schema| {
+            if (schema.storage_mapping == .native_v1) return true;
+        }
     }
     return false;
 }
@@ -8071,6 +8636,59 @@ fn validateMarketSegmentRootMatchesDescriptor(
         if (!std.mem.eql(u8, actual, expected)) return error.MarketSegmentDescriptorMismatch;
     }
     try market_segment_mod.validateSegmentRoot(alloc, store, root_id);
+}
+
+fn validateNativeMarketSnapshotCatalog(snapshot: Snapshot) !void {
+    if (snapshot.market_segment_descriptors.len == 0) return;
+    const catalog = snapshot.market_catalog_snapshot orelse
+        return error.MarketSegmentCatalogMismatch;
+    const market_series = catalog.market_series orelse
+        return error.MarketSegmentCatalogMismatch;
+
+    for (snapshot.market_segment_descriptors) |descriptor| {
+        var matching_series: ?market_catalog_mod.MarketSeriesIdentity = null;
+        for (market_series) |entry| {
+            if (entry.series_id == descriptor.market_series_id) {
+                matching_series = entry;
+                break;
+            }
+        }
+        const series = matching_series orelse
+            return error.MarketSegmentCatalogMismatch;
+        if (!std.mem.eql(u8, series.metric, descriptor.metric) or
+            !std.mem.eql(u8, series.canonical_labels, descriptor.canonical_labels))
+        {
+            return error.MarketSegmentCatalogMismatch;
+        }
+
+        var matching_schema: ?market_catalog_mod.MarketSchema = null;
+        for (catalog.schemas) |schema| {
+            if (std.mem.eql(u8, schema.metric, descriptor.metric)) {
+                matching_schema = schema;
+                break;
+            }
+        }
+        const schema = matching_schema orelse
+            return error.MarketSegmentCatalogMismatch;
+        const catalog_digest = schema.digest();
+        const native_digest = market_identity.schemaDigest(
+            schema.metric,
+            schema.ordered_columns,
+            schema.required_labels,
+            market_catalog_mod.StorageMapping.native_v1.text(),
+        );
+        if (!std.mem.eql(u8, series.schema_digest[0..], catalog_digest[0..]) or
+            !std.mem.eql(u8, native_digest[0..], descriptor.schema_digest[0..]) or
+            schema.ordered_columns.len != descriptor.column_names.len)
+        {
+            return error.MarketSegmentCatalogMismatch;
+        }
+        for (schema.ordered_columns, descriptor.column_names) |expected, actual| {
+            if (!std.mem.eql(u8, expected, actual)) {
+                return error.MarketSegmentCatalogMismatch;
+            }
+        }
+    }
 }
 
 fn checkpointStatesEql(lhs: CheckpointState, rhs: CheckpointState) bool {
@@ -8619,6 +9237,7 @@ const reftable_tables_list_path = "reftable/tables.list";
 const reftable_state_path = "reftable/state";
 const reftable_state_magic = "SYDRTST1";
 const reftable_summary_path = "reftable/info/summary";
+const reftable_summary_temp_path = reftable_summary_path ++ ".tmp";
 const reftable_summary_magic = "SYDRSUM1";
 const reftable_current_version: u16 = 3;
 const reftable_ref_block_entries: usize = 128;
@@ -8784,10 +9403,7 @@ fn writeReftableState(alloc: std.mem.Allocator, root: std.fs.Dir, state: Reftabl
         },
         else => return err,
     };
-    if (fsync != .none) {
-        var root_for_sync = root;
-        try syncDir(&root_for_sync);
-    }
+    if (fsync != .none) try syncParentDirs(root, reftable_state_path);
 }
 
 fn writeRepositoryId(root: std.fs.Dir, identity: RepositoryIdentity, fsync: cfg.FsyncPolicy) !void {
@@ -8808,10 +9424,7 @@ fn writeRepositoryId(root: std.fs.Dir, identity: RepositoryIdentity, fsync: cfg.
         },
         else => return err,
     };
-    if (fsync != .none) {
-        var root_for_sync = root;
-        try syncDir(&root_for_sync);
-    }
+    if (fsync != .none) try syncParentDirs(root, repository_id_path);
 }
 
 fn inferNextReftableUpdateIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !u64 {
@@ -8932,22 +9545,38 @@ fn writeReftableTablesList(alloc: std.mem.Allocator, root: std.fs.Dir, names: []
         },
         else => return err,
     };
-    if (fsync != .none) {
-        var root_for_sync = root;
-        try syncDir(&root_for_sync);
-    }
 }
 
-fn rebuildReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir, fsync: cfg.FsyncPolicy) !void {
-    var summary = try scanReftableSummaryIndex(alloc, root);
-    defer summary.deinit(alloc);
-    try writeReftableSummaryIndex(alloc, root, summary, fsync);
+fn publishReftableTablesList(alloc: std.mem.Allocator, root: std.fs.Dir, names: []const []const u8, fsync: cfg.FsyncPolicy) !void {
+    try prepareReftableSummaryIndex(alloc, root, names, fsync);
+    defer root.deleteFile(reftable_summary_temp_path) catch {};
+
+    writeReftableTablesList(alloc, root, names, fsync) catch |err| {
+        syncReftablePublicationDirs(root, fsync) catch {};
+        return err;
+    };
+
+    var first_error: ?anyerror = null;
+    publishPreparedReftableSummaryIndex(root) catch |err| {
+        first_error = err;
+    };
+    syncReftablePublicationDirs(root, fsync) catch |err| {
+        if (first_error == null) first_error = err;
+    };
+    if (first_error) |err| return err;
 }
 
 fn scanReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !ReftableSummaryIndex {
     const table_names = try loadReftableTableNames(alloc, root);
     defer freeOwnedStrings(alloc, table_names);
+    return try scanReftableSummaryIndexForNames(alloc, root, table_names);
+}
 
+fn scanReftableSummaryIndexForNames(
+    alloc: std.mem.Allocator,
+    root: std.fs.Dir,
+    table_names: []const []const u8,
+) !ReftableSummaryIndex {
     const records = try alloc.alloc(ReftableSummaryRecord, table_names.len);
     var loaded_count: usize = 0;
     errdefer {
@@ -9011,7 +9640,20 @@ fn scanReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !Reftabl
     return .{ .records = records };
 }
 
-fn writeReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir, summary: ReftableSummaryIndex, fsync: cfg.FsyncPolicy) !void {
+fn prepareReftableSummaryIndex(
+    alloc: std.mem.Allocator,
+    root: std.fs.Dir,
+    names: []const []const u8,
+    fsync: cfg.FsyncPolicy,
+) !void {
+    var summary = try scanReftableSummaryIndexForNames(alloc, root, names);
+    defer summary.deinit(alloc);
+    const bytes = try encodeReftableSummaryIndex(alloc, summary);
+    defer alloc.free(bytes);
+    try writeReftableSummaryIndexTemp(root, bytes, fsync);
+}
+
+fn encodeReftableSummaryIndex(alloc: std.mem.Allocator, summary: ReftableSummaryIndex) ![]u8 {
     var bytes = std.array_list.Managed(u8).init(alloc);
     defer bytes.deinit();
 
@@ -9036,25 +9678,26 @@ fn writeReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir, summary
     var checksum: [32]u8 = undefined;
     hasher.final(checksum[0..]);
     try bytes.appendSlice(checksum[0..]);
+    return try bytes.toOwnedSlice();
+}
 
+fn writeReftableSummaryIndexTemp(root: std.fs.Dir, bytes: []const u8, fsync: cfg.FsyncPolicy) !void {
     try root.makePath("reftable/info");
-    const temp_path = reftable_summary_path ++ ".tmp";
-    var file = try root.createFile(temp_path, .{ .truncate = true, .read = true });
+    var file = try root.createFile(reftable_summary_temp_path, .{ .truncate = true, .read = true });
     defer file.close();
-    errdefer root.deleteFile(temp_path) catch {};
-    try file.writeAll(bytes.items);
+    errdefer root.deleteFile(reftable_summary_temp_path) catch {};
+    try file.writeAll(bytes);
     if (fsync != .none) try file.sync();
-    root.rename(temp_path, reftable_summary_path) catch |err| switch (err) {
+}
+
+fn publishPreparedReftableSummaryIndex(root: std.fs.Dir) !void {
+    root.rename(reftable_summary_temp_path, reftable_summary_path) catch |err| switch (err) {
         error.PathAlreadyExists => {
             root.deleteFile(reftable_summary_path) catch {};
-            try root.rename(temp_path, reftable_summary_path);
+            try root.rename(reftable_summary_temp_path, reftable_summary_path);
         },
         else => return err,
     };
-    if (fsync != .none) {
-        var root_for_sync = root;
-        try syncDir(&root_for_sync);
-    }
 }
 
 fn loadReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !ReftableSummaryIndex {
@@ -9100,13 +9743,31 @@ fn loadReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !Reftabl
 }
 
 fn loadOrScanReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !ReftableSummaryIndex {
-    return loadReftableSummaryIndex(alloc, root) catch |err| switch (err) {
+    var summary = loadReftableSummaryIndex(alloc, root) catch |err| switch (err) {
         error.FileNotFound,
         error.CorruptReftableSummary,
         error.UnsupportedReftableSummaryVersion,
-        => try scanReftableSummaryIndex(alloc, root),
+        => return try scanReftableSummaryIndex(alloc, root),
         else => return err,
     };
+    var summary_owned = true;
+    defer if (summary_owned) summary.deinit(alloc);
+
+    const table_names = try loadReftableTableNames(alloc, root);
+    defer freeOwnedStrings(alloc, table_names);
+
+    if (summary.records.len == table_names.len) {
+        for (summary.records, table_names) |record, table_name| {
+            if (!std.mem.eql(u8, record.table_name, table_name)) break;
+        } else {
+            summary_owned = false;
+            return summary;
+        }
+    }
+
+    summary.deinit(alloc);
+    summary_owned = false;
+    return try scanReftableSummaryIndexForNames(alloc, root, table_names);
 }
 
 fn summaryContainsRef(record: ReftableSummaryRecord, ref_name: []const u8) bool {
@@ -9252,8 +9913,7 @@ fn writeReftableTable(
         else => return err,
     };
     if (fsync != .none) {
-        var root_for_sync = root;
-        try syncDir(&root_for_sync);
+        try syncParentDirs(root, table_path);
     }
 }
 
@@ -10277,9 +10937,132 @@ fn writeContentRefToPath(
     };
 }
 
-fn syncDir(dir: *std.fs.Dir) !void {
-    if (@hasDecl(std.fs.Dir, "sync")) {
-        try dir.sync();
+var test_directory_sync_hook: ?*const fn ([]const u8) anyerror!void = null;
+var test_directory_sync_primary_path: ?[]const u8 = null;
+var test_directory_sync_secondary_path: ?[]const u8 = null;
+var test_directory_sync_skip_publications: usize = 0;
+var test_directory_sync_primary_seen: usize = 0;
+var test_directory_sync_secondary_seen: usize = 0;
+
+fn failSelectedTestDirectorySync(path: []const u8) anyerror!void {
+    const primary_path = test_directory_sync_primary_path orelse return;
+    if (std.mem.eql(u8, path, primary_path)) {
+        test_directory_sync_primary_seen += 1;
+        if (test_directory_sync_primary_seen > test_directory_sync_skip_publications) {
+            return error.FirstInjectedDirectorySyncFailure;
+        }
+        return;
+    }
+
+    if (test_directory_sync_secondary_path) |secondary_path| {
+        if (std.mem.eql(u8, path, secondary_path) and
+            test_directory_sync_primary_seen > test_directory_sync_skip_publications)
+        {
+            test_directory_sync_secondary_seen += 1;
+            return error.SecondInjectedDirectorySyncFailure;
+        }
+    }
+}
+
+fn armTestDirectorySyncFailure(primary_path: []const u8, secondary_path: []const u8, skip_publications: usize) void {
+    test_directory_sync_primary_path = primary_path;
+    test_directory_sync_secondary_path = secondary_path;
+    test_directory_sync_skip_publications = skip_publications;
+    test_directory_sync_primary_seen = 0;
+    test_directory_sync_secondary_seen = 0;
+    test_directory_sync_hook = failSelectedTestDirectorySync;
+}
+
+fn resetTestDirectorySyncFailure() void {
+    test_directory_sync_hook = null;
+    test_directory_sync_primary_path = null;
+    test_directory_sync_secondary_path = null;
+    test_directory_sync_skip_publications = 0;
+    test_directory_sync_primary_seen = 0;
+    test_directory_sync_secondary_seen = 0;
+}
+
+fn syncPublicationDirs(root: std.fs.Dir, fsync: cfg.FsyncPolicy, paths: []const []const u8) !void {
+    if (fsync == .none) return;
+
+    var first_error: ?anyerror = null;
+    for (paths) |path| {
+        syncParentDirs(root, path) catch |err| {
+            if (first_error == null) first_error = err;
+        };
+    }
+    if (first_error) |err| return err;
+}
+
+fn syncReftablePublicationDirs(root: std.fs.Dir, fsync: cfg.FsyncPolicy) !void {
+    try syncPublicationDirs(root, fsync, &.{ reftable_tables_list_path, reftable_summary_path });
+}
+
+fn syncDir(dir: std.fs.Dir) !void {
+    // Linux opens non-iterable Dir handles with O_PATH, which fsync rejects.
+    var sync_dir = try dir.openDir(".", .{ .iterate = true });
+    defer sync_dir.close();
+    try std.posix.fsync(sync_dir.fd);
+}
+
+fn syncParentDirs(root: std.fs.Dir, path: []const u8) !void {
+    if (comptime builtin.is_test) {
+        if (test_directory_sync_hook) |hook| try hook(path);
+    }
+
+    // Sync the deepest containing directory first, then its ancestors.
+    const parent_path = std.fs.path.dirname(path) orelse "";
+    var parent_end = parent_path.len;
+    while (parent_end > 0) {
+        const prefix = parent_path[0..parent_end];
+        {
+            var parent = try root.openDir(prefix, .{});
+            defer parent.close();
+            try syncDir(parent);
+        }
+        parent_end = (std.mem.lastIndexOfScalar(u8, prefix, '/') orelse break);
+    }
+
+    var root_dir = try root.openDir(".", .{});
+    defer root_dir.close();
+    try syncDir(root_dir);
+}
+
+fn nearestExistingParent(root: std.fs.Dir, path: []const u8) ![]const u8 {
+    var existing_target = root.openDir(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (existing_target) |*target| {
+        target.close();
+        // The existing target's parent is the anchor; it does not need opening.
+        return std.fs.path.dirname(path) orelse ".";
+    }
+
+    var parent_path = std.fs.path.dirname(path) orelse ".";
+    while (true) {
+        var parent = root.openDir(parent_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                parent_path = std.fs.path.dirname(parent_path) orelse ".";
+                continue;
+            },
+            else => return err,
+        };
+        parent.close();
+        return parent_path;
+    }
+}
+
+fn syncCreatedPathParents(root: std.fs.Dir, path: []const u8, existing_parent: []const u8) !void {
+    var parent_path = std.fs.path.dirname(path) orelse ".";
+    while (true) {
+        {
+            var parent = try root.openDir(parent_path, .{});
+            defer parent.close();
+            try syncDir(parent);
+        }
+        if (std.mem.eql(u8, parent_path, existing_parent)) return;
+        parent_path = std.fs.path.dirname(parent_path) orelse ".";
     }
 }
 
@@ -10343,7 +11126,7 @@ test "cas manager initializes a repository format marker for fresh repositories"
     const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repo-format", .{tmp_dir.sub_path});
     defer alloc.free(data_path);
 
-    var cas_manager = try CasManager.init(alloc, data_path, .none);
+    var cas_manager = try CasManager.init(alloc, data_path, .always);
     defer cas_manager.deinit();
 
     try std.testing.expectEqual(current_repository_format_version, cas_manager.format.version);
@@ -10354,6 +11137,29 @@ test "cas manager initializes a repository format marker for fresh repositories"
     try std.testing.expectEqual(cas_manager.format.version, loaded.version);
     try std.testing.expectEqual(cas_manager.format.ref_backend, loaded.ref_backend);
     try std.testing.expectEqual(cas_manager.format.extent_chunk_bytes, loaded.extent_chunk_bytes);
+}
+
+test "cas manager reopens an existing repository below a searchable unreadable parent" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/existing-repository", .{tmp_dir.sub_path});
+    defer alloc.free(data_path);
+
+    var initial = try CasManager.init(alloc, data_path, .always);
+    initial.deinit();
+
+    const original_mode = (try tmp_dir.dir.stat()).mode & 0o7777;
+    defer tmp_dir.dir.chmod(original_mode) catch unreachable;
+
+    // Root can bypass POSIX mode checks, so this still exercises initialization
+    // there but cannot reproduce EACCES in a root-run test process.
+    try tmp_dir.dir.chmod(0o111);
+
+    var reopened = try CasManager.init(alloc, data_path, .always);
+    defer reopened.deinit();
+    try std.testing.expectEqual(current_repository_format_version, reopened.format.version);
 }
 
 test "repository format probe initializes fresh and preserves legacy repositories without CasManager" {
@@ -10416,6 +11222,73 @@ test "cas manager opens format 3 repositories without rewriting the marker" {
     try std.testing.expectEqual(primary_repository_format_version, loaded.version);
 }
 
+test "generic reftable migration and upgrade preserve format 3" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    inline for (.{ "migrate", "upgrade" }) |operation| {
+        const data_path = try std.fmt.allocPrint(
+            alloc,
+            ".zig-cache/tmp/{s}/format3-{s}",
+            .{ tmp_dir.sub_path, operation },
+        );
+        defer alloc.free(data_path);
+
+        var manager = try CasManager.init(alloc, data_path, .none);
+        defer manager.deinit();
+        manager.format.version = primary_repository_format_version;
+        manager.format.ref_backend = .loose;
+        manager.refs.setBackend(.loose);
+        try writeRepositoryFormat(alloc, manager.store.root, manager.format, .none);
+
+        if (std.mem.eql(u8, operation, "migrate")) {
+            try manager.migrateToReftable(manager.store.root);
+        } else {
+            const result = try manager.upgradeRepository(manager.store.root);
+            try std.testing.expectEqual(primary_repository_format_version, result.format_version);
+        }
+
+        try std.testing.expectEqual(primary_repository_format_version, manager.format.version);
+        try std.testing.expectEqual(RefBackend.reftable, manager.format.ref_backend);
+        const loaded = try loadRepositoryFormat(manager.store.root);
+        try std.testing.expectEqual(primary_repository_format_version, loaded.version);
+    }
+}
+
+test "native market promotion advances only format 3 reftable repositories" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    const data_path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/repo-native-promotion",
+        .{tmp_dir.sub_path},
+    );
+    defer alloc.free(data_path);
+    try std.fs.cwd().makePath(data_path);
+    var root = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer root.close();
+    try root.makePath("objects/info");
+    try writeRepositoryFormat(alloc, root, .{
+        .version = primary_repository_format_version,
+        .ref_backend = .reftable,
+        .extent_chunk_bytes = default_extent_chunk_bytes,
+    }, .none);
+
+    var cas_manager = try CasManager.init(alloc, data_path, .none);
+    defer cas_manager.deinit();
+    try std.testing.expect(try cas_manager.promoteFormatForNativeMarket());
+    try std.testing.expectEqual(
+        current_repository_format_version,
+        cas_manager.format.version,
+    );
+    try std.testing.expect(!(try cas_manager.promoteFormatForNativeMarket()));
+    const loaded = try loadRepositoryFormat(cas_manager.store.root);
+    try std.testing.expectEqual(current_repository_format_version, loaded.version);
+}
+
 test "cas manager rejects unsupported future repository formats before opening refs" {
     const alloc = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
@@ -10439,6 +11312,125 @@ test "cas manager rejects unsupported future repository formats before opening r
         CasManager.init(alloc, data_path, .none),
     );
     try std.testing.expectError(error.FileNotFound, root.access("refs", .{}));
+}
+
+test "repository format boundaries reject v4 transfers into format 3" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    const source_path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/format-boundary-source",
+        .{tmp_dir.sub_path},
+    );
+    defer alloc.free(source_path);
+    const bundle_path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/format-boundary-bundle",
+        .{tmp_dir.sub_path},
+    );
+    defer alloc.free(bundle_path);
+    const destination_path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/format-boundary-destination",
+        .{tmp_dir.sub_path},
+    );
+    defer alloc.free(destination_path);
+
+    try std.fs.cwd().makePath(source_path);
+    const source_probe = try probeOrInitRepositoryFormatWithState(alloc, source_path, .none);
+    try std.testing.expectEqual(current_repository_format_version, source_probe.format.version);
+    var source_dir = try std.fs.cwd().openDir(source_path, .{ .iterate = true });
+    defer source_dir.close();
+    var manifest = manifest_mod.Manifest{ .alloc = alloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = alloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(alloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(alloc, source_dir, .none);
+    defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(alloc, source_dir, .none);
+    defer metric_catalog.deinit();
+
+    {
+        var source = try CasManager.init(alloc, source_path, .none);
+        defer source.deinit();
+        try std.testing.expectEqual(current_repository_format_version, source.format.version);
+        _ = try source.bootstrapIfMissing(
+            source_dir,
+            &manifest,
+            &tags,
+            &series_catalog,
+            &metric_catalog,
+        );
+    }
+    _ = try createBundle(alloc, source_path, bundle_path, .none, null);
+
+    try std.fs.cwd().makePath(destination_path);
+    var destination_dir = try std.fs.cwd().openDir(destination_path, .{ .iterate = true });
+    defer destination_dir.close();
+    var destination_head: object_store.ObjectId = undefined;
+    var before_ids: []object_store.ObjectId = undefined;
+    {
+        var destination = try CasManager.init(alloc, destination_path, .none);
+        defer destination.deinit();
+        destination.format.version = primary_repository_format_version;
+        try writeRepositoryFormat(alloc, destination.store.root, destination.format, .none);
+        const destination_probe = try probeOrInitRepositoryFormatWithState(alloc, destination_path, .none);
+        try std.testing.expectEqual(primary_repository_format_version, destination_probe.format.version);
+        destination_head = try destination.bootstrapIfMissing(
+            destination_dir,
+            &manifest,
+            &tags,
+            &series_catalog,
+            &metric_catalog,
+        );
+        before_ids = try destination.store.listIds(alloc);
+    }
+    defer alloc.free(before_ids);
+
+    try std.testing.expectError(
+        error.RepositoryFormatMismatch,
+        applyBundle(alloc, bundle_path, destination_path, .none),
+    );
+    try std.testing.expectError(
+        error.RepositoryFormatMismatch,
+        pushLocalRepository(alloc, source_path, destination_path, .none),
+    );
+    try std.testing.expectError(
+        error.RepositoryFormatMismatch,
+        cloneLocalRepositoryWithOptions(
+            alloc,
+            source_path,
+            destination_path,
+            .none,
+            .{ .borrow = true },
+        ),
+    );
+
+    var future_bundle = try readBundleManifest(alloc, bundle_path);
+    defer future_bundle.deinit(alloc);
+    future_bundle.repository_format_version = current_repository_format_version + 1;
+    try writeBundleManifest(alloc, bundle_path, future_bundle);
+    try std.testing.expectError(
+        error.UnsupportedRepositoryFormatVersion,
+        verifyBundle(alloc, bundle_path),
+    );
+    try std.testing.expectError(
+        error.UnsupportedRepositoryFormatVersion,
+        applyBundle(alloc, bundle_path, destination_path, .none),
+    );
+
+    var preserved = try CasManager.init(alloc, destination_path, .none);
+    defer preserved.deinit();
+    try std.testing.expectEqual(primary_repository_format_version, preserved.format.version);
+    const preserved_head = try preserved.refs.readHead(main_ref) orelse
+        return error.MissingCasHead;
+    try std.testing.expect(preserved_head.eql(destination_head));
+    const after_ids = try preserved.store.listIds(alloc);
+    defer alloc.free(after_ids);
+    try std.testing.expectEqual(before_ids.len, after_ids.len);
+    try std.testing.expectEqual(@as(usize, 0), preserved.store.alternates.repo_paths.len);
 }
 
 test "market catalog snapshots preserve market series identities through head and bundle" {
@@ -10681,6 +11673,137 @@ test "native market segment descriptors roundtrip through CAS snapshot and check
     );
 }
 
+test "full fsck accepts pre-promotion catalogs and rejects native schema shape drift" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    const data_path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/native-fsck-pre-promotion",
+        .{tmp_dir.sub_path},
+    );
+    defer alloc.free(data_path);
+    try std.fs.cwd().makePath(data_path);
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var manifest = manifest_mod.Manifest{ .alloc = alloc, .entries = .{} };
+    defer manifest.deinit();
+    var market_manifest = market_manifest_mod.Manifest.init(alloc);
+    defer market_manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = alloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(alloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(alloc, data_dir, .none);
+    defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(alloc, data_dir, .none);
+    defer metric_catalog.deinit();
+    var market_catalog = try market_catalog_mod.Catalog.loadOrInit(alloc, data_dir, .none);
+    defer market_catalog.deinit();
+
+    const columns = [_][]const u8{ "price", "size" };
+    var schema = try market_catalog.registerSchema(.{
+        .metric = "market.migration",
+        .ordered_columns = &columns,
+        .required_labels = &.{"symbol"},
+        .storage_mapping = .fanout_v1,
+    });
+    defer schema.deinit(alloc);
+    var identity = try market_catalog.registerMarketSeries(
+        schema.metric,
+        "{\"symbol\":\"AAPL\"}",
+    );
+    defer identity.deinit(alloc);
+
+    const native_digest = market_identity.schemaDigest(
+        schema.metric,
+        schema.ordered_columns,
+        schema.required_labels,
+        market_catalog_mod.StorageMapping.native_v1.text(),
+    );
+    const values = [_]f64{ 101.5, 7.0 };
+    const rows = [_]market_segment_mod.MarketRowView{.{
+        .ts_ns = 10,
+        .write_sequence = 1,
+        .values = &values,
+    }};
+    const segment_path = try market_segment_mod.write(alloc, data_dir, .{
+        .market_series_id = identity.series_id,
+        .schema_digest = native_digest,
+        .metric = schema.metric,
+        .canonical_labels = identity.canonical_labels,
+        .hour = 0,
+        .column_names = schema.ordered_columns,
+    }, rows[0..]);
+    defer alloc.free(segment_path);
+    const file_bytes = try data_dir.readFileAlloc(alloc, segment_path, 16 * 1024 * 1024);
+    defer alloc.free(file_bytes);
+    const digest = market_manifest_mod.contentDigest(file_bytes);
+    try market_manifest.addBatch(data_dir, &.{.{
+        .path = segment_path,
+        .market_series_id = identity.series_id,
+        .schema_digest = native_digest,
+        .metric = schema.metric,
+        .canonical_labels = identity.canonical_labels,
+        .hour_bucket = 0,
+        .start_ts_ns = rows[0].ts_ns,
+        .end_ts_ns = rows[0].ts_ns,
+        .row_count = rows.len,
+        .block_count = 1,
+        .column_names = schema.ordered_columns,
+        .content_id = digest,
+        .file_hash = digest,
+        .file_size = file_bytes.len,
+    }});
+
+    var manager = try CasManager.init(alloc, data_path, .none);
+    defer manager.deinit();
+    manager.format.version = primary_repository_format_version;
+    try writeRepositoryFormat(alloc, manager.store.root, manager.format, .none);
+    _ = try manager.bootstrapIfMissingWithNativeMarket(
+        data_dir,
+        &manifest,
+        &tags,
+        &series_catalog,
+        &metric_catalog,
+        &market_catalog,
+        &market_manifest,
+    );
+    _ = try manager.fsck(data_dir, .{ .mode = .full });
+
+    var invalid_digest: ?market_identity.SchemaDigest = null;
+    for (market_catalog.schemas.items) |*entry| {
+        if (!std.mem.eql(u8, entry.metric, schema.metric)) continue;
+        alloc.free(entry.ordered_columns[0]);
+        entry.ordered_columns[0] = try alloc.dupe(u8, "corrupt_price");
+        invalid_digest = entry.digest();
+        break;
+    }
+    const changed_digest = invalid_digest orelse return error.MissingMarketSchema;
+    var series_updated = false;
+    for (market_catalog.market_series.items) |*entry| {
+        if (entry.series_id != identity.series_id) continue;
+        entry.schema_digest = changed_digest;
+        series_updated = true;
+        break;
+    }
+    try std.testing.expect(series_updated);
+    _ = try manager.syncLegacySnapshotWithNativeMarket(
+        data_dir,
+        &manifest,
+        &tags,
+        &series_catalog,
+        &metric_catalog,
+        &market_catalog,
+        &market_manifest,
+        "corrupt-native-catalog-shape",
+    );
+    try std.testing.expectError(
+        error.MarketSegmentCatalogMismatch,
+        manager.fsck(data_dir, .{ .mode = .full }),
+    );
+}
+
 test "market catalog snapshot decode accepts old payloads without market series" {
     const alloc = std.testing.allocator;
     const payload =
@@ -10804,11 +11927,11 @@ test "cas manager persists repository identities across reopen" {
     const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repo-id", .{tmp_dir.sub_path});
     defer alloc.free(data_path);
 
-    var first = try CasManager.init(alloc, data_path, .none);
+    var first = try CasManager.init(alloc, data_path, .always);
     const initial_id = first.repository_id;
     first.deinit();
 
-    var reopened = try CasManager.init(alloc, data_path, .none);
+    var reopened = try CasManager.init(alloc, data_path, .always);
     defer reopened.deinit();
     try std.testing.expect(initial_id.eql(reopened.repository_id));
 }
@@ -10904,7 +12027,7 @@ test "upgrade repository migrates legacy refs to reftable and refreshes format" 
 
     const result = try cas_manager.upgradeRepository(data_dir);
     try std.testing.expect(result.migrated_reftable);
-    try std.testing.expectEqual(current_repository_format_version, result.format_version);
+    try std.testing.expectEqual(primary_repository_format_version, result.format_version);
     try std.testing.expectEqual(RefBackend.reftable, result.ref_backend);
 
     const upgraded_head = try cas_manager.refs.readHead(main_ref) orelse return error.MissingCasHead;
@@ -11008,7 +12131,7 @@ test "upgrade normalizes active commits to canonical roots and clears compatibil
 
     const upgraded = try cas_manager.upgradeRepository(data_dir);
     try std.testing.expect(upgraded.normalized_commits > 0);
-    try std.testing.expectEqual(current_repository_format_version, upgraded.format_version);
+    try std.testing.expectEqual(primary_repository_format_version, upgraded.format_version);
 
     const after = try cas_manager.fsck(data_dir, .{});
     try std.testing.expectEqual(@as(usize, 0), after.compatibility_debt.legacy_segment_descriptors);
@@ -11117,7 +12240,7 @@ test "expire trims loose reflogs checkpoints and borrowed alternates" {
 
     var dest_dir = try std.fs.cwd().openDir(dest_path, .{ .iterate = true });
     defer dest_dir.close();
-    var dest_cas = try CasManager.init(talloc, dest_path, .none);
+    var dest_cas = try CasManager.init(talloc, dest_path, .always);
     defer dest_cas.deinit();
 
     dest_cas.format = legacyCompatibleRepositoryFormat();
@@ -11182,7 +12305,7 @@ test "prune only deletes expired cruft" {
     defer talloc.free(data_path);
     try std.fs.cwd().makePath(data_path);
 
-    var cas_manager = try CasManager.init(talloc, data_path, .none);
+    var cas_manager = try CasManager.init(talloc, data_path, .always);
     defer cas_manager.deinit();
 
     const now_ms = std.time.milliTimestamp();
@@ -11308,6 +12431,170 @@ test "legacy descriptor decoders normalize blob content refs" {
     try std.testing.expect(decoded_wal.entries[0].contentRef().?.eql(.{ .blob = content_id }));
     try std.testing.expectEqualStrings("current.wal", decoded_wal.entries[0].mirrorName());
     try std.testing.expectEqual(@as(u64, 128), decoded_wal.entries[0].captured_bytes);
+}
+
+test "legacy reachability rejects descriptor-shaped non-segment blobs" {
+    const alloc = std.testing.allocator;
+    const fake_root = object_store.computeId(.tree, "must-not-be-reachable");
+
+    var payload = std.array_list.Managed(u8).init(alloc);
+    defer payload.deinit();
+    try payload.append(3);
+    try payload.appendSlice(fake_root.hash[0..]);
+    try appendString(&payload, "native-value-stream");
+    try payload.appendSlice(([_]u8{0x42} ** 32)[0..]);
+    try appendInt(&payload, u64, 123);
+    try appendInt(&payload, u64, 77);
+    try appendInt(&payload, i64, 3600);
+    try appendInt(&payload, i64, 10);
+    try appendInt(&payload, i64, 20);
+    try appendInt(&payload, u32, 2);
+    try payload.append(1);
+    try payload.append(1);
+
+    var reachable = std.array_list.Managed(object_store.ObjectId).init(alloc);
+    defer reachable.deinit();
+    try std.testing.expect(!try appendSegmentDescriptorBlob(
+        &reachable,
+        payload.items,
+        true,
+    ));
+    try std.testing.expectEqual(@as(usize, 0), reachable.items.len);
+}
+
+test "legacy reachability follows snapshot tree roles" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/role-aware-reachability", .{tmp.sub_path});
+    defer alloc.free(data_path);
+    try std.fs.cwd().makePath(data_path);
+
+    var cas_manager = try CasManager.init(alloc, data_path, .none);
+    defer cas_manager.deinit();
+    var writer = CommitWriter{
+        .alloc = alloc,
+        .store = &cas_manager.store,
+        .extent_chunk_bytes = cas_manager.format.extent_chunk_bytes,
+    };
+
+    const legacy_content_id = try cas_manager.store.put(.blob, "legacy segment content");
+    var legacy_descriptor = std.array_list.Managed(u8).init(alloc);
+    defer legacy_descriptor.deinit();
+    try legacy_descriptor.append(3);
+    try legacy_descriptor.appendSlice(legacy_content_id.hash[0..]);
+    try appendString(&legacy_descriptor, "segments/legacy.seg");
+    try legacy_descriptor.appendSlice(([_]u8{0x42} ** 32)[0..]);
+    try appendInt(&legacy_descriptor, u64, 123);
+    try appendInt(&legacy_descriptor, u64, 77);
+    try appendInt(&legacy_descriptor, i64, 3_600);
+    try appendInt(&legacy_descriptor, i64, 10);
+    try appendInt(&legacy_descriptor, i64, 20);
+    try appendInt(&legacy_descriptor, u32, 2);
+    try legacy_descriptor.append(1);
+    try legacy_descriptor.append(1);
+    const legacy_descriptor_id = try cas_manager.store.put(.blob, legacy_descriptor.items);
+
+    const fabricated_id = object_store.computeId(.blob, "fabricated child");
+    var descriptor_shaped_values = std.array_list.Managed(u8).init(alloc);
+    defer descriptor_shaped_values.deinit();
+    try descriptor_shaped_values.append(3);
+    try descriptor_shaped_values.appendSlice(fabricated_id.hash[0..]);
+    try appendString(&descriptor_shaped_values, "segments/value-stream.seg");
+    try descriptor_shaped_values.appendSlice(([_]u8{0x24} ** 32)[0..]);
+    try appendInt(&descriptor_shaped_values, u64, 456);
+    try appendInt(&descriptor_shaped_values, u64, 88);
+    try appendInt(&descriptor_shaped_values, i64, 7_200);
+    try appendInt(&descriptor_shaped_values, i64, 30);
+    try appendInt(&descriptor_shaped_values, i64, 40);
+    try appendInt(&descriptor_shaped_values, u32, 2);
+    try descriptor_shaped_values.append(1);
+    try descriptor_shaped_values.append(1);
+    const values_blob_id = try cas_manager.store.put(.blob, descriptor_shaped_values.items);
+
+    const segment_leaf_entries = [_]TreeEntry{.{
+        .name = @constCast("legacy.seg"),
+        .object_type = .blob,
+        .object_id = legacy_descriptor_id,
+    }};
+    const segment_leaf_tree = try writer.putTree(segment_leaf_entries[0..]);
+    const segment_hour_entries = [_]TreeEntry{.{
+        .name = @constCast("0"),
+        .object_type = .tree,
+        .object_id = segment_leaf_tree,
+    }};
+    const segment_hour_tree = try writer.putTree(segment_hour_entries[0..]);
+    const segment_series_entries = [_]TreeEntry{.{
+        .name = @constCast("1"),
+        .object_type = .tree,
+        .object_id = segment_hour_tree,
+    }};
+    const segments_tree = try writer.putTree(segment_series_entries[0..]);
+
+    const market_leaf_entries = [_]TreeEntry{.{
+        .name = @constCast("values.bin"),
+        .object_type = .blob,
+        .object_id = values_blob_id,
+    }};
+    const market_leaf_tree = try writer.putTree(market_leaf_entries[0..]);
+    const market_hour_entries = [_]TreeEntry{.{
+        .name = @constCast("0"),
+        .object_type = .tree,
+        .object_id = market_leaf_tree,
+    }};
+    const market_hour_tree = try writer.putTree(market_hour_entries[0..]);
+    const market_series_entries = [_]TreeEntry{.{
+        .name = @constCast("1"),
+        .object_type = .tree,
+        .object_id = market_hour_tree,
+    }};
+    const market_segments_tree = try writer.putTree(market_series_entries[0..]);
+
+    const metadata_entries = [_]TreeEntry{
+        .{
+            .name = @constCast("segments"),
+            .object_type = .tree,
+            .object_id = segments_tree,
+        },
+        .{
+            .name = @constCast("market_segments"),
+            .object_type = .tree,
+            .object_id = market_segments_tree,
+        },
+    };
+    const metadata_tree = try writer.putTree(metadata_entries[0..]);
+    const empty_entries = [_]TreeEntry{};
+    const wal_tree = try writer.putTree(empty_entries[0..]);
+    const root_entries = [_]TreeEntry{
+        .{
+            .name = @constCast("metadata"),
+            .object_type = .tree,
+            .object_id = metadata_tree,
+        },
+        .{
+            .name = @constCast("wal"),
+            .object_type = .tree,
+            .object_id = wal_tree,
+        },
+    };
+    const root_id = try writer.putTree(root_entries[0..]);
+
+    const commit_payload = try encodeCommit(alloc, .{
+        .format_version = current_format_version,
+        .root = root_id,
+        .parents = &[_]object_store.ObjectId{},
+        .created_at_ms = 0,
+        .reason = @constCast("role-aware reachability"),
+    });
+    defer alloc.free(commit_payload);
+    const commit_id = try cas_manager.store.put(.commit, commit_payload);
+
+    var reachable = try cas_manager.collectReachableFromIds(&[_]object_store.ObjectId{commit_id});
+    defer reachable.deinit();
+    try std.testing.expect(reachable.contains(legacy_content_id));
+    try std.testing.expect(reachable.contains(values_blob_id));
+    try std.testing.expect(!reachable.contains(fabricated_id));
 }
 
 test "cas bootstrap imports legacy metadata into a genesis commit" {
@@ -11554,7 +12841,7 @@ test "ref transactions enforce compare-and-swap and append reflogs" {
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/ref-txn", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
 
-    var refs = try RefStore.init(std.testing.allocator, path, .none);
+    var refs = try RefStore.init(std.testing.allocator, path, .always);
     defer refs.deinit();
 
     const first = object_store.computeId(.commit, "first");
@@ -11570,6 +12857,7 @@ test "ref transactions enforce compare-and-swap and append reflogs" {
 
     const reflog = try refs.root.readFileAlloc(std.testing.allocator, "logs/refs/heads/main", 4096);
     defer std.testing.allocator.free(reflog);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, reflog, "\n"));
     try std.testing.expect(std.mem.indexOf(u8, reflog, "advance-main") != null);
 }
 
@@ -11580,7 +12868,7 @@ test "reftable transactions assign update spans and compact older tables" {
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/reftable-spans", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
 
-    var refs = try RefStore.init(std.testing.allocator, path, .none);
+    var refs = try RefStore.init(std.testing.allocator, path, .always);
     defer refs.deinit();
     refs.setBackend(.reftable);
 
@@ -11698,7 +12986,7 @@ test "reftable delete rename and reflog views work" {
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/reftable-ref-ops", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
 
-    var refs = try RefStore.init(std.testing.allocator, path, .none);
+    var refs = try RefStore.init(std.testing.allocator, path, .always);
     defer refs.deinit();
     refs.setBackend(.reftable);
 
@@ -11728,7 +13016,7 @@ test "symrefs persist head targets alongside reftable refs" {
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/symref-head", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
 
-    var refs = try RefStore.init(std.testing.allocator, path, .none);
+    var refs = try RefStore.init(std.testing.allocator, path, .always);
     defer refs.deinit();
     refs.setBackend(.reftable);
 
@@ -11741,6 +13029,493 @@ test "symrefs persist head targets alongside reftable refs" {
     try std.testing.expectEqualStrings(main_ref, restored);
 }
 
+test "reftable reads ignore checksum-valid summaries for stale table lists" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/reftable-stale-summary", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    const stale_id = object_store.computeId(.commit, "stale-summary-head");
+    const authoritative_id = object_store.computeId(.commit, "authoritative-table-head");
+    const authoritative_table = "reftable/2-2.table";
+    var stale_table_name: []const u8 = undefined;
+
+    {
+        var refs = try RefStore.init(alloc, path, .none);
+        defer refs.deinit();
+        refs.setBackend(.reftable);
+        try refs.updateRefAtomic(main_ref, stale_id);
+
+        const original_names = try loadReftableTableNames(alloc, refs.root);
+        defer freeOwnedStrings(alloc, original_names);
+        try std.testing.expectEqual(@as(usize, 1), original_names.len);
+        stale_table_name = original_names[0];
+
+        var authoritative_refs = [_]ReftableRefRecord{.{
+            .name = try alloc.dupe(u8, main_ref),
+            .id = authoritative_id,
+        }};
+        defer authoritative_refs[0].deinit(alloc);
+        var authoritative_logs = [_]ReflogEntry{.{
+            .ref_name = try alloc.dupe(u8, main_ref),
+            .old_id = stale_id,
+            .new_id = authoritative_id,
+            .timestamp_ms = std.time.milliTimestamp(),
+            .reason = try alloc.dupe(u8, "authoritative-table"),
+        }};
+        defer authoritative_logs[0].deinit(alloc);
+
+        try writeReftableTable(
+            alloc,
+            refs.root,
+            authoritative_table,
+            .{ .min_update_index = 2, .max_update_index = 2 },
+            authoritative_refs[0..],
+            authoritative_logs[0..],
+            .none,
+        );
+        try writeReftableTablesList(alloc, refs.root, &.{authoritative_table}, .none);
+
+        // Loading verifies the summary checksum. Its single old table name differs
+        // from the single authoritative name in tables.list.
+        var stale_summary = try loadReftableSummaryIndex(alloc, refs.root);
+        defer stale_summary.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), stale_summary.records.len);
+        try std.testing.expectEqualStrings(stale_table_name, stale_summary.records[0].table_name);
+
+        const head = try refs.readHead(main_ref) orelse return error.MissingCasHead;
+        try std.testing.expect(head.eql(authoritative_id));
+        const reflog = try refs.loadReflog(alloc, main_ref, 8);
+        defer {
+            for (reflog) |*entry| entry.deinit(alloc);
+            alloc.free(reflog);
+        }
+        try std.testing.expectEqual(@as(usize, 1), reflog.len);
+        try std.testing.expectEqualStrings("authoritative-table", reflog[0].reason);
+    }
+
+    {
+        var reopened = try RefStore.init(alloc, path, .none);
+        defer reopened.deinit();
+        reopened.setBackend(.reftable);
+
+        const head = try reopened.readHead(main_ref) orelse return error.MissingCasHead;
+        try std.testing.expect(head.eql(authoritative_id));
+        const reflog = try reopened.loadReflog(alloc, main_ref, 8);
+        defer {
+            for (reflog) |*entry| entry.deinit(alloc);
+            alloc.free(reflog);
+        }
+        try std.testing.expectEqual(@as(usize, 1), reflog.len);
+        try std.testing.expectEqualStrings("authoritative-table", reflog[0].reason);
+    }
+}
+
+test "loose ref update attempts directory sync when reflog append fails after ref publication" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/loose-reflog-io-failure", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var refs = try RefStore.init(alloc, path, .always);
+    defer refs.deinit();
+    const old_id = object_store.computeId(.commit, "loose-reflog-failure-before");
+    const new_id = object_store.computeId(.commit, "loose-reflog-failure-after");
+    try refs.updateRefAtomic(main_ref, old_id);
+
+    try refs.root.deleteFile("logs/refs/heads/main");
+    try refs.root.makeDir("logs/refs/heads/main");
+
+    defer resetTestDirectorySyncFailure();
+    armTestDirectorySyncFailure("refs/heads/main", "logs/refs/heads/main", 0);
+    try std.testing.expectError(error.IsDir, refs.updateRefAtomic(main_ref, new_id));
+    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_primary_seen);
+    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_secondary_seen);
+
+    const head = try refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(head.eql(new_id));
+}
+
+test "loose ref sync paths are allocated before publishing the ref" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const old_id = object_store.computeId(.commit, "loose-sync-allocation-before");
+    const new_id = object_store.computeId(.commit, "loose-sync-allocation-after");
+
+    const max_fail_index: usize = 32;
+    var saw_completion = false;
+    var prepublication_failures: usize = 0;
+    var postpublication_failures: usize = 0;
+
+    var fail_index: usize = 0;
+    while (fail_index <= max_fail_index) : (fail_index += 1) {
+        {
+            const path = try std.fmt.allocPrint(
+                alloc,
+                ".zig-cache/tmp/{s}/loose-sync-path-allocation-{d}",
+                .{ tmp.sub_path, fail_index },
+            );
+            defer alloc.free(path);
+
+            var refs = try RefStore.init(alloc, path, .always);
+            defer refs.deinit();
+            try refs.updateRefAtomic(main_ref, old_id);
+
+            var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+            refs.alloc = failing.allocator();
+            defer refs.alloc = alloc;
+
+            armTestDirectorySyncFailure("refs/heads/main", "logs/refs/heads/main", 0);
+            defer resetTestDirectorySyncFailure();
+
+            const update_result = refs.updateRefAtomic(main_ref, new_id);
+            refs.alloc = alloc;
+
+            if (failing.has_induced_failure) {
+                try std.testing.expectError(error.OutOfMemory, update_result);
+                try std.testing.expectEqual(fail_index, failing.alloc_index);
+
+                const head = try refs.readRef(main_ref) orelse return error.MissingCasHead;
+                const reflog = try refs.loadReflog(alloc, main_ref, 8);
+                defer {
+                    for (reflog) |*entry| entry.deinit(alloc);
+                    alloc.free(reflog);
+                }
+                try std.testing.expectEqual(@as(usize, 1), reflog.len);
+                try std.testing.expectEqualStrings("update-ref", reflog[0].reason);
+                try std.testing.expect(reflog[0].old_id == null);
+                try std.testing.expect(reflog[0].new_id.eql(old_id));
+
+                if (head.eql(old_id)) {
+                    prepublication_failures += 1;
+                    try std.testing.expect(test_directory_sync_primary_seen <= 1);
+                    try std.testing.expectEqual(test_directory_sync_primary_seen, test_directory_sync_secondary_seen);
+                } else if (head.eql(new_id)) {
+                    postpublication_failures += 1;
+                    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_primary_seen);
+                    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_secondary_seen);
+                } else {
+                    return error.UnexpectedCasHead;
+                }
+            } else {
+                try std.testing.expectEqual(fail_index, failing.alloc_index);
+                try std.testing.expectError(error.FirstInjectedDirectorySyncFailure, update_result);
+                try std.testing.expectEqual(@as(usize, 1), test_directory_sync_primary_seen);
+                try std.testing.expectEqual(@as(usize, 1), test_directory_sync_secondary_seen);
+
+                const head = try refs.readRef(main_ref) orelse return error.MissingCasHead;
+                try std.testing.expect(head.eql(new_id));
+                const reflog = try refs.loadReflog(alloc, main_ref, 8);
+                defer {
+                    for (reflog) |*entry| entry.deinit(alloc);
+                    alloc.free(reflog);
+                }
+                try std.testing.expectEqual(@as(usize, 2), reflog.len);
+                try std.testing.expectEqualStrings("update-ref", reflog[0].reason);
+                try std.testing.expect(reflog[0].old_id != null);
+                try std.testing.expect(reflog[0].old_id.?.eql(old_id));
+                try std.testing.expect(reflog[0].new_id.eql(new_id));
+                saw_completion = true;
+                break;
+            }
+        }
+    }
+
+    try std.testing.expect(saw_completion);
+    try std.testing.expect(prepublication_failures > 0);
+    try std.testing.expect(postpublication_failures > 0);
+}
+
+test "reftable summary candidate failure leaves the authoritative list unchanged" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/reftable-summary-candidate-failure", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var refs = try RefStore.init(alloc, path, .always);
+    defer refs.deinit();
+    refs.setBackend(.reftable);
+    const id = object_store.computeId(.commit, "reftable-summary-candidate-before");
+    try refs.updateRefAtomic(main_ref, id);
+
+    const original_list = try refs.root.readFileAlloc(alloc, reftable_tables_list_path, 1024 * 1024);
+    defer alloc.free(original_list);
+    const original_summary = try refs.root.readFileAlloc(alloc, reftable_summary_path, 16 * 1024 * 1024);
+    defer alloc.free(original_summary);
+    try refs.root.writeFile(.{
+        .sub_path = "reftable/2-2.table",
+        .data = "not a reftable table",
+    });
+
+    try std.testing.expectError(error.CorruptReftable, refs.rebuildReftableMetadata());
+
+    const current_list = try refs.root.readFileAlloc(alloc, reftable_tables_list_path, 1024 * 1024);
+    defer alloc.free(current_list);
+    try std.testing.expectEqualSlices(u8, original_list, current_list);
+    const current_summary = try refs.root.readFileAlloc(alloc, reftable_summary_path, 16 * 1024 * 1024);
+    defer alloc.free(current_summary);
+    try std.testing.expectEqualSlices(u8, original_summary, current_summary);
+    const head = try refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(head.eql(id));
+}
+
+test "loose ref update returns the first directory sync error after publishing ref and reflog" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/loose-update-sync-error", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var refs = try RefStore.init(alloc, path, .always);
+    defer refs.deinit();
+    const old_id = object_store.computeId(.commit, "loose-update-before");
+    const new_id = object_store.computeId(.commit, "loose-update-after");
+    try refs.updateRefAtomic(main_ref, old_id);
+
+    defer resetTestDirectorySyncFailure();
+    armTestDirectorySyncFailure("refs/heads/main", "logs/refs/heads/main", 0);
+    // The ref rename and reflog append precede this directory-sync failure. Their
+    // visibility here does not prove crash durability; multi-ref loose transactions
+    // can also retain earlier writes if a later ref or sync fails.
+    try std.testing.expectError(
+        error.FirstInjectedDirectorySyncFailure,
+        refs.updateRefAtomic(main_ref, new_id),
+    );
+    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_primary_seen);
+    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_secondary_seen);
+
+    const head = try refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(head.eql(new_id));
+    const reflog = try refs.loadReflog(alloc, main_ref, 8);
+    defer {
+        for (reflog) |*entry| entry.deinit(alloc);
+        alloc.free(reflog);
+    }
+    try std.testing.expectEqual(@as(usize, 2), reflog.len);
+    try std.testing.expectEqualStrings("update-ref", reflog[0].reason);
+    try std.testing.expectEqual(new_id, reflog[0].new_id);
+}
+
+test "loose ref delete returns the first directory sync error after publishing deletion and reflog" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/loose-delete-sync-error", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var refs = try RefStore.init(alloc, path, .always);
+    defer refs.deinit();
+    const old_id = object_store.computeId(.commit, "loose-delete-before");
+    try refs.updateRefAtomic(main_ref, old_id);
+
+    defer resetTestDirectorySyncFailure();
+    armTestDirectorySyncFailure("refs/heads/main", "logs/refs/heads/main", 0);
+    try std.testing.expectError(
+        error.FirstInjectedDirectorySyncFailure,
+        refs.deleteRef(main_ref, "delete-after-sync-failure"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_primary_seen);
+    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_secondary_seen);
+
+    try std.testing.expect((try refs.readHead(main_ref)) == null);
+    const reflog = try refs.loadReflog(alloc, main_ref, 8);
+    defer {
+        for (reflog) |*entry| entry.deinit(alloc);
+        alloc.free(reflog);
+    }
+    try std.testing.expectEqual(@as(usize, 2), reflog.len);
+    try std.testing.expectEqualStrings("delete-after-sync-failure", reflog[0].reason);
+    try std.testing.expectEqual(old_id, reflog[0].old_id.?);
+    try std.testing.expectEqual(old_id, reflog[0].new_id);
+}
+
+test "loose ref rename returns the first directory sync error after publishing both reflogs" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/loose-rename-sync-error", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var refs = try RefStore.init(alloc, path, .always);
+    defer refs.deinit();
+    const id = object_store.computeId(.commit, "loose-rename-before");
+    try refs.updateRefAtomic(main_ref, id);
+
+    defer resetTestDirectorySyncFailure();
+    armTestDirectorySyncFailure("refs/heads/main", "logs/refs/heads/main", 0);
+    try std.testing.expectError(
+        error.FirstInjectedDirectorySyncFailure,
+        refs.renameRef(main_ref, "heads/renamed", "rename-after-sync-failure"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_primary_seen);
+    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_secondary_seen);
+
+    try std.testing.expect((try refs.readHead(main_ref)) == null);
+    const renamed = try refs.readHead("heads/renamed") orelse return error.MissingCasHead;
+    try std.testing.expect(renamed.eql(id));
+
+    const old_reflog = try refs.loadReflog(alloc, main_ref, 8);
+    defer {
+        for (old_reflog) |*entry| entry.deinit(alloc);
+        alloc.free(old_reflog);
+    }
+    const new_reflog = try refs.loadReflog(alloc, "heads/renamed", 8);
+    defer {
+        for (new_reflog) |*entry| entry.deinit(alloc);
+        alloc.free(new_reflog);
+    }
+    try std.testing.expectEqual(@as(usize, 2), old_reflog.len);
+    try std.testing.expectEqual(@as(usize, 1), new_reflog.len);
+    try std.testing.expectEqualStrings("rename-after-sync-failure", old_reflog[0].reason);
+    try std.testing.expectEqualStrings("rename-after-sync-failure", new_reflog[0].reason);
+    try std.testing.expectEqual(id, old_reflog[0].new_id);
+    try std.testing.expectEqual(id, new_reflog[0].new_id);
+}
+
+test "loose ref update with fsync none bypasses the directory sync hook" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/loose-update-no-sync", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var refs = try RefStore.init(alloc, path, .none);
+    defer refs.deinit();
+    defer resetTestDirectorySyncFailure();
+    armTestDirectorySyncFailure("refs/heads/main", "logs/refs/heads/main", 0);
+
+    const id = object_store.computeId(.commit, "loose-update-no-sync");
+    try refs.updateRefAtomic(main_ref, id);
+    try std.testing.expectEqual(@as(usize, 0), test_directory_sync_primary_seen);
+    try std.testing.expectEqual(@as(usize, 0), test_directory_sync_secondary_seen);
+    const head = try refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(head.eql(id));
+}
+
+test "reftable replacement sync error keeps its new snapshot and old table files" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/reftable-replacement-sync-error", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var refs = try RefStore.init(alloc, path, .always);
+    defer refs.deinit();
+    refs.setBackend(.reftable);
+    const old_id = object_store.computeId(.commit, "reftable-replacement-before");
+    const new_id = object_store.computeId(.commit, "reftable-replacement-after");
+    try refs.updateRefAtomic(main_ref, old_id);
+
+    var replacement_records = [_]ReftableRefRecord{.{
+        .name = try alloc.dupe(u8, main_ref),
+        .id = new_id,
+    }};
+    defer replacement_records[0].deinit(alloc);
+    var replacement_logs = [_]ReflogEntry{.{
+        .ref_name = try alloc.dupe(u8, main_ref),
+        .old_id = old_id,
+        .new_id = new_id,
+        .timestamp_ms = std.time.milliTimestamp() + 60_000,
+        .reason = try alloc.dupe(u8, "replacement-visible"),
+    }};
+    defer replacement_logs[0].deinit(alloc);
+    try refs.appendReftableRecords(replacement_records[0..], replacement_logs[0..]);
+
+    const history = try loadReftableReflogEntries(alloc, refs.root);
+    defer {
+        for (history) |*entry| entry.deinit(alloc);
+        alloc.free(history);
+    }
+    var expiration_cutoff: ?i64 = null;
+    for (history) |entry| {
+        if (std.mem.eql(u8, entry.reason, "update-ref")) {
+            expiration_cutoff = entry.timestamp_ms + 1;
+        }
+    }
+    const cutoff = expiration_cutoff orelse return error.MissingReflogEntry;
+    try std.testing.expect(cutoff < replacement_logs[0].timestamp_ms);
+
+    const old_table_names = try loadReftableTableNames(alloc, refs.root);
+    defer freeOwnedStrings(alloc, old_table_names);
+    try std.testing.expect(old_table_names.len > 0);
+
+    defer resetTestDirectorySyncFailure();
+    armTestDirectorySyncFailure(reftable_tables_list_path, reftable_summary_path, 0);
+    try std.testing.expectError(
+        error.FirstInjectedDirectorySyncFailure,
+        refs.expireReflogEntries(cutoff),
+    );
+    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_primary_seen);
+    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_secondary_seen);
+
+    const head = try refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(head.eql(new_id));
+    const reflog = try refs.loadReflog(alloc, main_ref, 8);
+    defer {
+        for (reflog) |*entry| entry.deinit(alloc);
+        alloc.free(reflog);
+    }
+    try std.testing.expectEqual(@as(usize, 1), reflog.len);
+    try std.testing.expectEqualStrings("replacement-visible", reflog[0].reason);
+    for (old_table_names) |name| _ = try refs.root.statFile(name);
+}
+
+test "reftable compaction sync error keeps its new ref log and old table files" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/reftable-compaction-sync-error", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var refs = try RefStore.init(alloc, path, .always);
+    defer refs.deinit();
+    refs.setBackend(.reftable);
+    const old_id = object_store.computeId(.commit, "reftable-compaction-before");
+    const new_id = object_store.computeId(.commit, "reftable-compaction-after");
+    try refs.updateRefAtomic(main_ref, old_id);
+
+    const old_table_names = try loadReftableTableNames(alloc, refs.root);
+    defer freeOwnedStrings(alloc, old_table_names);
+    try std.testing.expectEqual(@as(usize, 1), old_table_names.len);
+
+    defer resetTestDirectorySyncFailure();
+    // Let append publication finish; fail the following compaction finalization.
+    armTestDirectorySyncFailure(reftable_tables_list_path, reftable_summary_path, 1);
+    try std.testing.expectError(
+        error.FirstInjectedDirectorySyncFailure,
+        refs.compareAndSwapRef(main_ref, old_id, new_id, "compaction-visible"),
+    );
+    try std.testing.expectEqual(@as(usize, 2), test_directory_sync_primary_seen);
+    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_secondary_seen);
+
+    const head = try refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(head.eql(new_id));
+    const reflog = try refs.loadReflog(alloc, main_ref, 8);
+    defer {
+        for (reflog) |*entry| entry.deinit(alloc);
+        alloc.free(reflog);
+    }
+    try std.testing.expectEqual(@as(usize, 2), reflog.len);
+    try std.testing.expectEqualStrings("compaction-visible", reflog[0].reason);
+    try std.testing.expectEqual(new_id, reflog[0].new_id);
+
+    for (old_table_names) |name| _ = try refs.root.statFile(name);
+    _ = try refs.root.statFile("reftable/2-2.table");
+}
 test "checkpoints support diffing and rollback" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -11773,6 +13548,13 @@ test "checkpoints support diffing and rollback" {
     var cas_manager = try CasManager.init(talloc, data_path, .none);
     defer cas_manager.deinit();
     const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
+    const deterministic_checkpoint = "checkpoints/market-migration";
+    try std.testing.expect(try cas_manager.createCheckpointAtRef(deterministic_checkpoint));
+    try std.testing.expect(!(try cas_manager.createCheckpointAtRef(deterministic_checkpoint)));
+    try std.testing.expectError(
+        error.InvalidCheckpointRef,
+        cas_manager.createCheckpointAtRef("heads/not-a-checkpoint"),
+    );
     const checkpoint_ref = (try cas_manager.createCheckpoint("manual")) orelse return error.MissingCasHead;
     defer talloc.free(checkpoint_ref);
 
@@ -11783,6 +13565,13 @@ test "checkpoints support diffing and rollback" {
 
     const advanced = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, &metric_catalog, "advance");
     try std.testing.expect(!advanced.eql(initial));
+    try std.testing.expectError(
+        error.RefConflict,
+        cas_manager.createCheckpointAtRef(deterministic_checkpoint),
+    );
+    const preserved_checkpoint = try cas_manager.refs.readRef(deterministic_checkpoint) orelse
+        return error.MissingCasHead;
+    try std.testing.expect(preserved_checkpoint.eql(initial));
 
     const diff = try cas_manager.diffSnapshots(checkpoint_ref, main_ref);
     try std.testing.expect(diff.segments_added > 0);
@@ -11821,7 +13610,7 @@ test "commit graph indexes reachable commit ancestry" {
     defer talloc.free(first_path);
     try manifest.add(data_dir, sid, 0, 1_000, 1_000, 1, first_path);
 
-    var cas_manager = try CasManager.init(talloc, data_path, .none);
+    var cas_manager = try CasManager.init(talloc, data_path, .always);
     defer cas_manager.deinit();
     const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
 
@@ -11883,7 +13672,7 @@ test "reachability bitmap falls back to graph walks when corrupt" {
     defer talloc.free(seg_path);
     try manifest.add(data_dir, sid, 0, 1_000, 1_000, 1, seg_path);
 
-    var cas_manager = try CasManager.init(talloc, data_path, .none);
+    var cas_manager = try CasManager.init(talloc, data_path, .always);
     defer cas_manager.deinit();
 
     _ = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
@@ -11998,7 +13787,7 @@ test "gc writes loose unreachable objects into cruft packs" {
     defer talloc.free(seg_path);
     try manifest.add(data_dir, sid, 0, 1_000, 1_000, 1, seg_path);
 
-    var cas_manager = try CasManager.init(talloc, data_path, .none);
+    var cas_manager = try CasManager.init(talloc, data_path, .always);
     defer cas_manager.deinit();
     const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
     const orphan = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, &metric_catalog, "cruft-pack-orphan");
@@ -12029,7 +13818,7 @@ test "gc writes loose unreachable objects into cruft packs" {
     try std.testing.expect(saw_manifest);
 }
 
-test "fsck and pack preserve the reachable CAS head" {
+test "fsck and pack preserve refs and reflog-protected objects" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -12071,13 +13860,16 @@ test "fsck and pack preserve the reachable CAS head" {
     try std.testing.expect(fsck.commit_graph_entries_checked > 0);
 
     const pack_result = try cas_manager.pack();
-    try std.testing.expectEqual(fsck.reachable_objects, pack_result.reachable_objects);
+    try std.testing.expectEqual(
+        fsck.reachable_objects + fsck.reflog_protected_objects,
+        pack_result.reachable_objects,
+    );
 
     const all_ids = try cas_manager.store.listIds(talloc);
     defer talloc.free(all_ids);
-    try std.testing.expectEqual(fsck.reachable_objects, all_ids.len);
+    try std.testing.expectEqual(pack_result.reachable_objects, all_ids.len);
     try std.testing.expect(containsObjectId(all_ids, initial));
-    try std.testing.expect(!containsObjectId(all_ids, orphan));
+    try std.testing.expect(containsObjectId(all_ids, orphan));
 }
 
 test "fsck validates active pack manifests" {
@@ -12108,7 +13900,7 @@ test "fsck validates active pack manifests" {
     defer talloc.free(seg_path);
     try manifest.add(data_dir, sid, 0, 1_000, 1_000, 1, seg_path);
 
-    var cas_manager = try CasManager.init(talloc, data_path, .none);
+    var cas_manager = try CasManager.init(talloc, data_path, .always);
     defer cas_manager.deinit();
     _ = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
     _ = try cas_manager.pack();

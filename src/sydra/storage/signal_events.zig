@@ -212,10 +212,11 @@ pub const Store = struct {
         defer self.alloc.free(rel_path);
         var file = try self.root.createFile(rel_path, .{ .read = true, .truncate = false });
         defer file.close();
-        try file.seekFromEnd(0);
+        const end_pos = try file.getEndPos();
 
         var write_buf: [2048]u8 = undefined;
         var writer_state = file.writer(&write_buf);
+        try writer_state.seekTo(end_pos);
         const writer = &writer_state.interface;
         var jw = std.json.Stringify{ .writer = writer };
         try jw.beginObject();
@@ -417,6 +418,15 @@ test "signal event store appends and replays recent events" {
     {
         var store = try Store.loadOrInit(alloc, tmp.dir, .none);
         defer store.deinit();
+        const all_events = try store.listAfter("ema", 1, null, null, null, 16);
+        defer {
+            for (all_events) |*event| event.deinit(alloc);
+            alloc.free(all_events);
+        }
+        try std.testing.expectEqual(@as(usize, 2), all_events.len);
+        try std.testing.expectEqual(@as(i64, 10), all_events[0].ts_ns);
+        try std.testing.expectEqual(@as(i64, 20), all_events[1].ts_ns);
+
         const events = try store.listAfter("ema", 1, 1, null, null, 16);
         defer {
             for (events) |*event| event.deinit(alloc);

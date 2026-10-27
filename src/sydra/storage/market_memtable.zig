@@ -154,6 +154,10 @@ const SeriesBuffer = struct {
             return;
         }
 
+        self.appendNewAssumeCapacity(row, row_bytes);
+    }
+
+    fn appendNewAssumeCapacity(self: *SeriesBuffer, row: MarketRowInput, row_bytes: usize) void {
         if (self.last_appended_ts) |last_ts| {
             if (row.ts_ns < last_ts) self.sorted = false;
         }
@@ -211,6 +215,8 @@ const BatchSeries = struct {
     schema_digest: SchemaDigest,
     column_count: usize,
     row_count: usize = 0,
+    last_ts_ns: i64,
+    strict_append: bool,
 };
 
 const PreparedSeries = struct {
@@ -318,13 +324,17 @@ pub const MarketMemtable = struct {
         try batch_series.ensureUnusedCapacity(@intCast(rows.len));
 
         var additional_upper_bytes: usize = 0;
+        var strict_append_batch = true;
         for (rows) |row| {
             try validateRowShape(row);
             const row_bytes = try rowResidentBytes(row.values.len);
             additional_upper_bytes = try checkedAdd(additional_upper_bytes, row_bytes);
 
+            var strict_append = true;
             if (self.series.getPtr(row.market_series_id)) |existing| {
                 try validateBinding(existing, row);
+                strict_append = existing.sorted and
+                    (existing.last_appended_ts == null or row.ts_ns > existing.last_appended_ts.?);
             }
 
             const gop = batch_series.getOrPutAssumeCapacity(row.market_series_id);
@@ -338,14 +348,21 @@ pub const MarketMemtable = struct {
                     .schema_digest = row.schema_digest,
                     .column_count = row.values.len,
                     .row_count = 1,
+                    .last_ts_ns = row.ts_ns,
+                    .strict_append = strict_append,
                 };
             } else {
                 try validateBatchBinding(gop.value_ptr.*, row);
+                if (row.ts_ns <= gop.value_ptr.last_ts_ns) {
+                    gop.value_ptr.strict_append = false;
+                }
+                gop.value_ptr.last_ts_ns = row.ts_ns;
                 gop.value_ptr.row_count = try checkedAdd(gop.value_ptr.row_count, 1);
             }
+            if (!gop.value_ptr.strict_append) strict_append_batch = false;
         }
         _ = try checkedAdd(self.resident_bytes, additional_upper_bytes);
-        try self.prevalidateCorrections(rows);
+        if (!strict_append_batch) try self.prevalidateCorrections(rows);
 
         var prepared = ManagedArrayList(PreparedSeries).init(self.allocator);
         defer {
@@ -396,7 +413,10 @@ pub const MarketMemtable = struct {
             const row_bytes = rowResidentBytes(row.values.len) catch unreachable;
             const buffer = self.series.getPtr(row.market_series_id).?;
             const before = buffer.resident_bytes;
-            buffer.appendValidated(row, row_bytes);
+            if (strict_append_batch)
+                buffer.appendNewAssumeCapacity(row, row_bytes)
+            else
+                buffer.appendValidated(row, row_bytes);
             self.resident_bytes += buffer.resident_bytes - before;
         }
     }
