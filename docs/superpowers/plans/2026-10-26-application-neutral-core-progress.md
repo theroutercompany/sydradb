@@ -6,39 +6,45 @@ Persistent goal: active in this conversation; no deadline or token budget.
 
 ## Current checkpoint
 
-Checkpoint `14290b9` passed 794/794 ReleaseSafe tests on macOS: 216
-storage and 578 runtime tests. That result includes repair intent and native
-directory synchronization (`root-repair-native-durability-tests.log`). A prior
-integration passed 577 runtime and 27 wire tests. These results do not establish
-Linux acceptance for that earlier checkpoint: PR 93 then failed Ubuntu CI because
-a default Zig directory handle uses `O_PATH` and cannot be passed to `fsync`.
-The scalar-manifest correction now passes Ubuntu and macOS CI. Other durability
-corrections remain under review, so M1 remains open.
+The signed root checkpoint remains `585cda2e9a680e0b47952f6ed0457f23b74ef185`
+with tree `f7d55b6ab001672abbfb83d3e99c8322ca1f0cc5`. It is unchanged. The
+checkout remains on `codex/native-market-storage` at
+`42fbd552d9382e862fb02535392c539e5ef7cd90`. The earlier 794/794 macOS result
+belongs to checkpoint `14290b9`. It does not establish acceptance for the newer
+delivery branches.
+
+PRs 94 and 95 passed hosted CI and are ready for review. PR 96 is ready for
+review. Its CI run passed, while its Docs run failed because local-ingest pages
+were absent from that branch. PR 78 supplies those pages and is an explicit
+dependency. PRs 97 and 99 passed Ubuntu and macOS CI and are ready for review.
+PR 98's first CI run exposed three test compilation prerequisites that remained
+in the timing commit. Its correction passed 461/461 Debug runtime tests locally;
+hosted checks are running for the corrected head. No PR has merged.
 
 The application boundary, empty generic catalog, neutral API routes, query
 limits, and general label selection have current-root test evidence. Trading
 schema and transform behavior lives under `applications/trading`; legacy routes
-and serialized identifiers remain compatible. Generic rollups remain design-only.
+and serialized identifiers remain compatible. M2 through M4 remain incomplete
+upstream. Generic rollups remain design-only.
 
-PRs 89, 90, 91, 92, and 93 passed Ubuntu and macOS CI and are ready for review.
-PRs 94 and 95 are draft while their hosted checks run. All PRs remain
-unmerged. Local checkpoints are signed; published GitHub App commits have matching
-trees but are unsigned. No work is pushed directly to main.
+PRs 89 through 95 passed Ubuntu and macOS CI and are ready for review. Local
+checkpoints have verified GPG signatures. Published GitHub App commits are
+unsigned and have matching trees. No work is pushed directly to main.
 
 The current source branch remains `codex/native-market-storage` at `42fbd55`.
 Atomic checkpoints are maintained separately so that its unpublished ancestry
-does not enter scoped feature PRs. The earlier 60-second restart soak recovered
-15,604 acknowledged rows after five restarts, and crash smoke passed seven
-points. Those earlier results are smoke evidence, not release qualification or
-evidence for every later patch.
+does not enter scoped feature PRs. New integration and P2 branches remain
+isolated and incomplete. The earlier 60-second restart soak recovered 15,604
+acknowledged rows after five restarts, and crash smoke passed seven points.
+Those results are smoke evidence. They do not establish long-soak acceptance.
 
 | Milestone | State | Acceptance evidence |
 | --- | --- | --- |
-| M1: native-storage stabilization | In progress | Local integration passes; scalar directory-handle fix passes both CI platforms; native-directory CI and CAS durability corrections remain open |
-| M2: application boundaries | Implemented locally; upstream delivery incomplete | Empty catalog, neutral routes, schema and transform extraction, and shared sensor/service/trading lifecycle tests pass |
-| M3: query limits | Implemented locally; upstream delivery incomplete | Accounting, exact-cap, overflow, cancellation, runtime, and wire checks pass; original test-first chronology is not established |
-| M4: general selection | Implemented locally; upstream delivery incomplete | Label filters, compiled families, ownership, and prepared-query lifecycle checks pass |
-| M5: generic rollups and final audit | Design review | Definition, bounded-read, and bucket-semantics contracts under review; no implementation |
+| M1: native-storage stabilization | Open | PRs 94, 95, 97, and 99 passed hosted checks. PR 96 is ready with a PR 78 Docs dependency. Corrected PR 98 awaits CI. CAS publication and Engine concurrency corrections remain open. |
+| M2: application boundaries | Implemented locally; upstream delivery incomplete | Empty catalog, neutral routes, schema and transform extraction, and shared sensor, service, and trading lifecycle tests pass locally. |
+| M3: query limits | Implemented locally; upstream delivery incomplete | Accounting, exact-cap, overflow, cancellation, runtime, and wire checks pass locally. Original test-first chronology is not established. |
+| M4: general selection | Implemented locally; upstream delivery incomplete | Label filters, compiled families, ownership, and prepared-query lifecycle checks pass locally. |
+| M5: generic rollups and final audit | Design only | Definition, bounded-read, and bucket-semantics contracts remain under review. No implementation exists. |
 
 ## Starting work and preservation
 
@@ -1227,3 +1233,63 @@ measurements and resets the timer on timeout. Restoring older samples would
 reverse that behavior. The same proposed block also shadowed a local name.
 A worker is restoring the original port behavior and regenerating its atomic
 patch hashes before tests. No such change entered root or a PR.
+
+## Current delivery results — 2026-10-27
+
+The earlier entries preserve the state at each checkpoint. The table below
+records later delivery results. Hosted run status follows the current delivery
+update. The artifact paths point to local test logs and commit maps.
+
+| Delivery | Current result | Evidence |
+| --- | --- | --- |
+| PRs 94 and 95 | PR 94 run `40490089513` passed Ubuntu and macOS CI. PR 95 run `40490402807` passed CI. Both are ready for review. | `/private/tmp/sydradb-core-20261026-gdxun_3i/recovery-directory-hash-publication-map.json`, `/private/tmp/sydradb-core-20261026-gdxun_3i/native-directory-sync-delivery-tests.log`, `/private/tmp/sydradb-core-20261026-gdxun_3i/native-segment-hash-port-runtime-tests.log` |
+| PR 96 | Signed local commit `d2246e9d7697dd1d47fe77f31bdcde995e11ba76` and App commit `5520336433acf3ae6fc59b1fb3f9f243af06de90` share tree `a4a8528bfba812ddb2368fb9ca4768ae5acb9d27`. Runtime tests passed 456/456. CI run `40492406256` passed. Docs run `40492406307` failed only because local-ingest pages were absent from this branch. PR 78 supplies those pages and is an explicit dependency. PR 96 is ready for review. | `/private/tmp/sydradb-core-20261026-gdxun_3i/native-mixed-auto-publication-map.json`, `/private/tmp/sydradb-core-20261026-gdxun_3i/native-mixed-auto-contract-corrected-runtime-tests.log`, `/private/tmp/sydradb-core-20261026-gdxun_3i/native-mixed-auto-docs-ci-failure.log` |
+| PR 97 | Signed local commit `b84322e932789ff5b325d667126ed921633f31ac` and App commit `3cbb49b2d35c32e85eb13a1872b0a807e422ab69` share tree `f1c4861f9e41c7155a5a240e82b9ab7ba4a83477`. Storage tests passed 201/201. CI run `40496986415` passed. Root will mark the PR ready. | `/private/tmp/sydradb-core-20261026-gdxun_3i/summary-timing-publication-map.json`, `/private/tmp/sydradb-core-20261026-gdxun_3i/reftable-summary-scoped-storage-tests.log` |
+| PRs 98 and 99 | PR 98 contains socket fixes at local commits `976a4cef0e46898d7da5103c49d0cd6813e1e759` and `20bb6ec6d81a8d97bbbdcd8b6e22c1d1941341ed`. PR 99 contains timing commit `97f39934f38c3e40e7c936ef9dac993580476a38`. Hosted checks are pending. Their combined local run passed 664/664 tests: 197 storage and 467 runtime. | `/private/tmp/sydradb-core-20261026-gdxun_3i/summary-timing-publication-map.json`, `/private/tmp/sydradb-core-20261026-gdxun_3i/native-timing-delivery-tests.log` |
+| Native prerequisite integration | The ordered integration passed 675/675 tests: 200 storage and 475 runtime. It includes the high-unsigned-ID WAL reopen case. Earlier isolated timing and recovery runs failed at 663/664 and 455/456 because each lacked a different prerequisite. The combined integration preserves the original assertions. | `/private/tmp/sydradb-core-20261026-gdxun_3i/native-prerequisite-integration-tests.log`, `/private/tmp/sydradb-core-20261026-gdxun_3i/native-prerequisite-integration-artifacts/README.md`, `/private/tmp/sydradb-core-20261026-gdxun_3i/native-timing-delivery-preparation-result.md`, `/private/tmp/sydradb-core-20261026-gdxun_3i/native-high-id-recovery-runtime-tests.log` |
+| CAS durability | The combined storage run passed 225/225 tests. Independent review found two publication gaps. A loose-ref update, delete, or rename can skip a directory-sync attempt after a reflog error or allocation failure. A reftable list rename can precede a fallible summary rebuild and skip its directory-sync attempt. A worker is correcting these paths. | `/private/tmp/sydradb-core-20261026-gdxun_3i/cas-combined-durability-storage-tests-v2.log`, `/private/tmp/sydradb-core-20261026-gdxun_3i/cas-combined-durability-review-result.md`, `/private/tmp/sydradb-core-20261026-gdxun_3i/cas-combined-durability-storage-tests.log` |
+
+The earlier combined 224-test log used a cached compile and did not test the
+initializer parent guard. The first parent-guard patch did not apply. Use the
+canonical full fix at
+`/private/tmp/sydradb-core-20261026-gdxun_3i/cas-init-parent-fix-artifacts/cas-init-parent-full-fix-reviewed.patch`.
+
+The signed root checkpoint remains unchanged. The new integration and P2
+branches remain isolated and incomplete. A socket-only local merge conflict
+remains with its worker. No main writes, PR merges, or force pushes occurred.
+The original untracked `CLAUDE.md` remains unchanged.
+
+These results do not establish physical power-loss behavior or long-soak
+acceptance. Not all PR checks have passed.
+
+### Socket CI correction and prerequisite checkpoint
+
+PR 97 is ready after CI run `40496986415` passed. PR 99 is ready after Ubuntu
+and macOS passed run `40497280802`. PR 98's first run `40497272309` failed
+compilation at the newly enabled socket tests. Three existing fixes were still
+in the later timing commit: an explicit acknowledgement-result type, direct
+error-code comparisons, and a boolean flush acknowledgement assertion.
+
+A worker ported those exact fixes into PR 98 without changing production timing
+or assertion meaning. All 461 Debug runtime tests passed at signed local commit
+`bc326656ef108a4292f02bb89dde8934f289c2d2`. App commit
+`d65a8d30056df9959d692432082578e14562c139` shares tree
+`9cbe8e1ee03ca6a67524ea823ed85e3a2e7f5de6`. CI run `40498343512` is pending.
+Evidence: `native-socket-ci-failure.log`,
+`native-socket-ci-correction-runtime-tests.log`, and
+`native-socket-ci-fix-publish-payload.json` under the project artifact directory.
+
+The socket-only local merge conflict is resolved. Signed local prerequisite
+checkpoint `b5934b0a6e3304ca2e3179edec9592123e43ccf7` has tree
+`f11962d5186a65542084b06df48c9ecdd04e5591`. The merge adds the exact bounded
+socket acceptance test from the tested timing branch. It preserves the native
+recovery, hash, mixed-auto, and high-ID source. This is a local feature-branch
+merge, not a PR merge or main update. The Engine P2 port remains in progress.
+
+The CAS worker corrected the two reviewed error paths. Loose-ref sync paths are
+prepared before mutation. Reftable summary candidates are prepared before list
+publication. Error exits attempt the required directory syncs and retain the
+primary error. New tests cover reflog failure, allocation failure, and candidate
+summary failure. These corrections await compilation and execution; the earlier
+225-test result does not validate them. The report is
+`cas-publication-error-correction-artifacts/report.md`.
