@@ -3356,7 +3356,7 @@ pub const Engine = struct {
     fn optionalBytesEqualNormalized(lhs: ?[]const u8, rhs: ?[]const u8) bool {
         return optionalBytesNormalized(lhs) == null and optionalBytesNormalized(rhs) == null or
             (optionalBytesNormalized(lhs) != null and optionalBytesNormalized(rhs) != null and
-            std.mem.eql(u8, optionalBytesNormalized(lhs).?, optionalBytesNormalized(rhs).?));
+                std.mem.eql(u8, optionalBytesNormalized(lhs).?, optionalBytesNormalized(rhs).?));
     }
 
     fn optionalBytesNormalized(value: ?[]const u8) ?[]const u8 {

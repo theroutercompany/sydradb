@@ -19,4 +19,3 @@ Treat it as historical context rather than a normative spec:
 
 - The source of truth for implementation is the `src/` tree.
 - The source of truth for user-facing behavior is this documentation site under `docs/`.
-

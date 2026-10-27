@@ -43,4 +43,3 @@ retention_days = 0
 For a full key-by-key reference, see:
 
 - `Reference/Configuration (sydradb.toml)`
-
