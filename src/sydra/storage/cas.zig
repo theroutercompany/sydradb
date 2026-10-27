@@ -7447,16 +7447,22 @@ fn ensureContentRefForFile(
     path: []const u8,
     chunk_bytes: u32,
 ) !?ContentRef {
-    const bytes = try data_dir.readFileAlloc(alloc, path, 128 * 1024 * 1024);
-    defer alloc.free(bytes);
     if (store) |object_store_ref| {
-        const written = try extents.writeAll(alloc, object_store_ref, bytes, chunk_bytes);
+        const written = try extents.writeFile(
+            alloc,
+            object_store_ref,
+            data_dir,
+            path,
+            chunk_bytes,
+        );
         return ContentRef{ .extent_tree = .{
             .root_id = written.root_id,
             .size_bytes = written.size_bytes,
             .chunk_bytes = written.chunk_bytes,
         } };
     }
+    const bytes = try data_dir.readFileAlloc(alloc, path, 128 * 1024 * 1024);
+    defer alloc.free(bytes);
     const blob_id = object_store.computeId(.blob, bytes);
     return ContentRef{ .blob = blob_id };
 }
