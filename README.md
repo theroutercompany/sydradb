@@ -50,13 +50,24 @@ zig build -Dallocator-mode=default       # supported Zig allocator path
 zig build -Dallocator-mode=small_pool    # experimental allocator path
 ```
 
-### Market-data truth engine alpha
+### Schemas and numeric rows
 
-The current trading-facing alpha is definition-driven and keeps the existing single-value storage path underneath:
+Use schema and row routes for sensor readings, service metrics, and trading data.
+Each schema defines ordered numeric columns and required labels.
 
-- Register market families with `POST /api/v1/market/schema/register`
-- Ingest market rows with `POST /api/v1/market/ingest`
-- Query market rows with `POST /api/v1/market/query`
+- Register schemas with `POST /api/v1/schemas/register`. The existing `POST /api/v1/market/schema/register` route remains available.
+- List schemas with `GET /api/v1/schemas` and read one schema with `GET /api/v1/schemas/<metric>`. The existing `GET /api/v1/market/schemas` and `GET /api/v1/market/schema/<metric>` routes remain available.
+- Ingest rows with `POST /api/v1/rows/ingest`. The existing `POST /api/v1/market/ingest` route remains available.
+- Query rows with `POST /api/v1/rows/query`. The existing `POST /api/v1/market/query` route remains available.
+
+The neutral and existing routes use the same request formats, authentication,
+validation, and errors. See the [HTTP API](docs/docs/reference/http-api.md#schemas-and-numeric-rows)
+for a sensor example.
+
+### Trading application alpha
+
+The trading application provides bar policies, derived signals, and analysis:
+
 - Register bar policies, rollups, and signals with:
   - `POST /api/v1/bar-policies/register`
   - `POST /api/v1/rollups/register`
@@ -178,7 +189,7 @@ Apache-2.0
 ## CLI
 
 ```bash
-./zig-out/bin/sydradb             # serve (HTTP): /api/v1/ingest, /api/v1/query/range, /api/v1/query/compare, /api/v1/metrics/find, /api/v1/metrics/health, /api/v1/series/find, /api/v1/labels/values, /api/v1/annotations/write, /api/v1/annotations/query, /api/v1/sydraql, /api/v1/market/schema/register, /api/v1/market/ingest, /api/v1/market/query, /api/v1/bar-policies/register, /api/v1/rollups, /api/v1/signals, /api/v1/signals/history, /api/v1/signals/subscribe, /api/v1/analysis/markout, /api/v1/analysis/slippage, /api/v1/analysis/quote-quality, /api/v1/analysis/catalog, /api/v1/cas/refs, /api/v1/cas/commits, /api/v1/cas/log, /api/v1/cas/diff, /metrics
+./zig-out/bin/sydradb             # serve (HTTP): /api/v1/ingest, /api/v1/query/range, /api/v1/query/compare, /api/v1/metrics/find, /api/v1/metrics/health, /api/v1/series/find, /api/v1/labels/values, /api/v1/annotations/write, /api/v1/annotations/query, /api/v1/sydraql, /api/v1/schemas/register, /api/v1/schemas, /api/v1/schemas/<metric>, /api/v1/rows/ingest, /api/v1/rows/query, /api/v1/market/schema/register, /api/v1/market/ingest, /api/v1/market/query, /api/v1/bar-policies/register, /api/v1/rollups, /api/v1/signals, /api/v1/signals/history, /api/v1/signals/subscribe, /api/v1/analysis/markout, /api/v1/analysis/slippage, /api/v1/analysis/quote-quality, /api/v1/analysis/catalog, /api/v1/cas/refs, /api/v1/cas/commits, /api/v1/cas/log, /api/v1/cas/diff, /metrics
 ./zig-out/bin/sydradb pgwire      # PostgreSQL wire protocol preview (simple query + preview prepared flow)
 ./zig-out/bin/sydradb ingest      # read NDJSON from stdin, flush, and exit only after points are queryable
 ./zig-out/bin/sydradb query <series_id> <start_ts> <end_ts>

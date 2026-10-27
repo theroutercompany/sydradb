@@ -113,16 +113,31 @@ fn handleRequest(handle: *alloc_mod.AllocatorHandle, alloc: std.mem.Allocator, e
     if (std.mem.eql(u8, path, "/api/v1/market/schema/register") and method == .POST) {
         return try handleMarketSchemaRegister(alloc, eng, req);
     }
+    if (std.mem.eql(u8, path, "/api/v1/schemas/register") and method == .POST) {
+        return try handleMarketSchemaRegister(alloc, eng, req);
+    }
     if (std.mem.eql(u8, path, "/api/v1/market/schemas") and method == .GET) {
+        return try handleMarketSchemaList(alloc, eng, req);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/schemas") and method == .GET) {
         return try handleMarketSchemaList(alloc, eng, req);
     }
     if (std.mem.startsWith(u8, path, "/api/v1/market/schema/") and method == .GET) {
         return try handleMarketSchemaGet(alloc, eng, req, path["/api/v1/market/schema/".len..]);
     }
+    if (std.mem.startsWith(u8, path, "/api/v1/schemas/") and method == .GET) {
+        return try handleMarketSchemaGet(alloc, eng, req, path["/api/v1/schemas/".len..]);
+    }
     if (std.mem.eql(u8, path, "/api/v1/market/ingest") and method == .POST) {
         return try handleMarketIngest(alloc, eng, req);
     }
+    if (std.mem.eql(u8, path, "/api/v1/rows/ingest") and method == .POST) {
+        return try handleMarketIngest(alloc, eng, req);
+    }
     if (std.mem.eql(u8, path, "/api/v1/market/query") and method == .POST) {
+        return try handleMarketQuery(alloc, eng, req);
+    }
+    if (std.mem.eql(u8, path, "/api/v1/rows/query") and method == .POST) {
         return try handleMarketQuery(alloc, eng, req);
     }
     if (std.mem.eql(u8, path, "/api/v1/bar-policies/register") and method == .POST) {
@@ -1910,9 +1925,29 @@ const HttpTestResponse = struct {
 fn serveSingleHttpConnection(ctx: *OneShotHttpServer) void {
     defer ctx.server.deinit();
     const connection = ctx.server.accept() catch return;
-    handleConnection(ctx.handle, std.heap.c_allocator, ctx.eng, connection) catch |err| switch (err) {
-        error.HttpConnectionClosing, error.HttpRequestTruncated => {},
+    defer connection.stream.close();
+
+    var in_buf: [4096]u8 = undefined;
+    var out_buf: [4096]u8 = undefined;
+    var reader_state = connection.stream.reader(&in_buf);
+    var writer_state = connection.stream.writer(&out_buf);
+    var http_server = std.http.Server.init(reader_state.interface(), &writer_state.interface);
+
+    var req = http_server.receiveHead() catch |err| switch (err) {
+        error.HttpConnectionClosing, error.HttpRequestTruncated => return,
+        else => {
+            std.log.warn("http one-shot test server receive failed: {s}", .{@errorName(err)});
+            return;
+        },
+    };
+    handleRequest(ctx.handle, std.heap.c_allocator, ctx.eng, &req) catch |err| switch (err) {
+        error.HttpExpectationFailed => {
+            _ = req.respond("expectation failed", .{ .status = .expectation_failed, .keep_alive = false }) catch {};
+        },
         else => std.log.warn("http one-shot test server error: {s}", .{@errorName(err)}),
+    };
+    writer_state.interface.flush() catch |err| {
+        std.log.warn("http one-shot test server flush failed: {s}", .{@errorName(err)});
     };
 }
 
@@ -1958,7 +1993,6 @@ fn sendHttpRequestToPortWithHeaders(
     var response = std.array_list.Managed(u8).init(alloc);
     defer response.deinit();
     var chunk: [4096]u8 = undefined;
-    var target_total: ?usize = null;
     while (true) {
         const n = reader.read(chunk[0..]) catch |err| switch (err) {
             error.EndOfStream => 0,
@@ -1966,32 +2000,40 @@ fn sendHttpRequestToPortWithHeaders(
         };
         if (n == 0) break;
         try response.appendSlice(chunk[0..n]);
-
-        if (target_total == null) {
-            if (std.mem.indexOf(u8, response.items, "\r\n\r\n")) |header_end| {
-                const header_bytes = response.items[0..header_end];
-                if (parseContentLengthHeader(header_bytes)) |content_length| {
-                    target_total = header_end + 4 + content_length;
-                }
-            }
-        }
-        if (target_total) |target| {
-            if (response.items.len >= target) break;
-        }
     }
 
-    const header_end = std.mem.indexOf(u8, response.items, "\r\n\r\n") orelse return error.InvalidHttpResponse;
-    const header_bytes = response.items[0..header_end];
-    const status_end = std.mem.indexOf(u8, header_bytes, "\r\n") orelse return error.InvalidHttpResponse;
-    const status_line = header_bytes[0..status_end];
-    if (!std.mem.startsWith(u8, status_line, "HTTP/1.1 ")) return error.InvalidHttpResponse;
-    const status_code = try std.fmt.parseInt(u16, status_line["HTTP/1.1 ".len .. "HTTP/1.1 ".len + 3], 10);
-    if (target_total) |target| {
-        if (response.items.len < target) return error.InvalidHttpResponse;
+    var offset: usize = 0;
+    var status_code: u16 = 0;
+    var header_bytes: []const u8 = "";
+    var body_bytes: []const u8 = "";
+    while (true) {
+        const header_end_rel = std.mem.indexOf(u8, response.items[offset..], "\r\n\r\n") orelse return error.InvalidHttpResponse;
+        const header_end = offset + header_end_rel;
+        header_bytes = response.items[offset..header_end];
+        const status_end = std.mem.indexOf(u8, header_bytes, "\r\n") orelse header_bytes.len;
+        const status_line = header_bytes[0..status_end];
+        if (!std.mem.startsWith(u8, status_line, "HTTP/1.1 ")) return error.InvalidHttpResponse;
+        status_code = try std.fmt.parseInt(u16, status_line["HTTP/1.1 ".len .. "HTTP/1.1 ".len + 3], 10);
+        offset = header_end + 4;
+        if (status_code < 100 or status_code >= 200) {
+            body_bytes = response.items[offset..];
+            break;
+        }
+        if (offset >= response.items.len) return error.InvalidHttpResponse;
     }
+
+    if (parseContentLengthHeader(header_bytes)) |content_length| {
+        if (body_bytes.len < content_length) return error.InvalidHttpResponse;
+        body_bytes = body_bytes[0..content_length];
+    }
+    const response_body = if (hasChunkedTransferEncoding(header_bytes))
+        try decodeChunkedHttpBody(alloc, body_bytes)
+    else
+        try alloc.dupe(u8, body_bytes);
+    errdefer alloc.free(response_body);
     return .{
         .status_code = status_code,
-        .body = try alloc.dupe(u8, response.items[header_end + 4 ..]),
+        .body = response_body,
     };
 }
 
@@ -2006,6 +2048,43 @@ fn parseContentLengthHeader(header_bytes: []const u8) ?usize {
         return std.fmt.parseInt(usize, value, 10) catch null;
     }
     return null;
+}
+
+fn hasChunkedTransferEncoding(header_bytes: []const u8) bool {
+    var lines = std.mem.splitSequence(u8, header_bytes, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        if (!std.ascii.eqlIgnoreCase(name, "Transfer-Encoding")) continue;
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        var encodings = std.mem.splitScalar(u8, value, ',');
+        while (encodings.next()) |encoding| {
+            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, encoding, " \t"), "chunked")) return true;
+        }
+    }
+    return false;
+}
+
+fn decodeChunkedHttpBody(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+    var out = std.array_list.Managed(u8).init(alloc);
+    errdefer out.deinit();
+
+    var offset: usize = 0;
+    while (true) {
+        const line_end_rel = std.mem.indexOf(u8, body[offset..], "\r\n") orelse return error.InvalidHttpResponse;
+        const line_end = offset + line_end_rel;
+        const raw_size = std.mem.trim(u8, body[offset..line_end], " \t");
+        const size_text = if (std.mem.indexOfScalar(u8, raw_size, ';')) |semicolon| raw_size[0..semicolon] else raw_size;
+        const size = std.fmt.parseInt(usize, size_text, 16) catch return error.InvalidHttpResponse;
+        offset = line_end + 2;
+        if (size == 0) return try out.toOwnedSlice();
+        if (body.len < offset + size + 2) return error.InvalidHttpResponse;
+        try out.appendSlice(body[offset .. offset + size]);
+        offset += size;
+        if (!std.mem.eql(u8, body[offset .. offset + 2], "\r\n")) return error.InvalidHttpResponse;
+        offset += 2;
+    }
 }
 
 fn runSingleRequestServer(
@@ -2038,6 +2117,352 @@ fn runSingleRequestServerWithHeaders(
     const thread = try std.Thread.spawn(.{}, serveSingleHttpConnection, .{&ctx});
     defer thread.join();
     return try sendHttpRequestToPortWithHeaders(alloc, port, method, path, body, extra_headers);
+}
+
+test "HTTP test client decodes chunked response bodies" {
+    const alloc = std.testing.allocator;
+    const headers = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+    try std.testing.expect(hasChunkedTransferEncoding(headers));
+
+    const decoded = try decodeChunkedHttpBody(alloc, "1;extension=value\r\n{\r\n1\r\n}\r\n0\r\n\r\n");
+    defer alloc.free(decoded);
+    try std.testing.expectEqualStrings("{}", decoded);
+}
+
+test "market ingest accepts final records with and without a newline" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/http-final-record", .{tmp.sub_path});
+    defer alloc.free(data_path);
+    var eng = try Engine.init(alloc, try testConfig(alloc, data_path));
+    defer eng.deinit();
+
+    const labels = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}";
+    for ([_][]const u8{ "\n", "", "\n \t" }, 0..) |ending, index| {
+        const body = try std.fmt.allocPrint(alloc, "{{\"metric\":\"market.trade\",\"ts_ns\":{d},\"labels\":{s},\"columns\":{{\"price\":12.5,\"size\":2}}}}{s}", .{ index + 1, labels, ending });
+        defer alloc.free(body);
+        const request_bytes = try std.fmt.allocPrint(alloc, "POST /api/v1/market/ingest HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
+        defer alloc.free(request_bytes);
+        var request_reader = std.Io.Reader.fixed(request_bytes);
+        var response_writer = std.Io.Writer.Allocating.init(alloc);
+        defer response_writer.deinit();
+        var server = std.http.Server.init(&request_reader, &response_writer.writer);
+        var request = try server.receiveHead();
+        try handleMarketIngest(alloc, eng, &request);
+        try std.testing.expect(std.mem.startsWith(u8, response_writer.written(), "HTTP/1.1 200"));
+        try std.testing.expect(std.mem.indexOf(u8, response_writer.written(), "\"rows\":1") != null);
+    }
+
+    const sid = types.seriesIdFrom("market.trade.price", labels);
+    try eng.waitForQueryablePoints(alloc, sid, 3, 1_000);
+    var points = std.array_list.Managed(types.Point).init(alloc);
+    defer points.deinit();
+    try eng.queryRange(sid, 0, 4, &points);
+    try std.testing.expectEqual(@as(usize, 3), points.items.len);
+    for (points.items, 0..) |point, index| {
+        try std.testing.expectEqual(@as(i64, @intCast(index + 1)), point.ts);
+        try std.testing.expectEqual(@as(f64, 12.5), point.value);
+    }
+}
+
+test "neutral schema and row aliases share market contracts across custom schemas" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/http-neutral-market-routes", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var conf = try testConfig(talloc, data_path);
+    conf.market_storage_mode = .fanout_v1;
+    conf.market_storage_read_mode = .fanout;
+    var eng = try Engine.init(talloc, conf);
+    defer eng.deinit();
+
+    var initial_list = try runSingleRequestServer(talloc, eng, "GET", "/api/v1/schemas", "");
+    defer initial_list.deinit(talloc);
+    try std.testing.expectEqual(@as(u16, 200), initial_list.status_code);
+    var initial_schemas = try std.json.parseFromSlice(std.json.Value, talloc, initial_list.body, .{});
+    defer initial_schemas.deinit();
+    try std.testing.expect(initial_schemas.value == .array);
+
+    const custom_schemas = [_]struct {
+        metric: []const u8,
+        register_path: []const u8,
+        schema_body: []const u8,
+        ingest_path: []const u8,
+        ingest_body: []const u8,
+        query_path: []const u8,
+        query_body: []const u8,
+        query_column: []const u8,
+        expected_value: f64,
+        corrected_value: f64,
+        timestamp: i64,
+    }{
+        .{
+            .metric = "sensor.http.environment",
+            .register_path = "/api/v1/schemas/register",
+            .schema_body = "{\"metric\":\"sensor.http.environment\",\"ordered_columns\":[\"temperature_c\",\"humidity_pct\"],\"required_labels\":[\"device_id\",\"site\"]}",
+            .ingest_path = "/api/v1/rows/ingest",
+            .ingest_body = "{\"metric\":\"sensor.http.environment\",\"ts_ns\":101,\"labels\":{\"device_id\":\"sensor-17\",\"site\":\"lab-west\"},\"columns\":{\"temperature_c\":21.5,\"humidity_pct\":36}}\n",
+            .query_path = "/api/v1/market/query",
+            .query_body = "{\"metric\":\"sensor.http.environment\",\"labels\":{\"device_id\":\"sensor-17\",\"site\":\"lab-west\"},\"start_ts_ns\":0,\"end_ts_ns\":1000,\"columns\":[\"temperature_c\"]}",
+            .query_column = "temperature_c",
+            .expected_value = 21.5,
+            .corrected_value = 22.5,
+            .timestamp = 101,
+        },
+        .{
+            .metric = "service.http.request",
+            .register_path = "/api/v1/market/schema/register",
+            .schema_body = "{\"metric\":\"service.http.request\",\"ordered_columns\":[\"latency_ms\",\"status_code\"],\"required_labels\":[\"service\",\"region\"]}",
+            .ingest_path = "/api/v1/market/ingest",
+            .ingest_body = "{\"metric\":\"service.http.request\",\"ts_ns\":202,\"labels\":{\"service\":\"checkout\",\"region\":\"us-east\"},\"columns\":{\"latency_ms\":14.25,\"status_code\":200}}\n",
+            .query_path = "/api/v1/rows/query",
+            .query_body = "{\"metric\":\"service.http.request\",\"labels\":{\"region\":\"us-east\",\"service\":\"checkout\"},\"start_ts_ns\":0,\"end_ts_ns\":1000,\"columns\":[\"latency_ms\"]}",
+            .query_column = "latency_ms",
+            .expected_value = 14.25,
+            .corrected_value = 15.25,
+            .timestamp = 202,
+        },
+        .{
+            .metric = "trading.http.fill",
+            .register_path = "/api/v1/schemas/register",
+            .schema_body = "{\"metric\":\"trading.http.fill\",\"ordered_columns\":[\"price\",\"quantity\"],\"required_labels\":[\"symbol\",\"venue\"]}",
+            .ingest_path = "/api/v1/rows/ingest",
+            .ingest_body = "{\"metric\":\"trading.http.fill\",\"ts_ns\":303,\"labels\":{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"},\"columns\":{\"price\":101.5,\"quantity\":3}}\n",
+            .query_path = "/api/v1/market/query",
+            .query_body = "{\"metric\":\"trading.http.fill\",\"labels\":{\"venue\":\"XNAS\",\"symbol\":\"AAPL\"},\"start_ts_ns\":0,\"end_ts_ns\":1000,\"columns\":[\"price\"]}",
+            .query_column = "price",
+            .expected_value = 101.5,
+            .corrected_value = 102.5,
+            .timestamp = 303,
+        },
+    };
+
+    for (custom_schemas) |schema| {
+        {
+            var registered = try runSingleRequestServer(
+                talloc,
+                eng,
+                "POST",
+                schema.register_path,
+                schema.schema_body,
+            );
+            defer registered.deinit(talloc);
+            try std.testing.expectEqual(@as(u16, 201), registered.status_code);
+
+            const alias_detail_path = try std.fmt.allocPrint(talloc, "/api/v1/schemas/{s}", .{schema.metric});
+            defer talloc.free(alias_detail_path);
+            var alias_detail = try runSingleRequestServer(talloc, eng, "GET", alias_detail_path, "");
+            defer alias_detail.deinit(talloc);
+            try std.testing.expectEqual(@as(u16, 200), alias_detail.status_code);
+            try std.testing.expectEqualStrings(registered.body, alias_detail.body);
+
+            const market_detail_path = try std.fmt.allocPrint(talloc, "/api/v1/market/schema/{s}", .{schema.metric});
+            defer talloc.free(market_detail_path);
+            var market_detail = try runSingleRequestServer(talloc, eng, "GET", market_detail_path, "");
+            defer market_detail.deinit(talloc);
+            try std.testing.expectEqual(@as(u16, 200), market_detail.status_code);
+            try std.testing.expectEqualStrings(registered.body, market_detail.body);
+        }
+    }
+
+    {
+        var neutral_list = try runSingleRequestServer(talloc, eng, "GET", "/api/v1/schemas", "");
+        defer neutral_list.deinit(talloc);
+        var market_list = try runSingleRequestServer(talloc, eng, "GET", "/api/v1/market/schemas", "");
+        defer market_list.deinit(talloc);
+        try std.testing.expectEqual(@as(u16, 200), neutral_list.status_code);
+        try std.testing.expectEqual(@as(u16, 200), market_list.status_code);
+        try std.testing.expectEqualStrings(market_list.body, neutral_list.body);
+
+        var listed = try std.json.parseFromSlice(std.json.Value, talloc, neutral_list.body, .{});
+        defer listed.deinit();
+        try std.testing.expect(listed.value == .array);
+        try std.testing.expectEqual(initial_schemas.value.array.items.len + custom_schemas.len, listed.value.array.items.len);
+    }
+
+    for (custom_schemas) |schema| {
+        {
+            var ingested = try runSingleRequestServer(
+                talloc,
+                eng,
+                "POST",
+                schema.ingest_path,
+                schema.ingest_body,
+            );
+            defer ingested.deinit(talloc);
+            try std.testing.expectEqual(@as(u16, 200), ingested.status_code);
+        }
+
+        {
+            _ = try eng.flushAndDrain(2_000);
+
+            var queried = try runSingleRequestServer(
+                talloc,
+                eng,
+                "POST",
+                schema.query_path,
+                schema.query_body,
+            );
+            defer queried.deinit(talloc);
+            try std.testing.expectEqual(@as(u16, 200), queried.status_code);
+
+            var parsed = try std.json.parseFromSlice(std.json.Value, talloc, queried.body, .{});
+            defer parsed.deinit();
+            try std.testing.expectEqualStrings(schema.metric, parsed.value.object.get("metric").?.string);
+            const rows = parsed.value.object.get("rows").?.array;
+            try std.testing.expectEqual(@as(usize, 1), rows.items.len);
+            try std.testing.expectEqual(schema.timestamp, rows.items[0].object.get("ts_ns").?.integer);
+            const columns = rows.items[0].object.get("columns").?.object;
+            try std.testing.expectEqual(@as(usize, 1), columns.count());
+            const value = columns.get(schema.query_column).?;
+            const actual: f64 = switch (value) {
+                .integer => |number| @floatFromInt(number),
+                .float => |number| number,
+                else => return error.InvalidTestResponse,
+            };
+            try std.testing.expectApproxEqAbs(schema.expected_value, actual, 1e-9);
+        }
+
+        var correction = try std.json.parseFromSlice(std.json.Value, talloc, schema.ingest_body, .{});
+        defer correction.deinit();
+        correction.value.object.getPtr("columns").?.object.getPtr(schema.query_column).?.* = .{ .float = schema.corrected_value };
+        const correction_body = try std.json.Stringify.valueAlloc(talloc, correction.value, .{});
+        defer talloc.free(correction_body);
+        try std.testing.expect(std.mem.endsWith(u8, schema.ingest_body, "\n"));
+        try std.testing.expect(!std.mem.endsWith(u8, correction_body, "\n"));
+        const correction_path = if (std.mem.eql(u8, schema.ingest_path, "/api/v1/rows/ingest"))
+            "/api/v1/market/ingest"
+        else
+            "/api/v1/rows/ingest";
+        var corrected = try runSingleRequestServer(talloc, eng, "POST", correction_path, correction_body);
+        defer corrected.deinit(talloc);
+        try std.testing.expectEqual(@as(u16, 200), corrected.status_code);
+        _ = try eng.flushAndDrain(2_000);
+
+        const corrected_query_path = if (std.mem.eql(u8, schema.query_path, "/api/v1/rows/query"))
+            "/api/v1/market/query"
+        else
+            "/api/v1/rows/query";
+        var queried_correction = try runSingleRequestServer(
+            talloc,
+            eng,
+            "POST",
+            corrected_query_path,
+            schema.query_body,
+        );
+        defer queried_correction.deinit(talloc);
+        try std.testing.expectEqual(@as(u16, 200), queried_correction.status_code);
+        var parsed_correction = try std.json.parseFromSlice(std.json.Value, talloc, queried_correction.body, .{});
+        defer parsed_correction.deinit();
+        const corrected_rows = parsed_correction.value.object.get("rows").?.array;
+        try std.testing.expectEqual(@as(usize, 2), corrected_rows.items.len);
+        var saw_original = false;
+        var saw_correction = false;
+        for (corrected_rows.items) |row| {
+            try std.testing.expectEqual(schema.timestamp, row.object.get("ts_ns").?.integer);
+            const columns = row.object.get("columns").?.object;
+            try std.testing.expectEqual(@as(usize, 1), columns.count());
+            const value = columns.get(schema.query_column).?;
+            const actual: f64 = switch (value) {
+                .integer => |number| @floatFromInt(number),
+                .float => |number| number,
+                else => return error.InvalidTestResponse,
+            };
+            if (@abs(actual - schema.expected_value) <= 1e-9) {
+                saw_original = true;
+            } else if (@abs(actual - schema.corrected_value) <= 1e-9) {
+                saw_correction = true;
+            } else {
+                try std.testing.expect(false);
+            }
+        }
+        try std.testing.expect(saw_original);
+        try std.testing.expect(saw_correction);
+    }
+}
+
+test "neutral route aliases preserve auth and validation parity" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/http-neutral-route-auth", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var conf = try testConfig(talloc, data_path);
+    conf.market_storage_mode = .fanout_v1;
+    conf.market_storage_read_mode = .fanout;
+    talloc.free(conf.auth_token);
+    conf.auth_token = try talloc.dupe(u8, "neutral-route-test-token");
+    var eng = try Engine.init(talloc, conf);
+    defer eng.deinit();
+
+    const protected_routes = [_]struct {
+        method: []const u8,
+        alias_path: []const u8,
+        market_path: []const u8,
+        body: []const u8,
+    }{
+        .{ .method = "POST", .alias_path = "/api/v1/schemas/register", .market_path = "/api/v1/market/schema/register", .body = "" },
+        .{ .method = "GET", .alias_path = "/api/v1/schemas", .market_path = "/api/v1/market/schemas", .body = "" },
+        .{ .method = "GET", .alias_path = "/api/v1/schemas/sensor.auth", .market_path = "/api/v1/market/schema/sensor.auth", .body = "" },
+        .{ .method = "POST", .alias_path = "/api/v1/rows/ingest", .market_path = "/api/v1/market/ingest", .body = "" },
+        .{ .method = "POST", .alias_path = "/api/v1/rows/query", .market_path = "/api/v1/market/query", .body = "" },
+    };
+
+    for (protected_routes) |route| {
+        var alias_response = try runSingleRequestServer(talloc, eng, route.method, route.alias_path, route.body);
+        defer alias_response.deinit(talloc);
+        var market_response = try runSingleRequestServer(talloc, eng, route.method, route.market_path, route.body);
+        defer market_response.deinit(talloc);
+        try std.testing.expectEqual(@as(u16, 401), alias_response.status_code);
+        try std.testing.expectEqual(market_response.status_code, alias_response.status_code);
+        try std.testing.expectEqualStrings(market_response.body, alias_response.body);
+    }
+
+    const auth_headers = [_]std.http.Header{
+        .{ .name = "Authorization", .value = "Bearer neutral-route-test-token" },
+    };
+    const invalid_requests = [_]struct {
+        method: []const u8,
+        alias_path: []const u8,
+        market_path: []const u8,
+        body: []const u8,
+        expected_status: u16,
+    }{
+        .{ .method = "POST", .alias_path = "/api/v1/schemas/register", .market_path = "/api/v1/market/schema/register", .body = "{\"metric\":\"sensor.validation\"}", .expected_status = 400 },
+        .{ .method = "POST", .alias_path = "/api/v1/rows/ingest", .market_path = "/api/v1/market/ingest", .body = "{}\n", .expected_status = 400 },
+        .{ .method = "POST", .alias_path = "/api/v1/rows/query", .market_path = "/api/v1/market/query", .body = "{}", .expected_status = 400 },
+        .{ .method = "GET", .alias_path = "/api/v1/schemas/sensor.missing", .market_path = "/api/v1/market/schema/sensor.missing", .body = "", .expected_status = 404 },
+    };
+
+    for (invalid_requests) |request| {
+        var alias_response = try runSingleRequestServerWithHeaders(
+            talloc,
+            eng,
+            request.method,
+            request.alias_path,
+            request.body,
+            &auth_headers,
+        );
+        defer alias_response.deinit(talloc);
+        var market_response = try runSingleRequestServerWithHeaders(
+            talloc,
+            eng,
+            request.method,
+            request.market_path,
+            request.body,
+            &auth_headers,
+        );
+        defer market_response.deinit(talloc);
+        try std.testing.expectEqual(request.expected_status, alias_response.status_code);
+        try std.testing.expectEqual(market_response.status_code, alias_response.status_code);
+        try std.testing.expectEqualStrings(market_response.body, alias_response.body);
+    }
 }
 
 test "parseIngestLine mirrors HTTP numeric and tags behavior" {
@@ -3027,12 +3452,15 @@ fn handleMarketIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Ser
     var rows: usize = 0;
     var writes: usize = 0;
 
-    while (true) {
+    var body_complete = false;
+    while (!body_complete) {
         const slice = body_reader.*.takeDelimiterExclusive('\n') catch |err| switch (err) {
             error.StreamTooLong => return respondJsonError(alloc, req, .payload_too_large, "line_too_long", "line too long"),
             error.EndOfStream => break,
             else => return err,
         };
+        // The final unterminated line can be returned together with EOF.
+        body_complete = req.server.reader.state == .ready;
         const trimmed = std.mem.trim(u8, slice, " \t\r\n");
         if (trimmed.len == 0) continue;
 
