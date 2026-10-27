@@ -32,6 +32,14 @@ jobs:
       - name: Install pre-commit
         run: pip install pre-commit
 
+      - name: Select macOS SDK
+        if: runner.os == 'macOS'
+        run: |
+          echo "DEVELOPER_DIR=/Applications/Xcode_26.3.app/Contents/Developer" >> "$GITHUB_ENV"
+          export DEVELOPER_DIR=/Applications/Xcode_26.3.app/Contents/Developer
+          echo "macOS SDK path: $(xcrun --sdk macosx --show-sdk-path)"
+          echo "macOS SDK version: $(xcrun --sdk macosx --show-sdk-version)"
+
       - name: Install Zig
         uses: goto-bus-stop/setup-zig@v2
         with:
@@ -72,6 +80,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Select macOS SDK
+        if: runner.os == 'macOS'
+        run: |
+          echo "DEVELOPER_DIR=/Applications/Xcode_26.3.app/Contents/Developer" >> "$GITHUB_ENV"
+          export DEVELOPER_DIR=/Applications/Xcode_26.3.app/Contents/Developer
+          echo "macOS SDK path: $(xcrun --sdk macosx --show-sdk-path)"
+          echo "macOS SDK version: $(xcrun --sdk macosx --show-sdk-version)"
 
       - name: Install Zig
         uses: goto-bus-stop/setup-zig@v2
