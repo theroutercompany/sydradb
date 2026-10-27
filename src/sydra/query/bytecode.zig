@@ -92,6 +92,7 @@ pub const Program = struct {
     instructions: []Instruction,
     constants: []value_mod.Value = &.{},
     exprs: []const *const ast.Expr = &.{},
+    /// Selector records are copied; resolved name and tag slices stay in the compile arena.
     selectors: []const ir.BoundSelector = &.{},
     schemas: []const []const plan.ColumnInfo = &.{},
     owned_schema_columns: []const []const plan.ColumnInfo = &.{},

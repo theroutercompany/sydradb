@@ -304,6 +304,7 @@ pub const WAL = struct {
     fsync: cfg.FsyncPolicy,
     file: std.fs.File,
     bytes_written: usize,
+    snapshot_mu: std.Thread.Mutex = .{},
 
     pub fn open(alloc: std.mem.Allocator, data_dir: std.fs.Dir, policy: cfg.FsyncPolicy) !WAL {
         data_dir.makePath("wal") catch {};
@@ -314,11 +315,31 @@ pub const WAL = struct {
         };
         const end_pos = try f.getEndPos();
         try f.seekFromEnd(0);
-        return .{ .alloc = alloc, .dir = data_dir, .fsync = policy, .file = f, .bytes_written = @intCast(end_pos) };
+        return .{
+            .alloc = alloc,
+            .dir = data_dir,
+            .fsync = policy,
+            .file = f,
+            .bytes_written = @intCast(end_pos),
+        };
     }
 
     pub fn close(self: *WAL) void {
         self.file.close();
+    }
+
+    pub fn lockForSnapshot(self: *WAL) void {
+        self.snapshot_mu.lock();
+    }
+
+    pub fn unlockForSnapshot(self: *WAL) void {
+        self.snapshot_mu.unlock();
+    }
+
+    pub fn sync(self: *WAL) !void {
+        self.snapshot_mu.lock();
+        defer self.snapshot_mu.unlock();
+        try self.file.sync();
     }
 
     pub fn append(self: *WAL, series_id: u64, ts: i64, value: f64) !u32 {
@@ -334,6 +355,8 @@ pub const WAL = struct {
         var header: [4]u8 = undefined;
         const plen: u32 = @intCast(payload.len);
         std.mem.writeInt(u32, &header, plen, .little);
+        self.snapshot_mu.lock();
+        defer self.snapshot_mu.unlock();
         try self.file.writeAll(&header);
         try self.file.writeAll(payload);
         var crc = std.hash.Crc32.init();
@@ -387,6 +410,8 @@ pub const WAL = struct {
             writeIntBytes(u32, encoded, &offset, crc.final());
         }
 
+        self.snapshot_mu.lock();
+        defer self.snapshot_mu.unlock();
         try self.file.writeAll(encoded);
         self.bytes_written += total_bytes;
         switch (self.fsync) {
@@ -454,6 +479,8 @@ pub const WAL = struct {
             writeIntBytes(u32, encoded, &offset, crc.final());
         }
 
+        self.snapshot_mu.lock();
+        defer self.snapshot_mu.unlock();
         try self.file.writeAll(encoded);
         self.bytes_written += total_bytes;
         switch (self.fsync) {
@@ -526,6 +553,8 @@ pub const WAL = struct {
         }
         std.debug.assert(offset == encoded.len);
 
+        self.snapshot_mu.lock();
+        defer self.snapshot_mu.unlock();
         try self.file.writeAll(encoded);
         self.bytes_written += total_bytes;
         switch (self.fsync) {
@@ -602,6 +631,8 @@ pub const WAL = struct {
         }
         std.debug.assert(offset == encoded.len);
 
+        self.snapshot_mu.lock();
+        defer self.snapshot_mu.unlock();
         try self.file.writeAll(encoded);
         self.bytes_written += total_bytes;
         switch (self.fsync) {
@@ -613,6 +644,8 @@ pub const WAL = struct {
     }
 
     pub fn rotateIfNeeded(self: *WAL) !void {
+        self.snapshot_mu.lock();
+        defer self.snapshot_mu.unlock();
         if (self.bytes_written < 64 * 1024 * 1024) return; // 64 MiB
         self.file.close();
         // move current to wal/<epoch>.wal
@@ -625,6 +658,8 @@ pub const WAL = struct {
     }
 
     pub fn reset(self: *WAL) !void {
+        self.snapshot_mu.lock();
+        defer self.snapshot_mu.unlock();
         self.file.close();
         self.dir.makePath("wal") catch {};
 
@@ -848,9 +883,9 @@ pub fn writeJournalRootForWalFile(
 ) !object_store.ObjectId {
     const path = try std.fmt.allocPrint(alloc, "wal/{s}", .{wal_name});
     defer alloc.free(path);
-    const bytes = try data_dir.readFileAlloc(alloc, path, 128 * 1024 * 1024);
-    defer alloc.free(bytes);
-    return try writeJournalRootFromBytes(alloc, store, bytes);
+    var file = try data_dir.openFile(path, .{});
+    defer file.close();
+    return try writeJournalRootFromFile(alloc, store, &file);
 }
 
 pub fn writeJournalRootFromBytes(
@@ -889,8 +924,76 @@ pub fn writeJournalRootFromBytes(
         offset += frame_len;
     }
 
+    return try finishJournalRoot(
+        alloc,
+        store,
+        &frame_entries,
+        &index_entries,
+        @intCast(bytes.len),
+    );
+}
+
+fn writeJournalRootFromFile(
+    alloc: std.mem.Allocator,
+    store: *object_store.ObjectStore,
+    file: *std.fs.File,
+) !object_store.ObjectId {
+    const stat = try file.stat();
+    var frame_entries = std.array_list.Managed(TreeEntry).init(alloc);
+    defer {
+        for (frame_entries.items) |*entry| entry.deinit(alloc);
+        frame_entries.deinit();
+    }
+
+    var index_entries = std.array_list.Managed(JournalFrameIndexEntry).init(alloc);
+    defer index_entries.deinit();
+
+    var offset: u64 = 0;
+    var frame_idx: usize = 0;
+    while (offset < stat.size) : (frame_idx += 1) {
+        const remaining = stat.size - offset;
+        if (remaining < 4) return error.CorruptWal;
+
+        var header: [4]u8 = undefined;
+        if (try file.readAll(header[0..]) != header.len) return error.CorruptWal;
+        const payload_len = std.mem.readInt(u32, &header, .little);
+        if (payload_len == 0 or payload_len > max_wal_payload_bytes) return error.CorruptWal;
+        const frame_len: usize = 4 + payload_len + 4;
+        const frame_len_u64: u64 = @intCast(frame_len);
+        if (frame_len_u64 > remaining) return error.CorruptWal;
+
+        const frame = try alloc.alloc(u8, frame_len);
+        defer alloc.free(frame);
+        @memcpy(frame[0..header.len], &header);
+        const frame_tail = frame[header.len..];
+        if (try file.readAll(frame_tail) != frame_tail.len) return error.CorruptWal;
+
+        const frame_id = try store.put(.blob, frame);
+        try frame_entries.append(.{
+            .name = try std.fmt.allocPrint(alloc, "{d:0>16}", .{frame_idx}),
+            .object_type = .blob,
+            .object_id = frame_id,
+        });
+        try index_entries.append(.{
+            .offset = offset,
+            .size_bytes = @intCast(frame_len),
+        });
+        offset += frame_len_u64;
+    }
+
+    if (offset != stat.size) return error.CorruptWal;
+    return try finishJournalRoot(alloc, store, &frame_entries, &index_entries, stat.size);
+}
+
+fn finishJournalRoot(
+    alloc: std.mem.Allocator,
+    store: *object_store.ObjectStore,
+    frame_entries: *std.array_list.Managed(TreeEntry),
+    index_entries: *std.array_list.Managed(JournalFrameIndexEntry),
+    file_size: u64,
+) !object_store.ObjectId {
     const meta_payload = try encodeJournalMeta(alloc, .{
-        .file_size = bytes.len,
+        .file_size = file_size,
         .frame_count = @intCast(index_entries.items.len),
     });
     defer alloc.free(meta_payload);
@@ -1146,6 +1249,8 @@ fn appendPayload(self: *WAL, payload: []const u8) !u32 {
     var header: [4]u8 = undefined;
     const plen: u32 = @intCast(payload.len);
     std.mem.writeInt(u32, &header, plen, .little);
+    self.snapshot_mu.lock();
+    defer self.snapshot_mu.unlock();
     try self.file.writeAll(&header);
     try self.file.writeAll(payload);
     var crc = std.hash.Crc32.init();
@@ -1268,6 +1373,55 @@ test "wal replays mixed scalar and market records in durable order" {
 
     try wal.replay(alloc, &ctx);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 2, 4, 1, 3 }, ctx.order[0..ctx.order_len]);
+}
+
+test "WAL snapshot lock serializes reset across current file capture" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var wal = try WAL.open(alloc, tmp.dir, .none);
+    defer wal.close();
+    _ = try wal.append(7, 1_000, 3.5);
+
+    const ResetWorker = struct {
+        wal: *WAL,
+        started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        completed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            self.wal.reset() catch |err| {
+                self.failure = err;
+                self.completed.store(true, .release);
+                return;
+            };
+            self.completed.store(true, .release);
+        }
+    };
+
+    wal.lockForSnapshot();
+    var snapshot_locked = true;
+    defer if (snapshot_locked) wal.unlockForSnapshot();
+
+    var worker = ResetWorker{ .wal = &wal };
+    const thread = try std.Thread.spawn(.{}, ResetWorker.run, .{&worker});
+    var thread_joined = false;
+    defer if (!thread_joined) thread.join();
+
+    while (!worker.started.load(.acquire)) std.atomic.spinLoopHint();
+    std.Thread.sleep(5 * std.time.ns_per_ms);
+    try std.testing.expect(!worker.completed.load(.acquire));
+    try tmp.dir.access("wal/current.wal", .{});
+
+    wal.unlockForSnapshot();
+    snapshot_locked = false;
+    thread.join();
+    thread_joined = true;
+    if (worker.failure) |err| return err;
+    try std.testing.expect(worker.completed.load(.acquire));
+    try tmp.dir.access("wal/current.wal", .{});
 }
 
 test "wal market batches round trip registrations and rows" {
@@ -1589,6 +1743,10 @@ test "journal roots replay captured wal frames in order" {
     _ = try wal.append(77, 1_005, 4.5);
 
     const root_id = try writeJournalRootForWalFile(alloc, tmp.dir, &store, "current.wal");
+    const file_bytes = try tmp.dir.readFileAlloc(alloc, "wal/current.wal", 1024 * 1024);
+    defer alloc.free(file_bytes);
+    const bytes_root_id = try writeJournalRootFromBytes(alloc, &store, file_bytes);
+    try std.testing.expect(root_id.eql(bytes_root_id));
 
     var ctx = struct {
         registered: bool = false,
