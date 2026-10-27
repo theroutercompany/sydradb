@@ -10969,7 +10969,7 @@ test "engine primary mode compacts from CAS-backed segment descriptors without s
             .data_dir = try talloc.dupe(u8, data_path),
             .http_port = 0,
             .fsync = .none,
-            .flush_interval_ms = 5,
+            .flush_interval_ms = std.math.maxInt(u32),
             .memtable_max_bytes = 512,
             .retention_days = 0,
             .auth_token = try talloc.dupe(u8, ""),
@@ -10989,6 +10989,8 @@ test "engine primary mode compacts from CAS-backed segment descriptors without s
         try std.testing.expectEqual(false, engine.metrics.maintenance_pause_active.load(.monotonic));
         try std.testing.expectEqual(@as(usize, 1), engine.metadata.manifest.entries.items.len);
         try engine.ingest(.{ .series_id = sid, .ts = 2_000, .value = 3.0, .tags_json = "{}" });
+        _ = try engine.flushNow();
+        try engine.verifyCasState();
         try engine.waitForQueryablePoints(talloc, sid, 3, 1_000);
 
         var results = std.array_list.Managed(types.Point).init(talloc);
