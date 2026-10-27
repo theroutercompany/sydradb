@@ -118,6 +118,11 @@ pub const Engine = struct {
         },
     };
 
+    pub const SimpleSelectorLookup = union(enum) {
+        by_id: types.SeriesId,
+        name: []const u8,
+    };
+
     pub const SeriesDescriptor = struct {
         series_id: types.SeriesId,
         metric: []const u8,
@@ -308,6 +313,56 @@ pub const Engine = struct {
             self.cas_index_mu.lock();
             defer self.cas_index_mu.unlock();
             if (self.cas_index) |*index| return try index.resolveExactSeriesDetailed(series, tags_json);
+            return null;
+        }
+
+        /// Copies snapshot-backed strings before releasing cas_index_mu.
+        pub fn resolveSimpleSelectorOwnedFromCas(
+            self: *MetadataState,
+            allocator: std.mem.Allocator,
+            lookup: SimpleSelectorLookup,
+        ) std.mem.Allocator.Error!?series_catalog_mod.Resolution {
+            self.cas_index_mu.lock();
+            defer self.cas_index_mu.unlock();
+            if (self.cas_index) |*index| {
+                const resolution = switch (lookup) {
+                    .by_id => |series_id| index.resolveBySeriesId(series_id),
+                    .name => |series| index.resolveUniqueSeriesNameDetailed(series),
+                };
+                return try cloneSelectorResolution(allocator, resolution);
+            }
+            return null;
+        }
+
+        pub fn simpleSelectorMatchesFromCas(
+            self: *MetadataState,
+            lookup: SimpleSelectorLookup,
+            expected: series_catalog_mod.Resolution,
+        ) ?bool {
+            self.cas_index_mu.lock();
+            defer self.cas_index_mu.unlock();
+            if (self.cas_index) |*index| {
+                const resolution = switch (lookup) {
+                    .by_id => |series_id| index.resolveBySeriesId(series_id),
+                    .name => |series| index.resolveUniqueSeriesNameDetailed(series),
+                };
+                return resolutionsEqual(expected, resolution);
+            }
+            return null;
+        }
+
+        pub fn exactSelectorMatchesFromCas(
+            self: *MetadataState,
+            series: []const u8,
+            tags_json: []const u8,
+            expected: series_catalog_mod.Resolution,
+        ) !?bool {
+            self.cas_index_mu.lock();
+            defer self.cas_index_mu.unlock();
+            if (self.cas_index) |*index| {
+                const resolution = try index.resolveExactSeriesDetailed(series, tags_json);
+                return resolutionsEqual(expected, resolution);
+            }
             return null;
         }
 
@@ -4917,8 +4972,8 @@ pub const Engine = struct {
                 return switch (self.config.metadata_read_mode) {
                     .legacy => legacy,
                     .shadow => blk: {
-                        if (self.metadata.resolveBySeriesIdFromCas(series_id)) |cas_resolution| {
-                            if (!resolutionsEqual(legacy, cas_resolution)) {
+                        if (self.metadata.simpleSelectorMatchesFromCas(.{ .by_id = series_id }, legacy)) |matches| {
+                            if (!matches) {
                                 self.recordCasShadowMismatch();
                                 std.log.warn("cas shadow mismatch: resolveBySeriesId series_id={d}", .{series_id});
                             }
@@ -4933,8 +4988,8 @@ pub const Engine = struct {
                 return switch (self.config.metadata_read_mode) {
                     .legacy => legacy,
                     .shadow => blk: {
-                        if (self.metadata.resolveUniqueSeriesNameDetailedFromCas(series)) |cas_resolution| {
-                            if (!resolutionsEqual(legacy, cas_resolution)) {
+                        if (self.metadata.simpleSelectorMatchesFromCas(.{ .name = series }, legacy)) |matches| {
+                            if (!matches) {
                                 self.recordCasShadowMismatch();
                                 std.log.warn("cas shadow mismatch: resolveUniqueSeriesName series='{s}'", .{series});
                             }
@@ -4949,8 +5004,8 @@ pub const Engine = struct {
                 return switch (self.config.metadata_read_mode) {
                     .legacy => legacy,
                     .shadow => blk: {
-                        if (try self.metadata.resolveExactSeriesDetailedFromCas(exact.series, exact.tags_json)) |cas_resolution| {
-                            if (!resolutionsEqual(legacy, cas_resolution)) {
+                        if (try self.metadata.exactSelectorMatchesFromCas(exact.series, exact.tags_json, legacy)) |matches| {
+                            if (!matches) {
                                 self.recordCasShadowMismatch();
                                 std.log.warn("cas shadow mismatch: resolveExactSeries series='{s}'", .{exact.series});
                             }
@@ -4961,6 +5016,47 @@ pub const Engine = struct {
                 };
             },
         }
+    }
+
+    /// Resolves a simple selector into allocator-owned metadata for compiled plans.
+    pub fn resolveSimpleSelectorOwned(
+        self: *Engine,
+        allocator: std.mem.Allocator,
+        lookup: SimpleSelectorLookup,
+    ) std.mem.Allocator.Error!series_catalog_mod.Resolution {
+        const legacy_view = self.metadata.legacyView();
+        return switch (self.config.metadata_read_mode) {
+            .legacy => try cloneSelectorResolution(allocator, switch (lookup) {
+                .by_id => |series_id| legacy_view.resolveBySeriesId(series_id),
+                .name => |series| legacy_view.resolveUniqueSeriesNameDetailed(series),
+            }),
+            .shadow => blk: {
+                const legacy_resolution = switch (lookup) {
+                    .by_id => |series_id| legacy_view.resolveBySeriesId(series_id),
+                    .name => |series| legacy_view.resolveUniqueSeriesNameDetailed(series),
+                };
+                if (self.metadata.simpleSelectorMatchesFromCas(lookup, legacy_resolution)) |matches| {
+                    if (!matches) {
+                        self.recordCasShadowMismatch();
+                        switch (lookup) {
+                            .by_id => |series_id| std.log.warn("cas shadow mismatch: resolveBySeriesId series_id={d}", .{series_id}),
+                            .name => |series| std.log.warn("cas shadow mismatch: resolveUniqueSeriesName series='{s}'", .{series}),
+                        }
+                    }
+                }
+                break :blk try cloneSelectorResolution(allocator, legacy_resolution);
+            },
+            .primary => blk: {
+                if (try self.metadata.resolveSimpleSelectorOwnedFromCas(allocator, lookup)) |resolution| {
+                    break :blk resolution;
+                }
+                const legacy_resolution = switch (lookup) {
+                    .by_id => |series_id| legacy_view.resolveBySeriesId(series_id),
+                    .name => |series| legacy_view.resolveUniqueSeriesNameDetailed(series),
+                };
+                break :blk try cloneSelectorResolution(allocator, legacy_resolution);
+            },
+        };
     }
 
     pub fn resolveUniqueSeriesName(self: *Engine, series: []const u8) series_catalog_mod.Match {
@@ -6721,6 +6817,22 @@ fn resolutionsEqual(lhs: series_catalog_mod.Resolution, rhs: series_catalog_mod.
     if (!optionalStringsEqual(lhs.series, rhs.series)) return false;
     if (!optionalStringsEqual(lhs.canonical_tags, rhs.canonical_tags)) return false;
     return true;
+}
+
+fn cloneSelectorResolution(
+    allocator: std.mem.Allocator,
+    resolution: series_catalog_mod.Resolution,
+) std.mem.Allocator.Error!series_catalog_mod.Resolution {
+    const series = if (resolution.series) |name| try allocator.dupe(u8, name) else null;
+    errdefer if (series) |name| allocator.free(name);
+    const canonical_tags = if (resolution.canonical_tags) |tags| try allocator.dupe(u8, tags) else null;
+
+    return .{
+        .status = resolution.status,
+        .series_id = resolution.series_id,
+        .series = series,
+        .canonical_tags = canonical_tags,
+    };
 }
 
 fn optionalStringsEqual(lhs: ?[]const u8, rhs: ?[]const u8) bool {
