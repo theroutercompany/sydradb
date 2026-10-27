@@ -243,7 +243,9 @@ fn ensureRepairIntent(data_dir: std.fs.Dir) !void {
 }
 
 fn syncDirectory(data_dir: std.fs.Dir) !void {
-    try std.posix.fsync(data_dir.fd);
+    var sync_dir = try data_dir.openDir(".", .{ .iterate = true });
+    defer sync_dir.close();
+    try std.posix.fsync(sync_dir.fd);
 }
 
 fn writeEntry(writer: *std.Io.AnyWriter, entry: Entry) !void {
@@ -380,6 +382,26 @@ test "load repairs an unterminated tail before later appends" {
     defer talloc.free(body);
     try std.testing.expect(std.mem.endsWith(u8, body, "\n"));
     try std.testing.expect(std.mem.indexOf(u8, body, "{\"series_id\"") != null);
+}
+
+test "manifest sync works with a default-opened directory" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = manifest_path,
+        .data = "{\"series_id\"",
+    });
+
+    var manifest = try Manifest.loadOrInitWithRepairIntent(talloc, tmp.dir, true);
+    defer manifest.deinit();
+
+    try std.testing.expect(manifest.repaired_torn_tail);
+    try std.testing.expect(try Manifest.repairIntentExists(tmp.dir));
+    try manifest.rewriteCheckpoint(tmp.dir);
+    try Manifest.clearRepairIntent(tmp.dir);
+    try std.testing.expect(!(try Manifest.repairIntentExists(tmp.dir)));
 }
 
 test "load rejects malformed newline terminated records" {
