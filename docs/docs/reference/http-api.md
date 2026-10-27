@@ -153,6 +153,50 @@ Error cases:
 
 For same-host writers that want lower overhead than HTTP NDJSON, use the [local ingest socket](./local-ingest.md) instead of widening the HTTP contract.
 
+## Schemas and numeric rows
+
+The neutral routes use the same handlers as the existing market routes. Both route sets keep the same request formats, authentication checks, validation, and errors.
+
+| Operation | Neutral route | Existing route |
+|---|---|---|
+| Register a schema | `POST /api/v1/schemas/register` | `POST /api/v1/market/schema/register` |
+| List schemas | `GET /api/v1/schemas` | `GET /api/v1/market/schemas` |
+| Read a schema | `GET /api/v1/schemas/<metric>` | `GET /api/v1/market/schema/<metric>` |
+| Ingest rows | `POST /api/v1/rows/ingest` | `POST /api/v1/market/ingest` |
+| Query rows | `POST /api/v1/rows/query` | `POST /api/v1/market/query` |
+
+### Register and inspect schemas
+
+Send a JSON object with these fields to either schema registration route:
+
+- `metric`: metric family name.
+- `ordered_columns`: column names in row order.
+- `required_labels`: label keys that each row must contain.
+
+Example:
+
+    {"metric":"sensor.environment","ordered_columns":["temperature_c","humidity_pct"],"required_labels":["device_id"]}
+
+Registration returns `201 Created`. The list route returns a JSON array. The detail route returns one schema object.
+
+### Ingest rows
+
+Send newline-delimited JSON to either row ingest route. Each line must include `metric`, integer `ts_ns`, object `labels`, and object `columns`. The metric must have a registered schema. Each row must include every required label and every registered column. Column values must be numeric.
+
+Example:
+
+    {"metric":"sensor.environment","ts_ns":1000,"labels":{"device_id":"sensor-17"},"columns":{"temperature_c":21.5,"humidity_pct":36}}
+
+The final record may end at the end of the request body without a newline. A successful response includes `rows` and `writes` counts.
+
+### Query rows
+
+Send a JSON object to either row query route. The request requires `metric`, a `labels` object, integer `start_ts_ns`, and integer `end_ts_ns`. The optional `columns` array selects columns. If omitted, the query returns all registered columns.
+
+    {"metric":"sensor.environment","labels":{"device_id":"sensor-17"},"start_ts_ns":0,"end_ts_ns":2000,"columns":["temperature_c"]}
+
+The response contains the metric name, a data revision, and a `rows` array. Each row contains `ts_ns`, selected `columns`, `labels`, and `data_revision`. The time fields use nanoseconds.
+
 ## `POST /api/v1/query/range`
 
 Requires `Content-Length` and a JSON body:
