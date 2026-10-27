@@ -6,19 +6,29 @@ Persistent goal: active in this conversation; no deadline or token budget.
 
 ## Current checkpoint
 
-M1 / Task 2 is in progress. Storage checks passed. Focused publication and neutral
-HTTP checks passed after fixes. All five focused CAS mirror checks passed. The
-full native integration target passed after pinning Python 3.13 in the shell.
-The restart soak exposed stale schema validation and a timing-bound mismatch.
-The schema 3 validator now passes 23 focused tests. An isolated worker owns the
-timing correction; the workload bound and process timeout must remain intact.
-Task 4 schema extraction
-passed storage checks; empty generic initialization is still pending.
+M1 / Task 2 is in progress. Native integration, crash smoke, and the bounded
+restart soak passed. The integrated driver build passed all four steps. The
+latest soak recovered all 15,604 acknowledged rows after five restarts. It
+reported zero row-loss, shadow-mismatch, verification, and ingest errors. The
+workload took 61 seconds; the complete run took 76 seconds. The unchanged
+workload bound is 60 to 70 seconds. All 35 Python evidence tests passed.
+
+The causal Engine test proved that raw timestamp bounds omitted emitted bucket
+rows. It failed with 4 of 6 rows before the fix and passed after the fix. Its
+second batch proves that progress counting includes later output beyond a
+captured raw timestamp. The mixed native/scalar derived-history fix is also
+integrated. The complete native suite still needs a rerun on this combined tree.
+
+Task 4 schema extraction passed storage checks. Empty generic initialization
+is under compiler and regression verification in an isolated worktree. Query
+resource limits and selector parsing have separate implementation workers.
+The atomic checkpoint split failed twice on engine dependencies. A worker must
+prove the full dependency boundary before the next compile attempt.
 The current branch is `codex/native-market-storage` at `42fbd55`.
 
 | Milestone | State | Acceptance evidence |
 | --- | --- | --- |
-| M1: native-storage stabilization | In progress | Native integration passes; restart soak and complete release qualification remain open |
+| M1: native-storage stabilization | In progress | Native integration, crash smoke, and bounded restart soak pass; combined-suite rerun and release qualification remain open |
 | M2: application boundaries | Partial | Schema extraction: 210 storage checks; neutral routes: 4 focused checks |
 | M3: query limits | Planned | Query ownership review complete; no implementation evidence |
 | M4: general selection | Planned | No implementation evidence |
@@ -70,6 +80,18 @@ artifacts, not a replacement for the user's source tree or an external backup.
 | 60-second restart soak | FAIL acceptance: schema 3 versus validator 2; max operations 3 versus validator 2; elapsed 74 seconds versus 70-second bound | `native-soak-60s.log`, `native-soak-60s/soak-evidence.json`; terminal exit 1 |
 | Crash smoke, one iteration, fsync always | PASS: all seven crash points, exercise exit 86 and recovery exit 0 | `native-crash-smoke.log`; terminal exit 0 |
 | Schema 3 soak validator and bundle tests | PASS: 23 tests, repeated by controller under Python 3.13.15 | `soak-contract-result.md`; controller terminal exit 0 |
+| Isolated soak timer build | PASS: 4/4 build steps and Zig format check | `soak-timing-build.log`; terminal exit 0 |
+| Soak with separate timing fields | FAIL acceptance: workload 61 seconds and total 73 seconds; peak 4 versus expected 3; restart label deltas 21 and 22 | `native-soak-timed-60s.log`, `native-soak-timed-60s/soak-evidence.json`; terminal exit 1 |
+| Isolated native derived-row checkpoint | PASS: 3/3 focused tests, including the test root | `native-derived-focused.log`; terminal exit 0 |
+| Native derived-row compatibility fix | PASS: 5/5 focused checks after causal failures before the fix | `native-derived-mixed-fix-tests.log`; terminal exit 0 |
+| Corrected soak driver | PASS: 4/4 build steps and 13/13 focused tests | `soak-progress-build.log`, `soak-progress-driver-tests.log`; terminal exit 0 |
+| Fresh run with stable progress counts | FAIL: `RollupProgressCountsInconsistent` after initial seed work; no workload evidence emitted | `native-soak-progress-60s.log`, `soak-progress-verification-complete.json`; terminal exit 1 |
+| First intermediate native checkpoint | Compile failure: `stopWriterWorker` and `stopDerivedWorker` were partitioned after their callers | `native-checkpoint-1-tests.log`; terminal exit 1 |
+| Rollup output-range causal regression | FAIL before fix: expected 6, found 4; PASS after fix: 1/1, including later output beyond a captured upper bound | `soak-count-range-tests.log`, `soak-count-range-result.md` |
+| Combined driver build and Python evidence suite | PASS: 4/4 build steps and 35 Python tests | `soak-range-integrated-build.log`, `soak-integrated-python.log`; terminal exit 0 |
+| Combined 60-second restart soak | PASS: 15,604 acknowledged and recovered rows, five restarts, all four error counters zero; workload 61 seconds, total 76 seconds | `native-soak-range-60s.log`, `native-soak-range-60s/soak-evidence.json`; terminal exit 0 |
+| Revised first intermediate checkpoint | Compile failure: `declareExactSeriesCanonicalBatchLocked` is still partitioned after its caller | `native-checkpoint-1-closure-tests.log`; terminal exit 1 |
+
 
 The runtime build summary reports completed tests, but its terminal exit is 1.
 Do not count this as a passing runtime suite. The stack shows the producer in
@@ -251,6 +273,26 @@ macOS format, build, and test checks passed. macOS job `122009783147` in run
 `40449858255` reports Xcode 26.3 and SDK 26.2. PR 80 is ready for review. Release
 packaging jobs did not run on the PR; this is not release-package evidence.
 
+Demo process-ownership PR: https://github.com/theroutercompany/sydradb/pull/81.
+Signed local commit: `39bb3c2698edf10e8ca7adea02e1bacff22852cf`.
+Published commit: `184165c47e2e814e5fec2e6118a28498e75960cc`.
+Both commits have tree `e167d5a072f4c26d6c58d844c0b7a6c54f52653b`.
+This is a clean replay of `6e23247` on PR 80. All demo shell syntax checks passed.
+The local-socket and quickstart scripts passed with the existing native
+integration binary. That binary was not rebuilt from the isolated PR branch.
+Hosted Ubuntu and macOS checks passed in run `40452048084`. Release jobs were
+skipped on this PR.
+
+Native derived-row draft PR: https://github.com/theroutercompany/sydradb/pull/82.
+Signed local commits: `feafcd422d8258096a707fe0ff712aa9d2ae1084` and
+`d0ca5ad75a8b1bb10df1860c43e50395c6e9111b`.
+Published commits: `b3b4e09291c775f40c1aeba627a8c314a6d45dbb` and
+`62e8b2204d3b944399c3ac2e2133cce4a65fd1de`.
+Each corresponding tree matches; the final tree is
+`0d2ccf4244413c9a06b08bbea29e255e3837fffc`. The PR targets the foundation branch.
+All five focused checks passed after the mixed-source fix. Full runtime and
+hosted acceptance of this intermediate branch remain open.
+
 An isolated worker prepares Task 5 in `trading-policy-preparation/`. It owns only
 the engine validation facade and the new trading policy module. It must preserve
 the original validators' error precedence and signal fallback behavior. It cannot
@@ -275,8 +317,54 @@ competing builds are assigned to this worker.
 
 The next native PR is prepared in `native-derived-pr/`, based on the published
 foundation tree. It replays `ff5ccc0` cleanly and changes only `engine.zig`.
-Independent review and focused native derived-row and flush-publication tests
-are in progress. Historical commit-message checks are not current evidence.
+The three focused checks passed. Independent review found that native identity
+groups can hide older scalar-only groups. The PR is held for a causal regression
+and compatibility fix in this worktree. The worker must also inspect overlapping
+timestamps in a mixed group. See `native-derived-review-result.md` and
+`native-derived-mixed-fix-agent.jsonl`.
+
+The timing patch remains isolated in `soak-timing-preparation/`. Its build passed.
+The 60-second rerun completed five restarts with zero reported acknowledged-row
+loss, shadow mismatches, verification failures, and ingest errors. Acceptance
+still failed: the validator assumes a fixed peak count and equal progress across
+labels. Engine telemetry counts nested operations; rollup checkpoints advance
+per label. The isolated worker in `soak-progress-preparation/` must derive valid
+invariants from those producers, retain per-label progress proof, and correct any
+inconsistent observation before another soak run.
+
+Independent evidence review also found that the consumer bounds overlap counts
+by only the paired operation count. The producer counts entries from either side
+and uses the combined ingest-plus-paired bound. The consumer must use that same
+contract and retain positive overlap checks. See `soak-evidence-review-result.md`.
+
+The checkpoint worker produced nine patches in `native-checkpoints/`. Sequential
+application and final byte identity passed for all ten captured source files.
+This proves reconstruction only; individual intermediate patches have not yet
+passed compilation. The first compile exposed two shutdown helpers split after
+their callers. A worker moved those existing helpers and required stop-state
+dependencies into patch 1. All nine patches still reproduce the captured files.
+The revised patch 1 is applied in `native-hardening-checkpoints/`, with format and
+whitespace checks passed; compilation is pending. Earlier applied versions are
+preserved in `early-metric-checkpoint.patch` and
+`native-checkpoint-1-pre-closure.patch`. No hardening checkpoint is committed yet.
+
+The latest engine port of the mixed-source fix is prepared in
+`native-mixed-integration.patch`. Its before-copy hash matches the captured root
+engine, and `git apply --check` passes in root. Format and whitespace checks pass.
+It is not integrated or tested on the latest engine yet.
+
+The empty-catalog patch is prepared in `task6-empty-catalog.patch`. Independent
+review found default mapping drift when an empty generic database is reopened,
+and a CAS publication failure that can remain unrepaired after restart. A worker
+owns those corrections in `empty-catalog-preparation/`. No Task 6 build or runtime
+acceptance is claimed.
+
+The soak counting failure occurs after initial seed work. The fixed raw timestamp
+origin is 20 seconds into a 60-second bucket. The engine emits the first bar at
+`1699999980000000000`, but the count query begins at `1700000000000000000`.
+The worker must prove this boundary with an actual-engine regression and inspect
+the upper range against the lifetime emission counter. Do not retry a full soak
+until that causal check passes. See `soak-count-range-agent.jsonl`.
 
 All delegation outputs live in the checkpoint directory.
 
@@ -322,3 +410,21 @@ process handles and logs before repeating any test. Collect the native integrati
 result and the active worker reports. Verify prepared policy changes before
 integration. Continue the native PR dependency sequence without rewriting the
 original local history. Do not mark M1 complete from focused tests alone.
+
+## Active isolated work after the bounded soak
+
+- `empty-catalog-preparation/`: explicit trading initialization, stable mapping
+  across reopen, and recovery after failed CAS publication. The worker owns the
+  serial Zig build slot. No generic initialization changes are integrated yet.
+- `query-limits-preparation/`: M3 resource ownership, enforcement, and protocol
+  errors. Optional caps preserve existing callers until configured. Not tested.
+- `selector-preparation/`: M4 selector parsing and frontend parity. Not tested.
+- `native-checkpoints/`: repair atomic boundaries from exact existing code.
+  No source behavior changes are authorized in this preparation task.
+- `native-migration-pr/`: prepare the next native migration checkpoint on PR 82.
+  No compiler or test evidence exists for this isolated branch yet.
+
+All implementation workers use GPT-6 Luna with max reasoning. The controller
+reviews and integrates patches, runs checks, and signs and publishes checkpoints.
+The controller does not write source or test code. No direct main update or merge
+is authorized. Longer soak and platform release qualification remain open.
