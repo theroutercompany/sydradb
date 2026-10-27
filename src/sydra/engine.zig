@@ -102,6 +102,7 @@ pub const Engine = struct {
     flush_generation: u64 = 0,
     flush_in_progress: bool = false,
     flush_requested: bool = false,
+    flush_publication_error: ?anyerror = null,
     market_writer_fault: ?MarketWriterFault = null,
 
     const MarketWriterFault = enum {
@@ -819,6 +820,7 @@ pub const Engine = struct {
         pending_bytes: usize = 0,
         in_flight_batches: usize = 0,
         closed: bool = false,
+        wake_requested: bool = false,
         metrics: *Metrics,
         const lock_wait_threshold_ns: i64 = 1_000;
 
@@ -935,7 +937,7 @@ pub const Engine = struct {
                 _ = self.metrics.queue_pop_lock_contention.fetchAdd(1, .monotonic);
             }
             var hold_start_ns = acquired_ns;
-            while (self.count == 0 and !self.closed) {
+            while (self.count == 0 and !self.closed and !self.wake_requested) {
                 const before_wait_ns = std.time.nanoTimestamp();
                 const hold_ns = before_wait_ns - hold_start_ns;
                 _ = self.metrics.queue_pop_lock_hold_ns_total.fetchAdd(@as(u64, @intCast(hold_ns)), .monotonic);
@@ -949,6 +951,7 @@ pub const Engine = struct {
                 hold_start_ns = acquired_ns;
             }
             if (self.count == 0) {
+                self.wake_requested = false;
                 const release_ns = std.time.nanoTimestamp();
                 const hold_ns = release_ns - hold_start_ns;
                 _ = self.metrics.queue_pop_lock_hold_ns_total.fetchAdd(@as(u64, @intCast(hold_ns)), .monotonic);
@@ -961,6 +964,7 @@ pub const Engine = struct {
             self.pending_points -= batch.payload.len();
             self.pending_bytes -= batch.bytes;
             self.in_flight_batches += 1;
+            self.wake_requested = false;
             if (self.count == 0) self.head = 0;
             const release_ns = std.time.nanoTimestamp();
             const hold_ns = release_ns - hold_start_ns;
@@ -988,6 +992,13 @@ pub const Engine = struct {
         pub fn reopen(self: *Queue) void {
             self.mu.lock();
             self.closed = false;
+            self.wake_requested = false;
+            self.mu.unlock();
+        }
+        fn wake(self: *Queue) void {
+            self.mu.lock();
+            self.wake_requested = true;
+            self.cv.signal();
             self.mu.unlock();
         }
         pub fn len(self: *Queue) usize {
@@ -2017,6 +2028,15 @@ pub const Engine = struct {
     fn beginFlush(self: *Engine) void {
         self.drain_mu.lock();
         self.flush_in_progress = true;
+        self.flush_publication_error = null;
+        self.drain_generation += 1;
+        self.drain_mu.unlock();
+        self.drain_cv.broadcast();
+    }
+
+    fn recordFlushPublicationError(self: *Engine, err: anyerror) void {
+        self.drain_mu.lock();
+        if (self.flush_publication_error == null) self.flush_publication_error = err;
         self.drain_generation += 1;
         self.drain_mu.unlock();
         self.drain_cv.broadcast();
@@ -2114,6 +2134,7 @@ pub const Engine = struct {
             if (mem_usage >= self.config.memtable_max_bytes or (mem_usage != 0 and queue_idle and ((now - last_flush) >= self.flush_timer_ms or force_flush))) {
                 self.beginFlush();
                 const flushed = flushMemtable(self) catch |err| blk: {
+                    self.recordFlushPublicationError(err);
                     std.log.warn("memtable flush failed: {s}", .{@errorName(err)});
                     break :blk false;
                 };
@@ -2137,6 +2158,7 @@ pub const Engine = struct {
                     else
                         "retention";
                     self.syncCasSnapshot(reason) catch |err| {
+                        self.recordFlushPublicationError(err);
                         std.log.warn("cas sync failed: {s}", .{@errorName(err)});
                     };
                     self.scheduleDerivedRefresh();
@@ -2158,11 +2180,13 @@ pub const Engine = struct {
         // final flush
         self.beginFlush();
         const flushed = flushMemtable(self) catch |err| blk: {
+            self.recordFlushPublicationError(err);
             std.log.warn("final memtable flush failed: {s}", .{@errorName(err)});
             break :blk false;
         };
         if (flushed) {
             self.syncCasSnapshot("shutdown-flush") catch |err| {
+                self.recordFlushPublicationError(err);
                 std.log.warn("cas sync failed: {s}", .{@errorName(err)});
             };
         }
@@ -5357,24 +5381,49 @@ pub const Engine = struct {
 
     pub fn flushAndDrain(self: *Engine, timeout_ms: u64) !bool {
         const prior_flush_generation = self.requestFlush();
-        self.queue.cv.signal();
-        try self.waitForDrained(timeout_ms);
+        self.queue.wake();
+        const wait_result = try self.waitForDrainedState(timeout_ms, false, prior_flush_generation);
+        if (wait_result.publication_error) |err| return err;
         self.drain_mu.lock();
         defer self.drain_mu.unlock();
         return self.flush_generation != prior_flush_generation;
     }
 
     pub fn waitForDrained(self: *Engine, timeout_ms: u64) WaitError!void {
+        _ = try self.waitForDrainedState(timeout_ms, true, null);
+    }
+
+    const DrainWaitResult = struct {
+        publication_error: ?anyerror = null,
+    };
+
+    fn waitForDrainedState(
+        self: *Engine,
+        timeout_ms: u64,
+        verify_cas: bool,
+        publication_error_after_flush: ?u64,
+    ) WaitError!DrainWaitResult {
         const wait_start_ns = std.time.nanoTimestamp();
         const deadline_ns: i128 = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ms)) * std.time.ns_per_ms;
         while (true) {
             self.drain_mu.lock();
             const generation = self.drain_generation;
             const flush_in_progress = self.flush_in_progress;
+            const flush_generation = self.flush_generation;
+            const publication_error = self.flush_publication_error;
             self.drain_mu.unlock();
 
+            if (publication_error_after_flush) |baseline| {
+                if (flush_generation != baseline) {
+                    if (publication_error) |err| {
+                        _ = self.metrics.flush_queue_drain_wait_ns_total.fetchAdd(@intCast(std.time.nanoTimestamp() - wait_start_ns), .monotonic);
+                        return .{ .publication_error = err };
+                    }
+                }
+            }
+
             if (self.queue.isDrained() and self.liveMemtableBytes() == 0 and !flush_in_progress) {
-                if (self.cas != null) {
+                if (verify_cas and self.cas != null) {
                     self.verifyCasState() catch {
                         const now_ns = std.time.nanoTimestamp();
                         if (now_ns >= deadline_ns) break;
@@ -5386,7 +5435,7 @@ pub const Engine = struct {
                     };
                 }
                 _ = self.metrics.flush_queue_drain_wait_ns_total.fetchAdd(@intCast(std.time.nanoTimestamp() - wait_start_ns), .monotonic);
-                return;
+                return .{};
             }
             const now_ns = std.time.nanoTimestamp();
             if (now_ns >= deadline_ns) break;
@@ -7136,6 +7185,21 @@ test "engine queue drain state includes dequeued in-flight batches" {
     try std.testing.expect(queue.isDrained());
 }
 
+test "engine queue preserves a maintenance wake until an idle pop observes it" {
+    const talloc = std.testing.allocator;
+    var metrics = Engine.Metrics.init();
+    const queue = try Engine.Queue.init(talloc, &metrics);
+    defer {
+        queue.deinit();
+        talloc.destroy(queue);
+    }
+
+    queue.wake();
+    try std.testing.expect(queue.wake_requested);
+    try std.testing.expect(queue.pop() == null);
+    try std.testing.expect(!queue.wake_requested);
+}
+
 test "engine market queue owns native batch payloads" {
     const talloc = std.testing.allocator;
     var metrics = Engine.Metrics.init();
@@ -8394,6 +8458,41 @@ test "engine flushAndDrain is a queryable barrier and zero timeout succeeds when
     _ = try engine.appendResolvedPoint(.{ .series_id = sid, .ts = 7, .value = 3.5 });
     try std.testing.expect(try engine.flushAndDrain(1_000));
     try std.testing.expect(!(try engine.flushAndDrain(0)));
+
+    var results = std.array_list.Managed(types.Point).init(talloc);
+    defer results.deinit();
+    try engine.queryRange(sid, 0, 10, &results);
+    try std.testing.expectEqual(@as(usize, 1), results.items.len);
+    try std.testing.expectEqual(@as(i64, 7), results.items[0].ts);
+    try std.testing.expectApproxEqAbs(@as(f64, 3.5), results.items[0].value, 1e-9);
+}
+
+test "engine flushAndDrain returns segment publication error and retains buffered input" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/flush-publication-error", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var config = try testConfig(talloc, data_path);
+    config.flush_interval_ms = std.math.maxInt(u32);
+    config.memtable_max_bytes = std.math.maxInt(usize);
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const sid = try engine.declareExactSeriesCanonical("svc.flush_error", "{}", null);
+    try engine.data_dir.makePath("segments");
+    var blocker = try engine.data_dir.createFile("segments/0", .{});
+    blocker.close();
+
+    _ = try engine.appendResolvedPoint(.{ .series_id = sid, .ts = 7, .value = 3.5 });
+    try std.testing.expectError(error.NotDir, engine.flushAndDrain(5_000));
+    try std.testing.expectEqual(@as(usize, 0), engine.queue.len());
+    try std.testing.expectEqual(@sizeOf(types.Point), engine.liveMemtableBytes());
+
+    try engine.data_dir.deleteFile("segments/0");
+    try std.testing.expect(try engine.flushAndDrain(5_000));
 
     var results = std.array_list.Managed(types.Point).init(talloc);
     defer results.deinit();
