@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const crash_injection = @import("crash_injection.zig");
 const cfg = @import("../config.zig");
 const types = @import("../types.zig");
@@ -740,10 +741,22 @@ pub const RefStore = struct {
         stale: usize,
     };
 
+    const PreparedDirectorySyncPaths = struct {
+        alloc: std.mem.Allocator,
+        paths: std.array_list.Managed([]const u8),
+
+        fn deinit(self: *PreparedDirectorySyncPaths) void {
+            for (self.paths.items) |path| self.alloc.free(path);
+            self.paths.deinit();
+        }
+    };
+
     pub fn init(alloc: std.mem.Allocator, path: []const u8, fsync: cfg.FsyncPolicy) !RefStore {
         var cwd = std.fs.cwd();
-        try cwd.makePath(path);
-        const root = try cwd.openDir(path, .{ .iterate = true });
+        const existing_parent = if (fsync != .none) try nearestExistingParent(cwd, path) else null;
+        const path_status = try cwd.makePathStatus(path);
+        var root = try cwd.openDir(path, .{ .iterate = true });
+        errdefer root.close();
         try root.makePath("refs");
         try root.makePath("refs/heads");
         try root.makePath("logs/refs");
@@ -752,6 +765,16 @@ pub const RefStore = struct {
         try root.makePath("reftable");
         try root.makePath("reftable/info");
         try root.makePath("symrefs");
+        if (fsync != .none) {
+            try syncParentDirs(root, "refs/heads");
+            try syncParentDirs(root, "refs/txn");
+            try syncParentDirs(root, "logs/refs/heads");
+            try syncParentDirs(root, "reftable/info");
+            try syncParentDirs(root, "symrefs");
+            if (path_status == .created) {
+                try syncCreatedPathParents(cwd, path, existing_parent.?);
+            }
+        }
         return .{ .alloc = alloc, .root = root, .fsync = fsync };
     }
 
@@ -798,7 +821,7 @@ pub const RefStore = struct {
             else => return err,
         };
         if (self.fsync != .none) {
-            try syncDir(&self.root);
+            try syncParentDirs(self.root, path);
         }
     }
 
@@ -874,8 +897,18 @@ pub const RefStore = struct {
             return;
         }
 
-        try self.deleteRefFile(ref_name);
-        try self.appendReflog(ref_name, current, current, reason);
+        var sync_paths = try self.prepareRefAndReflogSyncPaths(&.{ref_name});
+        defer sync_paths.deinit();
+
+        self.deleteRefFile(ref_name) catch |err| {
+            self.syncRefAndReflogDirectories(&sync_paths) catch {};
+            return err;
+        };
+        self.appendReflog(ref_name, current, current, reason) catch |err| {
+            self.syncRefAndReflogDirectories(&sync_paths) catch {};
+            return err;
+        };
+        try self.syncRefAndReflogDirectories(&sync_paths);
     }
 
     pub fn renameRef(self: *RefStore, old_ref_name: []const u8, new_ref_name: []const u8, reason: []const u8) !void {
@@ -920,10 +953,26 @@ pub const RefStore = struct {
             return;
         }
 
-        try self.writeRefFileAtomic(new_ref_name, current);
-        try self.deleteRefFile(old_ref_name);
-        try self.appendReflog(old_ref_name, current, current, reason);
-        try self.appendReflog(new_ref_name, null, current, reason);
+        var sync_paths = try self.prepareRefAndReflogSyncPaths(&.{ old_ref_name, new_ref_name });
+        defer sync_paths.deinit();
+
+        self.writeRefFileAtomic(new_ref_name, current) catch |err| {
+            self.syncRefAndReflogDirectories(&sync_paths) catch {};
+            return err;
+        };
+        self.deleteRefFile(old_ref_name) catch |err| {
+            self.syncRefAndReflogDirectories(&sync_paths) catch {};
+            return err;
+        };
+        self.appendReflog(old_ref_name, current, current, reason) catch |err| {
+            self.syncRefAndReflogDirectories(&sync_paths) catch {};
+            return err;
+        };
+        self.appendReflog(new_ref_name, null, current, reason) catch |err| {
+            self.syncRefAndReflogDirectories(&sync_paths) catch {};
+            return err;
+        };
+        try self.syncRefAndReflogDirectories(&sync_paths);
     }
 
     pub fn loadReflog(self: *RefStore, alloc: std.mem.Allocator, ref_name: []const u8, max_entries: usize) ![]ReflogEntry {
@@ -987,9 +1036,42 @@ pub const RefStore = struct {
         }
 
         for (updates, 0..) |update, idx| {
-            try self.writeRefFileAtomic(update.ref_name, update.new_id);
-            try self.appendReflog(update.ref_name, old_ids[idx], update.new_id, reason);
+            var sync_paths = try self.prepareRefAndReflogSyncPaths(&.{update.ref_name});
+            defer sync_paths.deinit();
+
+            self.writeRefFileAtomic(update.ref_name, update.new_id) catch |err| {
+                self.syncRefAndReflogDirectories(&sync_paths) catch {};
+                return err;
+            };
+            self.appendReflog(update.ref_name, old_ids[idx], update.new_id, reason) catch |err| {
+                self.syncRefAndReflogDirectories(&sync_paths) catch {};
+                return err;
+            };
+            try self.syncRefAndReflogDirectories(&sync_paths);
         }
+    }
+
+    fn prepareRefAndReflogSyncPaths(self: *RefStore, ref_names: []const []const u8) !PreparedDirectorySyncPaths {
+        var prepared = PreparedDirectorySyncPaths{
+            .alloc = self.alloc,
+            .paths = std.array_list.Managed([]const u8).init(self.alloc),
+        };
+        errdefer prepared.deinit();
+        if (self.fsync == .none) return prepared;
+
+        try prepared.paths.ensureTotalCapacity(try std.math.mul(usize, ref_names.len, 2));
+        for (ref_names) |ref_name| {
+            const ref_path = try std.fmt.allocPrint(self.alloc, "refs/{s}", .{ref_name});
+            prepared.paths.appendAssumeCapacity(ref_path);
+            const log_path = try std.fmt.allocPrint(self.alloc, "logs/refs/{s}", .{ref_name});
+            prepared.paths.appendAssumeCapacity(log_path);
+        }
+        return prepared;
+    }
+
+    fn syncRefAndReflogDirectories(self: *RefStore, prepared: *const PreparedDirectorySyncPaths) !void {
+        if (self.fsync == .none) return;
+        try syncPublicationDirs(self.root, self.fsync, prepared.paths.items);
     }
 
     fn updateReftableRefTxn(self: *RefStore, updates: []const RefTxnUpdate, reason: []const u8) !void {
@@ -1066,9 +1148,6 @@ pub const RefStore = struct {
             },
             else => return err,
         };
-        if (self.fsync != .none) {
-            try syncDir(&self.root);
-        }
     }
 
     fn deleteRefFile(self: *RefStore, ref_name: []const u8) !void {
@@ -1078,9 +1157,6 @@ pub const RefStore = struct {
             error.FileNotFound => return error.RefNotFound,
             else => return err,
         };
-        if (self.fsync != .none) {
-            try syncDir(&self.root);
-        }
     }
 
     fn writeIntent(self: *RefStore, updates: []const RefTxnUpdate, reason: []const u8) ![]u8 {
@@ -1103,7 +1179,7 @@ pub const RefStore = struct {
         try writer_state.end();
         if (self.fsync != .none) {
             try file.sync();
-            try syncDir(&self.root);
+            try syncParentDirs(self.root, intent_path);
         }
         return intent_path;
     }
@@ -1182,8 +1258,7 @@ pub const RefStore = struct {
             else => return err,
         };
         if (fsync != .none) {
-            var root_for_sync = root;
-            try syncDir(&root_for_sync);
+            try syncParentDirs(root, log_path);
         }
     }
 
@@ -1292,11 +1367,10 @@ pub const RefStore = struct {
 
         try self.root.makePath("reftable");
         try self.root.makePath("reftable/info");
-        try writeReftableTablesList(self.alloc, self.root, table_names, self.fsync);
         try writeReftableState(self.alloc, self.root, .{
             .next_update_index = try inferNextReftableUpdateIndexFromNames(table_names),
         }, self.fsync);
-        try rebuildReftableSummaryIndex(self.alloc, self.root, self.fsync);
+        try publishReftableTablesList(self.alloc, self.root, table_names, self.fsync);
         return .{
             .state_rebuilt = true,
             .tables_list_rebuilt = true,
@@ -1376,10 +1450,12 @@ pub const RefStore = struct {
             }
             if (!changed) continue;
             if (kept.items.len == 0) {
+                var deleted = true;
                 self.root.deleteFile(path) catch |err| switch (err) {
-                    error.FileNotFound => {},
+                    error.FileNotFound => deleted = false,
                     else => return err,
                 };
+                if (deleted and self.fsync != .none) try syncParentDirs(self.root, path);
                 continue;
             }
             try writeLooseReflogFile(self.alloc, self.root, path, kept.items, self.fsync);
@@ -1459,8 +1535,7 @@ pub const RefStore = struct {
         }
         for (tables) |name| try next.append(try self.alloc.dupe(u8, name));
         try next.append(try self.alloc.dupe(u8, table_name));
-        try writeReftableTablesList(self.alloc, self.root, next.items, self.fsync);
-        try rebuildReftableSummaryIndex(self.alloc, self.root, self.fsync);
+        try publishReftableTablesList(self.alloc, self.root, next.items, self.fsync);
     }
 
     fn writeReftableSnapshot(self: *RefStore, refs: []const RefEntry, reflogs: []const ReflogEntry) !void {
@@ -1489,8 +1564,7 @@ pub const RefStore = struct {
         defer self.alloc.free(table_name);
         try writeReftableTable(self.alloc, self.root, table_name, span, ref_records, reflogs, self.fsync);
         const names = [_][]const u8{table_name};
-        try writeReftableTablesList(self.alloc, self.root, names[0..], self.fsync);
-        try rebuildReftableSummaryIndex(self.alloc, self.root, self.fsync);
+        try publishReftableTablesList(self.alloc, self.root, names[0..], self.fsync);
     }
 
     fn replaceReftableSnapshot(self: *RefStore, refs: []const RefEntry, reflogs: []const ReflogEntry) !void {
@@ -1522,12 +1596,15 @@ pub const RefStore = struct {
         defer self.alloc.free(table_name);
         try writeReftableTable(self.alloc, self.root, table_name, span, ref_records, reflogs, self.fsync);
         const names = [_][]const u8{table_name};
-        try writeReftableTablesList(self.alloc, self.root, names[0..], self.fsync);
-        try rebuildReftableSummaryIndex(self.alloc, self.root, self.fsync);
+        try publishReftableTablesList(self.alloc, self.root, names[0..], self.fsync);
 
         for (existing_names) |name| {
             if (std.mem.eql(u8, name, table_name)) continue;
-            self.root.deleteFile(name) catch {};
+            var deleted = true;
+            self.root.deleteFile(name) catch {
+                deleted = false;
+            };
+            if (deleted and self.fsync != .none) try syncParentDirs(self.root, name);
         }
     }
 
@@ -1566,9 +1643,14 @@ pub const RefStore = struct {
         }
         for (table_names[0..start]) |name| try next.append(try self.alloc.dupe(u8, name));
         try next.append(try self.alloc.dupe(u8, merged_name));
-        try writeReftableTablesList(self.alloc, self.root, next.items, self.fsync);
-        try rebuildReftableSummaryIndex(self.alloc, self.root, self.fsync);
-        for (table_names[start..]) |name| self.root.deleteFile(name) catch {};
+        try publishReftableTablesList(self.alloc, self.root, next.items, self.fsync);
+        for (table_names[start..]) |name| {
+            var deleted = true;
+            self.root.deleteFile(name) catch {
+                deleted = false;
+            };
+            if (deleted and self.fsync != .none) try syncParentDirs(self.root, name);
+        }
     }
 
     fn hasReftableTables(self: *RefStore) !bool {
@@ -3295,7 +3377,7 @@ pub const CasManager = struct {
         if (!options.dry_run and unreachable_ids.items.len > 0) {
             const stamp_ms = now_ms;
             if (existing_pack_paths.len > 0) {
-                try quarantinePackFiles(self.alloc, self.store.root, existing_pack_paths, stamp_ms);
+                try quarantinePackFiles(self.alloc, self.store.root, existing_pack_paths, stamp_ms, self.store.fsync);
                 if (reachable.count() > 0) {
                     var reachable_ids = std.array_list.Managed(object_store.ObjectId).init(self.alloc);
                     defer reachable_ids.deinit();
@@ -3304,7 +3386,7 @@ pub const CasManager = struct {
                     var pack_write = try self.store.writePack(self.alloc, reachable_ids.items);
                     defer pack_write.deinit(self.alloc);
                 } else {
-                    try deleteActivePackFiles(self.store.root, existing_pack_paths);
+                    try deleteActivePackFiles(self.store.root, existing_pack_paths, self.store.fsync);
                 }
             }
 
@@ -3325,6 +3407,7 @@ pub const CasManager = struct {
         if (!options.dry_run) {
             for (prunable.entries) |entry| {
                 try self.store.root.deleteTree(entry.path);
+                if (self.store.fsync != .none) try syncParentDirs(self.store.root, entry.path);
                 pruned_count += entry.file_count;
                 pruned_bytes += entry.bytes;
             }
@@ -4191,6 +4274,7 @@ fn writeObjectRefsIndex(alloc: std.mem.Allocator, root: std.fs.Dir, index: Objec
         },
         else => return err,
     };
+    if (fsync != .none) try syncParentDirs(root, object_refs_index_path);
 }
 
 fn loadObjectRefsIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !ObjectRefsIndex {
@@ -5987,7 +6071,13 @@ fn countProtectedObjects(reachable: *const std.AutoHashMap(object_store.ObjectId
     return protected;
 }
 
-fn quarantinePackFiles(alloc: std.mem.Allocator, root: std.fs.Dir, pack_paths: [][]u8, stamp_ms: i64) !void {
+fn quarantinePackFiles(
+    alloc: std.mem.Allocator,
+    root: std.fs.Dir,
+    pack_paths: [][]u8,
+    stamp_ms: i64,
+    fsync: cfg.FsyncPolicy,
+) !void {
     const dst_dir = try std.fmt.allocPrint(alloc, "objects/cruft/{d}/packs", .{stamp_ms});
     defer alloc.free(dst_dir);
     try root.makePath(dst_dir);
@@ -5996,17 +6086,77 @@ fn quarantinePackFiles(alloc: std.mem.Allocator, root: std.fs.Dir, pack_paths: [
         const base = std.fs.path.basename(path);
         const dst_path = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ dst_dir, base });
         defer alloc.free(dst_path);
-        root.copyFile(path, root, dst_path, .{}) catch |err| switch (err) {
+        copyPackForQuarantine(root, path, dst_path, fsync) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
     }
+
+    if (fsync != .none) {
+        var destination_dir = try root.openDir(dst_dir, .{});
+        defer destination_dir.close();
+        try syncDir(destination_dir);
+        try syncParentDirs(root, dst_dir);
+    }
 }
 
-fn deleteActivePackFiles(root: std.fs.Dir, pack_paths: [][]u8) !void {
-    for (pack_paths) |path| {
-        root.deleteFile(path) catch {};
+fn copyPackForQuarantine(root: std.fs.Dir, src_path: []const u8, dst_path: []const u8, fsync: cfg.FsyncPolicy) !void {
+    var source_reader: std.fs.File.Reader = .init(try root.openFile(src_path, .{}), &.{});
+    defer source_reader.file.close();
+    const source_stat = try source_reader.file.stat();
+
+    var write_buffer: [1024]u8 = undefined;
+    var atomic_file = try root.atomicFile(dst_path, .{
+        .mode = source_stat.mode,
+        .write_buffer = &write_buffer,
+    });
+    defer atomic_file.deinit();
+
+    _ = atomic_file.file_writer.interface.sendFileAll(&source_reader, .unlimited) catch |err| switch (err) {
+        error.ReadFailed => return source_reader.err.?,
+        error.WriteFailed => return atomic_file.file_writer.err.?,
+    };
+    try atomic_file.file_writer.file.chmod(source_stat.mode);
+    if (fsync != .none) {
+        try atomic_file.flush();
+        try atomic_file.file_writer.file.sync();
     }
+    try atomic_file.finish();
+}
+
+fn deleteActivePackFiles(root: std.fs.Dir, pack_paths: [][]u8, fsync: cfg.FsyncPolicy) !void {
+    for (pack_paths) |path| {
+        var deleted = true;
+        root.deleteFile(path) catch {
+            deleted = false;
+        };
+        if (deleted and fsync != .none) try syncParentDirs(root, path);
+    }
+}
+
+test "gc quarantine preserves read-only pack modes while syncing the copy" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("objects/packs");
+    var source = try tmp.dir.createFile("objects/packs/read-only.pack", .{ .read = true });
+    defer source.close();
+    try source.writeAll("read-only pack contents");
+    try source.chmod(0o444);
+    const source_stat = try source.stat();
+
+    const source_path = try alloc.dupe(u8, "objects/packs/read-only.pack");
+    defer alloc.free(source_path);
+    var pack_paths = [_][]u8{source_path};
+    try quarantinePackFiles(alloc, tmp.dir, pack_paths[0..], 123, .always);
+
+    const destination_path = "objects/cruft/123/packs/read-only.pack";
+    const destination_stat = try tmp.dir.statFile(destination_path);
+    try std.testing.expectEqual(source_stat.mode, destination_stat.mode);
+    const copied = try tmp.dir.readFileAlloc(alloc, destination_path, 128);
+    defer alloc.free(copied);
+    try std.testing.expectEqualStrings("read-only pack contents", copied);
 }
 
 fn scanExpiredCruft(alloc: std.mem.Allocator, root: std.fs.Dir, now_ms: i64, grace_period_ms: i64) !CruftScan {
@@ -6423,6 +6573,7 @@ fn writeCommitGraph(alloc: std.mem.Allocator, root: std.fs.Dir, graph: CommitGra
         },
         else => return err,
     };
+    if (fsync != .none) try syncParentDirs(root, commit_graph_path);
 }
 
 fn loadCommitGraph(alloc: std.mem.Allocator, root: std.fs.Dir) !CommitGraph {
@@ -6544,8 +6695,7 @@ fn writeReachabilityBitmap(
         else => return err,
     };
     if (fsync != .none) {
-        var root_for_sync = root;
-        try syncDir(&root_for_sync);
+        try syncParentDirs(root, reachability_bitmap_path);
     }
 }
 
@@ -6614,13 +6764,18 @@ pub fn probeOrInitRepositoryFormatWithState(
 ) !RepositoryFormatProbe {
     try preflightRepositoryFormatVersion(path);
     var cwd = std.fs.cwd();
-    try cwd.makePath(path);
+    const existing_parent = if (fsync != .none) try nearestExistingParent(cwd, path) else null;
+    const path_status = try cwd.makePathStatus(path);
     var root = try cwd.openDir(path, .{ .iterate = true });
     defer root.close();
     const fresh_repository = !try hasRepositoryApplicationState(root);
     try root.makePath("objects/info");
+    const format = try loadOrInitRepositoryFormat(alloc, root, fsync);
+    if (fsync != .none and path_status == .created) {
+        try syncCreatedPathParents(cwd, path, existing_parent.?);
+    }
     return .{
-        .format = try loadOrInitRepositoryFormat(alloc, root, fsync),
+        .format = format,
         .fresh_repository = fresh_repository,
     };
 }
@@ -6835,8 +6990,7 @@ fn writeRepositoryFormat(alloc: std.mem.Allocator, root: std.fs.Dir, format: Rep
         else => return err,
     };
     if (fsync != .none) {
-        var mutable_root = root;
-        try syncDir(&mutable_root);
+        try syncParentDirs(root, store_format_path);
     }
 }
 
@@ -7447,16 +7601,22 @@ fn ensureContentRefForFile(
     path: []const u8,
     chunk_bytes: u32,
 ) !?ContentRef {
-    const bytes = try data_dir.readFileAlloc(alloc, path, 128 * 1024 * 1024);
-    defer alloc.free(bytes);
     if (store) |object_store_ref| {
-        const written = try extents.writeAll(alloc, object_store_ref, bytes, chunk_bytes);
+        const written = try extents.writeFile(
+            alloc,
+            object_store_ref,
+            data_dir,
+            path,
+            chunk_bytes,
+        );
         return ContentRef{ .extent_tree = .{
             .root_id = written.root_id,
             .size_bytes = written.size_bytes,
             .chunk_bytes = written.chunk_bytes,
         } };
     }
+    const bytes = try data_dir.readFileAlloc(alloc, path, 128 * 1024 * 1024);
+    defer alloc.free(bytes);
     const blob_id = object_store.computeId(.blob, bytes);
     return ContentRef{ .blob = blob_id };
 }
@@ -9077,6 +9237,7 @@ const reftable_tables_list_path = "reftable/tables.list";
 const reftable_state_path = "reftable/state";
 const reftable_state_magic = "SYDRTST1";
 const reftable_summary_path = "reftable/info/summary";
+const reftable_summary_temp_path = reftable_summary_path ++ ".tmp";
 const reftable_summary_magic = "SYDRSUM1";
 const reftable_current_version: u16 = 3;
 const reftable_ref_block_entries: usize = 128;
@@ -9242,10 +9403,7 @@ fn writeReftableState(alloc: std.mem.Allocator, root: std.fs.Dir, state: Reftabl
         },
         else => return err,
     };
-    if (fsync != .none) {
-        var root_for_sync = root;
-        try syncDir(&root_for_sync);
-    }
+    if (fsync != .none) try syncParentDirs(root, reftable_state_path);
 }
 
 fn writeRepositoryId(root: std.fs.Dir, identity: RepositoryIdentity, fsync: cfg.FsyncPolicy) !void {
@@ -9266,10 +9424,7 @@ fn writeRepositoryId(root: std.fs.Dir, identity: RepositoryIdentity, fsync: cfg.
         },
         else => return err,
     };
-    if (fsync != .none) {
-        var root_for_sync = root;
-        try syncDir(&root_for_sync);
-    }
+    if (fsync != .none) try syncParentDirs(root, repository_id_path);
 }
 
 fn inferNextReftableUpdateIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !u64 {
@@ -9390,22 +9545,38 @@ fn writeReftableTablesList(alloc: std.mem.Allocator, root: std.fs.Dir, names: []
         },
         else => return err,
     };
-    if (fsync != .none) {
-        var root_for_sync = root;
-        try syncDir(&root_for_sync);
-    }
 }
 
-fn rebuildReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir, fsync: cfg.FsyncPolicy) !void {
-    var summary = try scanReftableSummaryIndex(alloc, root);
-    defer summary.deinit(alloc);
-    try writeReftableSummaryIndex(alloc, root, summary, fsync);
+fn publishReftableTablesList(alloc: std.mem.Allocator, root: std.fs.Dir, names: []const []const u8, fsync: cfg.FsyncPolicy) !void {
+    try prepareReftableSummaryIndex(alloc, root, names, fsync);
+    defer root.deleteFile(reftable_summary_temp_path) catch {};
+
+    writeReftableTablesList(alloc, root, names, fsync) catch |err| {
+        syncReftablePublicationDirs(root, fsync) catch {};
+        return err;
+    };
+
+    var first_error: ?anyerror = null;
+    publishPreparedReftableSummaryIndex(root) catch |err| {
+        first_error = err;
+    };
+    syncReftablePublicationDirs(root, fsync) catch |err| {
+        if (first_error == null) first_error = err;
+    };
+    if (first_error) |err| return err;
 }
 
 fn scanReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !ReftableSummaryIndex {
     const table_names = try loadReftableTableNames(alloc, root);
     defer freeOwnedStrings(alloc, table_names);
+    return try scanReftableSummaryIndexForNames(alloc, root, table_names);
+}
 
+fn scanReftableSummaryIndexForNames(
+    alloc: std.mem.Allocator,
+    root: std.fs.Dir,
+    table_names: []const []const u8,
+) !ReftableSummaryIndex {
     const records = try alloc.alloc(ReftableSummaryRecord, table_names.len);
     var loaded_count: usize = 0;
     errdefer {
@@ -9469,7 +9640,20 @@ fn scanReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !Reftabl
     return .{ .records = records };
 }
 
-fn writeReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir, summary: ReftableSummaryIndex, fsync: cfg.FsyncPolicy) !void {
+fn prepareReftableSummaryIndex(
+    alloc: std.mem.Allocator,
+    root: std.fs.Dir,
+    names: []const []const u8,
+    fsync: cfg.FsyncPolicy,
+) !void {
+    var summary = try scanReftableSummaryIndexForNames(alloc, root, names);
+    defer summary.deinit(alloc);
+    const bytes = try encodeReftableSummaryIndex(alloc, summary);
+    defer alloc.free(bytes);
+    try writeReftableSummaryIndexTemp(root, bytes, fsync);
+}
+
+fn encodeReftableSummaryIndex(alloc: std.mem.Allocator, summary: ReftableSummaryIndex) ![]u8 {
     var bytes = std.array_list.Managed(u8).init(alloc);
     defer bytes.deinit();
 
@@ -9494,25 +9678,26 @@ fn writeReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir, summary
     var checksum: [32]u8 = undefined;
     hasher.final(checksum[0..]);
     try bytes.appendSlice(checksum[0..]);
+    return try bytes.toOwnedSlice();
+}
 
+fn writeReftableSummaryIndexTemp(root: std.fs.Dir, bytes: []const u8, fsync: cfg.FsyncPolicy) !void {
     try root.makePath("reftable/info");
-    const temp_path = reftable_summary_path ++ ".tmp";
-    var file = try root.createFile(temp_path, .{ .truncate = true, .read = true });
+    var file = try root.createFile(reftable_summary_temp_path, .{ .truncate = true, .read = true });
     defer file.close();
-    errdefer root.deleteFile(temp_path) catch {};
-    try file.writeAll(bytes.items);
+    errdefer root.deleteFile(reftable_summary_temp_path) catch {};
+    try file.writeAll(bytes);
     if (fsync != .none) try file.sync();
-    root.rename(temp_path, reftable_summary_path) catch |err| switch (err) {
+}
+
+fn publishPreparedReftableSummaryIndex(root: std.fs.Dir) !void {
+    root.rename(reftable_summary_temp_path, reftable_summary_path) catch |err| switch (err) {
         error.PathAlreadyExists => {
             root.deleteFile(reftable_summary_path) catch {};
-            try root.rename(temp_path, reftable_summary_path);
+            try root.rename(reftable_summary_temp_path, reftable_summary_path);
         },
         else => return err,
     };
-    if (fsync != .none) {
-        var root_for_sync = root;
-        try syncDir(&root_for_sync);
-    }
 }
 
 fn loadReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !ReftableSummaryIndex {
@@ -9558,13 +9743,31 @@ fn loadReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !Reftabl
 }
 
 fn loadOrScanReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !ReftableSummaryIndex {
-    return loadReftableSummaryIndex(alloc, root) catch |err| switch (err) {
+    var summary = loadReftableSummaryIndex(alloc, root) catch |err| switch (err) {
         error.FileNotFound,
         error.CorruptReftableSummary,
         error.UnsupportedReftableSummaryVersion,
-        => try scanReftableSummaryIndex(alloc, root),
+        => return try scanReftableSummaryIndex(alloc, root),
         else => return err,
     };
+    var summary_owned = true;
+    defer if (summary_owned) summary.deinit(alloc);
+
+    const table_names = try loadReftableTableNames(alloc, root);
+    defer freeOwnedStrings(alloc, table_names);
+
+    if (summary.records.len == table_names.len) {
+        for (summary.records, table_names) |record, table_name| {
+            if (!std.mem.eql(u8, record.table_name, table_name)) break;
+        } else {
+            summary_owned = false;
+            return summary;
+        }
+    }
+
+    summary.deinit(alloc);
+    summary_owned = false;
+    return try scanReftableSummaryIndexForNames(alloc, root, table_names);
 }
 
 fn summaryContainsRef(record: ReftableSummaryRecord, ref_name: []const u8) bool {
@@ -9710,8 +9913,7 @@ fn writeReftableTable(
         else => return err,
     };
     if (fsync != .none) {
-        var root_for_sync = root;
-        try syncDir(&root_for_sync);
+        try syncParentDirs(root, table_path);
     }
 }
 
@@ -10735,9 +10937,132 @@ fn writeContentRefToPath(
     };
 }
 
-fn syncDir(dir: *std.fs.Dir) !void {
-    if (@hasDecl(std.fs.Dir, "sync")) {
-        try dir.sync();
+var test_directory_sync_hook: ?*const fn ([]const u8) anyerror!void = null;
+var test_directory_sync_primary_path: ?[]const u8 = null;
+var test_directory_sync_secondary_path: ?[]const u8 = null;
+var test_directory_sync_skip_publications: usize = 0;
+var test_directory_sync_primary_seen: usize = 0;
+var test_directory_sync_secondary_seen: usize = 0;
+
+fn failSelectedTestDirectorySync(path: []const u8) anyerror!void {
+    const primary_path = test_directory_sync_primary_path orelse return;
+    if (std.mem.eql(u8, path, primary_path)) {
+        test_directory_sync_primary_seen += 1;
+        if (test_directory_sync_primary_seen > test_directory_sync_skip_publications) {
+            return error.FirstInjectedDirectorySyncFailure;
+        }
+        return;
+    }
+
+    if (test_directory_sync_secondary_path) |secondary_path| {
+        if (std.mem.eql(u8, path, secondary_path) and
+            test_directory_sync_primary_seen > test_directory_sync_skip_publications)
+        {
+            test_directory_sync_secondary_seen += 1;
+            return error.SecondInjectedDirectorySyncFailure;
+        }
+    }
+}
+
+fn armTestDirectorySyncFailure(primary_path: []const u8, secondary_path: []const u8, skip_publications: usize) void {
+    test_directory_sync_primary_path = primary_path;
+    test_directory_sync_secondary_path = secondary_path;
+    test_directory_sync_skip_publications = skip_publications;
+    test_directory_sync_primary_seen = 0;
+    test_directory_sync_secondary_seen = 0;
+    test_directory_sync_hook = failSelectedTestDirectorySync;
+}
+
+fn resetTestDirectorySyncFailure() void {
+    test_directory_sync_hook = null;
+    test_directory_sync_primary_path = null;
+    test_directory_sync_secondary_path = null;
+    test_directory_sync_skip_publications = 0;
+    test_directory_sync_primary_seen = 0;
+    test_directory_sync_secondary_seen = 0;
+}
+
+fn syncPublicationDirs(root: std.fs.Dir, fsync: cfg.FsyncPolicy, paths: []const []const u8) !void {
+    if (fsync == .none) return;
+
+    var first_error: ?anyerror = null;
+    for (paths) |path| {
+        syncParentDirs(root, path) catch |err| {
+            if (first_error == null) first_error = err;
+        };
+    }
+    if (first_error) |err| return err;
+}
+
+fn syncReftablePublicationDirs(root: std.fs.Dir, fsync: cfg.FsyncPolicy) !void {
+    try syncPublicationDirs(root, fsync, &.{ reftable_tables_list_path, reftable_summary_path });
+}
+
+fn syncDir(dir: std.fs.Dir) !void {
+    // Linux opens non-iterable Dir handles with O_PATH, which fsync rejects.
+    var sync_dir = try dir.openDir(".", .{ .iterate = true });
+    defer sync_dir.close();
+    try std.posix.fsync(sync_dir.fd);
+}
+
+fn syncParentDirs(root: std.fs.Dir, path: []const u8) !void {
+    if (comptime builtin.is_test) {
+        if (test_directory_sync_hook) |hook| try hook(path);
+    }
+
+    // Sync the deepest containing directory first, then its ancestors.
+    const parent_path = std.fs.path.dirname(path) orelse "";
+    var parent_end = parent_path.len;
+    while (parent_end > 0) {
+        const prefix = parent_path[0..parent_end];
+        {
+            var parent = try root.openDir(prefix, .{});
+            defer parent.close();
+            try syncDir(parent);
+        }
+        parent_end = (std.mem.lastIndexOfScalar(u8, prefix, '/') orelse break);
+    }
+
+    var root_dir = try root.openDir(".", .{});
+    defer root_dir.close();
+    try syncDir(root_dir);
+}
+
+fn nearestExistingParent(root: std.fs.Dir, path: []const u8) ![]const u8 {
+    var existing_target = root.openDir(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (existing_target) |*target| {
+        target.close();
+        // The existing target's parent is the anchor; it does not need opening.
+        return std.fs.path.dirname(path) orelse ".";
+    }
+
+    var parent_path = std.fs.path.dirname(path) orelse ".";
+    while (true) {
+        var parent = root.openDir(parent_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                parent_path = std.fs.path.dirname(parent_path) orelse ".";
+                continue;
+            },
+            else => return err,
+        };
+        parent.close();
+        return parent_path;
+    }
+}
+
+fn syncCreatedPathParents(root: std.fs.Dir, path: []const u8, existing_parent: []const u8) !void {
+    var parent_path = std.fs.path.dirname(path) orelse ".";
+    while (true) {
+        {
+            var parent = try root.openDir(parent_path, .{});
+            defer parent.close();
+            try syncDir(parent);
+        }
+        if (std.mem.eql(u8, parent_path, existing_parent)) return;
+        parent_path = std.fs.path.dirname(parent_path) orelse ".";
     }
 }
 
@@ -10801,7 +11126,7 @@ test "cas manager initializes a repository format marker for fresh repositories"
     const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repo-format", .{tmp_dir.sub_path});
     defer alloc.free(data_path);
 
-    var cas_manager = try CasManager.init(alloc, data_path, .none);
+    var cas_manager = try CasManager.init(alloc, data_path, .always);
     defer cas_manager.deinit();
 
     try std.testing.expectEqual(current_repository_format_version, cas_manager.format.version);
@@ -10812,6 +11137,29 @@ test "cas manager initializes a repository format marker for fresh repositories"
     try std.testing.expectEqual(cas_manager.format.version, loaded.version);
     try std.testing.expectEqual(cas_manager.format.ref_backend, loaded.ref_backend);
     try std.testing.expectEqual(cas_manager.format.extent_chunk_bytes, loaded.extent_chunk_bytes);
+}
+
+test "cas manager reopens an existing repository below a searchable unreadable parent" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/existing-repository", .{tmp_dir.sub_path});
+    defer alloc.free(data_path);
+
+    var initial = try CasManager.init(alloc, data_path, .always);
+    initial.deinit();
+
+    const original_mode = (try tmp_dir.dir.stat()).mode & 0o7777;
+    defer tmp_dir.dir.chmod(original_mode) catch unreachable;
+
+    // Root can bypass POSIX mode checks, so this still exercises initialization
+    // there but cannot reproduce EACCES in a root-run test process.
+    try tmp_dir.dir.chmod(0o111);
+
+    var reopened = try CasManager.init(alloc, data_path, .always);
+    defer reopened.deinit();
+    try std.testing.expectEqual(current_repository_format_version, reopened.format.version);
 }
 
 test "repository format probe initializes fresh and preserves legacy repositories without CasManager" {
@@ -11579,11 +11927,11 @@ test "cas manager persists repository identities across reopen" {
     const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repo-id", .{tmp_dir.sub_path});
     defer alloc.free(data_path);
 
-    var first = try CasManager.init(alloc, data_path, .none);
+    var first = try CasManager.init(alloc, data_path, .always);
     const initial_id = first.repository_id;
     first.deinit();
 
-    var reopened = try CasManager.init(alloc, data_path, .none);
+    var reopened = try CasManager.init(alloc, data_path, .always);
     defer reopened.deinit();
     try std.testing.expect(initial_id.eql(reopened.repository_id));
 }
@@ -11892,7 +12240,7 @@ test "expire trims loose reflogs checkpoints and borrowed alternates" {
 
     var dest_dir = try std.fs.cwd().openDir(dest_path, .{ .iterate = true });
     defer dest_dir.close();
-    var dest_cas = try CasManager.init(talloc, dest_path, .none);
+    var dest_cas = try CasManager.init(talloc, dest_path, .always);
     defer dest_cas.deinit();
 
     dest_cas.format = legacyCompatibleRepositoryFormat();
@@ -11957,7 +12305,7 @@ test "prune only deletes expired cruft" {
     defer talloc.free(data_path);
     try std.fs.cwd().makePath(data_path);
 
-    var cas_manager = try CasManager.init(talloc, data_path, .none);
+    var cas_manager = try CasManager.init(talloc, data_path, .always);
     defer cas_manager.deinit();
 
     const now_ms = std.time.milliTimestamp();
@@ -12493,7 +12841,7 @@ test "ref transactions enforce compare-and-swap and append reflogs" {
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/ref-txn", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
 
-    var refs = try RefStore.init(std.testing.allocator, path, .none);
+    var refs = try RefStore.init(std.testing.allocator, path, .always);
     defer refs.deinit();
 
     const first = object_store.computeId(.commit, "first");
@@ -12520,7 +12868,7 @@ test "reftable transactions assign update spans and compact older tables" {
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/reftable-spans", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
 
-    var refs = try RefStore.init(std.testing.allocator, path, .none);
+    var refs = try RefStore.init(std.testing.allocator, path, .always);
     defer refs.deinit();
     refs.setBackend(.reftable);
 
@@ -12638,7 +12986,7 @@ test "reftable delete rename and reflog views work" {
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/reftable-ref-ops", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
 
-    var refs = try RefStore.init(std.testing.allocator, path, .none);
+    var refs = try RefStore.init(std.testing.allocator, path, .always);
     defer refs.deinit();
     refs.setBackend(.reftable);
 
@@ -12668,7 +13016,7 @@ test "symrefs persist head targets alongside reftable refs" {
     const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/symref-head", .{tmp.sub_path});
     defer std.testing.allocator.free(path);
 
-    var refs = try RefStore.init(std.testing.allocator, path, .none);
+    var refs = try RefStore.init(std.testing.allocator, path, .always);
     defer refs.deinit();
     refs.setBackend(.reftable);
 
@@ -12681,6 +13029,493 @@ test "symrefs persist head targets alongside reftable refs" {
     try std.testing.expectEqualStrings(main_ref, restored);
 }
 
+test "reftable reads ignore checksum-valid summaries for stale table lists" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/reftable-stale-summary", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    const stale_id = object_store.computeId(.commit, "stale-summary-head");
+    const authoritative_id = object_store.computeId(.commit, "authoritative-table-head");
+    const authoritative_table = "reftable/2-2.table";
+    var stale_table_name: []const u8 = undefined;
+
+    {
+        var refs = try RefStore.init(alloc, path, .none);
+        defer refs.deinit();
+        refs.setBackend(.reftable);
+        try refs.updateRefAtomic(main_ref, stale_id);
+
+        const original_names = try loadReftableTableNames(alloc, refs.root);
+        defer freeOwnedStrings(alloc, original_names);
+        try std.testing.expectEqual(@as(usize, 1), original_names.len);
+        stale_table_name = original_names[0];
+
+        var authoritative_refs = [_]ReftableRefRecord{.{
+            .name = try alloc.dupe(u8, main_ref),
+            .id = authoritative_id,
+        }};
+        defer authoritative_refs[0].deinit(alloc);
+        var authoritative_logs = [_]ReflogEntry{.{
+            .ref_name = try alloc.dupe(u8, main_ref),
+            .old_id = stale_id,
+            .new_id = authoritative_id,
+            .timestamp_ms = std.time.milliTimestamp(),
+            .reason = try alloc.dupe(u8, "authoritative-table"),
+        }};
+        defer authoritative_logs[0].deinit(alloc);
+
+        try writeReftableTable(
+            alloc,
+            refs.root,
+            authoritative_table,
+            .{ .min_update_index = 2, .max_update_index = 2 },
+            authoritative_refs[0..],
+            authoritative_logs[0..],
+            .none,
+        );
+        try writeReftableTablesList(alloc, refs.root, &.{authoritative_table}, .none);
+
+        // Loading verifies the summary checksum. Its single old table name differs
+        // from the single authoritative name in tables.list.
+        var stale_summary = try loadReftableSummaryIndex(alloc, refs.root);
+        defer stale_summary.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), stale_summary.records.len);
+        try std.testing.expectEqualStrings(stale_table_name, stale_summary.records[0].table_name);
+
+        const head = try refs.readHead(main_ref) orelse return error.MissingCasHead;
+        try std.testing.expect(head.eql(authoritative_id));
+        const reflog = try refs.loadReflog(alloc, main_ref, 8);
+        defer {
+            for (reflog) |*entry| entry.deinit(alloc);
+            alloc.free(reflog);
+        }
+        try std.testing.expectEqual(@as(usize, 1), reflog.len);
+        try std.testing.expectEqualStrings("authoritative-table", reflog[0].reason);
+    }
+
+    {
+        var reopened = try RefStore.init(alloc, path, .none);
+        defer reopened.deinit();
+        reopened.setBackend(.reftable);
+
+        const head = try reopened.readHead(main_ref) orelse return error.MissingCasHead;
+        try std.testing.expect(head.eql(authoritative_id));
+        const reflog = try reopened.loadReflog(alloc, main_ref, 8);
+        defer {
+            for (reflog) |*entry| entry.deinit(alloc);
+            alloc.free(reflog);
+        }
+        try std.testing.expectEqual(@as(usize, 1), reflog.len);
+        try std.testing.expectEqualStrings("authoritative-table", reflog[0].reason);
+    }
+}
+
+test "loose ref update attempts directory sync when reflog append fails after ref publication" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/loose-reflog-io-failure", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var refs = try RefStore.init(alloc, path, .always);
+    defer refs.deinit();
+    const old_id = object_store.computeId(.commit, "loose-reflog-failure-before");
+    const new_id = object_store.computeId(.commit, "loose-reflog-failure-after");
+    try refs.updateRefAtomic(main_ref, old_id);
+
+    try refs.root.deleteFile("logs/refs/heads/main");
+    try refs.root.makeDir("logs/refs/heads/main");
+
+    defer resetTestDirectorySyncFailure();
+    armTestDirectorySyncFailure("refs/heads/main", "logs/refs/heads/main", 0);
+    try std.testing.expectError(error.IsDir, refs.updateRefAtomic(main_ref, new_id));
+    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_primary_seen);
+    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_secondary_seen);
+
+    const head = try refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(head.eql(new_id));
+}
+
+test "loose ref sync paths are allocated before publishing the ref" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const old_id = object_store.computeId(.commit, "loose-sync-allocation-before");
+    const new_id = object_store.computeId(.commit, "loose-sync-allocation-after");
+
+    const max_fail_index: usize = 32;
+    var saw_completion = false;
+    var prepublication_failures: usize = 0;
+    var postpublication_failures: usize = 0;
+
+    var fail_index: usize = 0;
+    while (fail_index <= max_fail_index) : (fail_index += 1) {
+        {
+            const path = try std.fmt.allocPrint(
+                alloc,
+                ".zig-cache/tmp/{s}/loose-sync-path-allocation-{d}",
+                .{ tmp.sub_path, fail_index },
+            );
+            defer alloc.free(path);
+
+            var refs = try RefStore.init(alloc, path, .always);
+            defer refs.deinit();
+            try refs.updateRefAtomic(main_ref, old_id);
+
+            var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
+            refs.alloc = failing.allocator();
+            defer refs.alloc = alloc;
+
+            armTestDirectorySyncFailure("refs/heads/main", "logs/refs/heads/main", 0);
+            defer resetTestDirectorySyncFailure();
+
+            const update_result = refs.updateRefAtomic(main_ref, new_id);
+            refs.alloc = alloc;
+
+            if (failing.has_induced_failure) {
+                try std.testing.expectError(error.OutOfMemory, update_result);
+                try std.testing.expectEqual(fail_index, failing.alloc_index);
+
+                const head = try refs.readRef(main_ref) orelse return error.MissingCasHead;
+                const reflog = try refs.loadReflog(alloc, main_ref, 8);
+                defer {
+                    for (reflog) |*entry| entry.deinit(alloc);
+                    alloc.free(reflog);
+                }
+                try std.testing.expectEqual(@as(usize, 1), reflog.len);
+                try std.testing.expectEqualStrings("update-ref", reflog[0].reason);
+                try std.testing.expect(reflog[0].old_id == null);
+                try std.testing.expect(reflog[0].new_id.eql(old_id));
+
+                if (head.eql(old_id)) {
+                    prepublication_failures += 1;
+                    try std.testing.expect(test_directory_sync_primary_seen <= 1);
+                    try std.testing.expectEqual(test_directory_sync_primary_seen, test_directory_sync_secondary_seen);
+                } else if (head.eql(new_id)) {
+                    postpublication_failures += 1;
+                    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_primary_seen);
+                    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_secondary_seen);
+                } else {
+                    return error.UnexpectedCasHead;
+                }
+            } else {
+                try std.testing.expectEqual(fail_index, failing.alloc_index);
+                try std.testing.expectError(error.FirstInjectedDirectorySyncFailure, update_result);
+                try std.testing.expectEqual(@as(usize, 1), test_directory_sync_primary_seen);
+                try std.testing.expectEqual(@as(usize, 1), test_directory_sync_secondary_seen);
+
+                const head = try refs.readRef(main_ref) orelse return error.MissingCasHead;
+                try std.testing.expect(head.eql(new_id));
+                const reflog = try refs.loadReflog(alloc, main_ref, 8);
+                defer {
+                    for (reflog) |*entry| entry.deinit(alloc);
+                    alloc.free(reflog);
+                }
+                try std.testing.expectEqual(@as(usize, 2), reflog.len);
+                try std.testing.expectEqualStrings("update-ref", reflog[0].reason);
+                try std.testing.expect(reflog[0].old_id != null);
+                try std.testing.expect(reflog[0].old_id.?.eql(old_id));
+                try std.testing.expect(reflog[0].new_id.eql(new_id));
+                saw_completion = true;
+                break;
+            }
+        }
+    }
+
+    try std.testing.expect(saw_completion);
+    try std.testing.expect(prepublication_failures > 0);
+    try std.testing.expect(postpublication_failures > 0);
+}
+
+test "reftable summary candidate failure leaves the authoritative list unchanged" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/reftable-summary-candidate-failure", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var refs = try RefStore.init(alloc, path, .always);
+    defer refs.deinit();
+    refs.setBackend(.reftable);
+    const id = object_store.computeId(.commit, "reftable-summary-candidate-before");
+    try refs.updateRefAtomic(main_ref, id);
+
+    const original_list = try refs.root.readFileAlloc(alloc, reftable_tables_list_path, 1024 * 1024);
+    defer alloc.free(original_list);
+    const original_summary = try refs.root.readFileAlloc(alloc, reftable_summary_path, 16 * 1024 * 1024);
+    defer alloc.free(original_summary);
+    try refs.root.writeFile(.{
+        .sub_path = "reftable/2-2.table",
+        .data = "not a reftable table",
+    });
+
+    try std.testing.expectError(error.CorruptReftable, refs.rebuildReftableMetadata());
+
+    const current_list = try refs.root.readFileAlloc(alloc, reftable_tables_list_path, 1024 * 1024);
+    defer alloc.free(current_list);
+    try std.testing.expectEqualSlices(u8, original_list, current_list);
+    const current_summary = try refs.root.readFileAlloc(alloc, reftable_summary_path, 16 * 1024 * 1024);
+    defer alloc.free(current_summary);
+    try std.testing.expectEqualSlices(u8, original_summary, current_summary);
+    const head = try refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(head.eql(id));
+}
+
+test "loose ref update returns the first directory sync error after publishing ref and reflog" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/loose-update-sync-error", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var refs = try RefStore.init(alloc, path, .always);
+    defer refs.deinit();
+    const old_id = object_store.computeId(.commit, "loose-update-before");
+    const new_id = object_store.computeId(.commit, "loose-update-after");
+    try refs.updateRefAtomic(main_ref, old_id);
+
+    defer resetTestDirectorySyncFailure();
+    armTestDirectorySyncFailure("refs/heads/main", "logs/refs/heads/main", 0);
+    // The ref rename and reflog append precede this directory-sync failure. Their
+    // visibility here does not prove crash durability; multi-ref loose transactions
+    // can also retain earlier writes if a later ref or sync fails.
+    try std.testing.expectError(
+        error.FirstInjectedDirectorySyncFailure,
+        refs.updateRefAtomic(main_ref, new_id),
+    );
+    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_primary_seen);
+    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_secondary_seen);
+
+    const head = try refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(head.eql(new_id));
+    const reflog = try refs.loadReflog(alloc, main_ref, 8);
+    defer {
+        for (reflog) |*entry| entry.deinit(alloc);
+        alloc.free(reflog);
+    }
+    try std.testing.expectEqual(@as(usize, 2), reflog.len);
+    try std.testing.expectEqualStrings("update-ref", reflog[0].reason);
+    try std.testing.expectEqual(new_id, reflog[0].new_id);
+}
+
+test "loose ref delete returns the first directory sync error after publishing deletion and reflog" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/loose-delete-sync-error", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var refs = try RefStore.init(alloc, path, .always);
+    defer refs.deinit();
+    const old_id = object_store.computeId(.commit, "loose-delete-before");
+    try refs.updateRefAtomic(main_ref, old_id);
+
+    defer resetTestDirectorySyncFailure();
+    armTestDirectorySyncFailure("refs/heads/main", "logs/refs/heads/main", 0);
+    try std.testing.expectError(
+        error.FirstInjectedDirectorySyncFailure,
+        refs.deleteRef(main_ref, "delete-after-sync-failure"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_primary_seen);
+    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_secondary_seen);
+
+    try std.testing.expect((try refs.readHead(main_ref)) == null);
+    const reflog = try refs.loadReflog(alloc, main_ref, 8);
+    defer {
+        for (reflog) |*entry| entry.deinit(alloc);
+        alloc.free(reflog);
+    }
+    try std.testing.expectEqual(@as(usize, 2), reflog.len);
+    try std.testing.expectEqualStrings("delete-after-sync-failure", reflog[0].reason);
+    try std.testing.expectEqual(old_id, reflog[0].old_id.?);
+    try std.testing.expectEqual(old_id, reflog[0].new_id);
+}
+
+test "loose ref rename returns the first directory sync error after publishing both reflogs" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/loose-rename-sync-error", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var refs = try RefStore.init(alloc, path, .always);
+    defer refs.deinit();
+    const id = object_store.computeId(.commit, "loose-rename-before");
+    try refs.updateRefAtomic(main_ref, id);
+
+    defer resetTestDirectorySyncFailure();
+    armTestDirectorySyncFailure("refs/heads/main", "logs/refs/heads/main", 0);
+    try std.testing.expectError(
+        error.FirstInjectedDirectorySyncFailure,
+        refs.renameRef(main_ref, "heads/renamed", "rename-after-sync-failure"),
+    );
+    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_primary_seen);
+    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_secondary_seen);
+
+    try std.testing.expect((try refs.readHead(main_ref)) == null);
+    const renamed = try refs.readHead("heads/renamed") orelse return error.MissingCasHead;
+    try std.testing.expect(renamed.eql(id));
+
+    const old_reflog = try refs.loadReflog(alloc, main_ref, 8);
+    defer {
+        for (old_reflog) |*entry| entry.deinit(alloc);
+        alloc.free(old_reflog);
+    }
+    const new_reflog = try refs.loadReflog(alloc, "heads/renamed", 8);
+    defer {
+        for (new_reflog) |*entry| entry.deinit(alloc);
+        alloc.free(new_reflog);
+    }
+    try std.testing.expectEqual(@as(usize, 2), old_reflog.len);
+    try std.testing.expectEqual(@as(usize, 1), new_reflog.len);
+    try std.testing.expectEqualStrings("rename-after-sync-failure", old_reflog[0].reason);
+    try std.testing.expectEqualStrings("rename-after-sync-failure", new_reflog[0].reason);
+    try std.testing.expectEqual(id, old_reflog[0].new_id);
+    try std.testing.expectEqual(id, new_reflog[0].new_id);
+}
+
+test "loose ref update with fsync none bypasses the directory sync hook" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/loose-update-no-sync", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var refs = try RefStore.init(alloc, path, .none);
+    defer refs.deinit();
+    defer resetTestDirectorySyncFailure();
+    armTestDirectorySyncFailure("refs/heads/main", "logs/refs/heads/main", 0);
+
+    const id = object_store.computeId(.commit, "loose-update-no-sync");
+    try refs.updateRefAtomic(main_ref, id);
+    try std.testing.expectEqual(@as(usize, 0), test_directory_sync_primary_seen);
+    try std.testing.expectEqual(@as(usize, 0), test_directory_sync_secondary_seen);
+    const head = try refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(head.eql(id));
+}
+
+test "reftable replacement sync error keeps its new snapshot and old table files" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/reftable-replacement-sync-error", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var refs = try RefStore.init(alloc, path, .always);
+    defer refs.deinit();
+    refs.setBackend(.reftable);
+    const old_id = object_store.computeId(.commit, "reftable-replacement-before");
+    const new_id = object_store.computeId(.commit, "reftable-replacement-after");
+    try refs.updateRefAtomic(main_ref, old_id);
+
+    var replacement_records = [_]ReftableRefRecord{.{
+        .name = try alloc.dupe(u8, main_ref),
+        .id = new_id,
+    }};
+    defer replacement_records[0].deinit(alloc);
+    var replacement_logs = [_]ReflogEntry{.{
+        .ref_name = try alloc.dupe(u8, main_ref),
+        .old_id = old_id,
+        .new_id = new_id,
+        .timestamp_ms = std.time.milliTimestamp() + 60_000,
+        .reason = try alloc.dupe(u8, "replacement-visible"),
+    }};
+    defer replacement_logs[0].deinit(alloc);
+    try refs.appendReftableRecords(replacement_records[0..], replacement_logs[0..]);
+
+    const history = try loadReftableReflogEntries(alloc, refs.root);
+    defer {
+        for (history) |*entry| entry.deinit(alloc);
+        alloc.free(history);
+    }
+    var expiration_cutoff: ?i64 = null;
+    for (history) |entry| {
+        if (std.mem.eql(u8, entry.reason, "update-ref")) {
+            expiration_cutoff = entry.timestamp_ms + 1;
+        }
+    }
+    const cutoff = expiration_cutoff orelse return error.MissingReflogEntry;
+    try std.testing.expect(cutoff < replacement_logs[0].timestamp_ms);
+
+    const old_table_names = try loadReftableTableNames(alloc, refs.root);
+    defer freeOwnedStrings(alloc, old_table_names);
+    try std.testing.expect(old_table_names.len > 0);
+
+    defer resetTestDirectorySyncFailure();
+    armTestDirectorySyncFailure(reftable_tables_list_path, reftable_summary_path, 0);
+    try std.testing.expectError(
+        error.FirstInjectedDirectorySyncFailure,
+        refs.expireReflogEntries(cutoff),
+    );
+    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_primary_seen);
+    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_secondary_seen);
+
+    const head = try refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(head.eql(new_id));
+    const reflog = try refs.loadReflog(alloc, main_ref, 8);
+    defer {
+        for (reflog) |*entry| entry.deinit(alloc);
+        alloc.free(reflog);
+    }
+    try std.testing.expectEqual(@as(usize, 1), reflog.len);
+    try std.testing.expectEqualStrings("replacement-visible", reflog[0].reason);
+    for (old_table_names) |name| _ = try refs.root.statFile(name);
+}
+
+test "reftable compaction sync error keeps its new ref log and old table files" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/reftable-compaction-sync-error", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var refs = try RefStore.init(alloc, path, .always);
+    defer refs.deinit();
+    refs.setBackend(.reftable);
+    const old_id = object_store.computeId(.commit, "reftable-compaction-before");
+    const new_id = object_store.computeId(.commit, "reftable-compaction-after");
+    try refs.updateRefAtomic(main_ref, old_id);
+
+    const old_table_names = try loadReftableTableNames(alloc, refs.root);
+    defer freeOwnedStrings(alloc, old_table_names);
+    try std.testing.expectEqual(@as(usize, 1), old_table_names.len);
+
+    defer resetTestDirectorySyncFailure();
+    // Let append publication finish; fail the following compaction finalization.
+    armTestDirectorySyncFailure(reftable_tables_list_path, reftable_summary_path, 1);
+    try std.testing.expectError(
+        error.FirstInjectedDirectorySyncFailure,
+        refs.compareAndSwapRef(main_ref, old_id, new_id, "compaction-visible"),
+    );
+    try std.testing.expectEqual(@as(usize, 2), test_directory_sync_primary_seen);
+    try std.testing.expectEqual(@as(usize, 1), test_directory_sync_secondary_seen);
+
+    const head = try refs.readHead(main_ref) orelse return error.MissingCasHead;
+    try std.testing.expect(head.eql(new_id));
+    const reflog = try refs.loadReflog(alloc, main_ref, 8);
+    defer {
+        for (reflog) |*entry| entry.deinit(alloc);
+        alloc.free(reflog);
+    }
+    try std.testing.expectEqual(@as(usize, 2), reflog.len);
+    try std.testing.expectEqualStrings("compaction-visible", reflog[0].reason);
+    try std.testing.expectEqual(new_id, reflog[0].new_id);
+
+    for (old_table_names) |name| _ = try refs.root.statFile(name);
+    _ = try refs.root.statFile("reftable/2-2.table");
+}
 test "checkpoints support diffing and rollback" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -12775,7 +13610,7 @@ test "commit graph indexes reachable commit ancestry" {
     defer talloc.free(first_path);
     try manifest.add(data_dir, sid, 0, 1_000, 1_000, 1, first_path);
 
-    var cas_manager = try CasManager.init(talloc, data_path, .none);
+    var cas_manager = try CasManager.init(talloc, data_path, .always);
     defer cas_manager.deinit();
     const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
 
@@ -12837,7 +13672,7 @@ test "reachability bitmap falls back to graph walks when corrupt" {
     defer talloc.free(seg_path);
     try manifest.add(data_dir, sid, 0, 1_000, 1_000, 1, seg_path);
 
-    var cas_manager = try CasManager.init(talloc, data_path, .none);
+    var cas_manager = try CasManager.init(talloc, data_path, .always);
     defer cas_manager.deinit();
 
     _ = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
@@ -12952,7 +13787,7 @@ test "gc writes loose unreachable objects into cruft packs" {
     defer talloc.free(seg_path);
     try manifest.add(data_dir, sid, 0, 1_000, 1_000, 1, seg_path);
 
-    var cas_manager = try CasManager.init(talloc, data_path, .none);
+    var cas_manager = try CasManager.init(talloc, data_path, .always);
     defer cas_manager.deinit();
     const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
     const orphan = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, &metric_catalog, "cruft-pack-orphan");
@@ -13065,7 +13900,7 @@ test "fsck validates active pack manifests" {
     defer talloc.free(seg_path);
     try manifest.add(data_dir, sid, 0, 1_000, 1_000, 1, seg_path);
 
-    var cas_manager = try CasManager.init(talloc, data_path, .none);
+    var cas_manager = try CasManager.init(talloc, data_path, .always);
     defer cas_manager.deinit();
     _ = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
     _ = try cas_manager.pack();

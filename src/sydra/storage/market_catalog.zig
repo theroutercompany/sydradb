@@ -1100,7 +1100,7 @@ pub const Catalog = struct {
 };
 
 fn syncDir(dir: *std.fs.Dir) !void {
-    if (@hasDecl(std.fs.Dir, "sync")) try dir.sync();
+    try std.posix.fsync(dir.fd);
 }
 
 fn inputToSchema(alloc: std.mem.Allocator, input: MarketSchemaInput) !MarketSchema {
@@ -1726,7 +1726,7 @@ test "catalog promotion rewrites schema mappings and registered digests atomical
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
-    var catalog = try Catalog.loadOrInit(alloc, tmp.dir, .none);
+    var catalog = try Catalog.loadOrInit(alloc, tmp.dir, .always);
     defer catalog.deinit();
     var identity = try catalog.registerMarketSeries(
         "market.trade",

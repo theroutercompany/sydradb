@@ -395,7 +395,19 @@ pub const Engine = struct {
             cas_manager: ?*cas_mod.CasManager,
             new_catalog_builtin_mapping: market_catalog_mod.StorageMapping,
         ) !MetadataState {
-            var manifest = try manifest_mod.Manifest.loadOrInit(alloc, data_dir);
+            const has_cas_head = if (cas_manager) |cas|
+                (try cas.refs.readHead(cas_mod.main_ref)) != null
+            else
+                false;
+            if (try manifest_mod.Manifest.repairIntentExists(data_dir) and !has_cas_head) {
+                return error.ManifestRepairRequiresCasHead;
+            }
+            // Without a CAS head, the existing recovery source is the WAL.
+            var manifest = try manifest_mod.Manifest.loadOrInitWithRepairIntent(
+                alloc,
+                data_dir,
+                has_cas_head,
+            );
             errdefer manifest.deinit();
             var tags = try tags_mod.TagIndex.loadOrInit(alloc, data_dir);
             errdefer tags.deinit();
@@ -431,6 +443,7 @@ pub const Engine = struct {
             errdefer index.deinit();
             var manifest = try manifestFromSnapshot(alloc, index.snapshot.segment_descriptors);
             errdefer manifest.deinit();
+            manifest.repaired_torn_tail = try manifest_mod.Manifest.repairIntentExists(data_dir);
             var tags = try tagIndexFromSnapshot(alloc, index.snapshot.tag_snapshot);
             errdefer tags.deinit();
             var series_catalog = try seriesCatalogFromSnapshot(alloc, fsync, index.snapshot.series_catalog_snapshot);
@@ -566,6 +579,9 @@ pub const Engine = struct {
         fanout_v1,
         dual_write_v1,
         native_v1,
+        /// An `auto` batch that resolved to more than one persisted schema
+        /// mapping. Individual queued rows retain their concrete write mode.
+        auto,
     };
 
     pub const MarketIngestInput = struct {
@@ -762,6 +778,7 @@ pub const Engine = struct {
     const QueuedMarketRow = struct {
         market_series_id: market_identity_mod.MarketSeriesId,
         schema_digest: market_identity_mod.SchemaDigest,
+        mode: MarketStorageWriteMode,
         metric: []u8,
         canonical_labels: []u8,
         ts_ns: i64,
@@ -1400,6 +1417,7 @@ pub const Engine = struct {
                 &engine.market_manifest,
             );
             try engine.metadata.refreshCasIndex(cas);
+            try engine.restoreRepairedScalarManifestFromCas();
         }
         try engine.recover();
         try engine.finalizeInterruptedMarketPromotion();
@@ -1654,7 +1672,12 @@ pub const Engine = struct {
 
             const mode = try self.resolveMarketWriteMode(schema);
             if (resolved_mode) |previous| {
-                if (previous != mode) return error.MixedMarketStorageModes;
+                if (previous != mode) {
+                    if (self.config.market_storage_mode != .auto) {
+                        return error.MixedMarketStorageModes;
+                    }
+                    resolved_mode = .auto;
+                }
             } else {
                 resolved_mode = mode;
             }
@@ -1745,6 +1768,7 @@ pub const Engine = struct {
             queued_rows[row_idx] = .{
                 .market_series_id = preflight_market_registrations[row_idx].series_id,
                 .schema_digest = schema.digest(),
+                .mode = row_mode,
                 .metric = metric_copy,
                 .canonical_labels = labels_copy,
                 .ts_ns = row.ts_ns,
@@ -2293,15 +2317,25 @@ pub const Engine = struct {
     fn processQueuedMarketBatch(self: *Engine, batch: *const QueuedMarketBatch) !void {
         if (batch.rows.len == 0) return;
 
-        var registrations = try self.alloc.alloc(wal_mod.MarketSeriesRegistrationAppend, batch.rows.len);
+        var native_row_count: usize = 0;
+        for (batch.rows) |row| {
+            if (row.mode == .native_v1 or row.mode == .dual_write_v1) {
+                native_row_count += 1;
+            }
+        }
+        std.debug.assert(native_row_count != 0);
+
+        var registrations = try self.alloc.alloc(wal_mod.MarketSeriesRegistrationAppend, native_row_count);
         defer self.alloc.free(registrations);
-        var wal_rows = try self.alloc.alloc(wal_mod.MarketRowAppend, batch.rows.len);
+        var wal_rows = try self.alloc.alloc(wal_mod.MarketRowAppend, native_row_count);
         defer self.alloc.free(wal_rows);
-        var mem_rows = try self.alloc.alloc(market_memtable_mod.MarketRowInput, batch.rows.len);
+        var mem_rows = try self.alloc.alloc(market_memtable_mod.MarketRowInput, native_row_count);
         defer self.alloc.free(mem_rows);
 
         var registration_count: usize = 0;
-        for (batch.rows, 0..) |row, idx| {
+        var native_row_idx: usize = 0;
+        for (batch.rows) |row| {
+            if (row.mode != .native_v1 and row.mode != .dual_write_v1) continue;
             var registration_seen = false;
             for (registrations[0..registration_count]) |registration| {
                 if (registration.market_series_id == row.market_series_id) {
@@ -2320,13 +2354,13 @@ pub const Engine = struct {
             }
             const sequence = self.next_market_write_sequence;
             self.next_market_write_sequence = std.math.add(u64, self.next_market_write_sequence, 1) catch return error.MarketWriteSequenceOverflow;
-            wal_rows[idx] = .{
+            wal_rows[native_row_idx] = .{
                 .market_series_id = row.market_series_id,
                 .write_sequence = sequence,
                 .ts_ns = row.ts_ns,
                 .values = row.values,
             };
-            mem_rows[idx] = .{
+            mem_rows[native_row_idx] = .{
                 .market_series_id = row.market_series_id,
                 .metric = row.metric,
                 .canonical_labels = row.canonical_labels,
@@ -2335,21 +2369,25 @@ pub const Engine = struct {
                 .write_sequence = sequence,
                 .values = row.values,
             };
+            native_row_idx += 1;
         }
+        std.debug.assert(native_row_idx == native_row_count);
 
         var fanout_points: []ResolvedIngestPoint = &.{};
         defer if (fanout_points.len != 0) self.alloc.free(fanout_points);
         var fanout_checkpoints: []FanoutMemtableCheckpoint = &.{};
         defer if (fanout_checkpoints.len != 0) self.alloc.free(fanout_checkpoints);
-        if (batch.mode == .dual_write_v1) {
+        if (batch.mode == .dual_write_v1 or batch.mode == .auto) {
             fanout_points = try self.flattenMarketFanoutPoints(batch);
-            std.sort.block(ResolvedIngestPoint, fanout_points, {}, struct {
-                fn lessThan(_: void, a: ResolvedIngestPoint, b: ResolvedIngestPoint) bool {
-                    if (a.series_id != b.series_id) return a.series_id < b.series_id;
-                    return a.ts < b.ts;
-                }
-            }.lessThan);
-            fanout_checkpoints = try self.captureFanoutMemtableCheckpoints(fanout_points);
+            if (batch.mode == .dual_write_v1) {
+                std.sort.block(ResolvedIngestPoint, fanout_points, {}, struct {
+                    fn lessThan(_: void, a: ResolvedIngestPoint, b: ResolvedIngestPoint) bool {
+                        if (a.series_id != b.series_id) return a.series_id < b.series_id;
+                        return a.ts < b.ts;
+                    }
+                }.lessThan);
+                fanout_checkpoints = try self.captureFanoutMemtableCheckpoints(fanout_points);
+            }
         }
 
         if (self.market_writer_fault == .wal_append) return error.InjectedMarketWalAppendFailure;
@@ -2358,7 +2396,36 @@ pub const Engine = struct {
             registrations[0..registration_count],
         );
         crash_injection.hit(.after_registration);
-        const row_bytes = try self.wal.appendMarketRowBatch(wal_rows);
+        var row_bytes: u64 = 0;
+        if (batch.mode == .auto) {
+            var fanout_offset: usize = 0;
+            native_row_idx = 0;
+            for (batch.rows, 0..) |row, row_idx| {
+                switch (row.mode) {
+                    .fanout_v1 => {
+                        const fanout_len = batch.fanout_series_ids[row_idx].len;
+                        const fanout_end = fanout_offset + fanout_len;
+                        row_bytes += try self.wal.appendBatch(fanout_points[fanout_offset..fanout_end]);
+                        fanout_offset = fanout_end;
+                    },
+                    .native_v1 => {
+                        const wal_row = wal_rows[native_row_idx];
+                        row_bytes += @as(u64, try self.wal.appendMarketRow(
+                            wal_row.market_series_id,
+                            wal_row.write_sequence,
+                            wal_row.ts_ns,
+                            wal_row.values,
+                        ));
+                        native_row_idx += 1;
+                    },
+                    .dual_write_v1, .auto => unreachable,
+                }
+            }
+            std.debug.assert(fanout_offset == fanout_points.len);
+            std.debug.assert(native_row_idx == native_row_count);
+        } else {
+            row_bytes = try self.wal.appendMarketRowBatch(wal_rows);
+        }
         crash_injection.hit(.after_wal_append);
         _ = self.metrics.wal_append_total.fetchAdd(@intCast(batch.rows.len), .monotonic);
         _ = self.metrics.wal_append_ns_total.fetchAdd(wal_timer.read(), .monotonic);
@@ -2369,7 +2436,16 @@ pub const Engine = struct {
         defer self.market_data_mu.unlock();
         var fanout_applied = false;
         errdefer if (fanout_applied) self.rollbackFanoutMemtable(fanout_checkpoints, fanout_points.len);
-        if (batch.mode == .dual_write_v1) {
+        if (batch.mode == .dual_write_v1 or batch.mode == .auto) {
+            if (batch.mode == .auto) {
+                std.sort.block(ResolvedIngestPoint, fanout_points, {}, struct {
+                    fn lessThan(_: void, a: ResolvedIngestPoint, b: ResolvedIngestPoint) bool {
+                        if (a.series_id != b.series_id) return a.series_id < b.series_id;
+                        return a.ts < b.ts;
+                    }
+                }.lessThan);
+                fanout_checkpoints = try self.captureFanoutMemtableCheckpoints(fanout_points);
+            }
             try self.appendMemtableBatchGrouped(fanout_points);
             fanout_applied = true;
             if (self.market_writer_fault == .native_apply_after_fanout) {
@@ -3846,9 +3922,7 @@ pub const Engine = struct {
             segment_write_ns_total += write_timer.read();
             errdefer self.alloc.free(path);
 
-            const file_bytes = try self.data_dir.readFileAlloc(self.alloc, path, 128 * 1024 * 1024);
-            defer self.alloc.free(file_bytes);
-            const digest = market_manifest_mod.contentDigest(file_bytes);
+            const file_identity = try marketSegmentFileIdentity(self.data_dir, path);
             const block_rows: usize = @intCast(market_segment_mod.market_segment_block_rows);
             const block_count: u32 = @intCast((row_count + block_rows - 1) / block_rows);
             const column_names = try self.alloc.alloc([]u8, schema.ordered_columns.len);
@@ -3876,9 +3950,9 @@ pub const Engine = struct {
                 .row_count = @intCast(row_count),
                 .block_count = block_count,
                 .column_names = column_names,
-                .content_id = digest,
-                .file_hash = digest,
-                .file_size = @intCast(file_bytes.len),
+                .content_id = file_identity.digest,
+                .file_hash = file_identity.digest,
+                .file_size = file_identity.size,
             });
             rows_written += row_count;
             segments_written += 1;
@@ -3903,6 +3977,32 @@ pub const Engine = struct {
             _ = self.metrics.flush_hour_slices_total.fetchAdd(@intCast(segments_written), .monotonic);
         }
         return segments_written != 0;
+    }
+
+    fn marketSegmentFileIdentity(
+        data_dir: std.fs.Dir,
+        path: []const u8,
+    ) !struct {
+        digest: market_manifest_mod.ContentDigest,
+        size: u64,
+    } {
+        var file = try data_dir.openFile(path, .{});
+        defer file.close();
+        const stat = try file.stat();
+
+        var hasher = std.crypto.hash.Blake3.init(.{});
+        var buffer: [64 * 1024]u8 = undefined;
+        while (true) {
+            const bytes_read = try file.read(&buffer);
+            if (bytes_read == 0) break;
+            hasher.update(buffer[0..bytes_read]);
+        }
+        var digest: market_manifest_mod.ContentDigest = undefined;
+        hasher.final(digest[0..]);
+        return .{
+            .digest = digest,
+            .size = stat.size,
+        };
     }
 
     fn quarantineFailedIngest(self: *Engine, item: ResolvedIngestPoint, stage: []const u8, err_name: []const u8) void {
@@ -5740,6 +5840,30 @@ pub const Engine = struct {
         _ = self.metrics.cas_shadow_mismatch_total.fetchAdd(1, .monotonic);
     }
 
+    fn restoreRepairedScalarManifestFromCas(self: *Engine) !void {
+        if (!self.metadata.manifest.repaired_torn_tail) return;
+
+        self.metadata.cas_index_mu.lock();
+        defer self.metadata.cas_index_mu.unlock();
+        const index = if (self.metadata.cas_index) |*snapshot_index|
+            snapshot_index
+        else
+            return error.ManifestRepairRequiresCasHead;
+
+        var replacement = try manifestFromSnapshot(
+            self.alloc,
+            index.snapshot.segment_descriptors,
+        );
+        errdefer replacement.deinit();
+        try replacement.rewriteCheckpoint(self.data_dir);
+        try manifest_mod.Manifest.clearRepairIntent(self.data_dir);
+
+        var previous_manifest = self.metadata.manifest;
+        self.metadata.manifest = replacement;
+        replacement = .{ .alloc = self.alloc, .entries = .{} };
+        previous_manifest.deinit();
+    }
+
     fn recover(self: *Engine) !void {
         var highwater = std.AutoHashMap(types.SeriesId, i64).init(self.alloc);
         defer highwater.deinit();
@@ -5764,11 +5888,24 @@ pub const Engine = struct {
                 try collectSegmentHighwater(&highwater, self.metadata.manifest.entries.items);
             }
         }
-        var max_market_sequence: u64 = 0;
+        var market_sequence_highwater = std.AutoHashMap(
+            market_identity_mod.MarketSeriesId,
+            u64,
+        ).init(self.alloc);
+        defer market_sequence_highwater.deinit();
+        var max_market_sequence = try self.collectPersistedMarketWriteSequences(
+            &market_sequence_highwater,
+            true,
+        );
+        const has_unpublished_market_segments = try self.hasUnpublishedLocalMarketSegments();
 
         var ctx = struct {
             engine: *Engine,
             highwater: *std.AutoHashMap(types.SeriesId, i64),
+            market_sequence_highwater: *std.AutoHashMap(
+                market_identity_mod.MarketSeriesId,
+                u64,
+            ),
             market_registrations: *std.AutoHashMap(market_identity_mod.MarketSeriesId, MarketReplayRegistration),
             max_market_sequence: *u64,
 
@@ -5858,6 +5995,9 @@ pub const Engine = struct {
                 }
                 const registration = self_ctx.market_registrations.get(market_series_id) orelse return error.OrphanMarketRow;
                 try market_identity_mod.validateValueShape(registration.column_count, values.len);
+                if (self_ctx.market_sequence_highwater.get(market_series_id)) |persisted_sequence| {
+                    if (write_sequence <= persisted_sequence) return;
+                }
 
                 try self_ctx.engine.market_mem.appendBatch(&.{.{
                     .market_series_id = market_series_id,
@@ -5871,10 +6011,12 @@ pub const Engine = struct {
                 self_ctx.engine.market_mem_allocated_bytes.store(self_ctx.engine.market_mem.allocatedBytes(), .monotonic);
                 self_ctx.engine.market_mem_resident_bytes.store(self_ctx.engine.market_mem.residentBytes(), .monotonic);
                 try self_ctx.engine.appendRecoveredMarketFanout(registration, ts_ns, values);
+                try self_ctx.market_sequence_highwater.put(market_series_id, write_sequence);
             }
         }{
             .engine = self,
             .highwater = &highwater,
+            .market_sequence_highwater = &market_sequence_highwater,
             .market_registrations = &market_registrations,
             .max_market_sequence = &max_market_sequence,
         };
@@ -5891,14 +6033,43 @@ pub const Engine = struct {
         if (self.liveMemtableBytes() > 0) {
             const flushed = try flushMemtable(self);
             if (flushed) try self.syncCasSnapshot("recovery-flush");
+        } else if (has_unpublished_market_segments) {
+            try self.syncCasSnapshot("recovery-market-manifest");
         }
     }
 
-    /// Refresh the next sequence from native segments after the caller drains
-    /// queued writes and flushes live market memtable rows.
-    pub fn refreshNextMarketWriteSequenceFromPersistedSegments(self: *Engine) !void {
-        var maximum: u64 = 0;
+    fn hasUnpublishedLocalMarketSegments(self: *Engine) !bool {
+        if (self.cas == null or self.market_manifest.list().len == 0) return false;
+
+        self.metadata.cas_index_mu.lock();
+        defer self.metadata.cas_index_mu.unlock();
+        const index = if (self.metadata.cas_index) |*snapshot_index| snapshot_index else return true;
+
+        var published_content_ids = std.AutoHashMap(
+            market_manifest_mod.ContentDigest,
+            void,
+        ).init(self.alloc);
+        defer published_content_ids.deinit();
+        try published_content_ids.ensureTotalCapacity(
+            @intCast(index.snapshot.market_segment_descriptors.len),
+        );
+        for (index.snapshot.market_segment_descriptors) |descriptor| {
+            published_content_ids.putAssumeCapacity(descriptor.content_id, {});
+        }
         for (self.market_manifest.list()) |descriptor| {
+            if (!published_content_ids.contains(descriptor.content_id)) return true;
+        }
+        return false;
+    }
+
+    fn collectPersistedMarketWriteSequences(
+        self: *Engine,
+        highwater: ?*std.AutoHashMap(market_identity_mod.MarketSeriesId, u64),
+        restore_missing_mirrors: bool,
+    ) !u64 {
+        var maximum: u64 = 0;
+        for (self.market_manifest.list()) |*descriptor| {
+            if (restore_missing_mirrors) try ensureMarketCompactionMirror(self, descriptor);
             var segment = try market_segment_mod.readProjectedRange(
                 self.alloc,
                 self.data_dir,
@@ -5910,8 +6081,21 @@ pub const Engine = struct {
             defer segment.deinit(self.alloc);
             for (segment.write_sequences) |sequence| {
                 if (sequence > maximum) maximum = sequence;
+                if (highwater) |sequences| {
+                    const entry = try sequences.getOrPut(descriptor.market_series_id);
+                    if (!entry.found_existing or sequence > entry.value_ptr.*) {
+                        entry.value_ptr.* = sequence;
+                    }
+                }
             }
         }
+        return maximum;
+    }
+
+    /// Refresh the next sequence from native segments after the caller drains
+    /// queued writes and flushes live market memtable rows.
+    pub fn refreshNextMarketWriteSequenceFromPersistedSegments(self: *Engine) !void {
+        const maximum = try self.collectPersistedMarketWriteSequences(null, false);
         try self.advanceNextMarketWriteSequencePast(maximum);
     }
 
@@ -7245,6 +7429,18 @@ fn testConfig(talloc: std.mem.Allocator, data_path: []const u8) !cfg.Config {
     };
 }
 
+fn manifestRepairTestConfig(talloc: std.mem.Allocator, data_path: []const u8) !cfg.Config {
+    var config = try testConfig(talloc, data_path);
+    config.fsync = .always;
+    config.cas_mode = .dual_write;
+    config.metadata_read_mode = .shadow;
+    config.market_storage_mode = .dual_write_v1;
+    config.market_storage_read_mode = .shadow;
+    config.flush_interval_ms = std.math.maxInt(u32);
+    config.memtable_max_bytes = std.math.maxInt(usize);
+    return config;
+}
+
 fn writeTestRepositoryFormatMarker(data_path: []const u8, version: u16) !void {
     const magic = "SYDSTORE1";
     var bytes: [magic.len + @sizeOf(u16) + 1 + @sizeOf(u32)]u8 = undefined;
@@ -7270,6 +7466,26 @@ fn writeTestRepositoryFormatMarker(data_path: []const u8, version: u16) !void {
         .data = &bytes,
         .flags = .{},
     });
+}
+
+test "engine native market segment identity matches memory hash across chunks" {
+    const test_file_size = 2 * 64 * 1024 + 37;
+    var bytes: [test_file_size]u8 = undefined;
+    for (0..bytes.len) |index| {
+        bytes[index] = @truncate(index);
+    }
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{
+        .sub_path = "segment.bin",
+        .data = &bytes,
+        .flags = .{},
+    });
+
+    const file_identity = try Engine.marketSegmentFileIdentity(tmp.dir, "segment.bin");
+    try std.testing.expectEqual(market_manifest_mod.contentDigest(&bytes), file_identity.digest);
+    try std.testing.expectEqual(@as(u64, test_file_size), file_identity.size);
 }
 
 test "engine queue wraps around and preserves order" {
@@ -7407,6 +7623,7 @@ test "engine market queue owns native batch payloads" {
     rows[0] = .{
         .market_series_id = market_identity_mod.seriesId("market.trade", labels),
         .schema_digest = @splat(0x11),
+        .mode = .dual_write_v1,
         .metric = metric,
         .canonical_labels = labels,
         .ts_ns = 1_000,
@@ -7915,7 +8132,7 @@ test "engine existing format4 catalog preserves mappings and fills missing built
     }
 }
 
-test "engine mixed market ingest preflight is atomic before catalog mutation" {
+test "engine auto mixed market batch preserves WAL order and native corrections" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
@@ -7927,7 +8144,8 @@ test "engine mixed market ingest preflight is atomic before catalog mutation" {
     config.cas_mode = .dual_write;
     config.market_storage_mode = .fanout_v1;
     var engine = try Engine.init(talloc, config);
-    defer engine.deinit();
+    var engine_open = true;
+    defer if (engine_open) engine.deinit();
 
     var fanout_schema = try engine.registerMarketSchema(.{
         .metric = "market.test_mixed_trade",
@@ -7947,31 +8165,192 @@ test "engine mixed market ingest preflight is atomic before catalog mutation" {
     defer native_schema.deinit(talloc);
     engine.config.market_storage_mode = .auto;
 
-    const trade_values = [_]f64{ 10.5, 100.0 };
-    const quote_values = [_]f64{ 10.0, 10.1 };
-    try std.testing.expectError(error.MixedMarketStorageModes, engine.ingestMarketBatch(&.{
+    const first_trade = [_]f64{ 10.5, 100.0 };
+    const first_quote = [_]f64{ 10.0, 10.1 };
+    const second_trade = [_]f64{ 10.6, 120.0 };
+    const corrected_quote = [_]f64{ 10.2, 10.3 };
+    const receipt = try engine.ingestMarketBatch(&.{
         .{
             .metric = "market.test_mixed_trade",
             .labels_json = "{\"symbol\":\"AAPL\"}",
             .ts_ns = 1_000,
-            .values = &trade_values,
+            .values = &first_trade,
         },
         .{
             .metric = "market.test_mixed_quote",
             .labels_json = "{\"symbol\":\"AAPL\"}",
             .ts_ns = 1_000,
-            .values = &quote_values,
+            .values = &first_quote,
         },
-    }));
+        .{
+            .metric = "market.test_mixed_trade",
+            .labels_json = "{\"symbol\":\"AAPL\"}",
+            .ts_ns = 2_000,
+            .values = &second_trade,
+        },
+        .{
+            .metric = "market.test_mixed_quote",
+            .labels_json = "{\"symbol\":\"AAPL\"}",
+            .ts_ns = 1_000,
+            .values = &corrected_quote,
+        },
+    });
+    try std.testing.expectEqual(Engine.MarketStorageWriteMode.auto, receipt.storage_mode);
+    try std.testing.expectEqual(@as(usize, 4), receipt.accepted_rows);
+    try std.testing.expectEqual(@as(usize, 2), receipt.native_rows);
+    try std.testing.expectEqual(@as(usize, 4), receipt.fanout_writes);
+    try std.testing.expectEqual(@as(usize, 0), engine.queue.len());
+
+    var trades = try engine.queryMarket(.{
+        .metric = "market.test_mixed_trade",
+        .label_filter_json = "{\"symbol\":\"AAPL\"}",
+        .start_ts_ns = 0,
+        .end_ts_ns = 3_000,
+    });
+    defer trades.deinit();
+    try std.testing.expectEqualStrings("fanout", trades.stats.storage_mode);
+    try std.testing.expectEqual(@as(usize, 2), trades.rows.len);
+    try std.testing.expectEqual(@as(i64, 1_000), trades.rows[0].ts_ns);
+    try std.testing.expectEqual(@as(i64, 2_000), trades.rows[1].ts_ns);
+
+    var quotes = try engine.queryMarket(.{
+        .metric = "market.test_mixed_quote",
+        .label_filter_json = "{\"symbol\":\"AAPL\"}",
+        .start_ts_ns = 0,
+        .end_ts_ns = 3_000,
+    });
+    defer quotes.deinit();
+    try std.testing.expectEqualStrings("native", quotes.stats.storage_mode);
+    try std.testing.expectEqual(@as(usize, 1), quotes.rows.len);
+    try std.testing.expectEqual(@as(i64, 1_000), quotes.rows[0].ts_ns);
+    try std.testing.expectEqual(@as(f64, 10.2), quotes.rows[0].values[0]);
+    try std.testing.expectEqual(@as(f64, 10.3), quotes.rows[0].values[1]);
+
+    var replay = struct {
+        events: [6]u8 = undefined,
+        event_count: usize = 0,
+        native_sequences: [2]u64 = undefined,
+        native_count: usize = 0,
+        native_registrations: usize = 0,
+
+        pub fn onRecord(self_ctx: *@This(), _: types.SeriesId, _: i64, _: f64) !void {
+            self_ctx.events[self_ctx.event_count] = 'f';
+            self_ctx.event_count += 1;
+        }
+
+        pub fn onMarketSeriesRegistration(
+            self_ctx: *@This(),
+            _: market_identity_mod.MarketSeriesId,
+            _: market_identity_mod.SchemaDigest,
+            _: []const u8,
+            _: []const u8,
+        ) !void {
+            self_ctx.native_registrations += 1;
+        }
+
+        pub fn onMarketRow(
+            self_ctx: *@This(),
+            _: market_identity_mod.MarketSeriesId,
+            write_sequence: u64,
+            _: i64,
+            _: []const f64,
+        ) !void {
+            self_ctx.events[self_ctx.event_count] = 'n';
+            self_ctx.event_count += 1;
+            self_ctx.native_sequences[self_ctx.native_count] = write_sequence;
+            self_ctx.native_count += 1;
+        }
+    }{};
+    try engine.wal.replay(talloc, &replay);
+    try std.testing.expectEqualStrings("ffnffn", replay.events[0..replay.event_count]);
+    try std.testing.expectEqual(@as(usize, 1), replay.native_registrations);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, replay.native_sequences[0..replay.native_count]);
 
     const identities = try engine.metadata.market_catalog.listMarketSeries();
     defer {
         for (identities) |*identity| identity.deinit(talloc);
         talloc.free(identities);
     }
-    try std.testing.expectEqual(@as(usize, 0), identities.len);
-    try std.testing.expectEqual(@as(usize, 0), engine.metadata.metric_catalog.entryCount());
-    try std.testing.expectEqual(@as(usize, 0), engine.queue.len());
+    try std.testing.expectEqual(@as(usize, 2), identities.len);
+
+    engine_open = false;
+    engine.deinit();
+
+    var reopen_config = try testConfig(talloc, data_path);
+    reopen_config.cas_mode = .dual_write;
+    reopen_config.market_storage_mode = .auto;
+    var reopened = try Engine.init(talloc, reopen_config);
+    defer reopened.deinit();
+
+    try std.testing.expectEqual(@as(u64, 3), reopened.next_market_write_sequence);
+
+    var reopened_trades = try reopened.queryMarket(.{
+        .metric = "market.test_mixed_trade",
+        .label_filter_json = "{\"symbol\":\"AAPL\"}",
+        .start_ts_ns = 0,
+        .end_ts_ns = 3_000,
+    });
+    defer reopened_trades.deinit();
+    try std.testing.expectEqualStrings("fanout", reopened_trades.stats.storage_mode);
+    try std.testing.expectEqual(@as(usize, 2), reopened_trades.rows.len);
+    try std.testing.expectEqual(@as(i64, 1_000), reopened_trades.rows[0].ts_ns);
+    try std.testing.expectEqual(@as(f64, 10.5), reopened_trades.rows[0].values[0]);
+    try std.testing.expectEqual(@as(f64, 100.0), reopened_trades.rows[0].values[1]);
+    try std.testing.expectEqual(@as(i64, 2_000), reopened_trades.rows[1].ts_ns);
+    try std.testing.expectEqual(@as(f64, 10.6), reopened_trades.rows[1].values[0]);
+    try std.testing.expectEqual(@as(f64, 120.0), reopened_trades.rows[1].values[1]);
+
+    var reopened_quotes = try reopened.queryMarket(.{
+        .metric = "market.test_mixed_quote",
+        .label_filter_json = "{\"symbol\":\"AAPL\"}",
+        .start_ts_ns = 0,
+        .end_ts_ns = 3_000,
+    });
+    defer reopened_quotes.deinit();
+    try std.testing.expectEqualStrings("native", reopened_quotes.stats.storage_mode);
+    try std.testing.expectEqual(@as(usize, 1), reopened_quotes.rows.len);
+    try std.testing.expectEqual(@as(i64, 1_000), reopened_quotes.rows[0].ts_ns);
+    try std.testing.expectEqual(@as(f64, 10.2), reopened_quotes.rows[0].values[0]);
+    try std.testing.expectEqual(@as(f64, 10.3), reopened_quotes.rows[0].values[1]);
+
+    const later_quote = [_]f64{ 10.4, 10.5 };
+    const later_receipt = try reopened.ingestMarketBatch(&.{.{
+        .metric = "market.test_mixed_quote",
+        .labels_json = "{\"symbol\":\"AAPL\"}",
+        .ts_ns = 3_000,
+        .values = &later_quote,
+    }});
+    try std.testing.expectEqual(Engine.MarketStorageWriteMode.native_v1, later_receipt.storage_mode);
+    try std.testing.expectEqual(@as(usize, 1), later_receipt.native_rows);
+    try std.testing.expectEqual(@as(u64, 4), reopened.next_market_write_sequence);
+
+    var later_replay = struct {
+        sequences: [3]u64 = undefined,
+        sequence_count: usize = 0,
+
+        pub fn onRecord(_: *@This(), _: types.SeriesId, _: i64, _: f64) !void {}
+
+        pub fn onMarketSeriesRegistration(
+            _: *@This(),
+            _: market_identity_mod.MarketSeriesId,
+            _: market_identity_mod.SchemaDigest,
+            _: []const u8,
+            _: []const u8,
+        ) !void {}
+
+        pub fn onMarketRow(
+            self_ctx: *@This(),
+            _: market_identity_mod.MarketSeriesId,
+            write_sequence: u64,
+            _: i64,
+            _: []const f64,
+        ) !void {
+            self_ctx.sequences[self_ctx.sequence_count] = write_sequence;
+            self_ctx.sequence_count += 1;
+        }
+    }{};
+    try reopened.wal.replay(talloc, &later_replay);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3 }, later_replay.sequences[0..later_replay.sequence_count]);
 }
 
 test "engine dual market writer emits one durable market row without scalar WAL" {
@@ -8145,6 +8524,222 @@ test "engine rolls back dual fanout when native live apply fails" {
     try std.testing.expectEqual(@as(usize, 0), engine.mem.series.count());
 }
 
+test "engine auto mixed native apply failure rolls back live fanout and retries from WAL" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/market-auto-mixed-live-rollback", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var config = try testConfig(talloc, data_path);
+    config.fsync = .always;
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .fanout_v1;
+    config.memtable_max_bytes = std.math.maxInt(usize);
+    config.flush_interval_ms = std.math.maxInt(u32);
+    var engine = try Engine.init(talloc, config);
+    var engine_open = true;
+    defer if (engine_open) engine.deinit();
+
+    var fanout_schema = try engine.registerMarketSchema(.{
+        .metric = "market.test_auto_rollback_trade",
+        .ordered_columns = &.{ "price", "size" },
+        .required_labels = &.{"symbol"},
+        .storage_mapping = .fanout_v1,
+    });
+    defer fanout_schema.deinit(talloc);
+
+    engine.config.market_storage_mode = .native_v1;
+    var native_schema = try engine.registerMarketSchema(.{
+        .metric = "market.test_auto_rollback_quote",
+        .ordered_columns = &.{ "bid", "ask" },
+        .required_labels = &.{"symbol"},
+        .storage_mapping = .native_v1,
+    });
+    defer native_schema.deinit(talloc);
+    engine.config.market_storage_mode = .auto;
+
+    const failed_trade = [_]f64{ 10.5, 100.0 };
+    const failed_quote = [_]f64{ 10.0, 10.1 };
+    engine.market_writer_fault = .native_apply_after_fanout;
+    try std.testing.expectError(error.InjectedNativeMarketApplyFailure, engine.ingestMarketBatch(&.{
+        .{
+            .metric = "market.test_auto_rollback_trade",
+            .labels_json = "{\"symbol\":\"AAPL\"}",
+            .ts_ns = 1_000,
+            .values = &failed_trade,
+        },
+        .{
+            .metric = "market.test_auto_rollback_quote",
+            .labels_json = "{\"symbol\":\"AAPL\"}",
+            .ts_ns = 1_000,
+            .values = &failed_quote,
+        },
+    }));
+    engine.market_writer_fault = null;
+    try std.testing.expectEqual(@as(usize, 0), engine.queue.len());
+
+    var rolled_back_trade = try engine.queryMarket(.{
+        .metric = "market.test_auto_rollback_trade",
+        .label_filter_json = "{\"symbol\":\"AAPL\"}",
+        .start_ts_ns = 0,
+        .end_ts_ns = 2_000,
+    });
+    defer rolled_back_trade.deinit();
+    try std.testing.expectEqual(@as(usize, 0), rolled_back_trade.rows.len);
+
+    try std.testing.expectError(error.NativeMarketDataUnavailable, engine.queryMarket(.{
+        .metric = "market.test_auto_rollback_quote",
+        .label_filter_json = "{\"symbol\":\"AAPL\"}",
+        .start_ts_ns = 0,
+        .end_ts_ns = 2_000,
+    }));
+
+    var failed_wal = struct {
+        scalar_records: usize = 0,
+        native_sequences: [1]u64 = undefined,
+        native_count: usize = 0,
+
+        pub fn onRecord(self_ctx: *@This(), _: types.SeriesId, _: i64, _: f64) !void {
+            self_ctx.scalar_records += 1;
+        }
+
+        pub fn onMarketSeriesRegistration(
+            _: *@This(),
+            _: market_identity_mod.MarketSeriesId,
+            _: market_identity_mod.SchemaDigest,
+            _: []const u8,
+            _: []const u8,
+        ) !void {}
+
+        pub fn onMarketRow(
+            self_ctx: *@This(),
+            _: market_identity_mod.MarketSeriesId,
+            write_sequence: u64,
+            _: i64,
+            _: []const f64,
+        ) !void {
+            self_ctx.native_sequences[self_ctx.native_count] = write_sequence;
+            self_ctx.native_count += 1;
+        }
+    }{};
+    try engine.wal.replay(talloc, &failed_wal);
+    try std.testing.expectEqual(@as(usize, 2), failed_wal.scalar_records);
+    try std.testing.expectEqualSlices(u64, &.{1}, failed_wal.native_sequences[0..failed_wal.native_count]);
+
+    // The injected error follows WAL append. Recovery must expose that record
+    // even though the failed call left no live fanout or native memtable rows.
+    engine_open = false;
+    engine.deinit();
+
+    var reopen_config = try testConfig(talloc, data_path);
+    reopen_config.fsync = .always;
+    reopen_config.cas_mode = .dual_write;
+    reopen_config.market_storage_mode = .auto;
+    reopen_config.memtable_max_bytes = std.math.maxInt(usize);
+    reopen_config.flush_interval_ms = std.math.maxInt(u32);
+    var recovered = try Engine.init(talloc, reopen_config);
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(u64, 2), recovered.next_market_write_sequence);
+
+    var recovered_trade = try recovered.queryMarket(.{
+        .metric = "market.test_auto_rollback_trade",
+        .label_filter_json = "{\"symbol\":\"AAPL\"}",
+        .start_ts_ns = 0,
+        .end_ts_ns = 2_000,
+    });
+    defer recovered_trade.deinit();
+    try std.testing.expectEqual(@as(usize, 1), recovered_trade.rows.len);
+    try std.testing.expectEqual(@as(i64, 1_000), recovered_trade.rows[0].ts_ns);
+    try std.testing.expectEqual(@as(f64, 10.5), recovered_trade.rows[0].values[0]);
+    try std.testing.expectEqual(@as(f64, 100.0), recovered_trade.rows[0].values[1]);
+
+    var recovered_quote = try recovered.queryMarket(.{
+        .metric = "market.test_auto_rollback_quote",
+        .label_filter_json = "{\"symbol\":\"AAPL\"}",
+        .start_ts_ns = 0,
+        .end_ts_ns = 2_000,
+    });
+    defer recovered_quote.deinit();
+    try std.testing.expectEqual(@as(usize, 1), recovered_quote.rows.len);
+    try std.testing.expectEqual(@as(i64, 1_000), recovered_quote.rows[0].ts_ns);
+    try std.testing.expectEqual(@as(f64, 10.0), recovered_quote.rows[0].values[0]);
+    try std.testing.expectEqual(@as(f64, 10.1), recovered_quote.rows[0].values[1]);
+
+    const retried_trade = [_]f64{ 10.6, 120.0 };
+    const retried_quote = [_]f64{ 10.2, 10.3 };
+    const retry_receipt = try recovered.ingestMarketBatch(&.{
+        .{
+            .metric = "market.test_auto_rollback_trade",
+            .labels_json = "{\"symbol\":\"AAPL\"}",
+            .ts_ns = 1_000,
+            .values = &retried_trade,
+        },
+        .{
+            .metric = "market.test_auto_rollback_quote",
+            .labels_json = "{\"symbol\":\"AAPL\"}",
+            .ts_ns = 1_000,
+            .values = &retried_quote,
+        },
+    });
+    try std.testing.expectEqual(Engine.MarketStorageWriteMode.auto, retry_receipt.storage_mode);
+    try std.testing.expectEqual(@as(usize, 2), retry_receipt.accepted_rows);
+    try std.testing.expectEqual(@as(usize, 1), retry_receipt.native_rows);
+    try std.testing.expectEqual(@as(usize, 2), retry_receipt.fanout_writes);
+    try std.testing.expectEqual(@as(u64, 3), recovered.next_market_write_sequence);
+
+    var retried_trade_result = try recovered.queryMarket(.{
+        .metric = "market.test_auto_rollback_trade",
+        .label_filter_json = "{\"symbol\":\"AAPL\"}",
+        .start_ts_ns = 0,
+        .end_ts_ns = 2_000,
+    });
+    defer retried_trade_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), retried_trade_result.rows.len);
+    try std.testing.expectEqual(@as(f64, 10.6), retried_trade_result.rows[0].values[0]);
+    try std.testing.expectEqual(@as(f64, 120.0), retried_trade_result.rows[0].values[1]);
+
+    var retried_quote_result = try recovered.queryMarket(.{
+        .metric = "market.test_auto_rollback_quote",
+        .label_filter_json = "{\"symbol\":\"AAPL\"}",
+        .start_ts_ns = 0,
+        .end_ts_ns = 2_000,
+    });
+    defer retried_quote_result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), retried_quote_result.rows.len);
+    try std.testing.expectEqual(@as(f64, 10.2), retried_quote_result.rows[0].values[0]);
+    try std.testing.expectEqual(@as(f64, 10.3), retried_quote_result.rows[0].values[1]);
+
+    var replay = struct {
+        sequences: [2]u64 = undefined,
+        sequence_count: usize = 0,
+
+        pub fn onRecord(_: *@This(), _: types.SeriesId, _: i64, _: f64) !void {}
+
+        pub fn onMarketSeriesRegistration(
+            _: *@This(),
+            _: market_identity_mod.MarketSeriesId,
+            _: market_identity_mod.SchemaDigest,
+            _: []const u8,
+            _: []const u8,
+        ) !void {}
+
+        pub fn onMarketRow(
+            self_ctx: *@This(),
+            _: market_identity_mod.MarketSeriesId,
+            write_sequence: u64,
+            _: i64,
+            _: []const f64,
+        ) !void {
+            self_ctx.sequences[self_ctx.sequence_count] = write_sequence;
+            self_ctx.sequence_count += 1;
+        }
+    }{};
+    try recovered.wal.replay(talloc, &replay);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2 }, replay.sequences[0..replay.sequence_count]);
+}
+
 test "engine restarts from an acknowledged always-sync native market row" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -8315,6 +8910,245 @@ test "engine dual market WAL recovery derives fanout from logical market rows" {
     try std.testing.expectEqual(@as(usize, 1), counts.market_rows);
 }
 
+test "engine restores a torn dual-write scalar manifest from the CAS snapshot" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(
+        talloc,
+        ".zig-cache/tmp/{s}/market-torn-scalar-manifest",
+        .{tmp.sub_path},
+    );
+    defer talloc.free(data_path);
+
+    {
+        var config = try testConfig(talloc, data_path);
+        config.fsync = .always;
+        config.cas_mode = .dual_write;
+        config.market_storage_mode = .dual_write_v1;
+        config.market_storage_read_mode = .shadow;
+        config.flush_interval_ms = std.math.maxInt(u32);
+        config.memtable_max_bytes = std.math.maxInt(usize);
+        var engine_owner: ?*Engine = try Engine.init(talloc, config);
+        defer if (engine_owner) |owned| owned.deinit();
+        const engine = engine_owner.?;
+
+        const values = [_]f64{ 10.5, 100.0 };
+        const receipt = try engine.ingestMarketBatch(&.{.{
+            .metric = "market.trade",
+            .labels_json = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}",
+            .ts_ns = 1_000,
+            .values = &values,
+        }});
+        try std.testing.expectEqual(@as(usize, 1), receipt.accepted_rows);
+        _ = try engine.flushNow();
+        try std.testing.expectEqual(@as(usize, 2), engine.metadata.manifest.entries.items.len);
+        engine.deinit();
+        engine_owner = null;
+    }
+
+    {
+        var root = try std.fs.cwd().openDir(data_path, .{});
+        defer root.close();
+        var file = try root.openFile(manifest_mod.manifest_path, .{ .mode = .read_write });
+        defer file.close();
+        const size = (try file.stat()).size;
+        try std.testing.expect(size > 8);
+        try file.setEndPos(size - 8);
+        try file.sync();
+    }
+
+    var config = try testConfig(talloc, data_path);
+    config.fsync = .always;
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .dual_write_v1;
+    config.market_storage_read_mode = .shadow;
+    var recovered = try Engine.init(talloc, config);
+    defer recovered.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), recovered.metadata.manifest.entries.items.len);
+    var result = try recovered.queryMarket(.{
+        .metric = "market.trade",
+        .label_filter_json = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}",
+        .start_ts_ns = 1_000,
+        .end_ts_ns = 1_000,
+    });
+    defer result.deinit();
+    try std.testing.expectEqualStrings("shadow", result.stats.storage_mode);
+    try std.testing.expectEqual(@as(u64, 0), result.stats.shadow_mismatches);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqual(
+        @as(u64, @bitCast(@as(f64, 10.5))),
+        @as(u64, @bitCast(result.rows[0].values[0])),
+    );
+    try std.testing.expectEqual(
+        @as(u64, @bitCast(@as(f64, 100.0))),
+        @as(u64, @bitCast(result.rows[0].values[1])),
+    );
+    try recovered.verifyCasState();
+}
+
+test "engine clears repair intent after checkpoint rewrite and recovers scalar and native data" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(
+        talloc,
+        ".zig-cache/tmp/{s}/market-torn-scalar-manifest",
+        .{tmp.sub_path},
+    );
+    defer talloc.free(data_path);
+
+    const scalar_series_id = types.hash64("manifest.repair.scalar");
+    var scalar_segment_count: usize = 0;
+    var native_segment_count: usize = 0;
+    {
+        const config = try manifestRepairTestConfig(talloc, data_path);
+        var engine_owner: ?*Engine = try Engine.init(talloc, config);
+        defer if (engine_owner) |owned| owned.deinit();
+        const engine = engine_owner.?;
+
+        const values = [_]f64{ 10.5, 100.0 };
+        const receipt = try engine.ingestMarketBatch(&.{.{
+            .metric = "market.trade",
+            .labels_json = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}",
+            .ts_ns = 1_000,
+            .values = &values,
+        }});
+        try std.testing.expectEqual(@as(usize, 1), receipt.accepted_rows);
+        _ = try engine.flushNow();
+
+        try engine.registerSeries("manifest.repair.scalar", "{}", scalar_series_id);
+        try engine.ingest(.{
+            .series_id = scalar_series_id,
+            .ts = 900,
+            .value = 42.25,
+            .tags_json = "{}",
+        });
+        _ = try engine.flushNow();
+
+        scalar_segment_count = engine.metadata.manifest.entries.items.len;
+        native_segment_count = engine.market_manifest.list().len;
+        try std.testing.expectEqual(@as(usize, 3), scalar_segment_count);
+        try std.testing.expectEqual(@as(usize, 1), native_segment_count);
+        engine.deinit();
+        engine_owner = null;
+    }
+
+    {
+        var root = try std.fs.cwd().openDir(data_path, .{});
+        defer root.close();
+        var size: u64 = 0;
+        {
+            var file = try root.openFile(manifest_mod.manifest_path, .{ .mode = .read_write });
+            defer file.close();
+            size = (try file.stat()).size;
+            try std.testing.expect(size > 8);
+            try file.setEndPos(size - 8);
+            try file.sync();
+        }
+
+        try root.makePath(manifest_mod.repair_intent_path);
+        var marker_failure_observed = false;
+        if (manifest_mod.Manifest.loadOrInitWithRepairIntent(talloc, root, true)) |unexpected| {
+            var loaded = unexpected;
+            loaded.deinit();
+        } else |_| {
+            marker_failure_observed = true;
+        }
+        try std.testing.expect(marker_failure_observed);
+
+        {
+            var file = try root.openFile(manifest_mod.manifest_path, .{});
+            defer file.close();
+            try std.testing.expectEqual(size - 8, (try file.stat()).size);
+        }
+        try root.deleteDir(manifest_mod.repair_intent_path);
+
+        var interrupted_repair = try manifest_mod.Manifest.loadOrInitWithRepairIntent(
+            talloc,
+            root,
+            true,
+        );
+        try std.testing.expect(interrupted_repair.repaired_torn_tail);
+        try std.testing.expectEqual(
+            scalar_segment_count - 1,
+            interrupted_repair.entries.items.len,
+        );
+        for (interrupted_repair.entries.items) |entry| {
+            try std.testing.expect(entry.series_id != scalar_series_id);
+        }
+        interrupted_repair.deinit();
+        try std.testing.expect(try manifest_mod.Manifest.repairIntentExists(root));
+    }
+
+    {
+        var root = try std.fs.cwd().openDir(data_path, .{});
+        defer root.close();
+        try root.makePath("MANIFEST.tmp");
+
+        const failed_config = try manifestRepairTestConfig(talloc, data_path);
+        var checkpoint_failure_observed = false;
+        if (Engine.init(talloc, failed_config)) |unexpected| {
+            unexpected.deinit();
+        } else |_| {
+            checkpoint_failure_observed = true;
+        }
+        try std.testing.expect(checkpoint_failure_observed);
+        try std.testing.expect(try manifest_mod.Manifest.repairIntentExists(root));
+        try root.deleteDir("MANIFEST.tmp");
+    }
+
+    {
+        const config = try manifestRepairTestConfig(talloc, data_path);
+        var recovered = try Engine.init(talloc, config);
+        defer recovered.deinit();
+
+        try std.testing.expectEqual(scalar_segment_count, recovered.metadata.manifest.entries.items.len);
+        try std.testing.expectEqual(native_segment_count, recovered.market_manifest.list().len);
+        try std.testing.expect(!(try manifest_mod.Manifest.repairIntentExists(recovered.data_dir)));
+
+        var scalar_points = std.array_list.Managed(types.Point).init(talloc);
+        defer scalar_points.deinit();
+        try recovered.queryRange(scalar_series_id, 900, 900, &scalar_points);
+        try std.testing.expectEqual(@as(usize, 1), scalar_points.items.len);
+        try std.testing.expectEqual(@as(f64, 42.25), scalar_points.items[0].value);
+
+        var result = try recovered.queryMarket(.{
+            .metric = "market.trade",
+            .label_filter_json = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}",
+            .start_ts_ns = 1_000,
+            .end_ts_ns = 1_000,
+        });
+        defer result.deinit();
+        try std.testing.expectEqualStrings("shadow", result.stats.storage_mode);
+        try std.testing.expectEqual(@as(u64, 0), result.stats.shadow_mismatches);
+        try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+        try std.testing.expectEqual(
+            @as(u64, @bitCast(@as(f64, 10.5))),
+            @as(u64, @bitCast(result.rows[0].values[0])),
+        );
+        try std.testing.expectEqual(
+            @as(u64, @bitCast(@as(f64, 100.0))),
+            @as(u64, @bitCast(result.rows[0].values[1])),
+        );
+        // Full CAS verification is valid after startup recovery, not during checkpoint restoration.
+        try recovered.verifyCasState();
+    }
+
+    {
+        const config = try manifestRepairTestConfig(talloc, data_path);
+        var reopened = try Engine.init(talloc, config);
+        defer reopened.deinit();
+
+        try std.testing.expectEqual(scalar_segment_count, reopened.metadata.manifest.entries.items.len);
+        try std.testing.expectEqual(native_segment_count, reopened.market_manifest.list().len);
+        try std.testing.expect(!(try manifest_mod.Manifest.repairIntentExists(reopened.data_dir)));
+    }
+}
+
 test "engine native market WAL recovery flushes row and advances sequence" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -8367,6 +9201,86 @@ test "engine native market WAL recovery flushes row and advances sequence" {
     try std.testing.expect(recovered.market_mem.allocatedBytes() > 0);
     try std.testing.expectEqual(recovered.market_mem.allocatedBytes(), recovered.market_mem_allocated_bytes.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 0), recovered.market_mem_resident_bytes.load(.monotonic));
+}
+
+test "engine restart skips native market WAL rows already persisted by sequence" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/market-wal-persisted-highwater", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var scalar_segment_count: usize = 0;
+    var market_segment_count: usize = 0;
+    {
+        var config = try testConfig(talloc, data_path);
+        config.cas_mode = .dual_write;
+        config.market_storage_mode = .dual_write_v1;
+        config.memtable_max_bytes = std.math.maxInt(usize);
+        config.flush_interval_ms = std.math.maxInt(u32);
+        var engine = try Engine.init(talloc, config);
+        defer engine.deinit();
+        const bootstrap_head = (try engine.cas.?.refs.readHead(cas_mod.main_ref)) orelse
+            return error.CasHeadMissing;
+
+        var schema = try engine.registerMarketSchema(.{
+            .metric = "market.test_persisted_highwater",
+            .ordered_columns = &.{ "price", "size" },
+            .required_labels = &.{"symbol"},
+            .storage_mapping = .native_v1,
+        });
+        defer schema.deinit(talloc);
+
+        const first_values = [_]f64{ 10.5, 100.0 };
+        const second_values = [_]f64{ 10.75, 125.0 };
+        const receipt = try engine.ingestMarketBatch(&.{
+            .{
+                .metric = "market.test_persisted_highwater",
+                .labels_json = "{\"symbol\":\"AAPL\"}",
+                .ts_ns = 1_000,
+                .values = &first_values,
+            },
+            .{
+                .metric = "market.test_persisted_highwater",
+                .labels_json = "{\"symbol\":\"AAPL\"}",
+                .ts_ns = 2_000,
+                .values = &second_values,
+            },
+        });
+        try std.testing.expectEqual(@as(usize, 2), receipt.accepted_rows);
+        _ = try engine.flushNow();
+        scalar_segment_count = engine.metadata.manifest.entries.items.len;
+        market_segment_count = engine.market_manifest.list().len;
+        try std.testing.expectEqual(@as(usize, 2), scalar_segment_count);
+        try std.testing.expectEqual(@as(usize, 1), market_segment_count);
+
+        const published_head = (try engine.cas.?.refs.readHead(cas_mod.main_ref)) orelse
+            return error.CasHeadMissing;
+        try engine.cas.?.refs.compareAndSwapRef(
+            cas_mod.main_ref,
+            published_head,
+            bootstrap_head,
+            "test stale native market head",
+        );
+    }
+
+    for (0..2) |_| {
+        var config = try testConfig(talloc, data_path);
+        config.cas_mode = .dual_write;
+        config.market_storage_mode = .dual_write_v1;
+        config.memtable_max_bytes = std.math.maxInt(usize);
+        config.flush_interval_ms = std.math.maxInt(u32);
+        var recovered = try Engine.init(talloc, config);
+        defer recovered.deinit();
+
+        try std.testing.expectEqual(scalar_segment_count, recovered.metadata.manifest.entries.items.len);
+        try std.testing.expectEqual(market_segment_count, recovered.market_manifest.list().len);
+        try std.testing.expectEqual(@as(u64, 3), recovered.next_market_write_sequence);
+        try std.testing.expectEqual(@as(usize, 0), recovered.mem.bytes.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, 0), recovered.market_mem.residentBytes());
+        try recovered.verifyCasState();
+    }
 }
 
 test "engine native market WAL recovery replays same timestamp corrections after flush" {
