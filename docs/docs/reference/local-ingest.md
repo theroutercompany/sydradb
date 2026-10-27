@@ -24,7 +24,7 @@ Current recommendation:
 - keep market-row ingest on HTTP
 - current preview gate status: transport-bound workloads pass, `warm_declared_10k` passes, `cold_declare_10k` is still the remaining blocker
 
-The current implementation uses the shared ingest service under [`src/sydra/ingest/service.zig`](./source/sydra/ingest/service.md) and the socket transport in [`src/sydra/ingest/socket.zig`](./source/sydra/ingest/socket.md).
+The current implementation uses the shared ingest service under [`src/sydra/ingest/service.zig`](https://github.com/theroutercompany/sydradb/blob/main/src/sydra/ingest/service.zig) and the socket transport in [`src/sydra/ingest/socket.zig`](https://github.com/theroutercompany/sydradb/blob/main/src/sydra/ingest/socket.zig).
 
 ## Why Use It
 
