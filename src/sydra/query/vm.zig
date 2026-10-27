@@ -413,6 +413,12 @@ pub const VirtualMachine = struct {
     }
 
     fn evaluateCurrentExpr(self: *VirtualMachine, expr: *const ast.Expr) VmError!value_mod.Value {
+        const constant_value = expression.evaluateConstant(expr) catch |err| switch (err) {
+            error.UnsupportedExpression => null,
+            else => return err,
+        };
+        if (constant_value) |value| return value;
+
         const point = self.series_cursors[0].current orelse return error.InvalidOpcode;
         const time_expr = ast.Expr{ .identifier = .{ .value = "time", .quoted = false, .span = .{ .start = 0, .end = 0 } } };
         const value_expr = ast.Expr{ .identifier = .{ .value = "value", .quoted = false, .span = .{ .start = 0, .end = 0 } } };

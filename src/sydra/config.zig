@@ -6,8 +6,8 @@ pub const FsyncPolicy = enum { always, interval, none };
 pub const CasMode = enum { off, dual_write };
 pub const QueryCompilerMode = enum { legacy, shadow, compiled };
 pub const MetadataReadMode = enum { legacy, shadow, primary };
-pub const MarketStorageMode = enum { fanout_v1, dual_write_v1, native_v1 };
-pub const MarketStorageReadMode = enum { fanout, shadow, native };
+pub const MarketStorageMode = enum { auto, fanout_v1, dual_write_v1, native_v1 };
+pub const MarketStorageReadMode = enum { auto, fanout, shadow, native };
 
 pub const Config = struct {
     data_dir: []const u8,
@@ -25,8 +25,8 @@ pub const Config = struct {
     cas_mode: CasMode,
     metadata_read_mode: MetadataReadMode = .legacy,
     query_compiler_mode: QueryCompilerMode = .compiled,
-    market_storage_mode: MarketStorageMode = .fanout_v1,
-    market_storage_read_mode: MarketStorageReadMode = .fanout,
+    market_storage_mode: MarketStorageMode = .auto,
+    market_storage_read_mode: MarketStorageReadMode = .auto,
     retention_ns: std.StringHashMap(u32),
 
     pub fn deinit(self: *Config, alloc: std.mem.Allocator) void {
@@ -66,10 +66,11 @@ fn parseToml(alloc: std.mem.Allocator, text: []const u8) !Config {
         .cas_mode = .off,
         .metadata_read_mode = .legacy,
         .query_compiler_mode = .compiled,
-        .market_storage_mode = .fanout_v1,
-        .market_storage_read_mode = .fanout,
+        .market_storage_mode = .auto,
+        .market_storage_read_mode = .auto,
         .retention_ns = std.StringHashMap(u32).init(alloc),
     };
+    errdefer cfg.deinit(alloc);
     var it = std.mem.tokenizeAny(u8, text, "\n\r");
     while (it.next()) |line_raw| {
         const line = std.mem.trim(u8, line_raw, " \t");
@@ -158,7 +159,9 @@ fn parseToml(alloc: std.mem.Allocator, text: []const u8) !Config {
         } else if (std.mem.eql(u8, key_raw, "market_storage_mode")) {
             var v2 = val_raw;
             if (v2.len >= 2 and v2[0] == '"' and v2[v2.len - 1] == '"') v2 = v2[1 .. v2.len - 1];
-            if (std.mem.eql(u8, v2, "fanout_v1")) {
+            if (std.mem.eql(u8, v2, "auto")) {
+                cfg.market_storage_mode = .auto;
+            } else if (std.mem.eql(u8, v2, "fanout_v1")) {
                 cfg.market_storage_mode = .fanout_v1;
             } else if (std.mem.eql(u8, v2, "dual_write_v1")) {
                 cfg.market_storage_mode = .dual_write_v1;
@@ -170,7 +173,9 @@ fn parseToml(alloc: std.mem.Allocator, text: []const u8) !Config {
         } else if (std.mem.eql(u8, key_raw, "market_storage_read_mode")) {
             var v2 = val_raw;
             if (v2.len >= 2 and v2[0] == '"' and v2[v2.len - 1] == '"') v2 = v2[1 .. v2.len - 1];
-            if (std.mem.eql(u8, v2, "fanout")) {
+            if (std.mem.eql(u8, v2, "auto")) {
+                cfg.market_storage_read_mode = .auto;
+            } else if (std.mem.eql(u8, v2, "fanout")) {
                 cfg.market_storage_read_mode = .fanout;
             } else if (std.mem.eql(u8, v2, "shadow")) {
                 cfg.market_storage_read_mode = .shadow;
@@ -197,4 +202,55 @@ pub fn ttlForSeries(cfg: *const Config, series: []const u8) u32 {
     const ns = namespaceOf(series);
     if (cfg.retention_ns.get(ns)) |days| return days;
     return cfg.retention_days;
+}
+
+test "market storage modes parse every supported value" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct {
+        write: []const u8,
+        read: []const u8,
+        expected_write: MarketStorageMode,
+        expected_read: MarketStorageReadMode,
+    }{
+        .{ .write = "auto", .read = "auto", .expected_write = .auto, .expected_read = .auto },
+        .{ .write = "fanout_v1", .read = "fanout", .expected_write = .fanout_v1, .expected_read = .fanout },
+        .{ .write = "dual_write_v1", .read = "shadow", .expected_write = .dual_write_v1, .expected_read = .shadow },
+        .{ .write = "native_v1", .read = "native", .expected_write = .native_v1, .expected_read = .native },
+    };
+
+    for (cases) |case| {
+        const text = try std.fmt.allocPrint(
+            alloc,
+            "market_storage_mode = \"{s}\"\nmarket_storage_read_mode = \"{s}\"\n",
+            .{ case.write, case.read },
+        );
+        defer alloc.free(text);
+
+        var parsed = try parseToml(alloc, text);
+        defer parsed.deinit(alloc);
+        try std.testing.expectEqual(case.expected_write, parsed.market_storage_mode);
+        try std.testing.expectEqual(case.expected_read, parsed.market_storage_read_mode);
+    }
+}
+
+test "market storage modes default to per-schema auto resolution" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseToml(alloc, "");
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectEqual(MarketStorageMode.auto, parsed.market_storage_mode);
+    try std.testing.expectEqual(MarketStorageReadMode.auto, parsed.market_storage_read_mode);
+}
+
+test "market storage modes reject unknown values" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectError(
+        error.InvalidMarketStorageMode,
+        parseToml(alloc, "market_storage_mode = \"future\""),
+    );
+    try std.testing.expectError(
+        error.InvalidMarketStorageReadMode,
+        parseToml(alloc, "market_storage_read_mode = \"future\""),
+    );
 }

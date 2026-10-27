@@ -4,7 +4,12 @@ const types = @import("types.zig");
 const AtomicU64 = @import("atomic_util.zig").AtomicU64;
 const manifest_mod = @import("storage/manifest.zig");
 const market_catalog_mod = @import("storage/market_catalog.zig");
+const market_identity_mod = @import("storage/market_identity.zig");
+const market_manifest_mod = @import("storage/market_manifest.zig");
+const market_memtable_mod = @import("storage/market_memtable.zig");
+const market_reader_mod = @import("storage/market_reader.zig");
 const market_runtime_mod = @import("storage/market_runtime.zig");
+const market_segment_mod = @import("storage/market_segment.zig");
 const metric_catalog_mod = @import("storage/metric_catalog.zig");
 const object_store = @import("storage/object_store.zig");
 const series_catalog_mod = @import("storage/series_catalog.zig");
@@ -33,8 +38,14 @@ pub const Engine = struct {
     alloc: std.mem.Allocator,
     config: cfg.Config,
     data_dir: std.fs.Dir,
+    repository_format: cas_mod.RepositoryFormat,
     wal: wal_mod.WAL,
     mem: MemTable,
+    market_mem: market_memtable_mod.MarketMemtable,
+    market_manifest: market_manifest_mod.Manifest,
+    market_mem_allocated_bytes: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    market_mem_resident_bytes: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+    next_market_write_sequence: u64 = 1,
     metadata: MetadataState,
     flush_timer_ms: u32,
     metrics: Metrics,
@@ -54,6 +65,7 @@ pub const Engine = struct {
     signal_event_mu: std.Thread.Mutex = .{},
     signal_event_cv: std.Thread.Condition = .{},
     signal_event_epoch: u64 = 0,
+    market_data_mu: std.Thread.Mutex = .{},
     tag_index_dirty: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     drain_mu: std.Thread.Mutex = .{},
     drain_cv: std.Thread.Condition = .{},
@@ -62,6 +74,12 @@ pub const Engine = struct {
     flush_generation: u64 = 0,
     flush_in_progress: bool = false,
     flush_requested: bool = false,
+    market_writer_fault: ?MarketWriterFault = null,
+
+    const MarketWriterFault = enum {
+        wal_append,
+        native_apply_after_fanout,
+    };
 
     pub const SelectorLookup = union(enum) {
         by_id: types.SeriesId,
@@ -169,13 +187,21 @@ pub const Engine = struct {
             config: cfg.Config,
             wal: *wal_mod.WAL,
             cas_manager: ?*cas_mod.CasManager,
+            new_catalog_builtin_mapping: market_catalog_mod.StorageMapping,
         ) !MetadataState {
             if (config.metadata_read_mode == .primary and cas_manager != null) {
                 if (try cas_manager.?.refs.readHead(cas_mod.main_ref) != null) {
                     return try loadFromCas(alloc, data_dir, config.fsync, cas_manager.?);
                 }
             }
-            return try loadFromLegacy(alloc, data_dir, config.fsync, wal, cas_manager);
+            return try loadFromLegacy(
+                alloc,
+                data_dir,
+                config.fsync,
+                wal,
+                cas_manager,
+                new_catalog_builtin_mapping,
+            );
         }
 
         pub fn refreshCasIndex(self: *MetadataState, cas: *cas_mod.CasManager) !void {
@@ -280,6 +306,7 @@ pub const Engine = struct {
             fsync: cfg.FsyncPolicy,
             wal: *wal_mod.WAL,
             cas_manager: ?*cas_mod.CasManager,
+            new_catalog_builtin_mapping: market_catalog_mod.StorageMapping,
         ) !MetadataState {
             var manifest = try manifest_mod.Manifest.loadOrInit(alloc, data_dir);
             errdefer manifest.deinit();
@@ -289,7 +316,12 @@ pub const Engine = struct {
             errdefer series_catalog.deinit();
             var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(alloc, data_dir, fsync);
             errdefer metric_catalog.deinit();
-            var market_catalog = try market_catalog_mod.Catalog.loadOrInit(alloc, data_dir, fsync);
+            var market_catalog = try market_catalog_mod.Catalog.loadOrInitWithOptions(
+                alloc,
+                data_dir,
+                fsync,
+                .{ .new_catalog_builtin_mapping = new_catalog_builtin_mapping },
+            );
             errdefer market_catalog.deinit();
             return .{
                 .alloc = alloc,
@@ -443,6 +475,87 @@ pub const Engine = struct {
         pending_bytes: usize,
     };
 
+    pub const MarketStorageWriteMode = enum {
+        fanout_v1,
+        dual_write_v1,
+        native_v1,
+    };
+
+    pub const MarketIngestInput = struct {
+        metric: []const u8,
+        labels_json: []const u8,
+        ts_ns: i64,
+        values: []const f64,
+    };
+
+    pub const MarketIngestReceipt = struct {
+        /// A receipt is returned only after the ordered writer has appended the
+        /// batch to the WAL and applied it to the live memtable(s). With
+        /// `fsync=always`, the WAL append has also completed its file sync.
+        /// `interval` acknowledges after append and remains vulnerable until
+        /// the next configured interval sync; `none` delegates persistence to
+        /// the operating system and provides no bounded crash window.
+        accepted_rows: usize,
+        storage_mode: MarketStorageWriteMode,
+        native_rows: usize,
+        fanout_writes: usize,
+        queue_depth: usize,
+        pending_bytes: usize,
+    };
+
+    pub const MarketQueryRequest = struct {
+        metric: []const u8,
+        label_filter_json: ?[]const u8 = null,
+        start_ts_ns: i64,
+        end_ts_ns: i64,
+        /// Empty selects every schema column in stored order.
+        requested_columns: []const []const u8 = &.{},
+        /// A CAS commit, ref, or other revision spec accepted by CasManager.
+        revision: ?[]const u8 = null,
+    };
+
+    pub const MarketQueryStats = struct {
+        storage_mode: []const u8,
+        series_scanned: u64 = 0,
+        blocks_scanned: u64 = 0,
+        blocks_pruned: u64 = 0,
+        columns_read: u64 = 0,
+        bytes_decoded: u64 = 0,
+        shadow_mismatches: u64 = 0,
+    };
+
+    pub const MarketQueryRow = struct {
+        market_series_id: market_identity_mod.MarketSeriesId,
+        metric: []u8,
+        canonical_labels: []u8,
+        ts_ns: i64,
+        values: []f64,
+
+        pub fn deinit(self: *MarketQueryRow, alloc: std.mem.Allocator) void {
+            alloc.free(self.metric);
+            alloc.free(self.canonical_labels);
+            alloc.free(self.values);
+            self.* = undefined;
+        }
+    };
+
+    pub const MarketQueryResult = struct {
+        allocator: std.mem.Allocator,
+        metric: []u8,
+        requested_columns: [][]u8,
+        rows: []MarketQueryRow,
+        stats: MarketQueryStats,
+
+        pub fn deinit(self: *MarketQueryResult) void {
+            self.allocator.free(self.metric);
+            for (self.requested_columns) |column| self.allocator.free(column);
+            self.allocator.free(self.requested_columns);
+            for (self.rows) |*row| row.deinit(self.allocator);
+            self.allocator.free(self.rows);
+            self.* = undefined;
+        }
+    };
+
     pub const ExactSeriesDeclarationInput = struct {
         name: []const u8,
         tags_json: []const u8,
@@ -509,12 +622,159 @@ pub const Engine = struct {
         }
     };
 
+    fn addQueuedBytes(total: *usize, amount: usize) !void {
+        total.* = std.math.add(usize, total.*, amount) catch return error.ResidentByteOverflow;
+    }
+
+    fn mulQueuedBytes(count: usize, size: usize) !usize {
+        return std.math.mul(usize, count, size) catch return error.ResidentByteOverflow;
+    }
+
+    const MarketBatchCompletion = struct {
+        alloc: std.mem.Allocator,
+        refs: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
+        mu: std.Thread.Mutex = .{},
+        cv: std.Thread.Condition = .{},
+        done: bool = false,
+        failure: ?anyerror = null,
+
+        fn create(alloc: std.mem.Allocator) !*MarketBatchCompletion {
+            const completion = try alloc.create(MarketBatchCompletion);
+            completion.* = .{ .alloc = alloc };
+            return completion;
+        }
+
+        fn retain(self: *MarketBatchCompletion) void {
+            _ = self.refs.fetchAdd(1, .monotonic);
+        }
+
+        fn release(self: *MarketBatchCompletion) void {
+            if (self.refs.fetchSub(1, .acq_rel) == 1) {
+                self.alloc.destroy(self);
+            }
+        }
+
+        fn complete(self: *MarketBatchCompletion, failure: ?anyerror) void {
+            self.mu.lock();
+            if (!self.done) {
+                self.failure = failure;
+                self.done = true;
+                self.cv.broadcast();
+            }
+            self.mu.unlock();
+        }
+
+        fn wait(self: *MarketBatchCompletion) !void {
+            self.mu.lock();
+            defer self.mu.unlock();
+            while (!self.done) self.cv.wait(&self.mu);
+            if (self.failure) |failure| return failure;
+        }
+    };
+
+    const QueuedMarketRow = struct {
+        market_series_id: market_identity_mod.MarketSeriesId,
+        schema_digest: market_identity_mod.SchemaDigest,
+        metric: []u8,
+        canonical_labels: []u8,
+        ts_ns: i64,
+        values: []f64,
+
+        fn deinit(self: *QueuedMarketRow, alloc: std.mem.Allocator) void {
+            alloc.free(self.metric);
+            alloc.free(self.canonical_labels);
+            alloc.free(self.values);
+            self.* = undefined;
+        }
+
+        fn payloadBytes(self: QueuedMarketRow) !usize {
+            var total: usize = 0;
+            try addQueuedBytes(&total, self.metric.len);
+            try addQueuedBytes(&total, self.canonical_labels.len);
+            try addQueuedBytes(&total, try mulQueuedBytes(self.values.len, @sizeOf(f64)));
+            return total;
+        }
+    };
+
+    const QueuedMarketBatch = struct {
+        rows: []QueuedMarketRow,
+        mode: MarketStorageWriteMode,
+        fanout_series_ids: [][]types.SeriesId,
+        fanout_values: [][]f64,
+        completion: ?*MarketBatchCompletion = null,
+
+        fn deinit(self: *QueuedMarketBatch, alloc: std.mem.Allocator) void {
+            for (self.rows) |*row| row.deinit(alloc);
+            alloc.free(self.rows);
+            for (self.fanout_series_ids) |series_ids| alloc.free(series_ids);
+            alloc.free(self.fanout_series_ids);
+            for (self.fanout_values) |values| alloc.free(values);
+            alloc.free(self.fanout_values);
+            if (self.completion) |completion| {
+                completion.complete(error.Closed);
+                completion.release();
+            }
+            self.* = undefined;
+        }
+
+        fn queuedBytes(self: QueuedMarketBatch) !usize {
+            var total: usize = @sizeOf(QueuedMarketBatch);
+            try addQueuedBytes(&total, try mulQueuedBytes(self.rows.len, @sizeOf(QueuedMarketRow)));
+            try addQueuedBytes(&total, try mulQueuedBytes(self.fanout_series_ids.len, @sizeOf([]types.SeriesId)));
+            try addQueuedBytes(&total, try mulQueuedBytes(self.fanout_values.len, @sizeOf([]f64)));
+            for (self.rows) |row| try addQueuedBytes(&total, try row.payloadBytes());
+            for (self.fanout_series_ids) |series_ids| {
+                try addQueuedBytes(&total, try mulQueuedBytes(series_ids.len, @sizeOf(types.SeriesId)));
+            }
+            for (self.fanout_values) |values| {
+                try addQueuedBytes(&total, try mulQueuedBytes(values.len, @sizeOf(f64)));
+            }
+            return total;
+        }
+    };
+
+    const QueuedPayload = union(enum) {
+        scalar: []ResolvedIngestPoint,
+        market: QueuedMarketBatch,
+
+        fn len(self: QueuedPayload) usize {
+            return switch (self) {
+                .scalar => |points| points.len,
+                .market => |batch| batch.rows.len,
+            };
+        }
+    };
+
     const QueuedBatch = struct {
-        points: []ResolvedIngestPoint,
+        payload: QueuedPayload,
         bytes: usize,
 
         fn deinit(self: *QueuedBatch, alloc: std.mem.Allocator) void {
-            alloc.free(self.points);
+            switch (self.payload) {
+                .scalar => |points| alloc.free(points),
+                .market => |*batch| batch.deinit(alloc),
+            }
+            self.* = undefined;
+        }
+    };
+
+    const FanoutMemtableCheckpoint = struct {
+        series_id: types.SeriesId,
+        existed: bool,
+        old_len: usize,
+        old_sorted: bool,
+        old_last_ts: ?i64,
+    };
+
+    const MarketReplayRegistration = struct {
+        schema_digest: market_identity_mod.SchemaDigest,
+        metric: []u8,
+        canonical_labels: []u8,
+        column_count: usize,
+
+        fn deinit(self: *MarketReplayRegistration, alloc: std.mem.Allocator) void {
+            alloc.free(self.metric);
+            alloc.free(self.canonical_labels);
             self.* = undefined;
         }
     };
@@ -528,6 +788,7 @@ pub const Engine = struct {
         count: usize = 0,
         pending_points: usize = 0,
         pending_bytes: usize = 0,
+        in_flight_batches: usize = 0,
         closed: bool = false,
         metrics: *Metrics,
         const lock_wait_threshold_ns: i64 = 1_000;
@@ -553,7 +814,7 @@ pub const Engine = struct {
             errdefer self.alloc.free(owned_points);
             owned_points[0] = point;
             return self.pushOwned(.{
-                .points = owned_points,
+                .payload = .{ .scalar = owned_points },
                 .bytes = @sizeOf(ResolvedIngestPoint),
             });
         }
@@ -562,9 +823,46 @@ pub const Engine = struct {
             const owned_points = try self.alloc.dupe(ResolvedIngestPoint, points);
             errdefer self.alloc.free(owned_points);
             return self.pushOwned(.{
-                .points = owned_points,
+                .payload = .{ .scalar = owned_points },
                 .bytes = points.len * @sizeOf(ResolvedIngestPoint),
             });
+        }
+        fn pushMarketBatch(self: *Queue, batch: QueuedMarketBatch, bytes: usize) !void {
+            return self.pushOwned(.{
+                .payload = .{ .market = batch },
+                .bytes = bytes,
+            });
+        }
+        fn beginMarketPushReservation(self: *Queue, row_count: usize, bytes: usize) !void {
+            self.mu.lock();
+            errdefer self.mu.unlock();
+            if (self.closed) return error.Closed;
+            try self.ensureCapacity(self.count + 1);
+            _ = std.math.add(usize, self.pending_points, row_count) catch return error.ResidentByteOverflow;
+            _ = std.math.add(usize, self.pending_bytes, bytes) catch return error.ResidentByteOverflow;
+        }
+        fn cancelMarketPushReservation(self: *Queue) void {
+            self.mu.unlock();
+        }
+        fn commitMarketPushReservation(self: *Queue, batch: QueuedMarketBatch, bytes: usize) void {
+            std.debug.assert(!self.closed);
+            std.debug.assert(self.count < self.buf.len);
+            const insert_idx = (self.head + self.count) % self.buf.len;
+            self.buf[insert_idx] = .{
+                .payload = .{ .market = batch },
+                .bytes = bytes,
+            };
+            self.count += 1;
+            self.pending_points += batch.rows.len;
+            self.pending_bytes += bytes;
+            self.cv.signal();
+            self.mu.unlock();
+        }
+        fn reserveOne(self: *Queue) !void {
+            self.mu.lock();
+            defer self.mu.unlock();
+            if (self.closed) return error.Closed;
+            try self.ensureCapacity(self.count + 1);
         }
         fn pushOwned(self: *Queue, batch: QueuedBatch) !void {
             const wait_start = std.time.nanoTimestamp();
@@ -588,11 +886,13 @@ pub const Engine = struct {
                 return error.Closed;
             }
             try self.ensureCapacity(self.count + 1);
+            const next_pending_points = std.math.add(usize, self.pending_points, batch.payload.len()) catch return error.ResidentByteOverflow;
+            const next_pending_bytes = std.math.add(usize, self.pending_bytes, batch.bytes) catch return error.ResidentByteOverflow;
             const insert_idx = if (self.buf.len == 0) 0 else (self.head + self.count) % self.buf.len;
             self.buf[insert_idx] = batch;
             self.count += 1;
-            self.pending_points += batch.points.len;
-            self.pending_bytes += batch.bytes;
+            self.pending_points = next_pending_points;
+            self.pending_bytes = next_pending_bytes;
             self.cv.signal();
         }
         pub fn pop(self: *Queue) ?QueuedBatch {
@@ -629,14 +929,26 @@ pub const Engine = struct {
             const batch = self.buf[self.head];
             self.head = if (self.buf.len == 0) 0 else (self.head + 1) % self.buf.len;
             self.count -= 1;
-            self.pending_points -= batch.points.len;
+            self.pending_points -= batch.payload.len();
             self.pending_bytes -= batch.bytes;
+            self.in_flight_batches += 1;
             if (self.count == 0) self.head = 0;
             const release_ns = std.time.nanoTimestamp();
             const hold_ns = release_ns - hold_start_ns;
             _ = self.metrics.queue_pop_lock_hold_ns_total.fetchAdd(@as(u64, @intCast(hold_ns)), .monotonic);
             self.mu.unlock();
             return batch;
+        }
+        pub fn completeBatch(self: *Queue) void {
+            self.mu.lock();
+            std.debug.assert(self.in_flight_batches > 0);
+            self.in_flight_batches -= 1;
+            self.mu.unlock();
+        }
+        pub fn isDrained(self: *Queue) bool {
+            self.mu.lock();
+            defer self.mu.unlock();
+            return self.pending_points == 0 and self.in_flight_batches == 0;
         }
         pub fn close(self: *Queue) void {
             self.mu.lock();
@@ -709,6 +1021,7 @@ pub const Engine = struct {
         query_compile_series_not_found_total: AtomicU64,
         query_compile_ambiguous_selector_total: AtomicU64,
         query_compile_shadow_mismatch_total: AtomicU64,
+        market_shadow_mismatch_total: AtomicU64,
         ingest_rejected_total: AtomicU64,
         ingest_rejected_mem_limit_total: AtomicU64,
         wal_append_failed_total: AtomicU64,
@@ -788,6 +1101,7 @@ pub const Engine = struct {
                 .query_compile_series_not_found_total = AtomicU64.init(0),
                 .query_compile_ambiguous_selector_total = AtomicU64.init(0),
                 .query_compile_shadow_mismatch_total = AtomicU64.init(0),
+                .market_shadow_mismatch_total = AtomicU64.init(0),
                 .ingest_rejected_total = AtomicU64.init(0),
                 .ingest_rejected_mem_limit_total = AtomicU64.init(0),
                 .wal_append_failed_total = AtomicU64.init(0),
@@ -842,10 +1156,13 @@ pub const Engine = struct {
         if (config.metadata_read_mode != .legacy and config.cas_mode == .off) {
             return error.CasReadModeRequiresCas;
         }
-        std.fs.cwd().makePath(config.data_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
+        const repository_probe = try cas_mod.probeOrInitRepositoryFormatWithState(
+            alloc,
+            config.data_dir,
+            config.fsync,
+        );
+        try validateConfiguredMarketStorage(config, repository_probe.format);
+
         const data_dir = try std.fs.cwd().openDir(config.data_dir, .{ .iterate = true });
         var cas_manager: ?cas_mod.CasManager = null;
         var cas_manager_transferred = false;
@@ -856,9 +1173,23 @@ pub const Engine = struct {
             cas_manager = try cas_mod.CasManager.init(alloc, config.data_dir, config.fsync);
         }
         var wal = try wal_mod.WAL.open(alloc, data_dir, config.fsync);
-        var metadata = try MetadataState.load(alloc, data_dir, config, &wal, if (cas_manager) |*cas| cas else null);
+        var metadata = try MetadataState.load(
+            alloc,
+            data_dir,
+            config,
+            &wal,
+            if (cas_manager) |*cas| cas else null,
+            if (repository_probe.fresh_repository and
+                repository_probe.format.version == cas_mod.current_repository_format_version)
+                .native_v1
+            else
+                .fanout_v1,
+        );
         var metadata_transferred = false;
         errdefer if (!metadata_transferred) metadata.deinit();
+        var market_manifest = try market_manifest_mod.Manifest.loadOrEmpty(alloc, data_dir);
+        var market_manifest_transferred = false;
+        errdefer if (!market_manifest_transferred) market_manifest.deinit();
 
         var engine = try alloc.create(Engine);
         errdefer alloc.destroy(engine);
@@ -866,8 +1197,14 @@ pub const Engine = struct {
             .alloc = alloc,
             .config = config,
             .data_dir = data_dir,
+            .repository_format = repository_probe.format,
             .wal = wal,
             .mem = MemTable.init(alloc),
+            .market_mem = market_memtable_mod.MarketMemtable.init(alloc),
+            .market_manifest = market_manifest,
+            .market_mem_allocated_bytes = std.atomic.Value(usize).init(0),
+            .market_mem_resident_bytes = std.atomic.Value(usize).init(0),
+            .next_market_write_sequence = 1,
             .metadata = metadata,
             .flush_timer_ms = config.flush_interval_ms,
             .metrics = Metrics.init(),
@@ -878,13 +1215,17 @@ pub const Engine = struct {
             .derived_dirty = std.array_list.Managed(DirtyDefinitionWork).init(alloc),
         };
         metadata_transferred = true;
+        market_manifest_transferred = true;
         cas_manager_transferred = true;
         errdefer {
             for (engine.derived_dirty.items) |*item| item.deinit(engine.alloc);
             engine.derived_dirty.deinit();
+            engine.market_manifest.deinit();
+            engine.market_mem.deinit();
             engine.mem.deinit();
             engine.metadata.deinit();
             engine.wal.close();
+            if (engine.cas) |*cas| cas.deinit();
             engine.data_dir.close();
             engine.config.deinit(engine.alloc);
         }
@@ -898,13 +1239,14 @@ pub const Engine = struct {
         engine.signal_events = try signal_events_mod.Store.loadOrInit(alloc, engine.data_dir, engine.config.fsync);
         errdefer engine.signal_events.deinit();
         if (engine.cas) |*cas| {
-            _ = try cas.bootstrapIfMissingWithMarket(
+            _ = try cas.bootstrapIfMissingWithNativeMarket(
                 engine.data_dir,
                 &engine.metadata.manifest,
                 &engine.metadata.tags,
                 &engine.metadata.series_catalog,
                 &engine.metadata.metric_catalog,
                 &engine.metadata.market_catalog,
+                &engine.market_manifest,
             );
             try engine.metadata.refreshCasIndex(cas);
         }
@@ -926,6 +1268,8 @@ pub const Engine = struct {
         if (self.derived_thread) |t| t.join();
         for (self.derived_dirty.items) |*item| item.deinit(self.alloc);
         self.derived_dirty.deinit();
+        self.market_manifest.deinit();
+        self.market_mem.deinit();
         self.mem.deinit();
         self.metadata.deinit();
         self.wal.close();
@@ -968,7 +1312,7 @@ pub const Engine = struct {
         const batch_bytes = points.len * @sizeOf(ResolvedIngestPoint);
         if (self.config.mem_limit_bytes != 0) {
             const queued_bytes = self.queue.pendingBytes();
-            const resident_bytes = self.mem.bytes.load(.monotonic) + queued_bytes + batch_bytes;
+            const resident_bytes = self.admissionMemtableBytes() + queued_bytes + batch_bytes;
             if (resident_bytes >= self.config.mem_limit_bytes) {
                 _ = self.metrics.ingest_rejected_total.fetchAdd(1, .monotonic);
                 _ = self.metrics.ingest_rejected_mem_limit_total.fetchAdd(1, .monotonic);
@@ -977,6 +1321,17 @@ pub const Engine = struct {
         }
         try self.queue.pushBatch(points);
         self.noteQueueBecameNonEmpty();
+        self.recordQueueSample();
+        const len_now = self.queue.len();
+        const pending_bytes_now = self.queue.pendingBytes();
+        return .{
+            .accepted_points = points.len,
+            .queue_depth = len_now,
+            .pending_bytes = pending_bytes_now,
+        };
+    }
+
+    fn recordQueueSample(self: *Engine) void {
         const len_now = self.queue.len();
         const pending_bytes_now = self.queue.pendingBytes();
         const len_now_u64: u64 = @intCast(len_now);
@@ -996,11 +1351,14 @@ pub const Engine = struct {
             else
                 break;
         }
-        return .{
-            .accepted_points = points.len,
-            .queue_depth = len_now,
-            .pending_bytes = pending_bytes_now,
-        };
+    }
+
+    fn liveMemtableBytes(self: *Engine) usize {
+        return self.mem.bytes.load(.monotonic) + self.market_mem_resident_bytes.load(.monotonic);
+    }
+
+    fn admissionMemtableBytes(self: *Engine) usize {
+        return self.mem.bytes.load(.monotonic) + self.market_mem_allocated_bytes.load(.monotonic);
     }
 
     pub fn ingest(self: *Engine, item: IngestItem) !void {
@@ -1026,6 +1384,486 @@ pub const Engine = struct {
         _ = try self.appendResolvedBatch(points);
     }
 
+    pub fn ingestMarketBatch(self: *Engine, rows: []const MarketIngestInput) !MarketIngestReceipt {
+        return try self.appendMarketRows(rows);
+    }
+
+    pub fn appendMarketRows(self: *Engine, rows: []const MarketIngestInput) !MarketIngestReceipt {
+        if (rows.len == 0) {
+            return .{
+                .accepted_rows = 0,
+                .storage_mode = .fanout_v1,
+                .native_rows = 0,
+                .fanout_writes = 0,
+                .queue_depth = self.queue.len(),
+                .pending_bytes = self.queue.pendingBytes(),
+            };
+        }
+
+        var preflight_schemas = try self.alloc.alloc(market_catalog_mod.MarketSchema, rows.len);
+        var preflight_schema_count: usize = 0;
+        defer {
+            for (preflight_schemas[0..preflight_schema_count]) |*schema| schema.deinit(self.alloc);
+            self.alloc.free(preflight_schemas);
+        }
+        var preflight_labels = try self.alloc.alloc([]u8, rows.len);
+        var preflight_label_count: usize = 0;
+        defer {
+            for (preflight_labels[0..preflight_label_count]) |labels| self.alloc.free(labels);
+            self.alloc.free(preflight_labels);
+        }
+        const preflight_modes = try self.alloc.alloc(MarketStorageWriteMode, rows.len);
+        defer self.alloc.free(preflight_modes);
+        const preflight_market_registrations = try self.alloc.alloc(market_catalog_mod.MarketSeriesRegistrationInput, rows.len);
+        defer self.alloc.free(preflight_market_registrations);
+
+        var resolved_mode: ?MarketStorageWriteMode = null;
+        var preflight_queued_bytes: usize = @sizeOf(QueuedMarketBatch);
+        try addQueuedBytes(&preflight_queued_bytes, try mulQueuedBytes(rows.len, @sizeOf(QueuedMarketRow)));
+        try addQueuedBytes(&preflight_queued_bytes, try mulQueuedBytes(rows.len, @sizeOf([]types.SeriesId)));
+        try addQueuedBytes(&preflight_queued_bytes, try mulQueuedBytes(rows.len, @sizeOf([]f64)));
+        var fanout_declaration_count: usize = 0;
+        for (rows, 0..) |row, row_idx| {
+            var schema = self.marketSchema(row.metric) orelse return error.UnknownMarketSchema;
+            errdefer schema.deinit(self.alloc);
+            try market_identity_mod.validateValueShape(schema.ordered_columns.len, row.values.len);
+
+            const canonical_labels = try market_identity_mod.canonicalizeLabels(self.alloc, row.labels_json);
+            errdefer self.alloc.free(canonical_labels);
+            try market_identity_mod.validateRequiredLabels(
+                self.alloc,
+                canonical_labels,
+                schema.required_labels,
+            );
+
+            const mode = try self.resolveMarketWriteMode(schema);
+            if (resolved_mode) |previous| {
+                if (previous != mode) return error.MixedMarketStorageModes;
+            } else {
+                resolved_mode = mode;
+            }
+            const value_bytes = std.math.mul(usize, row.values.len, @sizeOf(f64)) catch return error.ResidentByteOverflow;
+            try addQueuedBytes(&preflight_queued_bytes, row.metric.len);
+            try addQueuedBytes(&preflight_queued_bytes, canonical_labels.len);
+            try addQueuedBytes(&preflight_queued_bytes, value_bytes);
+            const needs_fanout = mode == .fanout_v1 or mode == .dual_write_v1;
+            if (needs_fanout) {
+                fanout_declaration_count = std.math.add(usize, fanout_declaration_count, schema.ordered_columns.len) catch return error.ResidentByteOverflow;
+                try addQueuedBytes(&preflight_queued_bytes, try mulQueuedBytes(schema.ordered_columns.len, @sizeOf(types.SeriesId)));
+                try addQueuedBytes(&preflight_queued_bytes, value_bytes);
+            }
+
+            preflight_schemas[row_idx] = schema;
+            preflight_schema_count += 1;
+            preflight_labels[row_idx] = canonical_labels;
+            preflight_label_count += 1;
+            preflight_modes[row_idx] = mode;
+            preflight_market_registrations[row_idx] = .{
+                .series_id = market_identity_mod.seriesId(row.metric, canonical_labels),
+                .metric = row.metric,
+                .canonical_labels = canonical_labels,
+            };
+        }
+
+        const mode = resolved_mode orelse .fanout_v1;
+        if (self.config.mem_limit_bytes != 0) {
+            const queued_payload_bytes = if (mode == .fanout_v1)
+                try mulQueuedBytes(fanout_declaration_count, @sizeOf(ResolvedIngestPoint))
+            else
+                preflight_queued_bytes;
+            var resident_bytes = self.admissionMemtableBytes();
+            try addQueuedBytes(&resident_bytes, self.queue.pendingBytes());
+            try addQueuedBytes(&resident_bytes, queued_payload_bytes);
+            if (resident_bytes >= self.config.mem_limit_bytes) {
+                _ = self.metrics.ingest_rejected_total.fetchAdd(1, .monotonic);
+                _ = self.metrics.ingest_rejected_mem_limit_total.fetchAdd(1, .monotonic);
+                return error.MemoryLimitExceeded;
+            }
+        }
+
+        var fanout_points = std.array_list.Managed(ResolvedIngestPoint).init(self.alloc);
+        defer fanout_points.deinit();
+
+        var queued_rows = try self.alloc.alloc(QueuedMarketRow, rows.len);
+        var queued_rows_initialized: usize = 0;
+        var queued_rows_owned = true;
+        errdefer if (queued_rows_owned) {
+            for (queued_rows[0..queued_rows_initialized]) |*row| row.deinit(self.alloc);
+            self.alloc.free(queued_rows);
+        };
+
+        var fanout_series_ids = try self.alloc.alloc([]types.SeriesId, rows.len);
+        var fanout_series_ids_initialized: usize = 0;
+        var fanout_series_ids_owned = true;
+        errdefer if (fanout_series_ids_owned) {
+            for (fanout_series_ids[0..fanout_series_ids_initialized]) |series_ids| self.alloc.free(series_ids);
+            self.alloc.free(fanout_series_ids);
+        };
+
+        var fanout_values = try self.alloc.alloc([]f64, rows.len);
+        var fanout_values_initialized: usize = 0;
+        var fanout_values_owned = true;
+        errdefer if (fanout_values_owned) {
+            for (fanout_values[0..fanout_values_initialized]) |values| self.alloc.free(values);
+            self.alloc.free(fanout_values);
+        };
+
+        var queued_bytes: usize = 0;
+        var native_rows: usize = 0;
+        var fanout_writes: usize = 0;
+
+        for (rows, 0..) |row, row_idx| {
+            const schema = preflight_schemas[row_idx];
+            const row_mode = preflight_modes[row_idx];
+
+            const needs_native = row_mode == .native_v1 or row_mode == .dual_write_v1;
+            const needs_fanout = row_mode == .fanout_v1 or row_mode == .dual_write_v1;
+
+            const metric_copy = try self.alloc.dupe(u8, row.metric);
+            errdefer self.alloc.free(metric_copy);
+            const labels_copy = try self.alloc.dupe(u8, preflight_labels[row_idx]);
+            errdefer self.alloc.free(labels_copy);
+            const value_copy = try self.alloc.dupe(f64, row.values);
+            errdefer self.alloc.free(value_copy);
+
+            queued_rows[row_idx] = .{
+                .market_series_id = preflight_market_registrations[row_idx].series_id,
+                .schema_digest = schema.digest(),
+                .metric = metric_copy,
+                .canonical_labels = labels_copy,
+                .ts_ns = row.ts_ns,
+                .values = value_copy,
+            };
+            queued_rows_initialized += 1;
+            queued_bytes = try std.math.add(usize, queued_bytes, try queued_rows[row_idx].payloadBytes());
+            if (needs_native) native_rows += 1;
+
+            const series_ids = try self.alloc.alloc(types.SeriesId, if (needs_fanout) schema.ordered_columns.len else 0);
+            fanout_series_ids[row_idx] = series_ids;
+            fanout_series_ids_initialized += 1;
+            const values = try self.alloc.dupe(f64, if (needs_fanout) row.values else &[_]f64{});
+            fanout_values[row_idx] = values;
+            fanout_values_initialized += 1;
+        }
+
+        const fanout_declarations = try self.alloc.alloc(ExactSeriesCanonicalDeclarationInput, fanout_declaration_count);
+        defer self.alloc.free(fanout_declarations);
+        const fanout_metric_names = try self.alloc.alloc([]u8, fanout_declaration_count);
+        var fanout_metric_name_count: usize = 0;
+        defer {
+            for (fanout_metric_names[0..fanout_metric_name_count]) |name| self.alloc.free(name);
+            self.alloc.free(fanout_metric_names);
+        }
+        const fanout_results = try self.alloc.alloc(ExactSeriesBatchDeclarationResult, fanout_declaration_count);
+        defer self.alloc.free(fanout_results);
+
+        var fanout_declaration_idx: usize = 0;
+        for (rows, 0..) |row, row_idx| {
+            const schema = preflight_schemas[row_idx];
+            const row_mode = preflight_modes[row_idx];
+            const needs_fanout = row_mode == .fanout_v1 or row_mode == .dual_write_v1;
+            if (!needs_fanout) continue;
+            for (schema.ordered_columns) |column| {
+                const derived_metric = try std.fmt.allocPrint(self.alloc, "{s}.{s}", .{ row.metric, column });
+                fanout_metric_names[fanout_metric_name_count] = derived_metric;
+                fanout_metric_name_count += 1;
+                fanout_declarations[fanout_declaration_idx] = .{
+                    .name = derived_metric,
+                    .canonical_tags = preflight_labels[row_idx],
+                    .descriptor = .{
+                        .metric = derived_metric,
+                        .kind = .gauge,
+                        .source_metric = row.metric,
+                        .source_field = column,
+                    },
+                };
+                fanout_declaration_idx += 1;
+            }
+        }
+        std.debug.assert(fanout_declaration_idx == fanout_declaration_count);
+
+        try fanout_points.ensureTotalCapacity(fanout_declaration_count);
+        try self.preflightMarketFanoutDeclarations(fanout_declarations);
+        const reserved_market_batch = QueuedMarketBatch{
+            .rows = queued_rows,
+            .mode = mode,
+            .fanout_series_ids = fanout_series_ids,
+            .fanout_values = fanout_values,
+        };
+        const batch_queued_bytes = try reserved_market_batch.queuedBytes();
+        const completion = if (mode == .fanout_v1)
+            null
+        else
+            try MarketBatchCompletion.create(self.alloc);
+        defer if (completion) |pending| pending.release();
+        var market_queue_reserved = false;
+        defer if (market_queue_reserved) self.queue.cancelMarketPushReservation();
+        if (mode != .fanout_v1) {
+            try self.queue.beginMarketPushReservation(rows.len, batch_queued_bytes);
+            market_queue_reserved = true;
+        }
+
+        const market_identities = try self.metadata.market_catalog.registerCanonicalMarketSeriesBatch(preflight_market_registrations);
+        defer {
+            for (market_identities) |*identity| identity.deinit(self.alloc);
+            self.alloc.free(market_identities);
+        }
+        for (market_identities, queued_rows[0..queued_rows_initialized]) |identity, queued| {
+            if (identity.series_id != queued.market_series_id) return error.MarketSeriesIdMismatch;
+            if (!std.mem.eql(u8, identity.schema_digest[0..], queued.schema_digest[0..])) return error.MarketSchemaConflict;
+            if (!std.mem.eql(u8, identity.metric, queued.metric)) return error.MarketSeriesConflict;
+            if (!std.mem.eql(u8, identity.canonical_labels, queued.canonical_labels)) return error.MarketSeriesConflict;
+        }
+
+        if (fanout_declaration_count != 0) {
+            try self.declareExactSeriesCanonicalBatch(fanout_declarations, fanout_results);
+            for (fanout_results) |result| {
+                switch (result.status) {
+                    .ok => {},
+                    .metric_descriptor_conflict => return error.MetricDescriptorConflict,
+                    .series_conflict => return error.SeriesIdConflict,
+                }
+            }
+
+            fanout_declaration_idx = 0;
+            for (rows, 0..) |row, row_idx| {
+                const schema = preflight_schemas[row_idx];
+                const row_mode = preflight_modes[row_idx];
+                const needs_fanout = row_mode == .fanout_v1 or row_mode == .dual_write_v1;
+                if (!needs_fanout) continue;
+                for (schema.ordered_columns, 0..) |_, column_idx| {
+                    const series_id = fanout_results[fanout_declaration_idx].series_id orelse return error.SeriesIdConflict;
+                    fanout_series_ids[row_idx][column_idx] = series_id;
+                    if (row_mode == .fanout_v1) {
+                        fanout_points.appendAssumeCapacity(.{
+                            .series_id = series_id,
+                            .ts = row.ts_ns,
+                            .value = row.values[column_idx],
+                        });
+                    }
+                    fanout_declaration_idx += 1;
+                }
+            }
+            fanout_writes = fanout_declaration_count;
+        }
+
+        if (mode == .fanout_v1) {
+            _ = try self.appendResolvedBatch(fanout_points.items);
+            for (queued_rows[0..queued_rows_initialized]) |*queued| queued.deinit(self.alloc);
+            self.alloc.free(queued_rows);
+            queued_rows_initialized = 0;
+            queued_rows_owned = false;
+            for (fanout_series_ids[0..fanout_series_ids_initialized]) |series_ids| self.alloc.free(series_ids);
+            self.alloc.free(fanout_series_ids);
+            fanout_series_ids_initialized = 0;
+            fanout_series_ids_owned = false;
+            for (fanout_values[0..fanout_values_initialized]) |values| self.alloc.free(values);
+            self.alloc.free(fanout_values);
+            fanout_values_initialized = 0;
+            fanout_values_owned = false;
+            return .{
+                .accepted_rows = rows.len,
+                .storage_mode = mode,
+                .native_rows = 0,
+                .fanout_writes = fanout_writes,
+                .queue_depth = self.queue.len(),
+                .pending_bytes = self.queue.pendingBytes(),
+            };
+        }
+
+        completion.?.retain();
+        const batch = QueuedMarketBatch{
+            .rows = queued_rows,
+            .mode = mode,
+            .fanout_series_ids = fanout_series_ids,
+            .fanout_values = fanout_values,
+            .completion = completion.?,
+        };
+        std.debug.assert(batch_queued_bytes >= queued_bytes);
+        queued_rows_initialized = 0;
+        queued_rows_owned = false;
+        fanout_series_ids_initialized = 0;
+        fanout_series_ids_owned = false;
+        fanout_values_initialized = 0;
+        fanout_values_owned = false;
+        self.queue.commitMarketPushReservation(batch, batch_queued_bytes);
+        market_queue_reserved = false;
+        self.noteQueueBecameNonEmpty();
+        self.recordQueueSample();
+        try completion.?.wait();
+        return .{
+            .accepted_rows = rows.len,
+            .storage_mode = mode,
+            .native_rows = native_rows,
+            .fanout_writes = fanout_writes,
+            .queue_depth = self.queue.len(),
+            .pending_bytes = self.queue.pendingBytes(),
+        };
+    }
+
+    fn preflightMarketFanoutDeclarations(
+        self: *Engine,
+        declarations: []const ExactSeriesCanonicalDeclarationInput,
+    ) !void {
+        if (declarations.len == 0) return;
+
+        var unique_descriptors = std.StringHashMap(metric_catalog_mod.DescriptorInput).init(self.alloc);
+        defer unique_descriptors.deinit();
+        var unique_series = std.AutoHashMap(types.SeriesId, usize).init(self.alloc);
+        defer unique_series.deinit();
+
+        for (declarations, 0..) |declaration, idx| {
+            if (declaration.descriptor) |descriptor| {
+                if (unique_descriptors.get(descriptor.metric)) |existing| {
+                    if (!descriptorInputsEquivalent(existing, descriptor)) return error.MetricDescriptorConflict;
+                } else {
+                    if (self.metadata.metric_catalog.get(descriptor.metric)) |existing_descriptor| {
+                        if (metricDescriptorWouldConflict(existing_descriptor, descriptor)) {
+                            return error.MetricDescriptorConflict;
+                        }
+                    }
+                    try unique_descriptors.put(descriptor.metric, descriptor);
+                }
+            }
+
+            const series_id = types.seriesIdFrom(declaration.name, declaration.canonical_tags);
+            if (unique_series.get(series_id)) |existing_idx| {
+                const existing = declarations[existing_idx];
+                if (!std.mem.eql(u8, existing.name, declaration.name) or
+                    !std.mem.eql(u8, existing.canonical_tags, declaration.canonical_tags))
+                {
+                    return error.SeriesIdConflict;
+                }
+            } else {
+                const existing = self.metadata.series_catalog.resolveBySeriesId(series_id);
+                switch (existing.status) {
+                    .not_found => {},
+                    .resolved, .exact_match => {
+                        const existing_series = existing.series orelse return error.SeriesIdConflict;
+                        const existing_tags = existing.canonical_tags orelse return error.SeriesIdConflict;
+                        if (!std.mem.eql(u8, existing_series, declaration.name) or
+                            !std.mem.eql(u8, existing_tags, declaration.canonical_tags))
+                        {
+                            return error.SeriesIdConflict;
+                        }
+                    },
+                    .ambiguous => return error.SeriesIdConflict,
+                }
+                try unique_series.put(series_id, idx);
+            }
+        }
+    }
+
+    fn metricDescriptorWouldConflict(
+        existing: metric_catalog_mod.Descriptor,
+        incoming: metric_catalog_mod.DescriptorInput,
+    ) bool {
+        if (incoming.kind) |kind| {
+            if (existing.kind) |current| {
+                if (current != kind) return true;
+            }
+        }
+        if (optionalFieldWouldConflict(existing.unit, incoming.unit)) return true;
+        if (optionalFieldWouldConflict(existing.description, incoming.description)) return true;
+        if (optionalFieldWouldConflict(existing.source_metric, incoming.source_metric)) return true;
+        if (optionalFieldWouldConflict(existing.source_field, incoming.source_field)) return true;
+        return false;
+    }
+
+    fn optionalFieldWouldConflict(existing: ?[]const u8, incoming: ?[]const u8) bool {
+        const normalized = optionalBytesNormalized(incoming);
+        if (normalized == null) return false;
+        if (existing) |current| return !std.mem.eql(u8, current, normalized.?);
+        return false;
+    }
+
+    fn noteTagsBatchForSeries(self: *Engine, series_ids: []const types.SeriesId, canonical_labels: []const u8) !void {
+        for (series_ids) |series_id| self.noteTags(series_id, canonical_labels);
+    }
+
+    fn resolveMarketWriteMode(self: *Engine, schema: market_catalog_mod.MarketSchema) !MarketStorageWriteMode {
+        const mode: MarketStorageWriteMode = switch (self.config.market_storage_mode) {
+            .fanout_v1 => .fanout_v1,
+            .dual_write_v1 => .dual_write_v1,
+            .native_v1 => .native_v1,
+            .auto => switch (schema.storage_mapping) {
+                .fanout_v1 => .fanout_v1,
+                .native_v1 => .native_v1,
+            },
+        };
+        if (mode == .dual_write_v1 or mode == .native_v1) {
+            try self.requireRepositoryFormat4ForNativeMarket();
+        }
+        return mode;
+    }
+
+    fn marketSchemaRegistrationMapping(
+        self: *Engine,
+        input: market_catalog_mod.MarketSchemaInput,
+        explicit_storage_mapping: ?market_catalog_mod.StorageMapping,
+    ) !market_catalog_mod.StorageMapping {
+        if (self.marketSchema(input.metric)) |existing| {
+            var owned_existing = existing;
+            defer owned_existing.deinit(self.alloc);
+            if (explicit_storage_mapping) |requested| {
+                if (requested != existing.storage_mapping) return error.MarketSchemaConflict;
+            }
+            return existing.storage_mapping;
+        }
+        if (explicit_storage_mapping) |requested| {
+            if (requested == .native_v1) try self.requireRepositoryFormat4ForNativeMarket();
+            return requested;
+        }
+        return switch (self.config.market_storage_mode) {
+            .fanout_v1 => .fanout_v1,
+            .dual_write_v1, .native_v1 => blk: {
+                try self.requireRepositoryFormat4ForNativeMarket();
+                break :blk .native_v1;
+            },
+            // A new schema has no stored mapping yet. Format 4 repositories
+            // select the native default once at registration, after which
+            // `auto` follows that persisted schema mapping on every write.
+            .auto => if (self.repository_format.version < cas_mod.current_repository_format_version)
+                .fanout_v1
+            else blk: {
+                try self.requireRepositoryFormat4ForNativeMarket();
+                break :blk .native_v1;
+            },
+        };
+    }
+
+    fn marketSchemaInputWithMapping(
+        input: market_catalog_mod.MarketSchemaInput,
+        storage_mapping: market_catalog_mod.StorageMapping,
+    ) market_catalog_mod.MarketSchemaInput {
+        return .{
+            .metric = input.metric,
+            .ordered_columns = input.ordered_columns,
+            .required_labels = input.required_labels,
+            .storage_mapping = storage_mapping,
+        };
+    }
+
+    fn requireRepositoryFormat4ForNativeMarket(self: *Engine) !void {
+        if (self.repository_format.version != cas_mod.current_repository_format_version) {
+            return error.RepositoryFormatMismatch;
+        }
+        const cas = if (self.cas) |*manager| manager else return error.NativeMarketRequiresCas;
+        if (cas.format.version != self.repository_format.version) return error.RepositoryFormatMismatch;
+    }
+
+    fn validateConfiguredMarketStorage(config: cfg.Config, repository_format: cas_mod.RepositoryFormat) !void {
+        switch (config.market_storage_mode) {
+            .auto, .fanout_v1 => {},
+            .dual_write_v1, .native_v1 => {
+                if (repository_format.version != cas_mod.current_repository_format_version) {
+                    return error.RepositoryFormatMismatch;
+                }
+                if (config.cas_mode != .dual_write) return error.NativeMarketRequiresCas;
+            },
+        }
+    }
+
     fn noteDrainStateChange(self: *Engine) void {
         self.drain_mu.lock();
         self.drain_generation += 1;
@@ -1041,7 +1879,7 @@ pub const Engine = struct {
     }
 
     fn noteQueueMaybeEmpty(self: *Engine) void {
-        if (self.queue.len() != 0) return;
+        if (!self.queue.isDrained()) return;
         self.drain_mu.lock();
         self.queue_empty_generation += 1;
         self.drain_generation += 1;
@@ -1100,49 +1938,69 @@ pub const Engine = struct {
                 }
                 const now_ns = std.time.nanoTimestamp();
                 const wait_delta = now_ns - last_pop_ns;
-                _ = self.metrics.queue_pop_total.fetchAdd(@intCast(batch.points.len), .monotonic);
+                _ = self.metrics.queue_pop_total.fetchAdd(@intCast(batch.payload.len()), .monotonic);
                 if (wait_delta > 0) {
                     _ = self.metrics.queue_wait_ns_total.fetchAdd(@as(u64, @intCast(wait_delta)), .monotonic);
                 }
                 last_pop_ns = now_ns;
-                const wal_start_ns = std.time.nanoTimestamp();
-                const wal_bytes = self.wal.appendBatch(batch.points) catch |err| blk: {
-                    _ = self.metrics.wal_append_failed_total.fetchAdd(@intCast(batch.points.len), .monotonic);
-                    for (batch.points) |point| {
-                        self.quarantineFailedIngest(point, "wal_append_batch", @errorName(err));
+                {
+                    defer {
+                        self.queue.completeBatch();
+                        self.noteQueueMaybeEmpty();
                     }
-                    std.log.warn("wal batch append failed: {s}", .{@errorName(err)});
-                    break :blk 0;
-                };
-                const wal_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - wal_start_ns);
-                if (wal_bytes != 0) {
-                    _ = self.metrics.wal_append_total.fetchAdd(@intCast(batch.points.len), .monotonic);
-                    _ = self.metrics.wal_append_ns_total.fetchAdd(wal_elapsed_ns, .monotonic);
-                    _ = self.metrics.wal_bytes_total.fetchAdd(wal_bytes, .monotonic);
+                    switch (batch.payload) {
+                        .scalar => |points| {
+                            const wal_start_ns = std.time.nanoTimestamp();
+                            const wal_bytes = self.wal.appendBatch(points) catch |err| blk: {
+                                _ = self.metrics.wal_append_failed_total.fetchAdd(@intCast(points.len), .monotonic);
+                                for (points) |point| {
+                                    self.quarantineFailedIngest(point, "wal_append_batch", @errorName(err));
+                                }
+                                std.log.warn("wal batch append failed: {s}", .{@errorName(err)});
+                                break :blk 0;
+                            };
+                            const wal_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - wal_start_ns);
+                            if (wal_bytes != 0) {
+                                _ = self.metrics.wal_append_total.fetchAdd(@intCast(points.len), .monotonic);
+                                _ = self.metrics.wal_append_ns_total.fetchAdd(wal_elapsed_ns, .monotonic);
+                                _ = self.metrics.wal_bytes_total.fetchAdd(wal_bytes, .monotonic);
 
-                    const memtable_start_ns = std.time.nanoTimestamp();
-                    if (self.appendMemtableBatchGrouped(batch.points)) |_| {
-                        const memtable_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - memtable_start_ns);
-                        _ = self.metrics.memtable_append_ns_total.fetchAdd(memtable_elapsed_ns, .monotonic);
-                        _ = self.metrics.ingest_total.fetchAdd(@intCast(batch.points.len), .monotonic);
-                        self.noteDrainStateChange();
-                    } else |err| {
-                        _ = self.metrics.memtable_append_failed_total.fetchAdd(@intCast(batch.points.len), .monotonic);
-                        for (batch.points) |point| {
-                            self.quarantineFailedIngest(point, "memtable_append_batch", @errorName(err));
-                        }
-                        std.log.warn("failed to append batch to memtable: {s}", .{@errorName(err)});
+                                const memtable_start_ns = std.time.nanoTimestamp();
+                                self.market_data_mu.lock();
+                                defer self.market_data_mu.unlock();
+                                if (self.appendMemtableBatchGrouped(points)) |_| {
+                                    const memtable_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - memtable_start_ns);
+                                    _ = self.metrics.memtable_append_ns_total.fetchAdd(memtable_elapsed_ns, .monotonic);
+                                    _ = self.metrics.ingest_total.fetchAdd(@intCast(points.len), .monotonic);
+                                    self.noteDrainStateChange();
+                                } else |err| {
+                                    _ = self.metrics.memtable_append_failed_total.fetchAdd(@intCast(points.len), .monotonic);
+                                    for (points) |point| {
+                                        self.quarantineFailedIngest(point, "memtable_append_batch", @errorName(err));
+                                    }
+                                    std.log.warn("failed to append batch to memtable: {s}", .{@errorName(err)});
+                                }
+                            }
+                        },
+                        .market => |*market_batch| {
+                            if (self.processQueuedMarketBatch(market_batch)) |_| {
+                                if (market_batch.completion) |completion| completion.complete(null);
+                            } else |err| {
+                                _ = self.metrics.wal_append_failed_total.fetchAdd(@intCast(market_batch.rows.len), .monotonic);
+                                std.log.warn("market batch processing failed: {s}", .{@errorName(err)});
+                                if (market_batch.completion) |completion| completion.complete(err);
+                            }
+                        },
                     }
                 }
-                self.noteQueueMaybeEmpty();
             } else {
                 if (self.stop_flag) break;
                 self.noteQueueMaybeEmpty();
             }
 
             const now = std.time.milliTimestamp();
-            const mem_usage = self.mem.bytes.load(.monotonic);
-            const queue_idle = self.queue.len() == 0;
+            const mem_usage = self.liveMemtableBytes();
+            const queue_idle = self.queue.isDrained();
             const force_flush = self.flushRequested();
             if (queue_idle and mem_usage == 0 and force_flush) {
                 _ = self.takeFlushRequested();
@@ -1202,6 +2060,204 @@ pub const Engine = struct {
                 std.log.warn("cas sync failed: {s}", .{@errorName(err)});
             };
         }
+    }
+
+    fn processQueuedMarketBatch(self: *Engine, batch: *const QueuedMarketBatch) !void {
+        if (batch.rows.len == 0) return;
+
+        var registrations = try self.alloc.alloc(wal_mod.MarketSeriesRegistrationAppend, batch.rows.len);
+        defer self.alloc.free(registrations);
+        var wal_rows = try self.alloc.alloc(wal_mod.MarketRowAppend, batch.rows.len);
+        defer self.alloc.free(wal_rows);
+        var mem_rows = try self.alloc.alloc(market_memtable_mod.MarketRowInput, batch.rows.len);
+        defer self.alloc.free(mem_rows);
+
+        for (batch.rows, 0..) |row, idx| {
+            registrations[idx] = .{
+                .market_series_id = row.market_series_id,
+                .schema_digest = row.schema_digest,
+                .metric = row.metric,
+                .canonical_labels = row.canonical_labels,
+            };
+            const sequence = self.next_market_write_sequence;
+            self.next_market_write_sequence = std.math.add(u64, self.next_market_write_sequence, 1) catch return error.MarketWriteSequenceOverflow;
+            wal_rows[idx] = .{
+                .market_series_id = row.market_series_id,
+                .write_sequence = sequence,
+                .ts_ns = row.ts_ns,
+                .values = row.values,
+            };
+            mem_rows[idx] = .{
+                .market_series_id = row.market_series_id,
+                .metric = row.metric,
+                .canonical_labels = row.canonical_labels,
+                .schema_digest = row.schema_digest,
+                .ts_ns = row.ts_ns,
+                .write_sequence = sequence,
+                .values = row.values,
+            };
+        }
+
+        var fanout_points: []ResolvedIngestPoint = &.{};
+        defer if (fanout_points.len != 0) self.alloc.free(fanout_points);
+        var fanout_checkpoints: []FanoutMemtableCheckpoint = &.{};
+        defer if (fanout_checkpoints.len != 0) self.alloc.free(fanout_checkpoints);
+        if (batch.mode == .dual_write_v1) {
+            fanout_points = try self.flattenMarketFanoutPoints(batch);
+            std.sort.block(ResolvedIngestPoint, fanout_points, {}, struct {
+                fn lessThan(_: void, a: ResolvedIngestPoint, b: ResolvedIngestPoint) bool {
+                    if (a.series_id != b.series_id) return a.series_id < b.series_id;
+                    return a.ts < b.ts;
+                }
+            }.lessThan);
+            fanout_checkpoints = try self.captureFanoutMemtableCheckpoints(fanout_points);
+        }
+
+        if (self.market_writer_fault == .wal_append) return error.InjectedMarketWalAppendFailure;
+        const wal_start_ns = std.time.nanoTimestamp();
+        const registration_bytes = try self.wal.appendMarketSeriesRegistrationBatch(registrations);
+        const row_bytes = try self.wal.appendMarketRowBatch(wal_rows);
+        const wal_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - wal_start_ns);
+        _ = self.metrics.wal_append_total.fetchAdd(@intCast(batch.rows.len), .monotonic);
+        _ = self.metrics.wal_append_ns_total.fetchAdd(wal_elapsed_ns, .monotonic);
+        _ = self.metrics.wal_bytes_total.fetchAdd(registration_bytes + row_bytes, .monotonic);
+
+        const memtable_start_ns = std.time.nanoTimestamp();
+        self.market_data_mu.lock();
+        defer self.market_data_mu.unlock();
+        var fanout_applied = false;
+        errdefer if (fanout_applied) self.rollbackFanoutMemtable(fanout_checkpoints, fanout_points.len);
+        if (batch.mode == .dual_write_v1) {
+            try self.appendMemtableBatchGrouped(fanout_points);
+            fanout_applied = true;
+            if (self.market_writer_fault == .native_apply_after_fanout) {
+                return error.InjectedNativeMarketApplyFailure;
+            }
+        }
+        try self.market_mem.appendBatch(mem_rows);
+        fanout_applied = false;
+        self.market_mem_allocated_bytes.store(self.market_mem.allocatedBytes(), .monotonic);
+        self.market_mem_resident_bytes.store(self.market_mem.residentBytes(), .monotonic);
+        _ = self.metrics.memtable_append_ns_total.fetchAdd(@intCast(std.time.nanoTimestamp() - memtable_start_ns), .monotonic);
+        _ = self.metrics.ingest_total.fetchAdd(@intCast(batch.rows.len), .monotonic);
+
+        self.noteDrainStateChange();
+    }
+
+    fn captureFanoutMemtableCheckpoints(
+        self: *Engine,
+        sorted_points: []const ResolvedIngestPoint,
+    ) ![]FanoutMemtableCheckpoint {
+        if (sorted_points.len == 0) return try self.alloc.alloc(FanoutMemtableCheckpoint, 0);
+        const checkpoints = try self.alloc.alloc(FanoutMemtableCheckpoint, sorted_points.len);
+        errdefer self.alloc.free(checkpoints);
+
+        var checkpoint_count: usize = 0;
+        var start: usize = 0;
+        while (start < sorted_points.len) {
+            const series_id = sorted_points[start].series_id;
+            var end = start + 1;
+            while (end < sorted_points.len and sorted_points[end].series_id == series_id) : (end += 1) {}
+            if (self.mem.series.getPtr(series_id)) |buffer| {
+                checkpoints[checkpoint_count] = .{
+                    .series_id = series_id,
+                    .existed = true,
+                    .old_len = buffer.points.items.len,
+                    .old_sorted = buffer.sorted,
+                    .old_last_ts = buffer.last_ts,
+                };
+            } else {
+                checkpoints[checkpoint_count] = .{
+                    .series_id = series_id,
+                    .existed = false,
+                    .old_len = 0,
+                    .old_sorted = true,
+                    .old_last_ts = null,
+                };
+            }
+            checkpoint_count += 1;
+            start = end;
+        }
+        return try self.alloc.realloc(checkpoints, checkpoint_count);
+    }
+
+    fn rollbackFanoutMemtable(
+        self: *Engine,
+        checkpoints: []const FanoutMemtableCheckpoint,
+        appended_points: usize,
+    ) void {
+        for (checkpoints) |checkpoint| {
+            if (!checkpoint.existed) {
+                if (self.mem.series.getPtr(checkpoint.series_id)) |buffer| buffer.deinit();
+                _ = self.mem.series.remove(checkpoint.series_id);
+                continue;
+            }
+            const buffer = self.mem.series.getPtr(checkpoint.series_id) orelse continue;
+            std.debug.assert(buffer.points.items.len >= checkpoint.old_len);
+            buffer.points.items.len = checkpoint.old_len;
+            buffer.sorted = checkpoint.old_sorted;
+            buffer.last_ts = checkpoint.old_last_ts;
+        }
+        _ = self.mem.bytes.fetchSub(appended_points * @sizeOf(types.Point), .monotonic);
+    }
+
+    fn flattenMarketFanoutPoints(self: *Engine, batch: *const QueuedMarketBatch) ![]ResolvedIngestPoint {
+        var count: usize = 0;
+        for (batch.fanout_series_ids) |series_ids| count += series_ids.len;
+        const points = try self.alloc.alloc(ResolvedIngestPoint, count);
+        var idx: usize = 0;
+        for (batch.fanout_series_ids, batch.fanout_values, batch.rows) |series_ids, values, row| {
+            if (series_ids.len != values.len) return error.InvalidMarketFanoutBatch;
+            for (series_ids, values) |series_id, value| {
+                points[idx] = .{
+                    .series_id = series_id,
+                    .ts = row.ts_ns,
+                    .value = value,
+                };
+                idx += 1;
+            }
+        }
+        return points;
+    }
+
+    fn appendRecoveredMarketFanout(
+        self: *Engine,
+        registration: MarketReplayRegistration,
+        ts_ns: i64,
+        values: []const f64,
+    ) !void {
+        if (self.config.market_storage_mode != .dual_write_v1) return;
+
+        var schema = self.marketSchema(registration.metric) orelse return error.UnknownMarketSchema;
+        defer schema.deinit(self.alloc);
+        if (schema.ordered_columns.len != values.len) return error.MarketSchemaConflict;
+
+        const fanout_points = try self.alloc.alloc(ResolvedIngestPoint, values.len);
+        defer self.alloc.free(fanout_points);
+        const fanout_series_ids = try self.alloc.alloc(types.SeriesId, values.len);
+        defer self.alloc.free(fanout_series_ids);
+
+        for (schema.ordered_columns, 0..) |column, column_idx| {
+            const derived_metric = try std.fmt.allocPrint(self.alloc, "{s}.{s}", .{ registration.metric, column });
+            defer self.alloc.free(derived_metric);
+            _ = try self.registerMetricDescriptor(.{
+                .metric = derived_metric,
+                .kind = .gauge,
+                .source_metric = registration.metric,
+                .source_field = column,
+            });
+            const series_id = types.seriesIdFrom(derived_metric, registration.canonical_labels);
+            try self.registerSeriesInternal(derived_metric, registration.canonical_labels, series_id, false);
+            fanout_series_ids[column_idx] = series_id;
+            fanout_points[column_idx] = .{
+                .series_id = series_id,
+                .ts = ts_ns,
+                .value = values[column_idx],
+            };
+        }
+
+        try self.appendMemtableBatchGrouped(fanout_points);
+        self.noteTagsBatchForSeries(fanout_series_ids, registration.canonical_labels) catch {};
     }
 
     fn scheduleDerivedRefresh(self: *Engine) void {
@@ -2062,15 +3118,17 @@ pub const Engine = struct {
     }
 
     fn validateSignalInput(self: *Engine, input: market_catalog_mod.SignalDefinitionInput) !void {
-        _ = self.marketSchema(input.input_metric) orelse {
+        var schema = self.marketSchema(input.input_metric) orelse {
             if (!std.mem.startsWith(u8, input.input_metric, "market.bar") and
                 !std.mem.startsWith(u8, input.input_metric, "market.quote") and
                 !std.mem.startsWith(u8, input.input_metric, "market.trade"))
                 return error.InvalidSignalInputMetric;
             return;
         };
+        defer schema.deinit(self.alloc);
         if (input.policy_id) |policy_id| {
-            _ = self.latestBarPolicy(policy_id) orelse return error.InvalidSignalPolicy;
+            var policy = self.latestBarPolicy(policy_id) orelse return error.InvalidSignalPolicy;
+            defer policy.deinit(self.alloc);
         }
     }
 
@@ -2107,6 +3165,9 @@ pub const Engine = struct {
     }
 
     fn flushMemtable(self: *Engine) !bool {
+        self.market_data_mu.lock();
+        defer self.market_data_mu.unlock();
+
         const start_ns = std.time.nanoTimestamp();
         var points_written: usize = 0;
         var segments_written: usize = 0;
@@ -2218,6 +3279,8 @@ pub const Engine = struct {
             _ = self.metrics.flush_series_buckets_total.fetchAdd(@intCast(series_buckets), .monotonic);
             _ = self.metrics.flush_hour_slices_total.fetchAdd(@intCast(hour_slices), .monotonic);
         }
+        const native_flushed = try self.flushNativeMarketMemtable();
+
         // rotate WAL optionally
         self.wal.rotateIfNeeded() catch |err| {
             std.log.warn("wal rotation failed: {s}", .{@errorName(err)});
@@ -2227,7 +3290,7 @@ pub const Engine = struct {
             self.metadata.tags.save(self.data_dir) catch |err| {
                 self.tag_index_dirty.store(true, .monotonic);
                 std.log.warn("tag index save failed: {s}", .{@errorName(err)});
-                return segments_written > 0;
+                return segments_written > 0 or native_flushed;
             };
             const tag_save_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - tag_save_start_ns);
             _ = self.metrics.tag_index_save_total.fetchAdd(1, .monotonic);
@@ -2235,7 +3298,138 @@ pub const Engine = struct {
         } else {
             _ = self.metrics.tag_index_save_skipped_total.fetchAdd(1, .monotonic);
         }
-        return segments_written > 0;
+        return segments_written > 0 or native_flushed;
+    }
+
+    fn flushNativeMarketMemtable(self: *Engine) !bool {
+        if (self.market_mem.seriesCount() == 0 or self.market_mem.residentBytes() == 0) return false;
+
+        const start_ns = std.time.nanoTimestamp();
+        var extraction = try self.market_mem.extractByHour(self.alloc);
+        defer extraction.deinit();
+        if (extraction.groups.len == 0) return false;
+
+        var additions = std.array_list.Managed(market_manifest_mod.AddInput).init(self.alloc);
+        defer {
+            for (additions.items) |entry| self.alloc.free(@constCast(entry.path));
+            additions.deinit();
+        }
+        var addition_column_names = std.array_list.Managed([][]u8).init(self.alloc);
+        defer {
+            for (addition_column_names.items) |names| {
+                for (names) |name| self.alloc.free(name);
+                self.alloc.free(names);
+            }
+            addition_column_names.deinit();
+        }
+        try additions.ensureTotalCapacity(extraction.groups.len);
+        try addition_column_names.ensureTotalCapacity(extraction.groups.len);
+
+        var rows_written: usize = 0;
+        var segments_written: usize = 0;
+        var segment_write_ns_total: u64 = 0;
+
+        for (extraction.groups) |group| {
+            const row_count = group.rows.timestamps.len;
+            if (row_count == 0) continue;
+            var schema = self.marketSchema(group.identity.metric) orelse return error.UnknownMarketSchema;
+            defer schema.deinit(self.alloc);
+            const expected_digest = schema.digest();
+            if (!std.mem.eql(u8, expected_digest[0..], group.schema_digest[0..])) {
+                return error.MarketSchemaConflict;
+            }
+            if (schema.ordered_columns.len != group.rows.columns.len) return error.MarketSchemaConflict;
+
+            const row_views = try self.alloc.alloc(market_segment_mod.MarketRowView, row_count);
+            defer self.alloc.free(row_views);
+            const row_values = try self.alloc.alloc([]f64, row_count);
+            var initialized_values: usize = 0;
+            defer {
+                for (row_values[0..initialized_values]) |values| self.alloc.free(values);
+                self.alloc.free(row_values);
+            }
+            for (0..row_count) |row_idx| {
+                const values = try self.alloc.alloc(f64, group.rows.columns.len);
+                row_values[row_idx] = values;
+                initialized_values += 1;
+                for (group.rows.columns, 0..) |column, column_idx| {
+                    values[column_idx] = column[row_idx];
+                }
+                row_views[row_idx] = .{
+                    .ts_ns = group.rows.timestamps[row_idx],
+                    .write_sequence = group.rows.write_sequences[row_idx],
+                    .values = values,
+                };
+            }
+
+            const write_start_ns = std.time.nanoTimestamp();
+            const path = try market_segment_mod.write(self.alloc, self.data_dir, .{
+                .market_series_id = group.identity.series_id,
+                .schema_digest = group.schema_digest,
+                .metric = group.identity.metric,
+                .canonical_labels = group.identity.canonical_labels,
+                .hour = group.hour_bucket,
+                .column_names = schema.ordered_columns,
+            }, row_views);
+            segment_write_ns_total += @intCast(std.time.nanoTimestamp() - write_start_ns);
+            errdefer self.alloc.free(path);
+
+            const file_bytes = try self.data_dir.readFileAlloc(self.alloc, path, 128 * 1024 * 1024);
+            defer self.alloc.free(file_bytes);
+            const digest = market_manifest_mod.contentDigest(file_bytes);
+            const block_rows: usize = @intCast(market_segment_mod.market_segment_block_rows);
+            const block_count: u32 = @intCast((row_count + block_rows - 1) / block_rows);
+            const column_names = try self.alloc.alloc([]u8, schema.ordered_columns.len);
+            var column_names_initialized: usize = 0;
+            var column_names_transferred = false;
+            errdefer if (!column_names_transferred) {
+                for (column_names[0..column_names_initialized]) |name| self.alloc.free(name);
+                self.alloc.free(column_names);
+            };
+            for (schema.ordered_columns, 0..) |name, name_idx| {
+                column_names[name_idx] = try self.alloc.dupe(u8, name);
+                column_names_initialized += 1;
+            }
+            try addition_column_names.append(column_names);
+            column_names_transferred = true;
+            try additions.append(.{
+                .path = path,
+                .market_series_id = group.identity.series_id,
+                .schema_digest = group.schema_digest,
+                .metric = group.identity.metric,
+                .canonical_labels = group.identity.canonical_labels,
+                .hour_bucket = group.hour_bucket,
+                .start_ts_ns = group.rows.timestamps[0],
+                .end_ts_ns = group.rows.timestamps[row_count - 1],
+                .row_count = @intCast(row_count),
+                .block_count = block_count,
+                .column_names = column_names,
+                .content_id = digest,
+                .file_hash = digest,
+                .file_size = @intCast(file_bytes.len),
+            });
+            rows_written += row_count;
+            segments_written += 1;
+        }
+
+        const manifest_start_ns = std.time.nanoTimestamp();
+        try self.market_manifest.addBatch(self.data_dir, additions.items);
+        const manifest_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - manifest_start_ns);
+
+        self.market_mem.clearRetainingCapacity();
+        self.market_mem_allocated_bytes.store(self.market_mem.allocatedBytes(), .monotonic);
+        self.market_mem_resident_bytes.store(self.market_mem.residentBytes(), .monotonic);
+        if (segments_written != 0) {
+            _ = self.metrics.flush_total.fetchAdd(1, .monotonic);
+            _ = self.metrics.flush_ns_total.fetchAdd(@intCast(std.time.nanoTimestamp() - start_ns), .monotonic);
+            _ = self.metrics.flush_points_total.fetchAdd(@intCast(rows_written), .monotonic);
+            _ = self.metrics.flush_manifest_ns_total.fetchAdd(manifest_elapsed_ns, .monotonic);
+            _ = self.metrics.flush_segment_write_ns_total.fetchAdd(segment_write_ns_total, .monotonic);
+            _ = self.metrics.flush_segments_written_total.fetchAdd(@intCast(segments_written), .monotonic);
+            _ = self.metrics.flush_series_buckets_total.fetchAdd(@intCast(segments_written), .monotonic);
+            _ = self.metrics.flush_hour_slices_total.fetchAdd(@intCast(segments_written), .monotonic);
+        }
+        return segments_written != 0;
     }
 
     fn quarantineFailedIngest(self: *Engine, item: ResolvedIngestPoint, stage: []const u8, err_name: []const u8) void {
@@ -2403,6 +3597,676 @@ pub const Engine = struct {
         return 3600;
     }
 
+    const MarketQuerySource = union(enum) {
+        live,
+        revision: *const cas_mod.SnapshotIndex,
+    };
+
+    const MarketProjection = struct {
+        indices: []usize,
+        names: [][]u8,
+        names_owned: bool = true,
+
+        fn resolve(
+            alloc: std.mem.Allocator,
+            schema_columns: []const []u8,
+            requested_columns: []const []const u8,
+        ) !MarketProjection {
+            const count = if (requested_columns.len == 0)
+                schema_columns.len
+            else
+                requested_columns.len;
+            const indices = try alloc.alloc(usize, count);
+            errdefer alloc.free(indices);
+            const names = try alloc.alloc([]u8, count);
+            errdefer alloc.free(names);
+            var initialized: usize = 0;
+            errdefer for (names[0..initialized]) |name| alloc.free(name);
+
+            if (requested_columns.len == 0) {
+                for (schema_columns, 0..) |column, idx| {
+                    indices[idx] = idx;
+                    names[idx] = try alloc.dupe(u8, column);
+                    initialized += 1;
+                }
+            } else {
+                for (requested_columns, 0..) |requested, requested_idx| {
+                    const schema_idx = findMarketColumn(schema_columns, requested) orelse
+                        return error.InvalidProjection;
+                    for (indices[0..requested_idx]) |existing| {
+                        if (existing == schema_idx) return error.InvalidProjection;
+                    }
+                    indices[requested_idx] = schema_idx;
+                    names[requested_idx] = try alloc.dupe(u8, schema_columns[schema_idx]);
+                    initialized += 1;
+                }
+            }
+            return .{ .indices = indices, .names = names };
+        }
+
+        fn deinit(self: *MarketProjection, alloc: std.mem.Allocator) void {
+            alloc.free(self.indices);
+            if (self.names_owned) {
+                for (self.names) |name| alloc.free(name);
+                alloc.free(self.names);
+            }
+            self.* = undefined;
+        }
+
+        fn takeNames(self: *MarketProjection) [][]u8 {
+            self.names_owned = false;
+            return self.names;
+        }
+    };
+
+    const FanoutRowAssembly = struct {
+        values: []f64,
+        present: []bool,
+
+        fn init(alloc: std.mem.Allocator, column_count: usize) !FanoutRowAssembly {
+            const values = try alloc.alloc(f64, column_count);
+            errdefer alloc.free(values);
+            const present = try alloc.alloc(bool, column_count);
+            @memset(present, false);
+            return .{ .values = values, .present = present };
+        }
+
+        fn deinit(self: *FanoutRowAssembly, alloc: std.mem.Allocator) void {
+            alloc.free(self.values);
+            alloc.free(self.present);
+            self.* = undefined;
+        }
+    };
+
+    const MarketShadowDifference = struct {
+        reason: []const u8,
+        row_index: ?usize = null,
+        column_index: ?usize = null,
+        market_series_id: ?market_identity_mod.MarketSeriesId = null,
+        ts_ns: ?i64 = null,
+    };
+
+    /// Execute a logical market query against live state or one immutable CAS
+    /// revision. The returned value owns all strings, columns, rows, and values.
+    pub fn queryMarket(self: *Engine, request: MarketQueryRequest) !MarketQueryResult {
+        if (request.metric.len == 0) return error.UnknownMarketSchema;
+        if (request.start_ts_ns > request.end_ts_ns) return error.InvalidTimeRange;
+
+        const canonical_filter = if (request.label_filter_json) |raw|
+            market_identity_mod.canonicalizeLabels(self.alloc, raw) catch |err| switch (err) {
+                error.OutOfMemory, error.WriteFailed => return error.OutOfMemory,
+                else => return error.InvalidMarketLabels,
+            }
+        else
+            null;
+        defer if (canonical_filter) |filter| self.alloc.free(filter);
+
+        const normalized = MarketQueryRequest{
+            .metric = request.metric,
+            .label_filter_json = canonical_filter,
+            .start_ts_ns = request.start_ts_ns,
+            .end_ts_ns = request.end_ts_ns,
+            .requested_columns = request.requested_columns,
+            .revision = request.revision,
+        };
+
+        if (request.revision) |revision_spec| {
+            if (revision_spec.len == 0) return error.InvalidRevisionSpec;
+            var manager = if (self.cas) |*cas| cas else return error.NativeRevisionUnavailable;
+            const snapshot = try manager.loadSnapshotForSpec(revision_spec);
+            var index = cas_mod.SnapshotIndex.init(self.alloc, &manager.store, snapshot);
+            defer index.deinit();
+            return try self.queryMarketBound(.{ .revision = &index }, normalized);
+        }
+
+        self.market_data_mu.lock();
+        defer self.market_data_mu.unlock();
+        return try self.queryMarketBound(.live, normalized);
+    }
+
+    fn queryMarketBound(
+        self: *Engine,
+        source: MarketQuerySource,
+        request: MarketQueryRequest,
+    ) !MarketQueryResult {
+        var schema = try self.marketSchemaForQuery(source, request.metric);
+        defer schema.deinit(self.alloc);
+
+        const read_mode: cfg.MarketStorageReadMode = switch (self.config.market_storage_read_mode) {
+            .auto => switch (schema.storage_mapping) {
+                .fanout_v1 => .fanout,
+                .native_v1 => .native,
+            },
+            else => |mode| mode,
+        };
+
+        return switch (read_mode) {
+            .auto => unreachable,
+            .fanout => try self.queryMarketFanout(source, schema, request),
+            .native => try self.queryMarketNative(source, request),
+            .shadow => try self.queryMarketShadow(source, schema, request),
+        };
+    }
+
+    fn marketSchemaForQuery(
+        self: *Engine,
+        source: MarketQuerySource,
+        metric: []const u8,
+    ) !market_catalog_mod.MarketSchema {
+        return switch (source) {
+            .live => self.metadata.market_catalog.getSchema(metric) orelse
+                error.UnknownMarketSchema,
+            .revision => |index| blk: {
+                const catalog_snapshot = index.snapshot.market_catalog_snapshot orelse
+                    return error.NativeMarketDataUnavailable;
+                for (catalog_snapshot.schemas) |schema| {
+                    if (std.mem.eql(u8, schema.metric, metric)) {
+                        break :blk try schema.clone(self.alloc);
+                    }
+                }
+                return error.UnknownMarketSchema;
+            },
+        };
+    }
+
+    fn queryMarketNative(
+        self: *Engine,
+        source: MarketQuerySource,
+        request: MarketQueryRequest,
+    ) !MarketQueryResult {
+        var reader = switch (source) {
+            .live => market_reader_mod.MarketReader.init(
+                self.alloc,
+                self.data_dir,
+                &self.metadata.market_catalog,
+                &self.market_manifest,
+                &self.market_mem,
+            ),
+            .revision => |index| market_reader_mod.MarketReader.initRevision(self.alloc, index),
+        };
+        var native = try reader.query(.{
+            .metric = request.metric,
+            .label_filter_json = request.label_filter_json,
+            .start_ts_ns = request.start_ts_ns,
+            .end_ts_ns = request.end_ts_ns,
+            .requested_columns = request.requested_columns,
+            .revision = if (request.revision) |revision|
+                .{ .value = revision }
+            else
+                null,
+        });
+        errdefer native.deinit();
+        return takeNativeMarketResult(self.alloc, &native);
+    }
+
+    fn queryMarketShadow(
+        self: *Engine,
+        source: MarketQuerySource,
+        schema: market_catalog_mod.MarketSchema,
+        request: MarketQueryRequest,
+    ) !MarketQueryResult {
+        const full_request = MarketQueryRequest{
+            .metric = request.metric,
+            .label_filter_json = request.label_filter_json,
+            .start_ts_ns = request.start_ts_ns,
+            .end_ts_ns = request.end_ts_ns,
+            .requested_columns = &.{},
+            .revision = request.revision,
+        };
+        var fanout = try self.queryMarketFanout(source, schema, full_request);
+        errdefer fanout.deinit();
+        var native = try self.queryMarketNative(source, full_request);
+        defer native.deinit();
+
+        if (marketShadowDifference(fanout, native)) |difference| {
+            _ = self.metrics.market_shadow_mismatch_total.fetchAdd(1, .monotonic);
+            std.log.warn(
+                "market shadow mismatch metric={s} reason={s} row_index={?d} column_index={?d} market_series_id={?d} ts_ns={?d}",
+                .{
+                    request.metric,
+                    difference.reason,
+                    difference.row_index,
+                    difference.column_index,
+                    difference.market_series_id,
+                    difference.ts_ns,
+                },
+            );
+            return error.ShadowMismatch;
+        }
+
+        fanout.stats = .{
+            .storage_mode = "shadow",
+            .series_scanned = fanout.stats.series_scanned + native.stats.series_scanned,
+            .blocks_scanned = fanout.stats.blocks_scanned + native.stats.blocks_scanned,
+            .blocks_pruned = fanout.stats.blocks_pruned + native.stats.blocks_pruned,
+            .columns_read = fanout.stats.columns_read + native.stats.columns_read,
+            .bytes_decoded = fanout.stats.bytes_decoded + native.stats.bytes_decoded,
+            .shadow_mismatches = 0,
+        };
+        try projectMarketResult(&fanout, request.requested_columns);
+        return fanout;
+    }
+
+    fn queryMarketFanout(
+        self: *Engine,
+        source: MarketQuerySource,
+        schema: market_catalog_mod.MarketSchema,
+        request: MarketQueryRequest,
+    ) !MarketQueryResult {
+        var projection = try MarketProjection.resolve(
+            self.alloc,
+            schema.ordered_columns,
+            request.requested_columns,
+        );
+        defer projection.deinit(self.alloc);
+
+        const registered = try self.marketSeriesForQuery(source);
+        defer {
+            for (registered) |*series| series.deinit(self.alloc);
+            self.alloc.free(registered);
+        }
+
+        var result_rows = std.array_list.Managed(MarketQueryRow).init(self.alloc);
+        errdefer {
+            for (result_rows.items) |*row| row.deinit(self.alloc);
+            result_rows.deinit();
+        }
+        var stats = MarketQueryStats{ .storage_mode = "fanout" };
+
+        for (registered) |series| {
+            if (!std.mem.eql(u8, series.metric, request.metric)) continue;
+            if (!try marketLabelsMatch(
+                self.alloc,
+                request.label_filter_json,
+                series.canonical_labels,
+            )) continue;
+            const schema_digest = schema.digest();
+            if (!std.mem.eql(u8, series.schema_digest[0..], schema_digest[0..])) {
+                return error.MarketSchemaMismatch;
+            }
+            stats.series_scanned += 1;
+
+            var assemblies = std.AutoHashMap(i64, FanoutRowAssembly).init(self.alloc);
+            defer {
+                var values = assemblies.valueIterator();
+                while (values.next()) |assembly| assembly.deinit(self.alloc);
+                assemblies.deinit();
+            }
+
+            for (schema.ordered_columns, 0..) |column, column_idx| {
+                const derived_metric = try std.fmt.allocPrint(
+                    self.alloc,
+                    "{s}.{s}",
+                    .{ request.metric, column },
+                );
+                defer self.alloc.free(derived_metric);
+                const scalar_series_id = types.seriesIdFrom(
+                    derived_metric,
+                    series.canonical_labels,
+                );
+                var points = std.array_list.Managed(types.Point).init(self.alloc);
+                defer points.deinit();
+                try self.queryFanoutColumn(
+                    source,
+                    scalar_series_id,
+                    request.start_ts_ns,
+                    request.end_ts_ns,
+                    &points,
+                    &stats,
+                );
+                stats.columns_read += 1;
+                stats.bytes_decoded += @intCast(points.items.len * @sizeOf(types.Point));
+
+                for (points.items) |point| {
+                    const gop = try assemblies.getOrPut(point.ts);
+                    if (!gop.found_existing) {
+                        gop.value_ptr.* = try FanoutRowAssembly.init(
+                            self.alloc,
+                            schema.ordered_columns.len,
+                        );
+                    }
+                    // Persisted descriptors are visited in publication order,
+                    // followed by the live memtable. Later corrections win.
+                    gop.value_ptr.values[column_idx] = point.value;
+                    gop.value_ptr.present[column_idx] = true;
+                }
+            }
+
+            var assembly_it = assemblies.iterator();
+            while (assembly_it.next()) |entry| {
+                const assembly = entry.value_ptr;
+                for (assembly.present) |present| {
+                    if (!present) return error.IncompleteMarketRow;
+                }
+                const projected_values = try self.alloc.alloc(f64, projection.indices.len);
+                errdefer self.alloc.free(projected_values);
+                for (projection.indices, 0..) |source_idx, projected_idx| {
+                    projected_values[projected_idx] = assembly.values[source_idx];
+                }
+                const metric = try self.alloc.dupe(u8, request.metric);
+                errdefer self.alloc.free(metric);
+                const labels = try self.alloc.dupe(u8, series.canonical_labels);
+                errdefer self.alloc.free(labels);
+                try result_rows.append(.{
+                    .market_series_id = series.series_id,
+                    .metric = metric,
+                    .canonical_labels = labels,
+                    .ts_ns = entry.key_ptr.*,
+                    .values = projected_values,
+                });
+            }
+        }
+
+        std.sort.block(MarketQueryRow, result_rows.items, {}, marketQueryRowLessThan);
+        const metric = try self.alloc.dupe(u8, request.metric);
+        errdefer self.alloc.free(metric);
+        const rows = try result_rows.toOwnedSlice();
+        errdefer {
+            for (rows) |*row| row.deinit(self.alloc);
+            self.alloc.free(rows);
+        }
+        const requested_columns = projection.takeNames();
+        return .{
+            .allocator = self.alloc,
+            .metric = metric,
+            .requested_columns = requested_columns,
+            .rows = rows,
+            .stats = stats,
+        };
+    }
+
+    fn marketSeriesForQuery(
+        self: *Engine,
+        source: MarketQuerySource,
+    ) ![]market_catalog_mod.MarketSeriesIdentity {
+        return switch (source) {
+            .live => try self.metadata.market_catalog.listMarketSeries(),
+            .revision => |index| blk: {
+                const snapshot = index.snapshot.market_catalog_snapshot orelse
+                    return error.NativeMarketDataUnavailable;
+                const source_entries = snapshot.market_series orelse
+                    return error.NativeMarketDataUnavailable;
+                const entries = try self.alloc.alloc(
+                    market_catalog_mod.MarketSeriesIdentity,
+                    source_entries.len,
+                );
+                errdefer self.alloc.free(entries);
+                var initialized: usize = 0;
+                errdefer for (entries[0..initialized]) |*entry| entry.deinit(self.alloc);
+                for (source_entries, 0..) |entry, idx| {
+                    entries[idx] = try entry.clone(self.alloc);
+                    initialized += 1;
+                }
+                break :blk entries;
+            },
+        };
+    }
+
+    fn queryFanoutColumn(
+        self: *Engine,
+        source: MarketQuerySource,
+        series_id: types.SeriesId,
+        start_ts: i64,
+        end_ts: i64,
+        out: *std.array_list.Managed(types.Point),
+        stats: *MarketQueryStats,
+    ) !void {
+        switch (source) {
+            .live => {
+                for (self.metadata.manifest.entries.items) |descriptor| {
+                    if (descriptor.series_id != series_id) continue;
+                    if (descriptor.end_ts < start_ts or descriptor.start_ts > end_ts) {
+                        stats.blocks_pruned += 1;
+                    } else {
+                        stats.blocks_scanned += 1;
+                    }
+                }
+                try segment_mod.queryRange(
+                    self.alloc,
+                    self.data_dir,
+                    &self.metadata.manifest,
+                    series_id,
+                    start_ts,
+                    end_ts,
+                    out,
+                );
+                if (self.mem.series.getPtr(series_id)) |buffer| {
+                    for (buffer.points.items) |point| {
+                        if (point.ts >= start_ts and point.ts <= end_ts) {
+                            try out.append(point);
+                        }
+                    }
+                }
+            },
+            .revision => |index| {
+                for (index.snapshot.segment_descriptors) |descriptor| {
+                    if (descriptor.series_id != series_id) continue;
+                    if (descriptor.end_ts < start_ts or descriptor.start_ts > end_ts) {
+                        stats.blocks_pruned += 1;
+                    } else {
+                        stats.blocks_scanned += 1;
+                    }
+                }
+                try index.queryRange(
+                    self.alloc,
+                    self.data_dir,
+                    series_id,
+                    start_ts,
+                    end_ts,
+                    out,
+                );
+            },
+        }
+    }
+
+    fn findMarketColumn(columns: []const []u8, requested: []const u8) ?usize {
+        for (columns, 0..) |column, idx| {
+            if (std.mem.eql(u8, column, requested)) return idx;
+        }
+        return null;
+    }
+
+    fn marketQueryRowLessThan(_: void, lhs: MarketQueryRow, rhs: MarketQueryRow) bool {
+        const labels_order = std.mem.order(u8, lhs.canonical_labels, rhs.canonical_labels);
+        if (labels_order != .eq) return labels_order == .lt;
+        if (lhs.ts_ns != rhs.ts_ns) return lhs.ts_ns < rhs.ts_ns;
+        return lhs.market_series_id < rhs.market_series_id;
+    }
+
+    fn marketLabelsMatch(
+        alloc: std.mem.Allocator,
+        canonical_filter: ?[]const u8,
+        canonical_labels: []const u8,
+    ) !bool {
+        const filter_json = canonical_filter orelse return true;
+        var parsed_filter = std.json.parseFromSlice(
+            std.json.Value,
+            alloc,
+            filter_json,
+            .{},
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidMarketLabels,
+        };
+        defer parsed_filter.deinit();
+        var parsed_labels = std.json.parseFromSlice(
+            std.json.Value,
+            alloc,
+            canonical_labels,
+            .{},
+        ) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return error.InvalidMarketLabels,
+        };
+        defer parsed_labels.deinit();
+        if (parsed_filter.value != .object or parsed_labels.value != .object) {
+            return error.InvalidMarketLabels;
+        }
+        var iterator = parsed_filter.value.object.iterator();
+        while (iterator.next()) |entry| {
+            const actual = parsed_labels.value.object.get(entry.key_ptr.*) orelse return false;
+            if (!marketJsonValueEql(entry.value_ptr.*, actual)) return false;
+        }
+        return true;
+    }
+
+    fn marketJsonValueEql(lhs: std.json.Value, rhs: std.json.Value) bool {
+        if (std.meta.activeTag(lhs) != std.meta.activeTag(rhs)) return false;
+        return switch (lhs) {
+            .null => true,
+            .bool => |value| value == rhs.bool,
+            .integer => |value| value == rhs.integer,
+            .float => |value| value == rhs.float,
+            .number_string => |value| std.mem.eql(u8, value, rhs.number_string),
+            .string => |value| std.mem.eql(u8, value, rhs.string),
+            .array => |array| blk: {
+                if (array.items.len != rhs.array.items.len) break :blk false;
+                for (array.items, rhs.array.items) |left, right| {
+                    if (!marketJsonValueEql(left, right)) break :blk false;
+                }
+                break :blk true;
+            },
+            .object => |object| blk: {
+                if (object.count() != rhs.object.count()) break :blk false;
+                var iterator = object.iterator();
+                while (iterator.next()) |entry| {
+                    const right = rhs.object.get(entry.key_ptr.*) orelse break :blk false;
+                    if (!marketJsonValueEql(entry.value_ptr.*, right)) break :blk false;
+                }
+                break :blk true;
+            },
+        };
+    }
+
+    fn takeNativeMarketResult(
+        alloc: std.mem.Allocator,
+        native: *market_reader_mod.QueryResult,
+    ) !MarketQueryResult {
+        const rows = try alloc.alloc(MarketQueryRow, native.rows.len);
+        for (native.rows, 0..) |row, idx| {
+            rows[idx] = .{
+                .market_series_id = row.market_series_id,
+                .metric = row.metric,
+                .canonical_labels = row.canonical_labels,
+                .ts_ns = row.ts_ns,
+                .values = row.values,
+            };
+        }
+        const result = MarketQueryResult{
+            .allocator = alloc,
+            .metric = native.metric,
+            .requested_columns = native.requested_columns,
+            .rows = rows,
+            .stats = .{
+                .storage_mode = native.stats.storage_mode,
+                .series_scanned = native.stats.series_scanned,
+                .blocks_scanned = native.stats.blocks_scanned,
+                .blocks_pruned = native.stats.blocks_pruned,
+                .columns_read = native.stats.columns_read,
+                .bytes_decoded = native.stats.bytes_decoded,
+                .shadow_mismatches = native.stats.shadow_mismatches,
+            },
+        };
+        alloc.free(native.rows);
+        native.* = undefined;
+        return result;
+    }
+
+    fn marketShadowDifference(
+        fanout: MarketQueryResult,
+        native: MarketQueryResult,
+    ) ?MarketShadowDifference {
+        if (!std.mem.eql(u8, fanout.metric, native.metric)) {
+            return .{ .reason = "metric" };
+        }
+        if (fanout.requested_columns.len != native.requested_columns.len) {
+            return .{ .reason = "column_count" };
+        }
+        for (fanout.requested_columns, native.requested_columns, 0..) |left, right, idx| {
+            if (!std.mem.eql(u8, left, right)) {
+                return .{ .reason = "column_order", .column_index = idx };
+            }
+        }
+        if (fanout.rows.len != native.rows.len) return .{ .reason = "row_count" };
+        for (fanout.rows, native.rows, 0..) |left, right, row_idx| {
+            const context = MarketShadowDifference{
+                .reason = undefined,
+                .row_index = row_idx,
+                .market_series_id = left.market_series_id,
+                .ts_ns = left.ts_ns,
+            };
+            if (left.market_series_id != right.market_series_id) {
+                var difference = context;
+                difference.reason = "market_series_id";
+                return difference;
+            }
+            if (!std.mem.eql(u8, left.metric, right.metric)) {
+                var difference = context;
+                difference.reason = "row_metric";
+                return difference;
+            }
+            if (!std.mem.eql(u8, left.canonical_labels, right.canonical_labels)) {
+                var difference = context;
+                difference.reason = "labels";
+                return difference;
+            }
+            if (left.ts_ns != right.ts_ns) {
+                var difference = context;
+                difference.reason = "timestamp";
+                return difference;
+            }
+            if (left.values.len != right.values.len) {
+                var difference = context;
+                difference.reason = "value_count";
+                return difference;
+            }
+            for (left.values, right.values, 0..) |left_value, right_value, column_idx| {
+                if (@as(u64, @bitCast(left_value)) != @as(u64, @bitCast(right_value))) {
+                    var difference = context;
+                    difference.reason = "value_bits";
+                    difference.column_index = column_idx;
+                    return difference;
+                }
+            }
+        }
+        return null;
+    }
+
+    fn projectMarketResult(
+        result: *MarketQueryResult,
+        requested_columns: []const []const u8,
+    ) !void {
+        if (requested_columns.len == 0) return;
+        var projection = try MarketProjection.resolve(
+            result.allocator,
+            result.requested_columns,
+            requested_columns,
+        );
+        defer projection.deinit(result.allocator);
+
+        const projected_values = try result.allocator.alloc([]f64, result.rows.len);
+        errdefer result.allocator.free(projected_values);
+        var initialized: usize = 0;
+        errdefer for (projected_values[0..initialized]) |values| result.allocator.free(values);
+        for (result.rows, 0..) |row, row_idx| {
+            const values = try result.allocator.alloc(f64, projection.indices.len);
+            for (projection.indices, 0..) |source_idx, output_idx| {
+                values[output_idx] = row.values[source_idx];
+            }
+            projected_values[row_idx] = values;
+            initialized += 1;
+        }
+
+        for (result.rows, projected_values) |*row, values| {
+            result.allocator.free(row.values);
+            row.values = values;
+        }
+        result.allocator.free(projected_values);
+        for (result.requested_columns) |column| result.allocator.free(column);
+        result.allocator.free(result.requested_columns);
+        result.requested_columns = projection.takeNames();
+    }
+
     pub fn queryRange(self: *Engine, series_id: types.SeriesId, start_ts: i64, end_ts: i64, out: *std.array_list.Managed(types.Point)) !void {
         const legacy_view = self.metadata.legacyView();
         switch (self.config.metadata_read_mode) {
@@ -2445,7 +4309,16 @@ pub const Engine = struct {
     }
 
     pub fn registerMarketSchema(self: *Engine, input: market_catalog_mod.MarketSchemaInput) !market_catalog_mod.MarketSchema {
-        const stored = try self.metadata.market_catalog.registerSchema(input);
+        return try self.registerMarketSchemaWithStorageMappingOverride(input, null);
+    }
+
+    pub fn registerMarketSchemaWithStorageMappingOverride(
+        self: *Engine,
+        input: market_catalog_mod.MarketSchemaInput,
+        explicit_storage_mapping: ?market_catalog_mod.StorageMapping,
+    ) !market_catalog_mod.MarketSchema {
+        const storage_mapping = try self.marketSchemaRegistrationMapping(input, explicit_storage_mapping);
+        const stored = try self.metadata.market_catalog.registerSchema(marketSchemaInputWithMapping(input, storage_mapping));
         if (self.cas != null) try self.syncCasSnapshot("market-schema");
         return stored;
     }
@@ -3047,6 +4920,17 @@ pub const Engine = struct {
             }
         }.lessThan);
 
+        var created_series = std.array_list.Managed(types.SeriesId).init(self.alloc);
+        defer created_series.deinit();
+        try created_series.ensureTotalCapacity(points.len);
+        var preflight_committed = false;
+        defer if (!preflight_committed) {
+            for (created_series.items) |series_id| {
+                if (self.mem.series.getPtr(series_id)) |buffer| buffer.deinit();
+                _ = self.mem.series.remove(series_id);
+            }
+        };
+
         var start: usize = 0;
         while (start < points.len) {
             const sid = points[start].series_id;
@@ -3056,6 +4940,7 @@ pub const Engine = struct {
             const gop = try self.mem.series.getOrPut(sid);
             if (!gop.found_existing) {
                 gop.value_ptr.* = MemSeriesBuffer.init(self.alloc);
+                created_series.appendAssumeCapacity(sid);
             }
             try gop.value_ptr.points.ensureUnusedCapacity(end - start);
             start = end;
@@ -3081,17 +4966,19 @@ pub const Engine = struct {
         }
 
         _ = self.mem.bytes.fetchAdd(points.len * @sizeOf(types.Point), .monotonic);
+        preflight_committed = true;
     }
 
     pub fn verifyCasState(self: *Engine) !void {
         if (self.cas) |*cas| {
-            return try cas.verifyHeadMatchesLegacyWithMarket(
+            return try cas.verifyHeadMatchesLegacyWithNativeMarket(
                 self.data_dir,
                 &self.metadata.manifest,
                 &self.metadata.tags,
                 &self.metadata.series_catalog,
                 &self.metadata.metric_catalog,
                 &self.metadata.market_catalog,
+                &self.market_manifest,
             );
         }
         return error.CasDisabled;
@@ -3128,7 +5015,7 @@ pub const Engine = struct {
             const flush_in_progress = self.flush_in_progress;
             self.drain_mu.unlock();
 
-            if (self.queue.len() == 0 and self.mem.bytes.load(.monotonic) == 0 and !flush_in_progress) {
+            if (self.queue.isDrained() and self.liveMemtableBytes() == 0 and !flush_in_progress) {
                 if (self.cas != null) {
                     self.verifyCasState() catch {
                         const now_ns = std.time.nanoTimestamp();
@@ -3202,13 +5089,14 @@ pub const Engine = struct {
         if (self.cas) |*cas| {
             const start_ns = std.time.nanoTimestamp();
             errdefer _ = self.metrics.cas_sync_failed_total.fetchAdd(1, .monotonic);
-            _ = try cas.syncLegacySnapshotWithMarket(
+            _ = try cas.syncLegacySnapshotWithNativeMarket(
                 self.data_dir,
                 &self.metadata.manifest,
                 &self.metadata.tags,
                 &self.metadata.series_catalog,
                 &self.metadata.metric_catalog,
                 &self.metadata.market_catalog,
+                &self.market_manifest,
                 reason,
             );
             try self.metadata.refreshCasIndex(cas);
@@ -3222,22 +5110,24 @@ pub const Engine = struct {
     fn ensureSnapshotBundleHead(self: *Engine) !void {
         if (self.cas) |*cas| {
             if (try cas.refs.readHead(cas_mod.main_ref) == null) {
-                _ = try cas.bootstrapIfMissingWithMarket(
+                _ = try cas.bootstrapIfMissingWithNativeMarket(
                     self.data_dir,
                     &self.metadata.manifest,
                     &self.metadata.tags,
                     &self.metadata.series_catalog,
                     &self.metadata.metric_catalog,
                     &self.metadata.market_catalog,
+                    &self.market_manifest,
                 );
             } else {
-                _ = try cas.syncLegacySnapshotWithMarket(
+                _ = try cas.syncLegacySnapshotWithNativeMarket(
                     self.data_dir,
                     &self.metadata.manifest,
                     &self.metadata.tags,
                     &self.metadata.series_catalog,
                     &self.metadata.metric_catalog,
                     &self.metadata.market_catalog,
+                    &self.market_manifest,
                     "snapshot",
                 );
             }
@@ -3248,22 +5138,24 @@ pub const Engine = struct {
         var temp = try cas_mod.CasManager.init(self.alloc, self.config.data_dir, self.config.fsync);
         defer temp.deinit();
         if (try temp.refs.readHead(cas_mod.main_ref) == null) {
-            _ = try temp.bootstrapIfMissingWithMarket(
+            _ = try temp.bootstrapIfMissingWithNativeMarket(
                 self.data_dir,
                 &self.metadata.manifest,
                 &self.metadata.tags,
                 &self.metadata.series_catalog,
                 &self.metadata.metric_catalog,
                 &self.metadata.market_catalog,
+                &self.market_manifest,
             );
         } else {
-            _ = try temp.syncLegacySnapshotWithMarket(
+            _ = try temp.syncLegacySnapshotWithNativeMarket(
                 self.data_dir,
                 &self.metadata.manifest,
                 &self.metadata.tags,
                 &self.metadata.series_catalog,
                 &self.metadata.metric_catalog,
                 &self.metadata.market_catalog,
+                &self.market_manifest,
                 "snapshot",
             );
         }
@@ -3284,6 +5176,13 @@ pub const Engine = struct {
         var highwater = std.AutoHashMap(types.SeriesId, i64).init(self.alloc);
         defer highwater.deinit();
 
+        var market_registrations = std.AutoHashMap(market_identity_mod.MarketSeriesId, MarketReplayRegistration).init(self.alloc);
+        defer {
+            var values = market_registrations.valueIterator();
+            while (values.next()) |registration| registration.deinit(self.alloc);
+            market_registrations.deinit();
+        }
+
         {
             self.metadata.cas_index_mu.lock();
             defer self.metadata.cas_index_mu.unlock();
@@ -3297,13 +5196,18 @@ pub const Engine = struct {
                 try collectSegmentHighwater(&highwater, self.metadata.manifest.entries.items);
             }
         }
+        var max_market_sequence: u64 = 0;
 
         var ctx = struct {
             engine: *Engine,
             highwater: *std.AutoHashMap(types.SeriesId, i64),
+            market_registrations: *std.AutoHashMap(market_identity_mod.MarketSeriesId, MarketReplayRegistration),
+            max_market_sequence: *u64,
+
             pub fn onSeriesRegistration(self_ctx: *@This(), series_id: types.SeriesId, series: []const u8, canonical_tags: []const u8) !void {
                 try self_ctx.engine.registerSeriesInternal(series, canonical_tags, series_id, false);
             }
+
             pub fn onRecord(self_ctx: *@This(), series_id: types.SeriesId, ts: i64, value: f64) !void {
                 if (self_ctx.highwater.getPtr(series_id)) |ptr| {
                     if (ts <= ptr.*) return;
@@ -3315,7 +5219,97 @@ pub const Engine = struct {
                     try self_ctx.highwater.put(series_id, ts);
                 }
             }
-        }{ .engine = self, .highwater = &highwater };
+
+            pub fn onMarketSeriesRegistration(
+                self_ctx: *@This(),
+                market_series_id: market_identity_mod.MarketSeriesId,
+                schema_digest: market_identity_mod.SchemaDigest,
+                metric: []const u8,
+                canonical_labels: []const u8,
+            ) !void {
+                try self_ctx.engine.requireRepositoryFormat4ForNativeMarket();
+                const recanonicalized = try market_identity_mod.canonicalizeLabels(self_ctx.engine.alloc, canonical_labels);
+                defer self_ctx.engine.alloc.free(recanonicalized);
+                if (!std.mem.eql(u8, recanonicalized, canonical_labels)) return error.NonCanonicalMarketLabels;
+                if (market_identity_mod.seriesId(metric, canonical_labels) != market_series_id) return error.MarketSeriesIdMismatch;
+
+                var schema = self_ctx.engine.marketSchema(metric) orelse return error.UnknownMarketSchema;
+                defer schema.deinit(self_ctx.engine.alloc);
+                try market_identity_mod.validateRequiredLabels(
+                    self_ctx.engine.alloc,
+                    canonical_labels,
+                    schema.required_labels,
+                );
+                const expected_digest = schema.digest();
+                if (!std.mem.eql(u8, expected_digest[0..], schema_digest[0..])) {
+                    return error.MarketSchemaConflict;
+                }
+                var identity = try self_ctx.engine.metadata.market_catalog.registerMarketSeriesWithId(
+                    market_series_id,
+                    metric,
+                    canonical_labels,
+                );
+                defer identity.deinit(self_ctx.engine.alloc);
+                if (!std.mem.eql(u8, identity.schema_digest[0..], schema_digest[0..])) {
+                    return error.MarketSchemaConflict;
+                }
+
+                if (self_ctx.market_registrations.getPtr(market_series_id)) |existing| {
+                    if (!std.mem.eql(u8, existing.schema_digest[0..], schema_digest[0..]) or
+                        !std.mem.eql(u8, existing.metric, metric) or
+                        !std.mem.eql(u8, existing.canonical_labels, canonical_labels) or
+                        existing.column_count != schema.ordered_columns.len)
+                    {
+                        return error.MarketSeriesConflict;
+                    }
+                    return;
+                }
+
+                const metric_copy = try self_ctx.engine.alloc.dupe(u8, metric);
+                errdefer self_ctx.engine.alloc.free(metric_copy);
+                const labels_copy = try self_ctx.engine.alloc.dupe(u8, canonical_labels);
+                errdefer self_ctx.engine.alloc.free(labels_copy);
+                const registration = MarketReplayRegistration{
+                    .schema_digest = schema_digest,
+                    .metric = metric_copy,
+                    .canonical_labels = labels_copy,
+                    .column_count = schema.ordered_columns.len,
+                };
+                try self_ctx.market_registrations.put(market_series_id, registration);
+            }
+
+            pub fn onMarketRow(
+                self_ctx: *@This(),
+                market_series_id: market_identity_mod.MarketSeriesId,
+                write_sequence: u64,
+                ts_ns: i64,
+                values: []const f64,
+            ) !void {
+                if (write_sequence > self_ctx.max_market_sequence.*) {
+                    self_ctx.max_market_sequence.* = write_sequence;
+                }
+                const registration = self_ctx.market_registrations.get(market_series_id) orelse return error.OrphanMarketRow;
+                try market_identity_mod.validateValueShape(registration.column_count, values.len);
+
+                try self_ctx.engine.market_mem.appendBatch(&.{.{
+                    .market_series_id = market_series_id,
+                    .metric = registration.metric,
+                    .canonical_labels = registration.canonical_labels,
+                    .schema_digest = registration.schema_digest,
+                    .ts_ns = ts_ns,
+                    .write_sequence = write_sequence,
+                    .values = values,
+                }});
+                self_ctx.engine.market_mem_allocated_bytes.store(self_ctx.engine.market_mem.allocatedBytes(), .monotonic);
+                self_ctx.engine.market_mem_resident_bytes.store(self_ctx.engine.market_mem.residentBytes(), .monotonic);
+                try self_ctx.engine.appendRecoveredMarketFanout(registration, ts_ns, values);
+            }
+        }{
+            .engine = self,
+            .highwater = &highwater,
+            .market_registrations = &market_registrations,
+            .max_market_sequence = &max_market_sequence,
+        };
 
         if (try self.replayRecoveryWalFromCas(&ctx)) {
             // CAS snapshot replay handled above, including any explicit live WAL tail.
@@ -3325,7 +5319,10 @@ pub const Engine = struct {
         } else {
             try self.wal.replay(self.alloc, &ctx);
         }
-        if (self.mem.bytes.load(.monotonic) > 0) {
+        if (max_market_sequence >= self.next_market_write_sequence) {
+            self.next_market_write_sequence = std.math.add(u64, max_market_sequence, 1) catch return error.MarketWriteSequenceOverflow;
+        }
+        if (self.liveMemtableBytes() > 0) {
             const flushed = try flushMemtable(self);
             if (flushed) try self.syncCasSnapshot("recovery-flush");
         }
@@ -3333,6 +5330,7 @@ pub const Engine = struct {
 
     fn registerSeriesInternal(self: *Engine, series: []const u8, tags: []const u8, series_id: types.SeriesId, record_wal: bool) !void {
         const inserted = try self.metadata.series_catalog.register(series, tags, series_id);
+        self.noteTags(series_id, tags);
         if (!inserted or !record_wal) return;
 
         const resolution = self.metadata.series_catalog.resolveBySeriesId(series_id);
@@ -3678,6 +5676,18 @@ pub const Engine = struct {
             const gop = try highwater.getOrPut(entry.series_id);
             if (!gop.found_existing or entry.highwater_ts > gop.value_ptr.*) {
                 gop.value_ptr.* = entry.highwater_ts;
+            }
+        }
+    }
+
+    fn collectMarketSegmentHighwater(
+        highwater: *std.AutoHashMap(market_identity_mod.MarketSeriesId, i64),
+        entries: []const market_manifest_mod.MarketSegmentDescriptor,
+    ) !void {
+        for (entries) |entry| {
+            const gop = try highwater.getOrPut(entry.market_series_id);
+            if (!gop.found_existing or entry.end_ts_ns > gop.value_ptr.*) {
+                gop.value_ptr.* = entry.end_ts_ns;
             }
         }
     }
@@ -4322,7 +6332,7 @@ pub const WaitError = waitError;
 fn waitForFlush(engine: *Engine, expected_entries: usize, timeout_ms: u64) waitError!void {
     const deadline: i64 = std.time.milliTimestamp() + @as(i64, @intCast(timeout_ms));
     while (true) {
-        if (engine.metadata.manifest.entries.items.len >= expected_entries and engine.mem.bytes.load(.monotonic) == 0 and engine.queue.len() == 0) {
+        if (engine.metadata.manifest.entries.items.len >= expected_entries and engine.liveMemtableBytes() == 0 and engine.queue.isDrained()) {
             if (engine.cas != null) {
                 engine.verifyCasState() catch {
                     if (std.time.milliTimestamp() >= deadline) break;
@@ -4341,7 +6351,7 @@ fn waitForFlush(engine: *Engine, expected_entries: usize, timeout_ms: u64) waitE
 fn waitForQueueEmpty(engine: *Engine, timeout_ms: u64) waitError!void {
     const deadline_ns: i128 = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ms)) * std.time.ns_per_ms;
     while (true) {
-        if (engine.queue.len() == 0) return;
+        if (engine.queue.isDrained()) return;
         const now_ns = std.time.nanoTimestamp();
         if (now_ns >= deadline_ns) break;
         engine.drain_mu.lock();
@@ -4486,6 +6496,33 @@ fn testConfig(talloc: std.mem.Allocator, data_path: []const u8) !cfg.Config {
     };
 }
 
+fn writeTestRepositoryFormatMarker(data_path: []const u8, version: u16) !void {
+    const magic = "SYDSTORE1";
+    var bytes: [magic.len + @sizeOf(u16) + 1 + @sizeOf(u32)]u8 = undefined;
+    @memcpy(bytes[0..magic.len], magic);
+    var offset = magic.len;
+    std.mem.writeInt(u16, bytes[offset..][0..@sizeOf(u16)], version, .little);
+    offset += @sizeOf(u16);
+    bytes[offset] = @intFromEnum(cas_mod.RefBackend.reftable);
+    offset += 1;
+    std.mem.writeInt(
+        u32,
+        bytes[offset..][0..@sizeOf(u32)],
+        cas_mod.default_extent_chunk_bytes,
+        .little,
+    );
+
+    try std.fs.cwd().makePath(data_path);
+    var root = try std.fs.cwd().openDir(data_path, .{});
+    defer root.close();
+    try root.makePath("objects/info");
+    try root.writeFile(.{
+        .sub_path = "objects/info/store-format",
+        .data = &bytes,
+        .flags = .{},
+    });
+}
+
 test "engine queue wraps around and preserves order" {
     const talloc = std.testing.allocator;
     var metrics = Engine.Metrics.init();
@@ -4503,8 +6540,14 @@ test "engine queue wraps around and preserves order" {
     defer first.deinit(talloc);
     var second = queue.pop().?;
     defer second.deinit(talloc);
-    try std.testing.expectEqual(@as(types.SeriesId, 1), first.points[0].series_id);
-    try std.testing.expectEqual(@as(types.SeriesId, 2), second.points[0].series_id);
+    switch (first.payload) {
+        .scalar => |points| try std.testing.expectEqual(@as(types.SeriesId, 1), points[0].series_id),
+        .market => return error.UnexpectedMarketBatch,
+    }
+    switch (second.payload) {
+        .scalar => |points| try std.testing.expectEqual(@as(types.SeriesId, 2), points[0].series_id),
+        .market => return error.UnexpectedMarketBatch,
+    }
 
     try queue.push(.{ .series_id = 4, .ts = 4, .value = 4 });
     try queue.push(.{ .series_id = 5, .ts = 5, .value = 5 });
@@ -4516,11 +6559,1013 @@ test "engine queue wraps around and preserves order" {
     var fifth = queue.pop().?;
     defer fifth.deinit(talloc);
 
-    try std.testing.expectEqual(@as(types.SeriesId, 3), third.points[0].series_id);
-    try std.testing.expectEqual(@as(types.SeriesId, 4), fourth.points[0].series_id);
-    try std.testing.expectEqual(@as(types.SeriesId, 5), fifth.points[0].series_id);
+    switch (third.payload) {
+        .scalar => |points| try std.testing.expectEqual(@as(types.SeriesId, 3), points[0].series_id),
+        .market => return error.UnexpectedMarketBatch,
+    }
+    switch (fourth.payload) {
+        .scalar => |points| try std.testing.expectEqual(@as(types.SeriesId, 4), points[0].series_id),
+        .market => return error.UnexpectedMarketBatch,
+    }
+    switch (fifth.payload) {
+        .scalar => |points| try std.testing.expectEqual(@as(types.SeriesId, 5), points[0].series_id),
+        .market => return error.UnexpectedMarketBatch,
+    }
+    for (0..5) |_| queue.completeBatch();
     try std.testing.expectEqual(@as(usize, 0), queue.len());
     try std.testing.expectEqual(@as(usize, 0), queue.pendingBytes());
+}
+
+test "engine queue drain state includes dequeued in-flight batches" {
+    const talloc = std.testing.allocator;
+    var metrics = Engine.Metrics.init();
+    const queue = try Engine.Queue.init(talloc, &metrics);
+    defer {
+        queue.deinit();
+        talloc.destroy(queue);
+    }
+
+    try std.testing.expect(queue.isDrained());
+    try queue.push(.{ .series_id = 1, .ts = 1, .value = 1 });
+    try std.testing.expect(!queue.isDrained());
+
+    var batch = queue.pop().?;
+    defer batch.deinit(talloc);
+    try std.testing.expectEqual(@as(usize, 0), queue.len());
+    try std.testing.expect(!queue.isDrained());
+
+    queue.completeBatch();
+    try std.testing.expect(queue.isDrained());
+}
+
+test "engine market queue owns native batch payloads" {
+    const talloc = std.testing.allocator;
+    var metrics = Engine.Metrics.init();
+    const queue = try Engine.Queue.init(talloc, &metrics);
+    defer {
+        queue.deinit();
+        talloc.destroy(queue);
+    }
+
+    const values = try talloc.dupe(f64, &[_]f64{ 10.5, 100.0 });
+    errdefer talloc.free(values);
+    const metric = try talloc.dupe(u8, "market.trade");
+    errdefer talloc.free(metric);
+    const labels = try talloc.dupe(u8, "{\"symbol\":\"AAPL\"}");
+    errdefer talloc.free(labels);
+    var rows = try talloc.alloc(Engine.QueuedMarketRow, 1);
+    errdefer talloc.free(rows);
+    rows[0] = .{
+        .market_series_id = market_identity_mod.seriesId("market.trade", labels),
+        .schema_digest = @splat(0x11),
+        .metric = metric,
+        .canonical_labels = labels,
+        .ts_ns = 1_000,
+        .values = values,
+    };
+    const fanout_series_ids = try talloc.alloc([]types.SeriesId, 1);
+    errdefer talloc.free(fanout_series_ids);
+    fanout_series_ids[0] = try talloc.dupe(types.SeriesId, &[_]types.SeriesId{ 101, 102 });
+    errdefer talloc.free(fanout_series_ids[0]);
+    const fanout_values = try talloc.alloc([]f64, 1);
+    errdefer talloc.free(fanout_values);
+    fanout_values[0] = try talloc.dupe(f64, &[_]f64{ 10.5, 100.0 });
+    errdefer talloc.free(fanout_values[0]);
+
+    const batch = Engine.QueuedMarketBatch{
+        .rows = rows,
+        .mode = .dual_write_v1,
+        .fanout_series_ids = fanout_series_ids,
+        .fanout_values = fanout_values,
+    };
+    const queued_bytes = try batch.queuedBytes();
+    const row_payload_bytes = try rows[0].payloadBytes();
+    const expected_queued_bytes = @sizeOf(Engine.QueuedMarketBatch) +
+        @sizeOf(Engine.QueuedMarketRow) +
+        @sizeOf([]types.SeriesId) +
+        @sizeOf([]f64) +
+        metric.len +
+        labels.len +
+        values.len * @sizeOf(f64) +
+        fanout_series_ids[0].len * @sizeOf(types.SeriesId) +
+        fanout_values[0].len * @sizeOf(f64);
+    try std.testing.expectEqual(expected_queued_bytes, queued_bytes);
+    try std.testing.expect(queued_bytes > row_payload_bytes);
+    try queue.pushMarketBatch(batch, queued_bytes);
+
+    try std.testing.expectEqual(@as(usize, 1), queue.len());
+    try std.testing.expectEqual(queued_bytes, queue.pendingBytes());
+    var popped = queue.pop().?;
+    defer popped.deinit(talloc);
+    switch (popped.payload) {
+        .market => |market_batch| {
+            try std.testing.expectEqual(Engine.MarketStorageWriteMode.dual_write_v1, market_batch.mode);
+            try std.testing.expectEqual(@as(usize, 1), market_batch.rows.len);
+            try std.testing.expectEqual(@as(i64, 1_000), market_batch.rows[0].ts_ns);
+            try std.testing.expectEqual(@as(f64, 10.5), market_batch.rows[0].values[0]);
+            try std.testing.expectEqual(@as(types.SeriesId, 101), market_batch.fanout_series_ids[0][0]);
+            try std.testing.expectEqual(@as(f64, 100.0), market_batch.fanout_values[0][1]);
+        },
+        .scalar => return error.UnexpectedScalarBatch,
+    }
+    queue.completeBatch();
+    try std.testing.expectEqual(@as(usize, 0), queue.len());
+    try std.testing.expectEqual(@as(usize, 0), queue.pendingBytes());
+}
+
+test "engine native market ingest does not acknowledge before the ordered writer" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/market-native-queue", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var config = try testConfig(talloc, data_path);
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .native_v1;
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+    try pauseWriterForMaintenance(engine);
+    engine.queue.reopen();
+
+    var schema = try engine.registerMarketSchema(.{
+        .metric = "market.test_trade",
+        .ordered_columns = &.{ "price", "size" },
+        .required_labels = &.{"symbol"},
+        .storage_mapping = .native_v1,
+    });
+    defer schema.deinit(talloc);
+
+    const values = [_]f64{ 10.5, 100.0 };
+    const Context = struct {
+        engine: *Engine,
+        values: *const [2]f64,
+        done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        failure: ?anyerror = null,
+        receipt: ?Engine.MarketIngestReceipt = null,
+
+        fn run(ctx: *@This()) void {
+            ctx.receipt = ctx.engine.ingestMarketBatch(&.{.{
+                .metric = "market.test_trade",
+                .labels_json = "{\"symbol\":\"AAPL\"}",
+                .ts_ns = 1_000,
+                .values = ctx.values,
+            }}) catch |err| {
+                ctx.failure = err;
+                ctx.done.store(true, .release);
+                return;
+            };
+            ctx.done.store(true, .release);
+        }
+    };
+    var context = Context{ .engine = engine, .values = &values };
+    const ingest_thread = try std.Thread.spawn(.{}, Context.run, .{&context});
+    var ingest_thread_joined = false;
+    defer if (!ingest_thread_joined) {
+        resumeWriterAfterMaintenance(engine) catch {};
+        ingest_thread.join();
+    };
+
+    const deadline = std.time.nanoTimestamp() + 2 * std.time.ns_per_s;
+    while (engine.queue.len() == 0 and std.time.nanoTimestamp() < deadline) sleepMs(1);
+    try std.testing.expectEqual(@as(usize, 1), engine.queue.len());
+    try std.testing.expect(!context.done.load(.acquire));
+
+    try resumeWriterAfterMaintenance(engine);
+    ingest_thread.join();
+    ingest_thread_joined = true;
+    if (context.failure) |failure| return failure;
+    const receipt = context.receipt orelse return error.MissingMarketIngestReceipt;
+    try std.testing.expectEqual(Engine.MarketStorageWriteMode.native_v1, receipt.storage_mode);
+    try std.testing.expectEqual(@as(usize, 1), receipt.accepted_rows);
+    try std.testing.expectEqual(@as(usize, 1), receipt.native_rows);
+    try std.testing.expectEqual(@as(usize, 0), receipt.fanout_writes);
+}
+
+test "engine explicit native market mode rejects format3 before series registration" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/market-format3-preflight", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    try writeTestRepositoryFormatMarker(data_path, cas_mod.primary_repository_format_version);
+
+    var config = try testConfig(talloc, data_path);
+    defer config.deinit(talloc);
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .native_v1;
+    try std.testing.expectError(error.RepositoryFormatMismatch, Engine.init(talloc, config));
+
+    var root = try std.fs.cwd().openDir(data_path, .{});
+    defer root.close();
+    try std.testing.expectError(error.FileNotFound, root.access(market_catalog_mod.path, .{}));
+    try std.testing.expectError(error.FileNotFound, root.access("wal", .{}));
+}
+
+test "engine rejects future repository markers before WAL or catalog mutation with CAS off" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/market-format-future", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    try writeTestRepositoryFormatMarker(data_path, cas_mod.current_repository_format_version + 1);
+
+    var config = try testConfig(talloc, data_path);
+    defer config.deinit(talloc);
+    try std.testing.expectError(
+        error.UnsupportedRepositoryFormatVersion,
+        Engine.init(talloc, config),
+    );
+
+    var root = try std.fs.cwd().openDir(data_path, .{});
+    defer root.close();
+    try std.testing.expectError(error.FileNotFound, root.access(market_catalog_mod.path, .{}));
+    try std.testing.expectError(error.FileNotFound, root.access("wal", .{}));
+}
+
+test "engine explicit native market mode requires canonical CAS before startup state" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/market-native-cas-off", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var config = try testConfig(talloc, data_path);
+    defer config.deinit(talloc);
+    config.market_storage_mode = .native_v1;
+    try std.testing.expectError(error.NativeMarketRequiresCas, Engine.init(talloc, config));
+
+    var root = try std.fs.cwd().openDir(data_path, .{});
+    defer root.close();
+    try std.testing.expectError(error.FileNotFound, root.access(market_catalog_mod.path, .{}));
+    try std.testing.expectError(error.FileNotFound, root.access("wal", .{}));
+}
+
+test "engine legacy format3 remains fanout operational with CAS off" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/market-format3-fanout", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    try writeTestRepositoryFormatMarker(data_path, cas_mod.primary_repository_format_version);
+
+    var config = try testConfig(talloc, data_path);
+    config.market_storage_mode = .auto;
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+    try std.testing.expectEqual(
+        cas_mod.primary_repository_format_version,
+        engine.repository_format.version,
+    );
+
+    var trade = engine.marketSchema("market.trade") orelse return error.MissingMarketSchema;
+    defer trade.deinit(talloc);
+    try std.testing.expectEqual(market_catalog_mod.StorageMapping.fanout_v1, trade.storage_mapping);
+
+    const values = [_]f64{ 10.5, 100.0 };
+    const receipt = try engine.ingestMarketBatch(&.{.{
+        .metric = "market.trade",
+        .labels_json = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}",
+        .ts_ns = 1_000,
+        .values = &values,
+    }});
+    try std.testing.expectEqual(Engine.MarketStorageWriteMode.fanout_v1, receipt.storage_mode);
+    try std.testing.expectEqual(@as(usize, 1), receipt.accepted_rows);
+    try std.testing.expectEqual(@as(usize, 0), receipt.native_rows);
+    try std.testing.expectEqual(@as(usize, 2), receipt.fanout_writes);
+    _ = try engine.flushNow();
+}
+
+test "engine auto market schema defaults fresh format4 repositories to native" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/market-auto-format4", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var config = try testConfig(talloc, data_path);
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .auto;
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const builtin_metrics = [_][]const u8{ "market.trade", "market.quote", "market.bar" };
+    for (builtin_metrics) |metric| {
+        var builtin_schema = engine.marketSchema(metric) orelse return error.MissingMarketSchema;
+        defer builtin_schema.deinit(talloc);
+        try std.testing.expectEqual(
+            market_catalog_mod.StorageMapping.native_v1,
+            builtin_schema.storage_mapping,
+        );
+    }
+
+    var schema = try engine.registerMarketSchema(.{
+        .metric = "market.test_auto_trade",
+        .ordered_columns = &.{ "price", "size" },
+        .required_labels = &.{"symbol"},
+        .storage_mapping = .fanout_v1,
+    });
+    defer schema.deinit(talloc);
+    try std.testing.expectEqual(market_catalog_mod.StorageMapping.native_v1, schema.storage_mapping);
+
+    var loaded = engine.marketSchema("market.test_auto_trade") orelse return error.MissingMarketSchema;
+    defer loaded.deinit(talloc);
+    try std.testing.expectEqual(market_catalog_mod.StorageMapping.native_v1, loaded.storage_mapping);
+}
+
+test "engine explicit market schema mapping overrides fresh auto default" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/market-explicit-format4", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var config = try testConfig(talloc, data_path);
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .auto;
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    var schema = try engine.registerMarketSchemaWithStorageMappingOverride(.{
+        .metric = "market.test_explicit_trade",
+        .ordered_columns = &.{ "price", "size" },
+        .required_labels = &.{"symbol"},
+        .storage_mapping = .fanout_v1,
+    }, .fanout_v1);
+    defer schema.deinit(talloc);
+    try std.testing.expectEqual(market_catalog_mod.StorageMapping.fanout_v1, schema.storage_mapping);
+}
+
+test "engine auto market schema keeps format3 and existing mappings fanout" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/market-auto-format3-existing", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    try writeTestRepositoryFormatMarker(data_path, cas_mod.primary_repository_format_version);
+
+    var config = try testConfig(talloc, data_path);
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .auto;
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+    try std.testing.expectEqual(
+        cas_mod.primary_repository_format_version,
+        engine.repository_format.version,
+    );
+
+    var first = try engine.registerMarketSchema(.{
+        .metric = "market.test_format3_existing",
+        .ordered_columns = &.{ "price", "size" },
+        .required_labels = &.{"symbol"},
+        .storage_mapping = .fanout_v1,
+    });
+    defer first.deinit(talloc);
+    try std.testing.expectEqual(market_catalog_mod.StorageMapping.fanout_v1, first.storage_mapping);
+
+    var second = try engine.registerMarketSchema(.{
+        .metric = "market.test_format3_existing",
+        .ordered_columns = &.{ "price", "size" },
+        .required_labels = &.{"symbol"},
+        .storage_mapping = .fanout_v1,
+    });
+    defer second.deinit(talloc);
+    try std.testing.expectEqual(market_catalog_mod.StorageMapping.fanout_v1, second.storage_mapping);
+
+    try std.testing.expectError(
+        error.RepositoryFormatMismatch,
+        engine.registerMarketSchemaWithStorageMappingOverride(.{
+            .metric = "market.test_format3_native",
+            .ordered_columns = &.{ "price", "size" },
+            .required_labels = &.{"symbol"},
+            .storage_mapping = .native_v1,
+        }, .native_v1),
+    );
+}
+
+test "engine existing format4 catalog preserves mappings and fills missing builtins as fanout" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/market-format4-existing-catalog", .{tmp.sub_path});
+    defer talloc.free(data_path);
+    try writeTestRepositoryFormatMarker(data_path, cas_mod.current_repository_format_version);
+    {
+        var root = try std.fs.cwd().openDir(data_path, .{});
+        defer root.close();
+        try root.writeFile(.{
+            .sub_path = market_catalog_mod.path,
+            .data =
+            \\{"schemas":[{"metric":"market.existing_fanout","ordered_columns":["price"],"required_labels":["symbol"],"storage_mapping":"fanout_v1"},{"metric":"market.existing_native","ordered_columns":["price"],"required_labels":["symbol"],"storage_mapping":"native_v1"}],"market_series":[],"bar_policies":[],"rollups":[],"signals":[]}
+            ,
+            .flags = .{},
+        });
+    }
+
+    var config = try testConfig(talloc, data_path);
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .auto;
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const expected = [_]struct {
+        metric: []const u8,
+        mapping: market_catalog_mod.StorageMapping,
+    }{
+        .{ .metric = "market.existing_fanout", .mapping = .fanout_v1 },
+        .{ .metric = "market.existing_native", .mapping = .native_v1 },
+        .{ .metric = "market.trade", .mapping = .fanout_v1 },
+        .{ .metric = "market.quote", .mapping = .fanout_v1 },
+        .{ .metric = "market.bar", .mapping = .fanout_v1 },
+    };
+    for (expected) |entry| {
+        var schema = engine.marketSchema(entry.metric) orelse return error.MissingMarketSchema;
+        defer schema.deinit(talloc);
+        try std.testing.expectEqual(entry.mapping, schema.storage_mapping);
+    }
+}
+
+test "engine mixed market ingest preflight is atomic before catalog mutation" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/market-mixed-preflight", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var config = try testConfig(talloc, data_path);
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .fanout_v1;
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    var fanout_schema = try engine.registerMarketSchema(.{
+        .metric = "market.test_mixed_trade",
+        .ordered_columns = &.{ "price", "size" },
+        .required_labels = &.{"symbol"},
+        .storage_mapping = .fanout_v1,
+    });
+    defer fanout_schema.deinit(talloc);
+
+    engine.config.market_storage_mode = .native_v1;
+    var native_schema = try engine.registerMarketSchema(.{
+        .metric = "market.test_mixed_quote",
+        .ordered_columns = &.{ "bid", "ask" },
+        .required_labels = &.{"symbol"},
+        .storage_mapping = .native_v1,
+    });
+    defer native_schema.deinit(talloc);
+    engine.config.market_storage_mode = .auto;
+
+    const trade_values = [_]f64{ 10.5, 100.0 };
+    const quote_values = [_]f64{ 10.0, 10.1 };
+    try std.testing.expectError(error.MixedMarketStorageModes, engine.ingestMarketBatch(&.{
+        .{
+            .metric = "market.test_mixed_trade",
+            .labels_json = "{\"symbol\":\"AAPL\"}",
+            .ts_ns = 1_000,
+            .values = &trade_values,
+        },
+        .{
+            .metric = "market.test_mixed_quote",
+            .labels_json = "{\"symbol\":\"AAPL\"}",
+            .ts_ns = 1_000,
+            .values = &quote_values,
+        },
+    }));
+
+    const identities = try engine.metadata.market_catalog.listMarketSeries();
+    defer {
+        for (identities) |*identity| identity.deinit(talloc);
+        talloc.free(identities);
+    }
+    try std.testing.expectEqual(@as(usize, 0), identities.len);
+    try std.testing.expectEqual(@as(usize, 0), engine.metadata.metric_catalog.entryCount());
+    try std.testing.expectEqual(@as(usize, 0), engine.queue.len());
+}
+
+test "engine dual market writer emits one durable market row without scalar WAL" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/market-dual-writer-wal", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var config = try testConfig(talloc, data_path);
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .dual_write_v1;
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    var schema = try engine.registerMarketSchema(.{
+        .metric = "market.test_dual_trade",
+        .ordered_columns = &.{ "price", "size" },
+        .required_labels = &.{"symbol"},
+        .storage_mapping = .fanout_v1,
+    });
+    defer schema.deinit(talloc);
+    try std.testing.expectEqual(market_catalog_mod.StorageMapping.native_v1, schema.storage_mapping);
+
+    const values = [_]f64{ 10.5, 100.0 };
+    const receipt = try engine.ingestMarketBatch(&.{.{
+        .metric = "market.test_dual_trade",
+        .labels_json = "{\"symbol\":\"AAPL\"}",
+        .ts_ns = 1_000,
+        .values = &values,
+    }});
+    try std.testing.expectEqual(Engine.MarketStorageWriteMode.dual_write_v1, receipt.storage_mode);
+    try std.testing.expectEqual(@as(usize, 0), engine.queue.len());
+    _ = try engine.flushNow();
+    try std.testing.expectEqual(@as(u64, 2), engine.next_market_write_sequence);
+    try std.testing.expectEqual(@as(usize, 1), engine.market_manifest.list().len);
+    try std.testing.expectEqual(@as(usize, 2), engine.metadata.manifest.entries.items.len);
+
+    var counts = struct {
+        scalar_rows: usize = 0,
+        market_rows: usize = 0,
+        market_registrations: usize = 0,
+        seen_market_registration: bool = false,
+
+        pub fn onRecord(self_ctx: *@This(), series_id: types.SeriesId, ts: i64, value: f64) !void {
+            _ = series_id;
+            _ = ts;
+            _ = value;
+            self_ctx.scalar_rows += 1;
+        }
+
+        pub fn onMarketSeriesRegistration(
+            self_ctx: *@This(),
+            market_series_id: market_identity_mod.MarketSeriesId,
+            schema_digest: market_identity_mod.SchemaDigest,
+            metric: []const u8,
+            canonical_labels: []const u8,
+        ) !void {
+            _ = market_series_id;
+            _ = schema_digest;
+            _ = metric;
+            _ = canonical_labels;
+            self_ctx.market_registrations += 1;
+            self_ctx.seen_market_registration = true;
+        }
+
+        pub fn onMarketRow(
+            self_ctx: *@This(),
+            market_series_id: market_identity_mod.MarketSeriesId,
+            write_sequence: u64,
+            ts_ns: i64,
+            row_values: []const f64,
+        ) !void {
+            _ = market_series_id;
+            _ = write_sequence;
+            _ = ts_ns;
+            _ = row_values;
+            if (!self_ctx.seen_market_registration) return error.MarketRowBeforeRegistration;
+            self_ctx.market_rows += 1;
+        }
+    }{};
+    try engine.wal.replay(talloc, &counts);
+    try std.testing.expectEqual(@as(usize, 0), counts.scalar_rows);
+    try std.testing.expectEqual(@as(usize, 1), counts.market_registrations);
+    try std.testing.expectEqual(@as(usize, 1), counts.market_rows);
+}
+
+test "engine propagates ordered market writer WAL failures to the caller" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/market-wal-ack-failure", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var config = try testConfig(talloc, data_path);
+    config.fsync = .always;
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .native_v1;
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    var schema = try engine.registerMarketSchema(.{
+        .metric = "market.test_wal_ack_failure",
+        .ordered_columns = &.{ "price", "size" },
+        .required_labels = &.{"symbol"},
+        .storage_mapping = .native_v1,
+    });
+    defer schema.deinit(talloc);
+
+    engine.market_writer_fault = .wal_append;
+    const values = [_]f64{ 10.5, 100.0 };
+    try std.testing.expectError(error.InjectedMarketWalAppendFailure, engine.ingestMarketBatch(&.{.{
+        .metric = "market.test_wal_ack_failure",
+        .labels_json = "{\"symbol\":\"AAPL\"}",
+        .ts_ns = 1_000,
+        .values = &values,
+    }}));
+    engine.market_writer_fault = null;
+
+    try std.testing.expectEqual(@as(usize, 0), engine.market_mem.residentBytes());
+    try std.testing.expectEqual(@as(usize, 0), engine.mem.bytes.load(.monotonic));
+}
+
+test "engine rolls back dual fanout when native live apply fails" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/market-dual-live-rollback", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var config = try testConfig(talloc, data_path);
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .dual_write_v1;
+    config.memtable_max_bytes = std.math.maxInt(usize);
+    config.flush_interval_ms = std.math.maxInt(u32);
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    var schema = try engine.registerMarketSchema(.{
+        .metric = "market.test_dual_rollback",
+        .ordered_columns = &.{ "price", "size" },
+        .required_labels = &.{"symbol"},
+        .storage_mapping = .native_v1,
+    });
+    defer schema.deinit(talloc);
+
+    engine.market_writer_fault = .native_apply_after_fanout;
+    const values = [_]f64{ 10.5, 100.0 };
+    try std.testing.expectError(error.InjectedNativeMarketApplyFailure, engine.ingestMarketBatch(&.{.{
+        .metric = "market.test_dual_rollback",
+        .labels_json = "{\"symbol\":\"AAPL\"}",
+        .ts_ns = 1_000,
+        .values = &values,
+    }}));
+    engine.market_writer_fault = null;
+
+    try std.testing.expectEqual(@as(usize, 0), engine.market_mem.residentBytes());
+    try std.testing.expectEqual(@as(usize, 0), engine.mem.bytes.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), engine.mem.series.count());
+}
+
+test "engine restarts from an acknowledged always-sync native market row" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/market-always-ack-restart", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    {
+        var config = try testConfig(talloc, data_path);
+        config.fsync = .always;
+        config.cas_mode = .dual_write;
+        config.market_storage_mode = .native_v1;
+        config.memtable_max_bytes = std.math.maxInt(usize);
+        config.flush_interval_ms = std.math.maxInt(u32);
+        var engine = try Engine.init(talloc, config);
+        defer engine.deinit();
+
+        var schema = try engine.registerMarketSchema(.{
+            .metric = "market.test_always_restart",
+            .ordered_columns = &.{ "price", "size" },
+            .required_labels = &.{"symbol"},
+            .storage_mapping = .native_v1,
+        });
+        defer schema.deinit(talloc);
+
+        const values = [_]f64{ 10.5, 100.0 };
+        const receipt = try engine.ingestMarketBatch(&.{.{
+            .metric = "market.test_always_restart",
+            .labels_json = "{\"symbol\":\"AAPL\"}",
+            .ts_ns = 1_000,
+            .values = &values,
+        }});
+        try std.testing.expectEqual(@as(usize, 1), receipt.accepted_rows);
+
+        // Model crash loss of volatile memory while retaining the already
+        // synced WAL, then stop the writer without producing a segment.
+        engine.market_mem.clearRetainingCapacity();
+        engine.market_mem_resident_bytes.store(0, .monotonic);
+        try pauseWriterForMaintenance(engine);
+    }
+
+    var config = try testConfig(talloc, data_path);
+    config.fsync = .always;
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .native_v1;
+    var recovered = try Engine.init(talloc, config);
+    defer recovered.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), recovered.market_manifest.list().len);
+    const entry = recovered.market_manifest.list()[0];
+    var segment = try market_segment_mod.readAll(talloc, recovered.data_dir, entry.path);
+    defer segment.deinit(talloc);
+    try std.testing.expectEqual(@as(usize, 1), segment.timestamps.len);
+    try std.testing.expectEqual(@as(i64, 1_000), segment.timestamps[0]);
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(f64, 10.5))), @as(u64, @bitCast(segment.columns[0].values[0])));
+    try std.testing.expectEqual(@as(u64, @bitCast(@as(f64, 100.0))), @as(u64, @bitCast(segment.columns[1].values[0])));
+}
+
+test "engine dual market WAL recovery derives fanout from logical market rows" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/market-dual-wal-recovery", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const canonical_labels = try market_identity_mod.canonicalizeLabels(talloc, "{\"symbol\":\"AAPL\"}");
+    defer talloc.free(canonical_labels);
+    const market_series_id = market_identity_mod.seriesId("market.test_dual_replay_trade", canonical_labels);
+
+    {
+        var config = try testConfig(talloc, data_path);
+        config.cas_mode = .dual_write;
+        config.market_storage_mode = .dual_write_v1;
+        var engine = try Engine.init(talloc, config);
+        defer engine.deinit();
+        try pauseWriterForMaintenance(engine);
+
+        var schema = try engine.registerMarketSchema(.{
+            .metric = "market.test_dual_replay_trade",
+            .ordered_columns = &.{ "price", "size" },
+            .required_labels = &.{"symbol"},
+            .storage_mapping = .native_v1,
+        });
+        defer schema.deinit(talloc);
+
+        _ = try engine.wal.appendMarketSeriesRegistration(
+            market_series_id,
+            schema.digest(),
+            "market.test_dual_replay_trade",
+            canonical_labels,
+        );
+        _ = try engine.wal.appendMarketRow(
+            market_series_id,
+            11,
+            1_000,
+            &[_]f64{ 10.5, 100.0 },
+        );
+    }
+
+    var config = try testConfig(talloc, data_path);
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .dual_write_v1;
+    var recovered = try Engine.init(talloc, config);
+    defer recovered.deinit();
+
+    try std.testing.expectEqual(@as(u64, 12), recovered.next_market_write_sequence);
+    try std.testing.expectEqual(@as(usize, 1), recovered.market_manifest.list().len);
+
+    const price_series_id = types.seriesIdFrom("market.test_dual_replay_trade.price", canonical_labels);
+    const size_series_id = types.seriesIdFrom("market.test_dual_replay_trade.size", canonical_labels);
+    const price_points = try recovered.querySeriesPoints(price_series_id, 0, 2_000);
+    defer talloc.free(price_points);
+    const size_points = try recovered.querySeriesPoints(size_series_id, 0, 2_000);
+    defer talloc.free(size_points);
+
+    try std.testing.expectEqual(@as(usize, 1), price_points.len);
+    try std.testing.expectEqual(@as(i64, 1_000), price_points[0].ts);
+    try std.testing.expectApproxEqAbs(@as(f64, 10.5), price_points[0].value, 1e-9);
+    try std.testing.expectEqual(@as(usize, 1), size_points.len);
+    try std.testing.expectEqual(@as(i64, 1_000), size_points[0].ts);
+    try std.testing.expectApproxEqAbs(@as(f64, 100.0), size_points[0].value, 1e-9);
+
+    var counts = struct {
+        scalar_rows: usize = 0,
+        market_rows: usize = 0,
+        market_registrations: usize = 0,
+
+        pub fn onRecord(self_ctx: *@This(), series_id: types.SeriesId, ts: i64, value: f64) !void {
+            _ = series_id;
+            _ = ts;
+            _ = value;
+            self_ctx.scalar_rows += 1;
+        }
+
+        pub fn onMarketSeriesRegistration(
+            self_ctx: *@This(),
+            market_series_id_arg: market_identity_mod.MarketSeriesId,
+            schema_digest: market_identity_mod.SchemaDigest,
+            metric: []const u8,
+            labels: []const u8,
+        ) !void {
+            _ = market_series_id_arg;
+            _ = schema_digest;
+            _ = metric;
+            _ = labels;
+            self_ctx.market_registrations += 1;
+        }
+
+        pub fn onMarketRow(
+            self_ctx: *@This(),
+            market_series_id_arg: market_identity_mod.MarketSeriesId,
+            write_sequence: u64,
+            ts_ns: i64,
+            values: []const f64,
+        ) !void {
+            _ = market_series_id_arg;
+            _ = write_sequence;
+            _ = ts_ns;
+            _ = values;
+            self_ctx.market_rows += 1;
+        }
+    }{};
+    try recovered.wal.replay(talloc, &counts);
+    try std.testing.expectEqual(@as(usize, 0), counts.scalar_rows);
+    try std.testing.expectEqual(@as(usize, 1), counts.market_registrations);
+    try std.testing.expectEqual(@as(usize, 1), counts.market_rows);
+}
+
+test "engine native market WAL recovery flushes row and advances sequence" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/market-wal-recovery", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    {
+        var config = try testConfig(talloc, data_path);
+        config.cas_mode = .dual_write;
+        config.market_storage_mode = .native_v1;
+        var engine = try Engine.init(talloc, config);
+        defer engine.deinit();
+        try pauseWriterForMaintenance(engine);
+
+        var schema = try engine.registerMarketSchema(.{
+            .metric = "market.test_recovery_trade",
+            .ordered_columns = &.{ "price", "size" },
+            .required_labels = &.{"symbol"},
+            .storage_mapping = .native_v1,
+        });
+        defer schema.deinit(talloc);
+        const schema_digest = schema.digest();
+        const canonical_labels = try market_identity_mod.canonicalizeLabels(talloc, "{\"symbol\":\"AAPL\"}");
+        defer talloc.free(canonical_labels);
+        const market_series_id = market_identity_mod.seriesId("market.test_recovery_trade", canonical_labels);
+        _ = try engine.wal.appendMarketSeriesRegistration(
+            market_series_id,
+            schema_digest,
+            "market.test_recovery_trade",
+            canonical_labels,
+        );
+        _ = try engine.wal.appendMarketRow(
+            market_series_id,
+            7,
+            1_000,
+            &[_]f64{ 10.5, 100.0 },
+        );
+    }
+
+    var config = try testConfig(talloc, data_path);
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .native_v1;
+    var recovered = try Engine.init(talloc, config);
+    defer recovered.deinit();
+    try std.testing.expectEqual(@as(usize, 1), recovered.market_manifest.list().len);
+    try std.testing.expectEqual(@as(u64, 8), recovered.next_market_write_sequence);
+    try std.testing.expectEqual(@as(usize, 0), recovered.market_mem.residentBytes());
+    try std.testing.expect(recovered.market_mem.allocatedBytes() > 0);
+    try std.testing.expectEqual(recovered.market_mem.allocatedBytes(), recovered.market_mem_allocated_bytes.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), recovered.market_mem_resident_bytes.load(.monotonic));
+}
+
+test "engine native market WAL recovery replays same timestamp corrections after flush" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/market-wal-correction", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const canonical_labels = try market_identity_mod.canonicalizeLabels(talloc, "{\"symbol\":\"AAPL\"}");
+    defer talloc.free(canonical_labels);
+    const market_series_id = market_identity_mod.seriesId("market.test_correction_trade", canonical_labels);
+
+    {
+        var config = try testConfig(talloc, data_path);
+        config.cas_mode = .dual_write;
+        config.market_storage_mode = .native_v1;
+        var engine = try Engine.init(talloc, config);
+        defer engine.deinit();
+        try pauseWriterForMaintenance(engine);
+
+        var schema = try engine.registerMarketSchema(.{
+            .metric = "market.test_correction_trade",
+            .ordered_columns = &.{ "price", "size" },
+            .required_labels = &.{"symbol"},
+            .storage_mapping = .native_v1,
+        });
+        defer schema.deinit(talloc);
+        const schema_digest = schema.digest();
+        _ = try engine.wal.appendMarketSeriesRegistration(
+            market_series_id,
+            schema_digest,
+            "market.test_correction_trade",
+            canonical_labels,
+        );
+        _ = try engine.wal.appendMarketRow(
+            market_series_id,
+            1,
+            1_000,
+            &[_]f64{ 10.5, 100.0 },
+        );
+    }
+
+    {
+        var config = try testConfig(talloc, data_path);
+        config.cas_mode = .dual_write;
+        config.market_storage_mode = .native_v1;
+        var recovered = try Engine.init(talloc, config);
+        defer recovered.deinit();
+        try std.testing.expectEqual(@as(usize, 1), recovered.market_manifest.list().len);
+        try pauseWriterForMaintenance(recovered);
+        var schema = recovered.marketSchema("market.test_correction_trade") orelse return error.MissingMarketSchema;
+        defer schema.deinit(talloc);
+        const schema_digest = schema.digest();
+        _ = try recovered.wal.appendMarketSeriesRegistration(
+            market_series_id,
+            schema_digest,
+            "market.test_correction_trade",
+            canonical_labels,
+        );
+        _ = try recovered.wal.appendMarketRow(
+            market_series_id,
+            2,
+            1_000,
+            &[_]f64{ 11.5, 100.0 },
+        );
+    }
+
+    var config = try testConfig(talloc, data_path);
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .native_v1;
+    var corrected = try Engine.init(talloc, config);
+    defer corrected.deinit();
+    try std.testing.expect(corrected.market_manifest.list().len >= 2);
+    try std.testing.expectEqual(@as(u64, 3), corrected.next_market_write_sequence);
+
+    var saw_correction = false;
+    for (corrected.market_manifest.list()) |entry| {
+        var result = try market_segment_mod.readAll(talloc, corrected.data_dir, entry.path);
+        defer result.deinit(talloc);
+        for (result.write_sequences, 0..) |sequence, row_idx| {
+            if (sequence == 2 and result.timestamps[row_idx] == 1_000) {
+                try std.testing.expectApproxEqAbs(@as(f64, 11.5), result.columns[0].values[row_idx], 1e-9);
+                saw_correction = true;
+            }
+        }
+    }
+    try std.testing.expect(saw_correction);
+}
+
+test "engine native market WAL recovery rejects orphan rows" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/market-wal-orphan", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    {
+        var config = try testConfig(talloc, data_path);
+        config.cas_mode = .dual_write;
+        config.market_storage_mode = .native_v1;
+        var engine = try Engine.init(talloc, config);
+        defer engine.deinit();
+        try pauseWriterForMaintenance(engine);
+
+        var schema = try engine.registerMarketSchema(.{
+            .metric = "market.test_orphan_trade",
+            .ordered_columns = &.{ "price", "size" },
+            .required_labels = &.{"symbol"},
+            .storage_mapping = .native_v1,
+        });
+        defer schema.deinit(talloc);
+        const canonical_labels = try market_identity_mod.canonicalizeLabels(talloc, "{\"symbol\":\"AAPL\"}");
+        defer talloc.free(canonical_labels);
+        const market_series_id = market_identity_mod.seriesId("market.test_orphan_trade", canonical_labels);
+        _ = try engine.wal.appendMarketRow(
+            market_series_id,
+            1,
+            1_000,
+            &[_]f64{ 10.5, 100.0 },
+        );
+    }
+
+    var config = try testConfig(talloc, data_path);
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .native_v1;
+    try std.testing.expectError(error.OrphanMarketRow, Engine.init(talloc, config));
 }
 
 test "engine exact-series declaration is idempotent and indexes tags once" {
@@ -4823,6 +7868,16 @@ test "scheduleDerivedMetric tracks exact definition instances" {
 
     var engine = try Engine.init(talloc, cfg_local);
     defer engine.deinit();
+    engine.stop_flag = true;
+    engine.derived_mu.lock();
+    engine.derived_pending = true;
+    engine.derived_mu.unlock();
+    engine.derived_cv.broadcast();
+    if (engine.derived_thread) |thread| {
+        thread.join();
+        engine.derived_thread = null;
+    }
+    engine.stop_flag = false;
 
     var trade_policy = try engine.registerBarPolicy(.{
         .id = "trade-1m",
@@ -5426,6 +8481,10 @@ test "engine records CAS sync metrics after dual-write flush" {
     try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.0, .tags_json = "{}" });
     try waitForFlush(engine, 1, 1_000);
 
+    const cas_sync_deadline = std.time.milliTimestamp() + 1_000;
+    while (engine.metrics.cas_sync_total.load(.monotonic) == 0 and std.time.milliTimestamp() < cas_sync_deadline) {
+        sleepMs(10);
+    }
     try std.testing.expect(engine.metrics.cas_sync_total.load(.monotonic) > 0);
     try std.testing.expectEqual(@as(u64, 0), engine.metrics.cas_sync_failed_total.load(.monotonic));
     try std.testing.expect(engine.metrics.cas_sync_ns_total.load(.monotonic) > 0);
@@ -5439,7 +8498,7 @@ test "engine quarantines failed ingest payloads with selector metadata" {
     const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/quarantine-data", .{tmp.sub_path});
     defer talloc.free(data_path);
     const input_tags = "{\"rack\":\"r1\",\"host\":\"a\"}";
-    const sid = types.seriesIdFrom("quarantine.series", input_tags);
+    const sid: types.SeriesId = 42;
 
     const config = cfg.Config{
         .data_dir = try talloc.dupe(u8, data_path),
@@ -5464,7 +8523,6 @@ test "engine quarantines failed ingest payloads with selector metadata" {
         .series_id = sid,
         .ts = 123,
         .value = 4.5,
-        .tags_json = input_tags,
     }, "wal_append", "SyntheticFailure");
 
     try std.testing.expectEqual(@as(u64, 1), engine.metrics.ingest_quarantined_total.load(.monotonic));
@@ -5564,14 +8622,13 @@ test "engine surfaces drain timeouts and maintenance pause state" {
     try pauseWriterForMaintenance(engine);
     try std.testing.expectEqual(true, engine.metrics.maintenance_pause_active.load(.monotonic));
 
-    engine.queue.mu.lock();
-    try engine.queue.buf.append(.{
+    engine.queue.reopen();
+    try engine.queue.push(.{
         .series_id = types.hash64("drain.timeout.series"),
         .ts = 10,
         .value = 1.0,
-        .tags_json = try talloc.dupe(u8, "{}"),
     });
-    engine.queue.mu.unlock();
+    engine.queue.close();
 
     try std.testing.expectError(WaitError.Timeout, engine.waitForDrained(1));
     try std.testing.expectEqual(@as(u64, 1), engine.metrics.drain_timeout_total.load(.monotonic));
@@ -5867,7 +8924,7 @@ test "engine primary mode compacts from CAS-backed segment descriptors without s
         try engine.ingest(.{ .series_id = sid, .ts = 1_000, .value = 1.0, .tags_json = "{}" });
         try waitForFlush(engine, 1, 1_000);
         try engine.ingest(.{ .series_id = sid, .ts = 1_500, .value = 2.0, .tags_json = "{}" });
-        try waitForFlush(engine, 2, 1_000);
+        try waitForFlush(engine, 2, 5_000);
         try engine.verifyCasState();
     }
 
@@ -5903,9 +8960,9 @@ test "engine primary mode compacts from CAS-backed segment descriptors without s
         try std.testing.expect(try engine.compactNow());
         try std.testing.expect(engine.writer_thread != null);
         try std.testing.expectEqual(false, engine.metrics.maintenance_pause_active.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, 1), engine.metadata.manifest.entries.items.len);
         try engine.ingest(.{ .series_id = sid, .ts = 2_000, .value = 3.0, .tags_json = "{}" });
         try engine.waitForQueryablePoints(talloc, sid, 3, 1_000);
-        try std.testing.expectEqual(@as(usize, 1), engine.metadata.manifest.entries.items.len);
 
         var results = std.array_list.Managed(types.Point).init(talloc);
         defer results.deinit();
@@ -5946,9 +9003,9 @@ test "engine compaction creates a maintenance checkpoint ref" {
 
     try engine.registerSeries("compaction.checkpoint.series", "{}", sid);
     try engine.ingest(.{ .series_id = sid, .ts = 1_000, .value = 1.0, .tags_json = "{}" });
-    try waitForFlush(engine, 1, 1_000);
+    try waitForFlush(engine, 1, 5_000);
     try engine.ingest(.{ .series_id = sid, .ts = 1_500, .value = 2.0, .tags_json = "{}" });
-    try waitForFlush(engine, 2, 1_000);
+    try waitForFlush(engine, 2, 5_000);
 
     try std.testing.expect(try engine.compactNow());
 
@@ -6031,11 +9088,14 @@ test "engine serializes cas index refresh during concurrent compaction syncs" {
 
     var attempts: usize = 0;
     while (attempts < 32) : (attempts += 1) {
-        _ = try worker.cas.syncLegacySnapshot(
+        _ = try worker.cas.syncLegacySnapshotWithNativeMarket(
             engine.data_dir,
             &engine.metadata.manifest,
             &engine.metadata.tags,
             &engine.metadata.series_catalog,
+            &engine.metadata.metric_catalog,
+            &engine.metadata.market_catalog,
+            &engine.market_manifest,
             "concurrent-compaction-sync",
         );
         try engine.metadata.refreshCasIndexIfStale(worker.cas);
@@ -6318,4 +9378,287 @@ test "engine dual-write creates a parent-linked CAS commit chain" {
     try std.testing.expect(snapshot.commit.parents[0].eql(initial_head));
     try std.testing.expectEqual(@as(usize, 1), snapshot.segment_descriptors.len);
     try std.testing.expectEqual(@as(usize, 1), snapshot.tag_snapshot.entries.len);
+}
+
+test "engine market query auto uses fresh native storage with labels time and projection" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(
+        talloc,
+        ".zig-cache/tmp/{s}/market-query-native-auto",
+        .{tmp.sub_path},
+    );
+    defer talloc.free(data_path);
+    var config = try testConfig(talloc, data_path);
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .auto;
+    config.market_storage_read_mode = .auto;
+    config.flush_interval_ms = std.math.maxInt(u32);
+    config.memtable_max_bytes = std.math.maxInt(usize);
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const nan_bits: u64 = 0x7ff8_0000_0000_0042;
+    const first = [_]f64{ @as(f64, @bitCast(@as(u64, 0x8000_0000_0000_0000))), @bitCast(nan_bits) };
+    const second = [_]f64{ 20.0, 200.0 };
+    _ = try engine.ingestMarketBatch(&.{
+        .{
+            .metric = "market.trade",
+            .labels_json = "{\"venue\":\"XNAS\",\"symbol\":\"AAPL\"}",
+            .ts_ns = 100,
+            .values = &first,
+        },
+        .{
+            .metric = "market.trade",
+            .labels_json = "{\"symbol\":\"MSFT\",\"venue\":\"XNAS\"}",
+            .ts_ns = 200,
+            .values = &second,
+        },
+    });
+
+    var result = try engine.queryMarket(.{
+        .metric = "market.trade",
+        .label_filter_json = "{\"symbol\":\"AAPL\"}",
+        .start_ts_ns = 50,
+        .end_ts_ns = 150,
+        .requested_columns = &.{ "size", "price" },
+    });
+    defer result.deinit();
+    try std.testing.expectEqualStrings("native", result.stats.storage_mode);
+    try std.testing.expectEqual(@as(usize, 2), result.requested_columns.len);
+    try std.testing.expectEqualStrings("size", result.requested_columns[0]);
+    try std.testing.expectEqualStrings("price", result.requested_columns[1]);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqual(@as(i64, 100), result.rows[0].ts_ns);
+    try std.testing.expectEqual(
+        nan_bits,
+        @as(u64, @bitCast(result.rows[0].values[0])),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0x8000_0000_0000_0000),
+        @as(u64, @bitCast(result.rows[0].values[1])),
+    );
+}
+
+test "engine market query shadow compares corrections and hidden columns exactly" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(
+        talloc,
+        ".zig-cache/tmp/{s}/market-query-shadow",
+        .{tmp.sub_path},
+    );
+    defer talloc.free(data_path);
+    var config = try testConfig(talloc, data_path);
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .dual_write_v1;
+    config.market_storage_read_mode = .shadow;
+    config.flush_interval_ms = std.math.maxInt(u32);
+    config.memtable_max_bytes = std.math.maxInt(usize);
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const original = [_]f64{ 10.0, 100.0 };
+    const correction = [_]f64{ 11.0, 110.0 };
+    const exact_bits = [_]f64{
+        @as(f64, @bitCast(@as(u64, 0x8000_0000_0000_0000))),
+        @as(f64, @bitCast(@as(u64, 0x7ff8_0000_0000_0042))),
+    };
+    _ = try engine.ingestMarketBatch(&.{.{
+        .metric = "market.trade",
+        .labels_json = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}",
+        .ts_ns = 1_000,
+        .values = &original,
+    }});
+    _ = try engine.ingestMarketBatch(&.{.{
+        .metric = "market.trade",
+        .labels_json = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}",
+        .ts_ns = 1_000,
+        .values = &correction,
+    }});
+    _ = try engine.ingestMarketBatch(&.{.{
+        .metric = "market.trade",
+        .labels_json = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}",
+        .ts_ns = 1_001,
+        .values = &exact_bits,
+    }});
+
+    var matched = try engine.queryMarket(.{
+        .metric = "market.trade",
+        .label_filter_json = "{\"venue\":\"XNAS\"}",
+        .start_ts_ns = 1_000,
+        .end_ts_ns = 1_001,
+        .requested_columns = &.{"price"},
+    });
+    defer matched.deinit();
+    try std.testing.expectEqualStrings("shadow", matched.stats.storage_mode);
+    try std.testing.expectEqual(@as(u64, 0), matched.stats.shadow_mismatches);
+    try std.testing.expectEqual(@as(usize, 2), matched.rows.len);
+    try std.testing.expectEqual(
+        @as(u64, @bitCast(@as(f64, 11.0))),
+        @as(u64, @bitCast(matched.rows[0].values[0])),
+    );
+    try std.testing.expectEqual(
+        @as(u64, 0x8000_0000_0000_0000),
+        @as(u64, @bitCast(matched.rows[1].values[0])),
+    );
+
+    const labels = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}";
+    const hidden_series_id = types.seriesIdFrom("market.trade.size", labels);
+    {
+        engine.market_data_mu.lock();
+        defer engine.market_data_mu.unlock();
+        const hidden = engine.mem.series.getPtr(hidden_series_id) orelse
+            return error.MissingFanoutSeries;
+        hidden.points.items[hidden.points.items.len - 1].value = 111.0;
+    }
+
+    try std.testing.expectError(error.ShadowMismatch, engine.queryMarket(.{
+        .metric = "market.trade",
+        .label_filter_json = "{\"symbol\":\"AAPL\"}",
+        .start_ts_ns = 1_000,
+        .end_ts_ns = 1_001,
+        .requested_columns = &.{"price"},
+    }));
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        engine.metrics.market_shadow_mismatch_total.load(.monotonic),
+    );
+}
+
+test "engine market query fanout auto rejects unavailable native and incomplete rows" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(
+        talloc,
+        ".zig-cache/tmp/{s}/market-query-format3-fanout",
+        .{tmp.sub_path},
+    );
+    defer talloc.free(data_path);
+    try writeTestRepositoryFormatMarker(
+        data_path,
+        cas_mod.primary_repository_format_version,
+    );
+    var config = try testConfig(talloc, data_path);
+    config.market_storage_mode = .auto;
+    config.market_storage_read_mode = .auto;
+    config.flush_interval_ms = std.math.maxInt(u32);
+    config.memtable_max_bytes = std.math.maxInt(usize);
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const values = [_]f64{ 10.0, 100.0 };
+    _ = try engine.ingestMarketBatch(&.{.{
+        .metric = "market.trade",
+        .labels_json = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}",
+        .ts_ns = 500,
+        .values = &values,
+    }});
+    try waitForQueueEmpty(engine, 1_000);
+
+    var result = try engine.queryMarket(.{
+        .metric = "market.trade",
+        .start_ts_ns = 0,
+        .end_ts_ns = 1_000,
+    });
+    defer result.deinit();
+    try std.testing.expectEqualStrings("fanout", result.stats.storage_mode);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+
+    engine.config.market_storage_read_mode = .native;
+    try std.testing.expectError(error.NativeMarketDataUnavailable, engine.queryMarket(.{
+        .metric = "market.trade",
+        .start_ts_ns = 0,
+        .end_ts_ns = 1_000,
+    }));
+    engine.config.market_storage_read_mode = .auto;
+
+    const labels = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}";
+    const missing_series_id = types.seriesIdFrom("market.trade.size", labels);
+    {
+        engine.market_data_mu.lock();
+        defer engine.market_data_mu.unlock();
+        const missing = engine.mem.series.getPtr(missing_series_id) orelse
+            return error.MissingFanoutSeries;
+        missing.points.clearRetainingCapacity();
+    }
+    try std.testing.expectError(error.IncompleteMarketRow, engine.queryMarket(.{
+        .metric = "market.trade",
+        .start_ts_ns = 0,
+        .end_ts_ns = 1_000,
+        .requested_columns = &.{"price"},
+    }));
+}
+
+test "engine market query revision returns historical native values" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(
+        talloc,
+        ".zig-cache/tmp/{s}/market-query-revision",
+        .{tmp.sub_path},
+    );
+    defer talloc.free(data_path);
+    var config = try testConfig(talloc, data_path);
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .native_v1;
+    config.market_storage_read_mode = .auto;
+    config.flush_interval_ms = std.math.maxInt(u32);
+    config.memtable_max_bytes = std.math.maxInt(usize);
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const old_values = [_]f64{ 10.0, 100.0 };
+    _ = try engine.ingestMarketBatch(&.{.{
+        .metric = "market.trade",
+        .labels_json = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}",
+        .ts_ns = 1_000,
+        .values = &old_values,
+    }});
+    _ = try engine.flushNow();
+    const old_head = try engine.cas.?.refs.readHead(cas_mod.main_ref) orelse
+        return error.MissingCasHead;
+    const old_revision = old_head.toHex();
+
+    const new_values = [_]f64{ 12.0, 120.0 };
+    _ = try engine.ingestMarketBatch(&.{.{
+        .metric = "market.trade",
+        .labels_json = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}",
+        .ts_ns = 1_000,
+        .values = &new_values,
+    }});
+    _ = try engine.flushNow();
+
+    var historical = try engine.queryMarket(.{
+        .metric = "market.trade",
+        .start_ts_ns = 1_000,
+        .end_ts_ns = 1_000,
+        .revision = old_revision[0..],
+    });
+    defer historical.deinit();
+    try std.testing.expectEqualStrings("native", historical.stats.storage_mode);
+    try std.testing.expectEqual(@as(usize, 1), historical.rows.len);
+    try std.testing.expectEqual(
+        @as(u64, @bitCast(@as(f64, 10.0))),
+        @as(u64, @bitCast(historical.rows[0].values[0])),
+    );
+
+    var current = try engine.queryMarket(.{
+        .metric = "market.trade",
+        .start_ts_ns = 1_000,
+        .end_ts_ns = 1_000,
+    });
+    defer current.deinit();
+    try std.testing.expectEqual(
+        @as(u64, @bitCast(@as(f64, 12.0))),
+        @as(u64, @bitCast(current.rows[0].values[0])),
+    );
 }

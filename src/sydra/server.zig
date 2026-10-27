@@ -9,6 +9,7 @@ const compat = @import("compat.zig");
 const alloc_mod = @import("alloc.zig");
 const cas_mod = @import("storage/cas.zig");
 const object_store = @import("storage/object_store.zig");
+const repository_lock = @import("storage/repository_lock.zig");
 
 const cas_json_schema_version: u32 = 1;
 
@@ -60,8 +61,9 @@ pub fn run(handle: *alloc_mod.AllocatorHandle) !void {
     defer std.process.argsFree(alloc, args);
     if (args.len <= 1 or std.mem.eql(u8, args[1], "serve")) {
         var cfg = try loadConfigOrDefault(alloc);
-        var eng = try initOwnedEngine(alloc, &cfg);
-        defer eng.deinit();
+        var owned_engine = try initOwnedEngine(alloc, &cfg);
+        defer owned_engine.deinit();
+        const eng = owned_engine.engine;
         try catalog.bootstrap(alloc);
         try validateConfiguredSocketPath(&eng.config);
         switch (listenerMode(&eng.config)) {
@@ -110,11 +112,26 @@ fn loadConfigOrDefault(alloc: std.mem.Allocator) !config.Config {
     return loadConfigOrDefaultForPaths(alloc, "sydradb.toml", "./data");
 }
 
-fn initOwnedEngine(alloc: std.mem.Allocator, cfg_ptr: *config.Config) !*engine_mod.Engine {
+const OwnedEngine = struct {
+    engine: *engine_mod.Engine,
+    repository_writer_lease: repository_lock.RepositoryLock,
+
+    fn deinit(self: *OwnedEngine) void {
+        self.engine.deinit();
+        self.repository_writer_lease.deinit();
+    }
+};
+
+fn initOwnedEngine(alloc: std.mem.Allocator, cfg_ptr: *config.Config) !OwnedEngine {
     errdefer cfg_ptr.deinit(alloc);
+    var lease = try repository_lock.RepositoryLock.acquirePath(cfg_ptr.data_dir);
+    errdefer lease.deinit();
     const engine = try engine_mod.Engine.init(alloc, cfg_ptr.*);
     cfg_ptr.* = undefined;
-    return engine;
+    return .{
+        .engine = engine,
+        .repository_writer_lease = lease,
+    };
 }
 
 fn loadConfigOrDefaultForPaths(
@@ -145,8 +162,9 @@ fn loadConfigOrDefaultForPaths(
 
 fn cmdPgWire(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     var cfg = try loadConfigOrDefault(alloc);
-    var eng = try initOwnedEngine(alloc, &cfg);
-    defer eng.deinit();
+    var owned_engine = try initOwnedEngine(alloc, &cfg);
+    defer owned_engine.deinit();
+    const eng = owned_engine.engine;
 
     try catalog.bootstrap(alloc);
 
@@ -192,8 +210,9 @@ fn cmdIngest(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     }
 
     var cfg = try loadConfigOrDefault(alloc);
-    var eng = try initOwnedEngine(alloc, &cfg);
-    defer eng.deinit();
+    var owned_engine = try initOwnedEngine(alloc, &cfg);
+    defer owned_engine.deinit();
+    const eng = owned_engine.engine;
     // Read NDJSON from stdin
     var stdin_file = std.fs.File.stdin();
     var stdin_buf: [4096]u8 = undefined;
@@ -272,8 +291,9 @@ fn localSocketListenerThread(eng: *engine_mod.Engine, socket_path: []const u8, m
 fn cmdQuery(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     if (args.len < 5) return error.Invalid;
     var cfg = try loadConfigOrDefault(alloc);
-    var eng = try initOwnedEngine(alloc, &cfg);
-    defer eng.deinit();
+    var owned_engine = try initOwnedEngine(alloc, &cfg);
+    defer owned_engine.deinit();
+    const eng = owned_engine.engine;
     const sid = try std.fmt.parseInt(u64, args[2], 10);
     const start_ts = try std.fmt.parseInt(i64, args[3], 10);
     const end_ts = try std.fmt.parseInt(i64, args[4], 10);
@@ -285,14 +305,17 @@ fn cmdQuery(alloc: std.mem.Allocator, args: [][:0]u8) !void {
 
 fn cmdCompact(alloc: std.mem.Allocator, _: [][:0]u8) !void {
     var cfg = try loadConfigOrDefault(alloc);
-    var eng = try initOwnedEngine(alloc, &cfg);
-    defer eng.deinit();
+    var owned_engine = try initOwnedEngine(alloc, &cfg);
+    defer owned_engine.deinit();
+    const eng = owned_engine.engine;
     _ = try eng.compactNow();
 }
 
 fn cmdStats(handle: *alloc_mod.AllocatorHandle, alloc: std.mem.Allocator, _: [][:0]u8) !void {
     var cfg = try loadConfigOrDefault(alloc);
     defer cfg.deinit(alloc);
+    var inspection = try repository_lock.RepositoryLock.acquireInspectionPath(cfg.data_dir);
+    defer inspection.deinit();
     var d = try std.fs.cwd().openDir(cfg.data_dir, .{ .iterate = true });
     defer d.close();
     var it = d.iterate();
@@ -349,8 +372,9 @@ fn cmdStats(handle: *alloc_mod.AllocatorHandle, alloc: std.mem.Allocator, _: [][
 fn cmdSnapshot(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     if (args.len < 3) return error.Invalid;
     var cfg = try loadConfigOrDefault(alloc);
-    var eng = try initOwnedEngine(alloc, &cfg);
-    defer eng.deinit();
+    var owned_engine = try initOwnedEngine(alloc, &cfg);
+    defer owned_engine.deinit();
+    const eng = owned_engine.engine;
     try eng.snapshotTo(args[2]);
 }
 
@@ -358,6 +382,8 @@ fn cmdRestore(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     if (args.len < 3) return error.Invalid;
     var cfg = try loadConfigOrDefault(alloc);
     defer cfg.deinit(alloc);
+    var lock = try repository_lock.RepositoryLock.acquirePath(cfg.data_dir);
+    defer lock.deinit();
     try @import("snapshot.zig").restore(alloc, cfg.data_dir, args[2], cfg.fsync);
 }
 
@@ -829,6 +855,12 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
             if (!std.mem.eql(u8, std.mem.sliceTo(rest[3], 0), "--borrow")) return error.Invalid;
             options.borrow = true;
         }
+        var locks = try repository_lock.RepositoryLockPair.acquirePaths(
+            alloc,
+            std.mem.sliceTo(rest[1], 0),
+            std.mem.sliceTo(rest[2], 0),
+        );
+        defer locks.deinit();
         const result = try cas_mod.cloneLocalRepositoryWithOptions(
             alloc,
             std.mem.sliceTo(rest[1], 0),
@@ -861,6 +893,12 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
             if (!std.mem.eql(u8, std.mem.sliceTo(rest[2], 0), "--materialize")) return error.Invalid;
             options.materialize = true;
         }
+        var locks = try repository_lock.RepositoryLockPair.acquirePaths(
+            alloc,
+            std.mem.sliceTo(rest[1], 0),
+            cfg.data_dir,
+        );
+        defer locks.deinit();
         const result = try cas_mod.fetchLocalRepositoryWithOptions(alloc, std.mem.sliceTo(rest[1], 0), cfg.data_dir, cfg.fsync, options);
         if (json_output) {
             try writeCasLocalExchangeJson(alloc, "fetch-local", result);
@@ -881,6 +919,12 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
             if (!std.mem.eql(u8, std.mem.sliceTo(rest[2], 0), "--borrow")) return error.Invalid;
             options.borrow = true;
         }
+        var locks = try repository_lock.RepositoryLockPair.acquirePaths(
+            alloc,
+            cfg.data_dir,
+            std.mem.sliceTo(rest[1], 0),
+        );
+        defer locks.deinit();
         const result = try cas_mod.pushLocalRepositoryWithOptions(alloc, cfg.data_dir, std.mem.sliceTo(rest[1], 0), cfg.fsync, options);
         if (json_output) {
             try writeCasLocalExchangeJson(alloc, "push-local", result);
@@ -920,6 +964,8 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
             } else if (rest.len == 4) {
                 return error.Invalid;
             }
+            var source_lock = try repository_lock.RepositoryLock.acquirePath(cfg.data_dir);
+            defer source_lock.deinit();
             const result = try cas_mod.createBundle(alloc, cfg.data_dir, dst, cfg.fsync, since_spec);
             if (json_output) {
                 try writeCasBundleJson(alloc, "bundle", "create", result);
@@ -946,6 +992,8 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
             return;
         }
         if (std.mem.eql(u8, action, "apply")) {
+            var lock = try repository_lock.RepositoryLock.acquirePath(cfg.data_dir);
+            defer lock.deinit();
             const result = try cas_mod.applyBundle(alloc, std.mem.sliceTo(rest[2], 0), cfg.data_dir, cfg.fsync);
             if (json_output) {
                 try writeCasBundleJson(alloc, "bundle", "apply", result);
@@ -960,6 +1008,13 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         }
         return error.Invalid;
     }
+
+    // CasManager.init can initialize format, identity, refs, and object-store
+    // directories. Consequently every command reaching this common path owns
+    // an exclusive writer lease, including commands whose result is
+    // observational after initialization.
+    var lock = try repository_lock.RepositoryLock.acquirePath(cfg.data_dir);
+    defer lock.deinit();
 
     var data_dir = try std.fs.cwd().openDir(cfg.data_dir, .{ .iterate = true });
     defer data_dir.close();
@@ -1440,6 +1495,127 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         return;
     }
     return error.Invalid;
+}
+
+fn testOwnedEngineConfig(
+    alloc: std.mem.Allocator,
+    data_path: []const u8,
+    cas_mode: config.CasMode,
+) !config.Config {
+    return .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = cas_mode,
+        .metadata_read_mode = if (cas_mode == .dual_write) .primary else .legacy,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+}
+
+fn createEmptyTestFile(path: []const u8) !void {
+    var file = try std.fs.cwd().createFile(path, .{});
+    file.close();
+}
+
+fn waitForTestFile(path: []const u8) !void {
+    for (0..5_000) |_| {
+        std.fs.cwd().access(path, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                std.Thread.sleep(std.time.ns_per_ms);
+                continue;
+            },
+            else => return err,
+        };
+        return;
+    }
+    return error.TestTimedOut;
+}
+
+test "Engine-owning processes contend for one repository writer lease" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) {
+        return error.SkipZigTest;
+    }
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repository", .{tmp.sub_path});
+    defer alloc.free(data_path);
+    const ready_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/engine-ready", .{tmp.sub_path});
+    defer alloc.free(ready_path);
+    const release_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/engine-release", .{tmp.sub_path});
+    defer alloc.free(release_path);
+
+    const owner_pid = try std.posix.fork();
+    if (owner_pid == 0) {
+        const child_alloc = std.heap.page_allocator;
+        var cfg = testOwnedEngineConfig(child_alloc, data_path, .off) catch std.posix.exit(10);
+        var owner = initOwnedEngine(child_alloc, &cfg) catch std.posix.exit(11);
+        createEmptyTestFile(ready_path) catch std.posix.exit(12);
+        waitForTestFile(release_path) catch std.posix.exit(13);
+        owner.deinit();
+        std.posix.exit(0);
+    }
+
+    var child_reaped = false;
+    defer if (!child_reaped) {
+        createEmptyTestFile(release_path) catch {};
+        _ = std.posix.waitpid(owner_pid, 0);
+    };
+
+    try waitForTestFile(ready_path);
+
+    var contending_cfg = try testOwnedEngineConfig(alloc, data_path, .off);
+    try std.testing.expectError(
+        error.RepositoryLocked,
+        initOwnedEngine(alloc, &contending_cfg),
+    );
+
+    try createEmptyTestFile(release_path);
+    const owner_result = std.posix.waitpid(owner_pid, 0);
+    child_reaped = true;
+    try std.testing.expect(std.posix.W.IFEXITED(owner_result.status));
+    try std.testing.expectEqual(@as(u8, 0), std.posix.W.EXITSTATUS(owner_result.status));
+
+    var reacquire_cfg = try testOwnedEngineConfig(alloc, data_path, .off);
+    var reacquired = try initOwnedEngine(alloc, &reacquire_cfg);
+    reacquired.deinit();
+}
+
+test "repository writer lock is excluded from snapshot bundles" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repository", .{tmp.sub_path});
+    defer alloc.free(data_path);
+    const bundle_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bundle", .{tmp.sub_path});
+    defer alloc.free(bundle_path);
+
+    var cfg = try testOwnedEngineConfig(alloc, data_path, .dual_write);
+    var owned = try initOwnedEngine(alloc, &cfg);
+    defer owned.deinit();
+
+    try owned.engine.snapshotTo(bundle_path);
+
+    var bundle = try std.fs.cwd().openDir(bundle_path, .{});
+    defer bundle.close();
+    try std.testing.expectError(
+        error.FileNotFound,
+        bundle.statFile(repository_lock.lock_file_name),
+    );
+    try std.testing.expectError(
+        error.RepositoryLocked,
+        repository_lock.RepositoryLock.acquirePath(data_path),
+    );
 }
 
 test "loadConfigOrDefault prefers primary defaults for fresh repositories" {

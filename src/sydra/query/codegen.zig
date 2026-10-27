@@ -91,8 +91,9 @@ fn buildScanProgram(allocator: std.mem.Allocator, compiled: compiler.CompiledSel
     const columns = try buildColumns(allocator, typed.projections);
     errdefer allocator.free(columns);
     const orderings = try buildExecutableOrderings(allocator, typed.ordering, typed.projections);
+    errdefer if (orderings.len != 0) freeExecutableOrderings(allocator, orderings);
     const hidden_order_columns = try buildHiddenOrderingColumns(allocator, typed.ordering, columns);
-    errdefer if (hidden_order_columns.len != 0) allocator.free(hidden_order_columns);
+    defer if (hidden_order_columns.len != 0) allocator.free(hidden_order_columns);
     const sorter_columns = if (hidden_order_columns.len != 0)
         try concatColumns(allocator, columns, hidden_order_columns)
     else
@@ -177,23 +178,46 @@ fn buildScanProgram(allocator: std.mem.Allocator, compiled: compiler.CompiledSel
     }
     try instructions.append(.{ .opcode = .halt });
 
+    const instruction_slice = try instructions.toOwnedSlice();
+    errdefer if (instruction_slice.len != 0) allocator.free(instruction_slice);
+    const constant_slice = try constants.toOwnedSlice();
+    errdefer if (constant_slice.len != 0) allocator.free(constant_slice);
+    const expr_slice = try exprs.toOwnedSlice();
+    errdefer if (expr_slice.len != 0) allocator.free(expr_slice);
+    const selector_slice = try allocator.dupe(compiler.BoundSelector, &.{selector});
+    errdefer allocator.free(selector_slice);
+    const schema_slice = try allocator.dupe([]const plan.ColumnInfo, &.{sorter_columns});
+    errdefer allocator.free(schema_slice);
+    const owned_schema_columns = if (sorter_columns.ptr != columns.ptr)
+        try allocator.dupe([]const plan.ColumnInfo, &.{sorter_columns})
+    else
+        &.{};
+    errdefer if (owned_schema_columns.len != 0) allocator.free(owned_schema_columns);
+    const ordering_slice = if (typed.ordering.len != 0)
+        try allocator.dupe([]const ast.OrderExpr, &.{orderings})
+    else
+        &.{};
+    errdefer if (ordering_slice.len != 0) allocator.free(ordering_slice);
+    const cursor_slice = try allocator.dupe(bytecode.CursorDecl, &.{.{ .id = 0, .name = "series0" }});
+    errdefer allocator.free(cursor_slice);
+    const temp_store_slice = if (uses_sorter)
+        try allocator.dupe(bytecode.TempStoreDecl, &.{.{ .id = 0, .name = "sorter0" }})
+    else
+        &.{};
+    errdefer if (temp_store_slice.len != 0) allocator.free(temp_store_slice);
+
     return .{
         .program = .{
             .allocator = allocator,
-            .instructions = try instructions.toOwnedSlice(),
-            .constants = try constants.toOwnedSlice(),
-            .exprs = try exprs.toOwnedSlice(),
-            .selectors = try allocator.dupe(compiler.BoundSelector, &.{selector}),
-            .schemas = try allocator.dupe([]const plan.ColumnInfo, &.{sorter_columns}),
-            .orderings = if (typed.ordering.len != 0)
-                try allocator.dupe([]const ast.OrderExpr, &.{orderings})
-            else
-                &.{},
-            .cursors = try allocator.dupe(bytecode.CursorDecl, &.{.{ .id = 0, .name = "series0" }}),
-            .temp_stores = if (uses_sorter)
-                try allocator.dupe(bytecode.TempStoreDecl, &.{.{ .id = 0, .name = "sorter0" }})
-            else
-                &.{},
+            .instructions = instruction_slice,
+            .constants = constant_slice,
+            .exprs = expr_slice,
+            .selectors = selector_slice,
+            .schemas = schema_slice,
+            .owned_schema_columns = owned_schema_columns,
+            .orderings = ordering_slice,
+            .cursors = cursor_slice,
+            .temp_stores = temp_store_slice,
             .register_count = @max(sorter_value_count, 3),
             .source_name = "prepared_series_scan",
         },
@@ -207,6 +231,7 @@ fn buildAggregateProgram(allocator: std.mem.Allocator, compiled: compiler.Compil
     const columns = try buildColumns(allocator, typed.projections);
     errdefer allocator.free(columns);
     const orderings = try buildExecutableOrderings(allocator, typed.ordering, typed.projections);
+    errdefer if (orderings.len != 0) freeExecutableOrderings(allocator, orderings);
 
     var instructions = std.array_list.Managed(bytecode.Instruction).init(allocator);
     errdefer instructions.deinit();
@@ -303,24 +328,43 @@ fn buildAggregateProgram(allocator: std.mem.Allocator, compiled: compiler.Compil
     }
     try instructions.append(.{ .opcode = .halt });
 
+    const instruction_slice = try instructions.toOwnedSlice();
+    errdefer if (instruction_slice.len != 0) allocator.free(instruction_slice);
+    const constant_slice = try constants.toOwnedSlice();
+    errdefer if (constant_slice.len != 0) allocator.free(constant_slice);
+    const expr_slice = try exprs.toOwnedSlice();
+    errdefer if (expr_slice.len != 0) allocator.free(expr_slice);
+    const selector_slice = try allocator.dupe(compiler.BoundSelector, &.{selector});
+    errdefer allocator.free(selector_slice);
+    const schema_slice = try allocator.dupe([]const plan.ColumnInfo, &.{columns});
+    errdefer allocator.free(schema_slice);
+    const ordering_slice = if (typed.ordering.len != 0)
+        try allocator.dupe([]const ast.OrderExpr, &.{orderings})
+    else
+        &.{};
+    errdefer if (ordering_slice.len != 0) allocator.free(ordering_slice);
+    const aggregate_slice = try allocator.dupe(compiler.AggregateSpec, typed.aggregates);
+    errdefer allocator.free(aggregate_slice);
+    const cursor_slice = try allocator.dupe(bytecode.CursorDecl, &.{.{ .id = 0, .name = "series0" }});
+    errdefer allocator.free(cursor_slice);
+    const temp_store_slice = if (uses_sorter)
+        try allocator.dupe(bytecode.TempStoreDecl, &.{.{ .id = 0, .name = "sorter0" }})
+    else
+        &.{};
+    errdefer if (temp_store_slice.len != 0) allocator.free(temp_store_slice);
+
     return .{
         .program = .{
             .allocator = allocator,
-            .instructions = try instructions.toOwnedSlice(),
-            .constants = try constants.toOwnedSlice(),
-            .exprs = try exprs.toOwnedSlice(),
-            .selectors = try allocator.dupe(compiler.BoundSelector, &.{selector}),
-            .schemas = try allocator.dupe([]const plan.ColumnInfo, &.{columns}),
-            .orderings = if (typed.ordering.len != 0)
-                try allocator.dupe([]const ast.OrderExpr, &.{orderings})
-            else
-                &.{},
-            .aggregates = try allocator.dupe(compiler.AggregateSpec, typed.aggregates),
-            .cursors = try allocator.dupe(bytecode.CursorDecl, &.{.{ .id = 0, .name = "series0" }}),
-            .temp_stores = if (uses_sorter)
-                try allocator.dupe(bytecode.TempStoreDecl, &.{.{ .id = 0, .name = "sorter0" }})
-            else
-                &.{},
+            .instructions = instruction_slice,
+            .constants = constant_slice,
+            .exprs = expr_slice,
+            .selectors = selector_slice,
+            .schemas = schema_slice,
+            .orderings = ordering_slice,
+            .aggregates = aggregate_slice,
+            .cursors = cursor_slice,
+            .temp_stores = temp_store_slice,
             .register_count = @max(typed.projections.len, 3),
             .source_name = "prepared_series_aggregate",
         },
@@ -482,6 +526,9 @@ fn buildExecutableOrderings(
     if (ordering.len == 0) return &.{};
 
     const executable = try allocator.alloc(ast.OrderExpr, ordering.len);
+    errdefer allocator.free(executable);
+    var initialized: usize = 0;
+    errdefer freeExecutableOrderingExprs(allocator, executable[0..initialized]);
     for (ordering, 0..) |ordering_expr, idx| {
         const expr = try rewriteOrderingExpr(allocator, ordering_expr.expr.expr, projections);
         executable[idx] = .{
@@ -489,8 +536,21 @@ fn buildExecutableOrderings(
             .direction = ordering_expr.direction,
             .span = spanForExpr(expr),
         };
+        initialized += 1;
     }
     return executable;
+}
+
+fn freeExecutableOrderings(allocator: std.mem.Allocator, orderings: []const ast.OrderExpr) void {
+    freeExecutableOrderingExprs(allocator, orderings);
+    allocator.free(orderings);
+}
+
+fn freeExecutableOrderingExprs(allocator: std.mem.Allocator, orderings: []const ast.OrderExpr) void {
+    for (orderings) |ordering| {
+        if (ordering.expr.* == .identifier) allocator.free(ordering.expr.identifier.value);
+        allocator.destroy(@constCast(ordering.expr));
+    }
 }
 
 fn astSpan() @import("common.zig").Span {

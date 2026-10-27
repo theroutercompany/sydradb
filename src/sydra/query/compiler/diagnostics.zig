@@ -69,6 +69,7 @@ pub fn fromCompileError(err: anyerror) ?FallbackReason {
         error.UnsupportedPredicate => .unsupported_predicate,
         error.UnsupportedExpression => .unsupported_expression,
         error.UnsupportedFunction => .unsupported_function,
+        error.UnknownFunction => .unsupported_function,
         error.SeriesNotFound => .series_not_found,
         error.AmbiguousSelector => .ambiguous_selector,
         error.ShadowMismatch => .shadow_mismatch,

@@ -218,7 +218,9 @@ test "compileSelectDetailed surfaces fallback diagnostics" {
     var engine = try engine_mod.Engine.init(alloc, config);
     defer engine.deinit();
 
-    var parser_inst = parser.Parser.init(arena.allocator(), "select abs(-1)");
+    try engine.registerSeries("compiler.detailed", "{}", 101);
+
+    var parser_inst = parser.Parser.init(arena.allocator(), "select unknownfn(time) from compiler.detailed where time >= 0");
     var statement = try parser_inst.parse();
     const detailed = try compileSelectDetailed(arena.allocator(), engine, &statement);
 

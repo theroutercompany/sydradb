@@ -165,7 +165,7 @@ test "parse duration literals to seconds" {
 }
 
 test "parse timestamp literals to epoch seconds" {
-    try std.testing.expectApproxEqAbs(@as(f64, 1_648_099_200.0), try parseTimestampSeconds("2022-03-27T00:00:00Z"), 1e-9);
-    try std.testing.expectApproxEqAbs(@as(f64, 1_648_099_200.0), try parseTimestampSeconds("2022-03-27T01:00:00+01:00"), 1e-9);
-    try std.testing.expectApproxEqAbs(@as(f64, 1_648_099_200.25), try parseTimestampSeconds("2022-03-27T00:00:00.25Z"), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1_648_339_200.0), try parseTimestampSeconds("2022-03-27T00:00:00Z"), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1_648_339_200.0), try parseTimestampSeconds("2022-03-27T01:00:00+01:00"), 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 1_648_339_200.25), try parseTimestampSeconds("2022-03-27T00:00:00.25Z"), 1e-9);
 }

@@ -102,6 +102,7 @@ const Dispatcher = struct {
         if (std.mem.eql(u8, action_name, "emitPrimaryExpr()")) return rhs[0];
         if (std.mem.eql(u8, action_name, "emitBinaryExpr()")) return try self.emitBinaryExpr(rhs);
         if (std.mem.eql(u8, action_name, "emitIdentifier()")) return try self.emitIdentifier(rhs);
+        if (std.mem.eql(u8, action_name, "emitTagIdentifier()")) return try self.emitTagIdentifier(rhs);
         if (std.mem.eql(u8, action_name, "emitNumber()")) return try self.emitNumber(rhs);
         if (std.mem.eql(u8, action_name, "emitDuration()")) return try self.emitDuration(rhs);
         if (std.mem.eql(u8, action_name, "emitString()")) return try self.emitString(rhs);
@@ -312,6 +313,17 @@ const Dispatcher = struct {
         const identifier = try identifierFromValue(rhs[0]);
         const expr = try self.arena.create(stmt_mod.Expr);
         expr.* = .{ .identifier = identifier };
+        return .{ .expr = expr };
+    }
+
+    fn emitTagIdentifier(self: *@This(), rhs: []const SemanticValue) !SemanticValue {
+        const name = try tokenFromValue(rhs[2]);
+        const value = try std.fmt.allocPrint(self.arena, "tag.{s}", .{name.lexeme});
+        const expr = try self.arena.create(stmt_mod.Expr);
+        expr.* = .{ .identifier = .{
+            .value = value,
+            .span = combinedSpan(rhs),
+        } };
         return .{ .expr = expr };
     }
 

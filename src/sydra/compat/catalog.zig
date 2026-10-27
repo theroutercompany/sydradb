@@ -541,29 +541,35 @@ test "build catalog snapshot" {
     try std.testing.expectEqual('r', snapshot.classes[1].relkind);
     try std.testing.expectEqual(@as(f64, 42), snapshot.classes[1].reltuples);
 
-    try std.testing.expectEqual('v', snapshot.classes[2].relkind);
-    try std.testing.expectEqual('S', snapshot.classes[3].relkind);
+    try std.testing.expectEqualStrings("users_id_seq", snapshot.classes[2].relname);
+    try std.testing.expectEqual('S', snapshot.classes[2].relkind);
+    try std.testing.expectEqualStrings("users_view", snapshot.classes[3].relname);
+    try std.testing.expectEqual('v', snapshot.classes[3].relkind);
 
     try std.testing.expectEqual(@as(usize, 3), snapshot.attributes.len);
-    try std.testing.expectEqual(snapshot.classes[1].oid, snapshot.attributes[0].attrelid);
+    try std.testing.expectEqualStrings("token", snapshot.attributes[0].attname);
+    try std.testing.expectEqual(snapshot.classes[0].oid, snapshot.attributes[0].attrelid);
     try std.testing.expectEqual(@as(i16, 1), snapshot.attributes[0].attnum);
-    try std.testing.expect(snapshot.attributes[0].attnotnull);
-    try std.testing.expectEqual('a', snapshot.attributes[0].attidentity);
-    try std.testing.expectEqualStrings("name", snapshot.attributes[1].attname);
-    try std.testing.expectEqual(@as(i16, 2), snapshot.attributes[1].attnum);
-    try std.testing.expectEqualStrings("token", snapshot.attributes[2].attname);
-    try std.testing.expectEqual(snapshot.classes[0].oid, snapshot.attributes[2].attrelid);
+    try std.testing.expectEqualStrings("id", snapshot.attributes[1].attname);
+    try std.testing.expectEqual(snapshot.classes[1].oid, snapshot.attributes[1].attrelid);
+    try std.testing.expectEqual(@as(i16, 1), snapshot.attributes[1].attnum);
+    try std.testing.expect(snapshot.attributes[1].attnotnull);
+    try std.testing.expectEqual('a', snapshot.attributes[1].attidentity);
+    try std.testing.expectEqualStrings("name", snapshot.attributes[2].attname);
+    try std.testing.expectEqual(snapshot.classes[1].oid, snapshot.attributes[2].attrelid);
+    try std.testing.expectEqual(@as(i16, 2), snapshot.attributes[2].attnum);
     try std.testing.expectEqual(@as(usize, 3), snapshot.types.len);
-    try std.testing.expectEqual(@as(u32, 23), snapshot.types[0].oid);
-    try std.testing.expectEqualStrings("int4", snapshot.types[0].typname);
-    try std.testing.expect(snapshot.types[0].typbyval);
-    try std.testing.expectEqual(@as(u8, 'N'), snapshot.types[0].typcategory);
-    try std.testing.expectEqual(@as(u32, 25), snapshot.types[1].oid);
-    try std.testing.expectEqualStrings("text", snapshot.types[1].typname);
-    try std.testing.expectEqual(@as(i16, -1), snapshot.types[1].typlen);
-    try std.testing.expect(!snapshot.types[1].typbyval);
-    try std.testing.expectEqual(@as(u32, 1007), snapshot.types[2].oid);
-    try std.testing.expectEqual(@as(u32, 23), snapshot.types[2].typelem);
+    try std.testing.expectEqual(@as(u32, 1007), snapshot.types[0].oid);
+    try std.testing.expectEqualStrings("_int4", snapshot.types[0].typname);
+    try std.testing.expectEqual(@as(u32, 23), snapshot.types[0].typelem);
+    try std.testing.expectEqual(@as(u32, 23), snapshot.types[1].oid);
+    try std.testing.expectEqualStrings("int4", snapshot.types[1].typname);
+    try std.testing.expect(snapshot.types[1].typbyval);
+    try std.testing.expectEqual(@as(u8, 'N'), snapshot.types[1].typcategory);
+    try std.testing.expectEqual(@as(u32, 25), snapshot.types[2].oid);
+    try std.testing.expectEqualStrings("text", snapshot.types[2].typname);
+    try std.testing.expectEqual(@as(i16, -1), snapshot.types[2].typlen);
+    try std.testing.expect(!snapshot.types[2].typbyval);
 }
 
 test "store load lifecycle" {

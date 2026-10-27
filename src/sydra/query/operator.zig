@@ -307,16 +307,24 @@ fn createOperator(allocator: std.mem.Allocator, schema: []const plan.ColumnInfo,
 fn createScanOperator(allocator: std.mem.Allocator, engine: *engine_mod.Engine, node: physical.Scan, schema: []const plan.ColumnInfo) ExecuteError!*Operator {
     if (node.selector == null) return error.UnsupportedPlan;
 
+    const series = try allocator.alloc(Operator.ScanSeries, 0);
+    var series_owned = true;
+    errdefer if (series_owned) allocator.free(series);
+    const buffer = try allocator.alloc(Value, schema.len);
+    var buffer_owned = true;
+    errdefer if (buffer_owned) allocator.free(buffer);
+
     var payload = Operator.Scan{
         .engine = engine,
-        .series = try allocator.alloc(Operator.ScanSeries, 0),
+        .series = series,
         .series_index = 0,
-        .buffer = try allocator.alloc(Value, schema.len),
+        .buffer = buffer,
         .selector_mode = "exact",
         .selected_series_count = 0,
     };
-    errdefer allocator.free(payload.series);
-    errdefer allocator.free(payload.buffer);
+    series_owned = false;
+    buffer_owned = false;
+    errdefer deinitScanPayload(allocator, &payload);
 
     for (payload.buffer) |*slot| slot.* = Value.null;
 
@@ -385,16 +393,20 @@ fn scanNext(op: *Operator) ExecuteError!?Row {
 
 fn scanDestroy(op: *Operator) void {
     const payload = &op.payload.scan;
+    deinitScanPayload(op.allocator, payload);
+}
+
+fn deinitScanPayload(allocator: std.mem.Allocator, payload: *Operator.Scan) void {
     for (payload.series) |scan_series| {
         scan_series.points.deinit();
         for (scan_series.tags) |tag| {
-            op.allocator.free(tag.key);
-            op.allocator.free(tag.value);
+            allocator.free(tag.key);
+            allocator.free(tag.value);
         }
-        op.allocator.free(scan_series.tags);
+        allocator.free(scan_series.tags);
     }
-    op.allocator.free(payload.series);
-    op.allocator.free(payload.buffer);
+    allocator.free(payload.series);
+    allocator.free(payload.buffer);
 }
 
 fn appendScanSeries(
@@ -459,9 +471,13 @@ fn parseTagFields(allocator: std.mem.Allocator, tags_json: []const u8) ExecuteEr
     var it = parsed.value.object.iterator();
     while (it.next()) |entry| {
         if (entry.value_ptr.* != .string) continue;
+        const key = try allocator.dupe(u8, entry.key_ptr.*);
+        errdefer allocator.free(key);
+        const value = try allocator.dupe(u8, entry.value_ptr.string);
+        errdefer allocator.free(value);
         try fields.append(.{
-            .key = try allocator.dupe(u8, entry.key_ptr.*),
-            .value = try allocator.dupe(u8, entry.value_ptr.string),
+            .key = key,
+            .value = value,
         });
     }
     return try fields.toOwnedSlice();
@@ -676,16 +692,18 @@ fn aggregateNext(op: *Operator) ExecuteError!?Row {
 fn aggregateDestroy(op: *Operator) void {
     var payload = &op.payload.aggregate;
     payload.child.destroy();
-    for (payload.groups.items) |group| {
-        for (group.aggregates) |state| deinitAggregateState(op.allocator, state);
-        op.allocator.free(group.keys);
-        op.allocator.free(group.aggregates);
-    }
+    for (payload.groups.items) |group| deinitGroupState(op.allocator, group);
     payload.groups.deinit();
     payload.key_buffer.deinit();
     op.allocator.free(payload.output_buffer);
     op.allocator.free(payload.aggregates);
     op.allocator.free(payload.column_meta);
+}
+
+fn deinitGroupState(allocator: std.mem.Allocator, group: Operator.GroupState) void {
+    for (group.aggregates) |state| deinitAggregateState(allocator, state);
+    allocator.free(group.keys);
+    allocator.free(group.aggregates);
 }
 
 fn materializeGroups(allocator: std.mem.Allocator, payload: *Operator.Aggregate, child: *Operator) ExecuteError!void {
@@ -1329,18 +1347,15 @@ fn applyFill(allocator: std.mem.Allocator, payload: *Operator.Aggregate) Execute
     const fill = payload.fill orelse return;
     const bucket_idx = timeBucketGroupIndex(payload.group_exprs) orelse return error.UnsupportedFill;
     const bucket_step = timeBucketStep(payload.group_exprs[bucket_idx].expr) orelse return error.UnsupportedFill;
+    if (bucket_step <= 0) return error.UnsupportedFill;
 
     std.sort.pdq(Operator.GroupState, payload.groups.items, FillSortContext{ .bucket_idx = bucket_idx }, FillSortContext.lessThan);
 
     var filled = ManagedArrayList(Operator.GroupState).init(allocator);
-    errdefer {
-        for (filled.items) |group| {
-            for (group.aggregates) |state| deinitAggregateState(allocator, state);
-            allocator.free(group.keys);
-            allocator.free(group.aggregates);
-        }
-        filled.deinit();
-    }
+    errdefer filled.deinit();
+    var generated = ManagedArrayList(Operator.GroupState).init(allocator);
+    defer generated.deinit();
+    errdefer for (generated.items) |group| deinitGroupState(allocator, group);
 
     var idx: usize = 0;
     while (idx < payload.groups.items.len) {
@@ -1363,6 +1378,10 @@ fn applyFill(allocator: std.mem.Allocator, payload: *Operator.Aggregate) Execute
                     else => return error.UnsupportedFill,
                 };
                 const filled_group = try makeFilledGroup(allocator, payload, previous, bucket_idx, missing_bucket, fill_value);
+                var filled_group_owned = true;
+                errdefer if (filled_group_owned) deinitGroupState(allocator, filled_group);
+                try generated.append(filled_group);
+                filled_group_owned = false;
                 try filled.append(filled_group);
             }
             try filled.append(next_group);
@@ -1444,6 +1463,7 @@ fn makeFilledGroup(
 ) !Operator.GroupState {
     defer allocator.free(filled_values);
     const keys = try Value.copySlice(allocator, source.keys);
+    errdefer allocator.free(keys);
     keys[bucket_idx] = .{ .integer = bucket_value };
     const states = try allocator.alloc(Operator.AggregateState, payload.aggregates.len);
     for (payload.aggregates, 0..) |aggregate, idx| {
@@ -1570,6 +1590,7 @@ test "aggregate avg without grouping" {
         .child = undefined,
         .requires_hash = false,
         .has_fill_clause = false,
+        .fill = null,
     };
 
     var agg_op = try createAggregateOperator(alloc, child, aggregate_node, agg_columns);
@@ -1688,6 +1709,7 @@ test "aggregate min max first and last without grouping" {
         .child = undefined,
         .requires_hash = false,
         .has_fill_clause = false,
+        .fill = null,
     };
 
     var agg_op = try createAggregateOperator(alloc, child, aggregate_node, agg_columns);

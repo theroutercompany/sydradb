@@ -1619,7 +1619,7 @@ test "prepareSydraQL falls back to the physical backend for native fill(previous
     defer engine.deinit();
 
     const sid: u64 = 7446;
-    try engine.registerSeries("fill.room3", "{}", sid);
+    try engine.registerSeries("filltest.room3", "{}", sid);
     try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.5, .tags_json = "{}" });
     try engine.ingest(.{ .series_id = sid, .ts = 130, .value = 4.0, .tags_json = "{}" });
     try waitForQueryablePoints(alloc, engine, sid, 2, 1_000);
@@ -1627,7 +1627,7 @@ test "prepareSydraQL falls back to the physical backend for native fill(previous
     var stmt = try prepareSydraQL(
         alloc,
         engine,
-        "select time_bucket(60, time) as bucket, avg(value) as avg_value from fill.room3 where time >= 0 group by time_bucket(60, time) fill(previous) order by bucket asc",
+        "select time_bucket(60, time) as bucket, avg(value) as avg_value from filltest.room3 where time >= 0 group by time_bucket(60, time) fill(previous) order by bucket asc",
         .{},
     );
     defer stmt.finalize();

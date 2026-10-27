@@ -907,8 +907,14 @@ test "segment root range queries skip unrelated blocks" {
 
     var first_block = try loadTreeObject(alloc, &store, blocks_tree.entries[0].object_id);
     defer first_block.deinit(alloc);
-    const first_block_ts_root = findTreeEntry(first_block.entries, "ts", .tree).?;
-    try corruptLooseObject(store.root, first_block_ts_root);
+    const first_block_values_root = findTreeEntry(first_block.entries, "values", .tree).?;
+
+    var second_block = try loadTreeObject(alloc, &store, blocks_tree.entries[1].object_id);
+    defer second_block.deinit(alloc);
+    const second_block_values_root = findTreeEntry(second_block.entries, "values", .tree).?;
+    try std.testing.expect(!first_block_values_root.eql(second_block_values_root));
+
+    try corruptLooseObject(store.root, first_block_values_root);
 
     const second_block_start_idx: usize = segment_root_block_point_count;
     const second_block_end_idx: usize = second_block_start_idx + segment_root_block_point_count - 1;
