@@ -864,3 +864,92 @@ not integrated into root.
 The next native port owns derived event-ID lifetime, runtime directory ownership,
 writer wakeups, flush publication errors, and strict append behavior. It starts
 from the PR 88 source tree and will preserve separate reviewable checkpoints.
+
+## Selector lifetime and writer delivery checkpoints
+
+The compiled-selector regression fails on the unfixed integrated source
+(`query-selector-ownership-red-runtime.log`, 534/535). Its fix passes 535/535
+runtime tests (`query-selector-ownership-green-runtime.log`). Root applied the
+five-file patch and verified that each file matches the tested worker source.
+Signed local checkpoint `452f4a3d1fe1bc61fd22475aa373e022112b6c6d` records it.
+The integrated root also passes all 26 wire tests
+(`query-limits-root-wire-final.log`).
+
+The scoped upstream port passes 444/444 runtime tests and is published in PR 89.
+Ubuntu and macOS CI pass at its head in run `40475252112`; it is ready for review.
+Signed local commit `f9df4b19571b9dea11f2f5a916fc15a8d2c08222` and published
+commit `6895cc171b8c30422e7162747473141ed44f5928` share tree
+`3e2d9708ef51edcc52bc32daf3c356a414f0b29f`.
+
+The remaining AST query consumers have a separate ownership patch. Its regression
+initially had a pointer-type compilation error, then aborted on a null tag in the
+unfixed path. An explicit type assertion produced a clean RED result: 535/536
+tests passed, with only the new regression failing
+(`query-ast-selector-red-asserted-runtime.log`). After correction of four caller
+adaptation errors, the worker tree passed 536/536
+(`query-ast-selector-green-fixed-runtime.log`). Root integration passed 549/549
+with terminal exit 0 (`query-ast-selector-root-runtime-terminal.log`). Signed
+checkpoint `936d8de97ba9498a2fe2abaca46128cd757a28a1` has tree
+`a16ff1e0fc14b28e7f1338e9e5d95c375ca57432`. The patch covers AST scans and the
+HTTP comparison endpoint. The checkpoint is local and is not part of PR 89 yet.
+
+PR 90 contains four atomic native checkpoints and the PR 89 dependency merge:
+
+| Scope | Signed local commit | Published commit |
+| --- | --- | --- |
+| Derived event and directory ownership | `43e048e0d213cd9f66ab39468f1c064cceadc69d` | `f6cb39300c968d2cc09652e46b4864bd561702f6` |
+| Writer wake and flush errors | `0749b31cf10f46fa003afb3e00067f1a84a6cacb` | `d30ea5b169021788a1c9115fa9e026c03f6d2dfc` |
+| Strict ordered append | `5999440b1db305a61a5923778da10a08464b1d87` | `8aef7c9370e4f5c85d8c65eca5407626d6525957` |
+| Benchmark phase timings | `1fc9d7a565015d0a66006aaf7e1c5d90b99dc836` | `4a6cf54b633a43a1c70d1e515cfe48f63fa6a573` |
+| Selector dependency merge | `edeb1e4a2f26e000a80ee7ad0d33de6c4c025f66` | `26d4700209fcd9cd4a1c49263615d3a9db422e25` |
+
+Every checkpoint has matching signed-local and published trees. The final tree
+is `b41115c1a2786725f0e5f6222d41e6475596fc32`. It passes 447 runtime and 197
+storage tests, the benchmark smoke, and all 10 build steps in ReleaseSafe
+(`native-writer-delivery-tests.log`). The prior tree passed 642/643 and failed a
+compiled-selector test; the explicit dependency resolved that failure. This is
+smoke evidence, not a throughput claim. The new buffered-publication-error
+regression and early error return must also be reconciled into the current-root
+monotonic barrier implementation before M1 closure.
+
+Hosted PR 90 run `40476994553` failed on Ubuntu; the macOS job was canceled.
+All 644 assertions passed, but CAS verification emitted error-level descriptor
+count mismatches. A read-only caller trace found two private test helpers that
+verify after the live manifest changes but before CAS publication completes.
+They must cross the existing drain barrier before explicit verification. The
+worker is adding a causal regression and retaining error-level corruption
+diagnostics. See `native-writer-ci-diagnosis-result.md` and
+`native-writer-delivery-ci-failure.txt`. PR 90 remains draft. This evidence does
+not establish data loss or persistent CAS corruption.
+
+The selector preparation tree now passes 493/493 runtime tests
+(`selector-family-covered-runtime.log`). Its prepared test asserts the exact
+existing parser coverage diagnostics for `AS` and `>=` and retains all execution
+and rebinding assertions. The integration worker preserved query budgets and
+owned selector metadata, added a compiled family budget regression, and produced
+a 26-file patch. That tree passed 550/550 runtime tests
+(`selector-family-integrated-runtime.log`). A later test-only addition prepares a
+by-ID query before CAS replacement and checks the retained plan after replacement;
+it still needs final integration evidence. The integration worker is combining
+this patch with the AST ownership fix and shared application fixtures.
+
+The first native maintenance run passed all 523 assertions but exited 1 because
+two deliberate persistent-startup-failure tests emitted error logs
+(`native-maintenance-final-runtime.log`). A narrow test-hook correction now
+observes and asserts those injected errors; production logging is unchanged.
+The worker tree passed 523/523 with exit 0
+(`native-maintenance-verified-runtime.log`), and root integration passed 548/548
+with exit 0 (`native-maintenance-root-runtime.log`). Signed checkpoint
+`475a9e933af9323e0a27f17dfcc397b293e41967` has tree
+`49930b726dd0b985078240d3adf68d49ee00d252`.
+
+The sensor/service/trading lifecycle test passed 536/536 in its worker tree
+(`application-contract-final-runtime.log`). It checks explicit reversed-column
+projection, corrections, restart, snapshot restore, and historical revisions
+against independently expected values. Its root integration remains pending.
+
+The WAL streaming and torn scalar-manifest recovery prerequisites are ported to
+the PR 90 base in two ordered patches. Independent review and storage/runtime
+checks are in progress. Trading-transform extraction and the current-root
+publication-error reconciliation have separate workers and isolated worktrees.
+No PR has been merged, and no branch has been pushed directly to main.
