@@ -9411,7 +9411,14 @@ fn rebuildReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir, fsync
 fn scanReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !ReftableSummaryIndex {
     const table_names = try loadReftableTableNames(alloc, root);
     defer freeOwnedStrings(alloc, table_names);
+    return try scanReftableSummaryIndexForNames(alloc, root, table_names);
+}
 
+fn scanReftableSummaryIndexForNames(
+    alloc: std.mem.Allocator,
+    root: std.fs.Dir,
+    table_names: []const []const u8,
+) !ReftableSummaryIndex {
     const records = try alloc.alloc(ReftableSummaryRecord, table_names.len);
     var loaded_count: usize = 0;
     errdefer {
@@ -9564,13 +9571,31 @@ fn loadReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !Reftabl
 }
 
 fn loadOrScanReftableSummaryIndex(alloc: std.mem.Allocator, root: std.fs.Dir) !ReftableSummaryIndex {
-    return loadReftableSummaryIndex(alloc, root) catch |err| switch (err) {
+    var summary = loadReftableSummaryIndex(alloc, root) catch |err| switch (err) {
         error.FileNotFound,
         error.CorruptReftableSummary,
         error.UnsupportedReftableSummaryVersion,
-        => try scanReftableSummaryIndex(alloc, root),
+        => return try scanReftableSummaryIndex(alloc, root),
         else => return err,
     };
+    var summary_owned = true;
+    defer if (summary_owned) summary.deinit(alloc);
+
+    const table_names = try loadReftableTableNames(alloc, root);
+    defer freeOwnedStrings(alloc, table_names);
+
+    if (summary.records.len == table_names.len) {
+        for (summary.records, table_names) |record, table_name| {
+            if (!std.mem.eql(u8, record.table_name, table_name)) break;
+        } else {
+            summary_owned = false;
+            return summary;
+        }
+    }
+
+    summary.deinit(alloc);
+    summary_owned = false;
+    return try scanReftableSummaryIndexForNames(alloc, root, table_names);
 }
 
 fn summaryContainsRef(record: ReftableSummaryRecord, ref_name: []const u8) bool {
@@ -12685,6 +12710,90 @@ test "symrefs persist head targets alongside reftable refs" {
     const restored = try refs.readSymRef("HEAD") orelse return error.MissingCasHead;
     defer std.testing.allocator.free(restored);
     try std.testing.expectEqualStrings(main_ref, restored);
+}
+
+test "reftable reads ignore checksum-valid summaries for stale table lists" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/reftable-stale-summary", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    const stale_id = object_store.computeId(.commit, "stale-summary-head");
+    const authoritative_id = object_store.computeId(.commit, "authoritative-table-head");
+    const authoritative_table = "reftable/2-2.table";
+    var stale_table_name: []const u8 = undefined;
+
+    {
+        var refs = try RefStore.init(alloc, path, .none);
+        defer refs.deinit();
+        refs.setBackend(.reftable);
+        try refs.updateRefAtomic(main_ref, stale_id);
+
+        const original_names = try loadReftableTableNames(alloc, refs.root);
+        defer freeOwnedStrings(alloc, original_names);
+        try std.testing.expectEqual(@as(usize, 1), original_names.len);
+        stale_table_name = original_names[0];
+
+        var authoritative_refs = [_]ReftableRefRecord{.{
+            .name = try alloc.dupe(u8, main_ref),
+            .id = authoritative_id,
+        }};
+        defer authoritative_refs[0].deinit(alloc);
+        var authoritative_logs = [_]ReflogEntry{.{
+            .ref_name = try alloc.dupe(u8, main_ref),
+            .old_id = stale_id,
+            .new_id = authoritative_id,
+            .timestamp_ms = std.time.milliTimestamp(),
+            .reason = try alloc.dupe(u8, "authoritative-table"),
+        }};
+        defer authoritative_logs[0].deinit(alloc);
+
+        try writeReftableTable(
+            alloc,
+            refs.root,
+            authoritative_table,
+            .{ .min_update_index = 2, .max_update_index = 2 },
+            authoritative_refs[0..],
+            authoritative_logs[0..],
+            .none,
+        );
+        try writeReftableTablesList(alloc, refs.root, &.{authoritative_table}, .none);
+
+        // Loading verifies the summary checksum. Its single old table name differs
+        // from the single authoritative name in tables.list.
+        var stale_summary = try loadReftableSummaryIndex(alloc, refs.root);
+        defer stale_summary.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 1), stale_summary.records.len);
+        try std.testing.expectEqualStrings(stale_table_name, stale_summary.records[0].table_name);
+
+        const head = try refs.readHead(main_ref) orelse return error.MissingCasHead;
+        try std.testing.expect(head.eql(authoritative_id));
+        const reflog = try refs.loadReflog(alloc, main_ref, 8);
+        defer {
+            for (reflog) |*entry| entry.deinit(alloc);
+            alloc.free(reflog);
+        }
+        try std.testing.expectEqual(@as(usize, 1), reflog.len);
+        try std.testing.expectEqualStrings("authoritative-table", reflog[0].reason);
+    }
+
+    {
+        var reopened = try RefStore.init(alloc, path, .none);
+        defer reopened.deinit();
+        reopened.setBackend(.reftable);
+
+        const head = try reopened.readHead(main_ref) orelse return error.MissingCasHead;
+        try std.testing.expect(head.eql(authoritative_id));
+        const reflog = try reopened.loadReflog(alloc, main_ref, 8);
+        defer {
+            for (reflog) |*entry| entry.deinit(alloc);
+            alloc.free(reflog);
+        }
+        try std.testing.expectEqual(@as(usize, 1), reflog.len);
+        try std.testing.expectEqualStrings("authoritative-table", reflog[0].reason);
+    }
 }
 
 test "checkpoints support diffing and rollback" {
