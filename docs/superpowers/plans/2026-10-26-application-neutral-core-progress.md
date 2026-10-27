@@ -748,3 +748,119 @@ derived-bar fixture. Prepared statements again allow binding after
 `UnboundParameter`, and the catalog-budget fixture binds its parameter before
 checking the limit. No all-green M3 result is claimed. See
 `query-limits-integration-runtime-attempt3.log`.
+
+## Query integration, native failure evidence, and published ports
+
+The reviewed M3 patch applied to the current root without conflicts. Root saved
+all 24 affected paths in `query-limits-root-before/` first. Twenty-one files match
+the worker's source byte-for-byte; Engine, HTTP, and the API reference preserve
+the later empty-catalog, policy, and documentation changes. The integrated runtime
+run passed 534/534 tests and four build steps (`query-limits-root-runtime.log`).
+
+The wire run passed 23/26 tests (`query-limits-root-wire.log`). The three failures
+concern the new tests' message expectations: two extra NoticeResponse frames and
+a RowDescription before an execution error. A worker is checking the actual wire
+contract and retaining the SQLSTATE, Sync, discarded INSERT, and recovery checks.
+M3 is not fully verified yet.
+
+The first native regression run passed 510 tests but omitted the storage command
+module from Zig's lazy test graph. It is not regression evidence. The worker added
+the module to `src/runtime_tests.zig`. The corrected run executed 519 tests and
+failed exactly the two new regressions: promotion's continuous worker pause and
+scalar WAL failure propagation. Evidence:
+`native-maintenance-wired-red-runtime.log` (517/519, exit 1). A worker now owns
+the production fix and repeat-barrier regression in the isolated maintenance tree.
+
+The original seven-patch series and the later feature work now have separate
+signed local checkpoints. `signed-native-checkpoint-history.tsv` records each
+commit and tree. The latest feature checkpoints are:
+
+| Change | Signed local commit |
+| --- | --- |
+| Mixed native and scalar derived history | `20dacc9c40340549044d415a191c4a75654ea477` |
+| Empty generic catalog and explicit trading initialization | `b28f67c4c29d7bdd788dcc84138d3f37e11e7514` |
+| Pure trading policy validation | `5c4bb84e159c38398f20a1383ab7fed80abd1022` |
+| Query budgets and cancellation | `de59db429f1dd665c9fa90f572d4f60208f0fa3f` |
+
+The policy checkpoint's Engine and policy hashes match the verified source. The
+query checkpoint's Engine hash is
+`3b52c30be7b2e3ed698577c30846f119bf53a58add0d87e5e21a5ad52f72ae39`,
+which matches the integrated root. These local branches retain the original
+unpublished ancestry and will be ported through scoped PRs; they are not pushed
+as a replacement for the existing upstream stack.
+
+Two additional ports are published as drafts:
+
+| PR | Signed local commit | Published commit | Shared tree |
+| --- | --- | --- | --- |
+| 86, native compaction | `bd2e0a0c8edf104eaef30a38cff4c7cf080c9fe6` | `ab14a950da7635ae3c9b238f35f737fe82186358` | `172761dbac5ad43a3844a5e4ba804e33a1aecf95` |
+| 87, crash recovery | `2c4e88b56cce4531f6571a6eff99d7a449cbd120` | `ebbd88da68ac62a488f4018073ef7cb9dc48e352` | `5fb1bfa209d43dc61f26775cdc7c21ce50adea02` |
+
+Their patch IDs match the original `fb0c346` and `d3c10b8` changes. Ubuntu and
+macOS CI pass at both heads (runs `40467477939` and `40467528071`). The crash
+driver has not been executed at this PR head. PR 83's two later checkpoints are
+published as `4c2fda426e2bdd016626ac58a7f8603dee26bccf` and
+`feac8a4c9e8bdecd76c5d3245ab34a5422d9763a`; their trees match the signed local
+checkpoints. Ubuntu passed at `feac8a4`; macOS failed a compiled/legacy query parity
+test with a tag JSON parse error. The failure is preserved in
+`migration-macos-query-tags-failure.log`. A separate worker is tracing selector
+metadata ownership across CAS index replacement in a tree based on `de59db4`.
+
+Independent selector review found four defects: family first/last ordering,
+whitespace in dotted names, the prepared ambiguity error, and inconsistent
+generated bracket-filter validation. The worker's corrections and causal tests
+are prepared in `selector-family-review-fix.patch`; no revised suite has run yet.
+
+The final native prerequisite audit gives useful missing-interface evidence, but
+its claim that P2 is stale is rejected. Comparing patch IDs or added-helper lists
+does not prove different final source. Root compared commit `d66e064` with the
+original-patch reconstruction again; all three files are byte-identical. See
+`p2-commit-byte-recheck.json`. The original P2 artifact remains valid. The audit's
+remaining writer, recovery, timing, and snapshot prerequisites still need scoped
+ports and verification.
+
+## Wire verification and append-history checkpoint
+
+The wire fixture correction passed all 26 tests in the query preparation tree
+(`query-wire-budget-fixtures-tests.log`). The correction preserves the SQLSTATE,
+discarded pipelined INSERT, Sync, and recovery assertions. Root applied the exact
+tested file delta. Signed local commit
+`7249907adb22569c45f4411f622d8e12aa1919f9` records this test correction.
+The root wire target has not been rerun after this test-only change.
+
+PR 88 ports append-history correctness and CAS mismatch diagnostics in separate
+checkpoints. Its 197 storage tests pass (`native-append-history-storage.log`).
+Ubuntu and macOS CI pass in run `40471997243` at published head
+`5b7418426288c8fab9ad2bb9812db68251a35195`. The shared final tree is
+`20d8e3eda9b4782e49cb0a0d11f54d4bd42d124b`.
+
+| Scope | Signed local commit | Published commit |
+| --- | --- | --- |
+| Append correctness | `8b0a49b5fbf8a5a4d5492cabb8bbdc26aa9c574c` | `2a9e48240fdeeadc644046e89e888b71d9a2799a` |
+| Mismatch diagnostics | `b006f15f965f19830afc1a4f677e9c6be4c9aad2` | `5b7418426288c8fab9ad2bb9812db68251a35195` |
+
+The selector ownership investigation found that the compiler stores metadata
+slices from a CAS index that a concurrent refresh can replace. The proposed fix
+copies selector strings while holding the index lock. It also keeps shadow
+comparisons inside that lock. The prepared-query regression, production fix,
+and combined patch are separate artifacts under
+`query-selector-ownership-patches/`. Independent review and RED/GREEN execution
+remain pending. The macOS failure is consistent with this lifetime defect;
+the CI log alone does not prove that cause.
+
+The native maintenance production patch now includes cleanup for a promotion
+result if worker restart fails, and a regression for a caller's cleanup retry
+after a failed restart. The queue rejects work while the writer is stopped.
+The final patch is under independent review and a full runtime run; no GREEN
+claim is made yet.
+
+The revised selector-family suite still passes 492 of 493 tests
+(`selector-family-bounded-runtime.log`). The prepared rebinding test reports two
+diagnostics after the time-bound correction. Further fixture edits are stopped.
+A read-only worker is tracing preparation and parsing; the assumption that this
+was only a missing time bound is not supported by the latest run. The feature is
+not integrated into root.
+
+The next native port owns derived event-ID lifetime, runtime directory ownership,
+writer wakeups, flush publication errors, and strict append behavior. It starts
+from the PR 88 source tree and will preserve separate reviewable checkpoints.
