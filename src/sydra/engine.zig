@@ -5716,11 +5716,24 @@ pub const Engine = struct {
                 try collectSegmentHighwater(&highwater, self.metadata.manifest.entries.items);
             }
         }
-        var max_market_sequence: u64 = 0;
+        var market_sequence_highwater = std.AutoHashMap(
+            market_identity_mod.MarketSeriesId,
+            u64,
+        ).init(self.alloc);
+        defer market_sequence_highwater.deinit();
+        var max_market_sequence = try self.collectPersistedMarketWriteSequences(
+            &market_sequence_highwater,
+            true,
+        );
+        const has_unpublished_market_segments = try self.hasUnpublishedLocalMarketSegments();
 
         var ctx = struct {
             engine: *Engine,
             highwater: *std.AutoHashMap(types.SeriesId, i64),
+            market_sequence_highwater: *std.AutoHashMap(
+                market_identity_mod.MarketSeriesId,
+                u64,
+            ),
             market_registrations: *std.AutoHashMap(market_identity_mod.MarketSeriesId, MarketReplayRegistration),
             max_market_sequence: *u64,
 
@@ -5810,6 +5823,9 @@ pub const Engine = struct {
                 }
                 const registration = self_ctx.market_registrations.get(market_series_id) orelse return error.OrphanMarketRow;
                 try market_identity_mod.validateValueShape(registration.column_count, values.len);
+                if (self_ctx.market_sequence_highwater.get(market_series_id)) |persisted_sequence| {
+                    if (write_sequence <= persisted_sequence) return;
+                }
 
                 try self_ctx.engine.market_mem.appendBatch(&.{.{
                     .market_series_id = market_series_id,
@@ -5823,10 +5839,12 @@ pub const Engine = struct {
                 self_ctx.engine.market_mem_allocated_bytes.store(self_ctx.engine.market_mem.allocatedBytes(), .monotonic);
                 self_ctx.engine.market_mem_resident_bytes.store(self_ctx.engine.market_mem.residentBytes(), .monotonic);
                 try self_ctx.engine.appendRecoveredMarketFanout(registration, ts_ns, values);
+                try self_ctx.market_sequence_highwater.put(market_series_id, write_sequence);
             }
         }{
             .engine = self,
             .highwater = &highwater,
+            .market_sequence_highwater = &market_sequence_highwater,
             .market_registrations = &market_registrations,
             .max_market_sequence = &max_market_sequence,
         };
@@ -5843,14 +5861,43 @@ pub const Engine = struct {
         if (self.liveMemtableBytes() > 0) {
             const flushed = try flushMemtable(self);
             if (flushed) try self.syncCasSnapshot("recovery-flush");
+        } else if (has_unpublished_market_segments) {
+            try self.syncCasSnapshot("recovery-market-manifest");
         }
     }
 
-    /// Refresh the next sequence from native segments after the caller drains
-    /// queued writes and flushes live market memtable rows.
-    pub fn refreshNextMarketWriteSequenceFromPersistedSegments(self: *Engine) !void {
-        var maximum: u64 = 0;
+    fn hasUnpublishedLocalMarketSegments(self: *Engine) !bool {
+        if (self.cas == null or self.market_manifest.list().len == 0) return false;
+
+        self.metadata.cas_index_mu.lock();
+        defer self.metadata.cas_index_mu.unlock();
+        const index = if (self.metadata.cas_index) |*snapshot_index| snapshot_index else return true;
+
+        var published_content_ids = std.AutoHashMap(
+            market_manifest_mod.ContentDigest,
+            void,
+        ).init(self.alloc);
+        defer published_content_ids.deinit();
+        try published_content_ids.ensureTotalCapacity(
+            @intCast(index.snapshot.market_segment_descriptors.len),
+        );
+        for (index.snapshot.market_segment_descriptors) |descriptor| {
+            published_content_ids.putAssumeCapacity(descriptor.content_id, {});
+        }
         for (self.market_manifest.list()) |descriptor| {
+            if (!published_content_ids.contains(descriptor.content_id)) return true;
+        }
+        return false;
+    }
+
+    fn collectPersistedMarketWriteSequences(
+        self: *Engine,
+        highwater: ?*std.AutoHashMap(market_identity_mod.MarketSeriesId, u64),
+        restore_missing_mirrors: bool,
+    ) !u64 {
+        var maximum: u64 = 0;
+        for (self.market_manifest.list()) |*descriptor| {
+            if (restore_missing_mirrors) try ensureMarketCompactionMirror(self, descriptor);
             var segment = try market_segment_mod.readProjectedRange(
                 self.alloc,
                 self.data_dir,
@@ -5862,8 +5909,21 @@ pub const Engine = struct {
             defer segment.deinit(self.alloc);
             for (segment.write_sequences) |sequence| {
                 if (sequence > maximum) maximum = sequence;
+                if (highwater) |sequences| {
+                    const entry = try sequences.getOrPut(descriptor.market_series_id);
+                    if (!entry.found_existing or sequence > entry.value_ptr.*) {
+                        entry.value_ptr.* = sequence;
+                    }
+                }
             }
         }
+        return maximum;
+    }
+
+    /// Refresh the next sequence from native segments after the caller drains
+    /// queued writes and flushes live market memtable rows.
+    pub fn refreshNextMarketWriteSequenceFromPersistedSegments(self: *Engine) !void {
+        const maximum = try self.collectPersistedMarketWriteSequences(null, false);
         try self.advanceNextMarketWriteSequencePast(maximum);
     }
 
@@ -8292,6 +8352,86 @@ test "engine native market WAL recovery flushes row and advances sequence" {
     try std.testing.expect(recovered.market_mem.allocatedBytes() > 0);
     try std.testing.expectEqual(recovered.market_mem.allocatedBytes(), recovered.market_mem_allocated_bytes.load(.monotonic));
     try std.testing.expectEqual(@as(usize, 0), recovered.market_mem_resident_bytes.load(.monotonic));
+}
+
+test "engine restart skips native market WAL rows already persisted by sequence" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/market-wal-persisted-highwater", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var scalar_segment_count: usize = 0;
+    var market_segment_count: usize = 0;
+    {
+        var config = try testConfig(talloc, data_path);
+        config.cas_mode = .dual_write;
+        config.market_storage_mode = .dual_write_v1;
+        config.memtable_max_bytes = std.math.maxInt(usize);
+        config.flush_interval_ms = std.math.maxInt(u32);
+        var engine = try Engine.init(talloc, config);
+        defer engine.deinit();
+        const bootstrap_head = (try engine.cas.?.refs.readHead(cas_mod.main_ref)) orelse
+            return error.CasHeadMissing;
+
+        var schema = try engine.registerMarketSchema(.{
+            .metric = "market.test_persisted_highwater",
+            .ordered_columns = &.{ "price", "size" },
+            .required_labels = &.{"symbol"},
+            .storage_mapping = .native_v1,
+        });
+        defer schema.deinit(talloc);
+
+        const first_values = [_]f64{ 10.5, 100.0 };
+        const second_values = [_]f64{ 10.75, 125.0 };
+        const receipt = try engine.ingestMarketBatch(&.{
+            .{
+                .metric = "market.test_persisted_highwater",
+                .labels_json = "{\"symbol\":\"AAPL\"}",
+                .ts_ns = 1_000,
+                .values = &first_values,
+            },
+            .{
+                .metric = "market.test_persisted_highwater",
+                .labels_json = "{\"symbol\":\"AAPL\"}",
+                .ts_ns = 2_000,
+                .values = &second_values,
+            },
+        });
+        try std.testing.expectEqual(@as(usize, 2), receipt.accepted_rows);
+        _ = try engine.flushNow();
+        scalar_segment_count = engine.metadata.manifest.entries.items.len;
+        market_segment_count = engine.market_manifest.list().len;
+        try std.testing.expectEqual(@as(usize, 2), scalar_segment_count);
+        try std.testing.expectEqual(@as(usize, 1), market_segment_count);
+
+        const published_head = (try engine.cas.?.refs.readHead(cas_mod.main_ref)) orelse
+            return error.CasHeadMissing;
+        try engine.cas.?.refs.compareAndSwapRef(
+            cas_mod.main_ref,
+            published_head,
+            bootstrap_head,
+            "test stale native market head",
+        );
+    }
+
+    for (0..2) |_| {
+        var config = try testConfig(talloc, data_path);
+        config.cas_mode = .dual_write;
+        config.market_storage_mode = .dual_write_v1;
+        config.memtable_max_bytes = std.math.maxInt(usize);
+        config.flush_interval_ms = std.math.maxInt(u32);
+        var recovered = try Engine.init(talloc, config);
+        defer recovered.deinit();
+
+        try std.testing.expectEqual(scalar_segment_count, recovered.metadata.manifest.entries.items.len);
+        try std.testing.expectEqual(market_segment_count, recovered.market_manifest.list().len);
+        try std.testing.expectEqual(@as(u64, 3), recovered.next_market_write_sequence);
+        try std.testing.expectEqual(@as(usize, 0), recovered.mem.bytes.load(.monotonic));
+        try std.testing.expectEqual(@as(usize, 0), recovered.market_mem.residentBytes());
+        try recovered.verifyCasState();
+    }
 }
 
 test "engine native market WAL recovery replays same timestamp corrections after flush" {
