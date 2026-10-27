@@ -7335,9 +7335,15 @@ fn decodeBarPolicyEntry(alloc: std.mem.Allocator, value: std.json.Value) !market
     if (id_value != .string or source_value != .string or session_value != .string or no_trade_value != .string or halt_value != .string or correction_value != .string) return error.InvalidMetricCatalogSnapshotObject;
     return .{
         .id = try alloc.dupe(u8, id_value.string),
-        .version = switch (version_value) { .integer => @intCast(version_value.integer), else => return error.InvalidMetricCatalogSnapshotObject },
+        .version = switch (version_value) {
+            .integer => @intCast(version_value.integer),
+            else => return error.InvalidMetricCatalogSnapshotObject,
+        },
         .source_metric = try alloc.dupe(u8, source_value.string),
-        .interval_ns = switch (interval_value) { .integer => interval_value.integer, else => return error.InvalidMetricCatalogSnapshotObject },
+        .interval_ns = switch (interval_value) {
+            .integer => interval_value.integer,
+            else => return error.InvalidMetricCatalogSnapshotObject,
+        },
         .session_rule = try alloc.dupe(u8, session_value.string),
         .no_trade_rule = try alloc.dupe(u8, no_trade_value.string),
         .halt_rule = try alloc.dupe(u8, halt_value.string),
@@ -7358,7 +7364,10 @@ fn decodeRollupEntry(alloc: std.mem.Allocator, value: std.json.Value) !market_ca
     if (id_value != .string or source_value != .string or target_value != .string or policy_value != .string or kind_value != .string) return error.InvalidMetricCatalogSnapshotObject;
     return .{
         .id = try alloc.dupe(u8, id_value.string),
-        .version = switch (version_value) { .integer => @intCast(version_value.integer), else => return error.InvalidMetricCatalogSnapshotObject },
+        .version = switch (version_value) {
+            .integer => @intCast(version_value.integer),
+            else => return error.InvalidMetricCatalogSnapshotObject,
+        },
         .source_metric = try alloc.dupe(u8, source_value.string),
         .target_metric = try alloc.dupe(u8, target_value.string),
         .policy_id = try alloc.dupe(u8, policy_value.string),
@@ -7378,7 +7387,10 @@ fn decodeSignalEntry(alloc: std.mem.Allocator, value: std.json.Value) !market_ca
     if (id_value != .string or input_value != .string or expression_value != .string or params_value != .string or emit_value != .string) return error.InvalidMetricCatalogSnapshotObject;
     return .{
         .id = try alloc.dupe(u8, id_value.string),
-        .version = switch (version_value) { .integer => @intCast(version_value.integer), else => return error.InvalidMetricCatalogSnapshotObject },
+        .version = switch (version_value) {
+            .integer => @intCast(version_value.integer),
+            else => return error.InvalidMetricCatalogSnapshotObject,
+        },
         .input_metric = try alloc.dupe(u8, input_value.string),
         .policy_id = if (obj.get("policy_id")) |policy_value| if (policy_value == .string) try alloc.dupe(u8, policy_value.string) else null else null,
         .expression_kind = market_catalog_mod.SignalExpressionKind.parse(expression_value.string) orelse return error.InvalidMetricCatalogSnapshotObject,

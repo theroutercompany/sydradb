@@ -21,4 +21,3 @@ npm run serve
 ## Legacy docs backup
 
 The previous contents of `/<repo root>/docs` were moved into `docs/_backup/` (timestamped).
-

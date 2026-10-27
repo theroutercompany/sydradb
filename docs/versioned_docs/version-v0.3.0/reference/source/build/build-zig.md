@@ -129,4 +129,3 @@ Builds and runs a tool executable:
   - `sydra_tooling` (a module rooted at `src/sydra/tooling.zig`)
 
 Mimalloc handling mirrors the main executable and tests.
-

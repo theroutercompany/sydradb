@@ -45,4 +45,3 @@ The current fixture set includes basic rewrites and fallbacks for:
 - `DELETE` with and without `WHERE`, plus `RETURNING`
 
 Several “invalid” statements are included to assert fallback behavior (e.g. empty `SET`, empty `WHERE`, missing `RETURNING` list).
-
