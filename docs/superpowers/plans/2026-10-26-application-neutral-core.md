@@ -130,11 +130,11 @@ modify the corresponding methods in `engine.zig` and analysis handlers in
 Preserve engine method signatures and existing error names during extraction.
 Keep generic scheduling, retries, publication, and checkpoints in the runtime.
 
-- [ ] Pin valid and invalid policy/transform cases before moving them.
-- [ ] Extract literal metric rules and transform algorithms into application code.
-- [ ] Pass only required data or operations across the boundary.
-- [ ] Keep existing tests for retries, corrections, shutdown, and native emission.
-- [ ] Verify application helpers do not acquire ownership that callers still hold.
+- [x] Pin valid and invalid policy/transform cases before moving them.
+- [x] Extract literal metric rules and transform algorithms into application code.
+- [x] Pass only required data or operations across the boundary.
+- [x] Keep existing tests for retries, corrections, shutdown, and native emission.
+- [x] Verify application helpers do not acquire ownership that callers still hold.
 
 Do not use a dynamic plugin registry or broad callback interface. Extract pure
 validation first. Move stateful algorithms only after their data flow is mapped.
@@ -163,11 +163,11 @@ never be deleted or rewritten merely to remove application defaults.
 **Files:** existing runtime/storage tests and a small shared fixture helper only
 if the same test sequence would otherwise be repeated.
 
-- [ ] Run schema, ingest, projection, and query for sensor, service, and trade data.
-- [ ] Apply same-timestamp corrections and verify independent expected values.
-- [ ] Repeat reads after flush and restart.
-- [ ] Snapshot, restore, and compare current and historical revision results.
-- [ ] Verify none of the general fixtures require trading metric or label names.
+- [x] Run schema, ingest, projection, and query for sensor, service, and trade data.
+- [x] Apply same-timestamp corrections and verify independent expected values.
+- [x] Repeat reads after flush and restart.
+- [x] Snapshot, restore, and compare current and historical revision results.
+- [x] Verify none of the general fixtures require trading metric or label names.
 
 Expected: the same database contract passes for all three fixture families.
 
@@ -182,11 +182,11 @@ Expected: the same database contract passes for all three fixture families.
 for the cursor or prepared execution lifetime. Existing execute/prepare callers
 retain compatibility. Configuration supplies defaults through one shared path.
 
-- [ ] Trace allocator ownership across arena, cursor, VM, and prepared reset.
-- [ ] Record exact limit defaults, error names, and ownership interfaces.
+- [x] Trace allocator ownership across arena, cursor, VM, and prepared reset.
+- [x] Record exact limit defaults, error names, and ownership interfaces.
 - [ ] Write limit-boundary and allocation-failure tests before implementation.
-- [ ] Enforce allocation accounting without preallocating the entire budget.
-- [ ] Test reset, finalization, early destruction, and successful subsequent queries.
+- [x] Enforce allocation accounting without preallocating the entire budget.
+- [x] Test reset, finalization, early destruction, and successful subsequent queries.
 
 Reject arithmetic overflow. Do not share one mutable budget between concurrent
 queries. Distinguish a configured limit from unrelated allocator exhaustion.
@@ -196,11 +196,11 @@ queries. Distinguish a configured limit from unrelated allocator exhaustion.
 **Files:** `query/operator.zig`, `query/vm.zig`, `query/exec.zig`,
 `query/prepared.zig`, and engine range-read interfaces if required.
 
-- [ ] Add scan-ceiling tests for exact-series and metric-family reads.
-- [ ] Check limits before materializing points, rows, groups, and sort buffers.
-- [ ] Cover legacy, compiled physical, VM, and prepared execution.
-- [ ] Verify a SQL `LIMIT` does not silently stand in for a scan budget.
-- [ ] Verify cancellation and cleanup after a partial execution.
+- [x] Add scan-ceiling tests for exact-series and metric-family reads.
+- [x] Check limits before materializing points, rows, groups, and sort buffers.
+- [x] Cover legacy, compiled physical, VM, and prepared execution.
+- [x] Verify a SQL `LIMIT` does not silently stand in for a scan budget.
+- [x] Verify cancellation and cleanup after a partial execution.
 
 Expected: all paths observe the same configured contract and release resources.
 Do not claim bounded storage decoding if temporary storage allocations remain
@@ -211,11 +211,11 @@ outside the query budget. Include those allocations or state and fix the gap.
 **Files:** `http.zig`, `compat/wire/session.zig`, `compat/sqlstate.zig`,
 query diagnostics, HTTP/wire tests, and API/configuration documentation.
 
-- [ ] Define stable error payloads for failures before response headers.
-- [ ] Define terminal behavior for failures after streamed rows begin.
-- [ ] Map the same limit failures in prepared and simple wire queries.
-- [ ] Test connection reuse and subsequent successful queries after failure.
-- [ ] Document exact defaults, units, scope, and terminal error behavior.
+- [x] Define stable error payloads for failures before response headers.
+- [x] Define terminal behavior for failures after streamed rows begin.
+- [x] Map the same limit failures in prepared and simple wire queries.
+- [x] Test connection reuse and subsequent successful queries after failure.
+- [x] Document exact defaults, units, scope, and terminal error behavior.
 
 ## M4: Complete general selection
 
@@ -229,11 +229,11 @@ parser fixtures, language documentation.
 selector form and label equality/inequality expressions. Keep regular
 `WHERE tag.<name>` predicates supported.
 
-- [ ] Specify syntax, missing-label behavior, and unsupported expressions.
-- [ ] Add parser and normalization fixtures for success and malformed input.
-- [ ] Preserve precedence when combining selector filters with WHERE predicates.
-- [ ] Verify generated and hand-written frontends agree on the supported subset.
-- [ ] Test escaping, empty labels, no matches, and exact-ID selectors.
+- [x] Specify syntax, missing-label behavior, and unsupported expressions.
+- [x] Add parser and normalization fixtures for success and malformed input.
+- [x] Preserve precedence when combining selector filters with WHERE predicates.
+- [x] Verify generated and hand-written frontends agree on the supported subset.
+- [x] Test escaping, empty labels, no matches, and exact-ID selectors.
 
 ### Task 12: Bind and execute compiled metric families
 
@@ -245,11 +245,11 @@ selector form and label equality/inequality expressions. Keep regular
 selection. Represent family selection explicitly. Use the compiled physical path
 when the VM cannot yet execute a shape; report the actual execution path.
 
-- [ ] Add differential tests for exact and family selection in all modes.
-- [ ] Cover filters, aggregates, grouping, ordering, LIMIT, and OFFSET.
-- [ ] Ensure family scans use the M3 limits and preserve missing-label semantics.
-- [ ] Keep destructive multi-series writes outside this read-only extension.
-- [ ] Verify selected-series statistics and fallback diagnostics are truthful.
+- [x] Add differential tests for exact and family selection in all modes.
+- [x] Cover filters, aggregates, grouping, ordering, LIMIT, and OFFSET.
+- [x] Ensure family scans use the M3 limits and preserve missing-label semantics.
+- [x] Keep destructive multi-series writes outside this read-only extension.
+- [x] Verify selected-series statistics and fallback diagnostics are truthful.
 
 ## M5: Generic persisted rollups
 

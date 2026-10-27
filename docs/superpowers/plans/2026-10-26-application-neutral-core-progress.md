@@ -953,3 +953,142 @@ the PR 90 base in two ordered patches. Independent review and storage/runtime
 checks are in progress. Trading-transform extraction and the current-root
 publication-error reconciliation have separate workers and isolated worktrees.
 No PR has been merged, and no branch has been pushed directly to main.
+
+
+### Integrated family queries and application contracts
+
+Root passes 566/566 runtime tests in ReleaseSafe with terminal exit 0
+(`neutral-query-root-integrated-runtime.log`). This run includes the AST ownership
+fix, native maintenance barriers, buffered-publication-error reconciliation,
+shared application fixtures, and the full metric-family selector patch. The
+prepared by-ID query is created before CAS replacement and checked afterward;
+this preserves direct evidence of compiled-plan metadata lifetime.
+
+| Scope | Signed checkpoint | Tree |
+| --- | --- | --- |
+| Buffered publication error with retained input | `58de7cddd084ffc8b9fe1126e943717c5220317f` | `8c20c2c9efdecafd124e082f342ac46ec96a4043` |
+| Shared application lifecycle fixtures | `e406668f641686d7c7883c1139065b0effb839ae` | `16d4d523b8e5caf411a0e37b90013995c6124d6a` |
+| Label filters and compiled family reads | `829e07588b2e574ebec0ff0e13b1ae8a64212aa3` | `0c263fa7e87f5154cd969fb542eb180c1f91bf12` |
+
+The buffered-error worker tree also passed 550/550 ReleaseSafe runtime tests
+(`native-root-publication-error-runtime.log`). Its filesystem regression retains
+the input after `NotDir`, removes the blocker, retries, and queries the exact
+stored point. These three checkpoints are local; they are not published feature
+PR heads yet.
+
+Task 7 and M4 Tasks 11–12 have integrated runtime evidence. M3's independent
+acceptance audit supports Tasks 9–10 and most of Task 8. It identified missing
+exact-cap and true integer-overflow assertions, plus a storage-buffer wording
+clarification. A bounded follow-up keeps the existing saturating counters and
+adds coverage; no counter-semantics change is required. The inspected commit
+history does not establish that all original M3 tests preceded implementation.
+See `query-limits-acceptance-audit-result.md`.
+
+PR 74 now publishes ledger commit `d73a9f0e5feebf481994125d1cb0bad35053c48f`.
+Its tree `349c4a46b34c9c45ea8a871b3fe5febaed709ad0` matches signed local
+checkpoint `3350999baa8dc93cd0be25d5c4899bed1e847341`. The GitHub App commit is
+not signed. The paragraphs in this section are newer than that publication.
+
+### Recovery port findings
+
+The first streaming-plus-torn-manifest port passed 199/199 storage tests and
+449/450 runtime tests; the torn-manifest restart assertion expected two scalar
+segments and found four (`native-snapshot-recovery-tests.log`). The target lacks
+per-series durable native WAL sequence filtering. The existing `3fe0be1`
+prerequisite is now ported ahead of torn-manifest restoration; its stable-count
+assertion remains unchanged. This revised ordering is not yet runtime-verified.
+
+Independent review found a separate interruption gap: truncation and sync of the
+torn manifest erase the on-disk evidence needed by a later startup, while CAS
+restoration is requested only by an in-memory flag. The same pattern exists in
+current root. A worker is preserving repair state through checkpoint completion
+and adding an interrupted-recovery regression. Neither the recovery port nor M1
+is complete until this is fixed and verified.
+
+The PR 90 CI helper patch now crosses the drain barrier and propagates explicit
+verification failures. Its first test-only RED attempt did not compile because
+the query test accessed private `Engine.liveMemtableBytes`; this is fixture
+failure, not causal RED evidence. A worker is correcting both test trees before
+RED/GREEN runs. CAS error-level diagnostics remain unchanged.
+
+
+### Trading boundary and integrated protocol checkpoint
+
+The trading extraction passed 560/560 runtime tests in its isolated tree
+(`trading-transform-extraction-runtime.log`). Independent review found no material
+behavior change against its base; see `trading-transforms-review-result.md`.
+Root integration then passed 604/604 checks in ReleaseSafe: 577 runtime tests and
+27 wire tests, with all seven build steps successful
+(`neutral-core-transform-root-tests.log`).
+
+Signed checkpoint `c7767ee57b4926a756546b2dc21a4a2d90b58670`, tree
+`e2a0bec7ed9c2990e2bd41dfd5c8f021c3f72ebc`, moves trading sample alignment,
+rollup math, signal parameter handling, and signal formulas into
+`applications/trading/transforms.zig`. Engine retains storage reads, publication,
+retries, events, reports, and checkpoints. Eleven helper tests add independent
+numeric expectations. Schema column order and serialized identifiers remain
+covered by existing tests. Task 5 now has integrated evidence.
+
+The exact-cap and overflow follow-up preserves production counter behavior. Root
+passes 566/566 Debug runtime tests with those assertions
+(`query-limit-boundaries-root-runtime.log`). Signed checkpoint
+`4900502c70db2d9c4f136b76f792f26046b085d7`, tree
+`3eac5b4811437297397958b855e99ffdbb9460c9`, contains tests and configuration
+wording only. Task 8's test-first chronology remains unverified; current boundary
+behavior is verified.
+
+The corrected PR 90 RED fixture compiled but failed both preconditions before
+starting the helper under test: 447/449 passed
+(`native-writer-ci-red-runtime-fixed.log`). WAL rotation takes the held snapshot
+mutex before the writer clears its flush request. This is another fixture
+failure, not accepted causal RED evidence. The next correction observes a new
+drain generation instead of waiting for the pending flag to clear; the worker is
+tracing all generation writers before another run.
+
+Root review of the proposed interrupted-manifest fix found that its directory
+sync helper would be a no-op with pinned Zig 0.15.1, whose `std.fs.Dir` has no
+`sync` method. It also called full-engine verification before native WAL recovery.
+A worker is correcting both before testing. The same conditional directory-sync
+pattern already exists in CAS and object-store helpers; a separate read-only
+native-storage audit is in progress. A local diagnostic confirmed that directory
+`fsync` succeeds on the task filesystem. This is source and syscall evidence, not
+an observed power-loss test or a claim of data loss.
+
+
+### Scoped upstream selector and CI delivery
+
+PR 91 publishes the AST selector ownership fix on PR 89. Signed local commit
+`55347aa7fd09254624f2c842cd5e16c7ad242224` and App commit
+`d88c9a374894db3ca81d33b4a67c6e53e98f979c` share tree
+`fc11223fc1b7d80d7f4bf8e2aa35a90b8d9f02dd`. The scoped tree passed 445/445
+ReleaseSafe runtime tests (`ast-selector-lifetime-port-runtime.log`), then Ubuntu
+and macOS CI in run `40483609993`. PR 91 is ready for review and remains unmerged.
+Its upstream adaptation also propagates allocation errors instead of returning
+empty labels or a default metric kind.
+
+The source-corrected PR 90 regressions now provide causal RED evidence: 447/449
+passed, with both new tests failing at `poller_barrier_observed`
+(`native-writer-ci-red-generation-runtime.log`). The fixed tree passed 449/449
+ReleaseSafe runtime tests (`native-writer-ci-green-runtime.log`). Signed local
+commit `109fc5e67388fc4513c675371b4e0860b193cca4` and App commit
+`e2421592201d437d849f65c5ef7edbd9f1e36649` share tree
+`2534308241d5017da100d1534f5698b7c824b5ca`. The update is published to PR 90;
+its hosted run `40484116520` is in progress. Neither diagnostic severity nor the
+underlying CAS checks were relaxed.
+
+The native recovery integration, including sequence filtering, streaming capture,
+repair intent, and the CI helper correction, passed 652/652 ReleaseSafe tests:
+199 storage and 453 runtime (`native-recovery-sequences-and-intent-tests.log`).
+Review found that the new interruption test had replaced the original two-segment
+restoration test. A worker is restoring that original test unchanged and adding
+an independent three-segment expectation to the separate interruption fixture.
+The 652-test result is valid for that earlier tree, but is not final evidence for
+the restored-test version.
+
+The directory-sync audit found four conditional helpers and one inline guard
+that skip synchronization under pinned Zig. The CAS/object-store call sites also
+need the containing directory for nested entries. Two isolated implementation
+lanes own those fixes: native catalog/manifest/migration and CAS/object-store.
+The local syscall diagnostic ran on Darwin (`uname -s`), correcting the audit
+report's mistaken reference to Linux. Current-root repair-intent integration is
+separate and still pending verification.
