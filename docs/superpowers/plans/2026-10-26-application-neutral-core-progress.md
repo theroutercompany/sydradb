@@ -18,7 +18,8 @@ review. Its CI run passed, while its Docs run failed because local-ingest pages
 were absent from that branch. PR 78 supplies those pages and is an explicit
 dependency. PRs 97, 98, and 99 passed Ubuntu and macOS CI and are ready for review.
 PR 100 contains the CAS directory and publication-error correction. Its scoped
-branch passed 679/679 tests; hosted checks are pending. No PR has merged.
+branch passed 679/679 tests and its Ubuntu/macOS checks passed. It is ready for
+review. No PR has merged.
 
 The application boundary, empty generic catalog, neutral API routes, query
 limits, and general label selection have current-root test evidence. Trading
@@ -39,7 +40,7 @@ Those results are smoke evidence. They do not establish long-soak acceptance.
 
 | Milestone | State | Acceptance evidence |
 | --- | --- | --- |
-| M1: native-storage stabilization | Open | PRs 94, 95, 97, 98, and 99 passed hosted checks. PR 96 has a PR 78 Docs dependency. PR 100 awaits CI. The complete Engine concurrency port is under validation. |
+| M1: native-storage stabilization | Open | PRs 94, 95, and 97 through 100 passed hosted checks. PR 96 has a PR 78 Docs dependency. Engine concurrency review corrections remain under validation. |
 | M2: application boundaries | Implemented locally; upstream delivery incomplete | Empty catalog, neutral routes, schema and transform extraction, and shared sensor, service, and trading lifecycle tests pass locally. |
 | M3: query limits | Implemented locally; upstream delivery incomplete | Accounting, exact-cap, overflow, cancellation, runtime, and wire checks pass locally. Original test-first chronology is not established. |
 | M4: general selection | Implemented locally; upstream delivery incomplete | Label filters, compiled families, ownership, and prepared-query lifecycle checks pass locally. |
@@ -1325,7 +1326,8 @@ PR 100 is based on PR 97. Signed local commit
 `33806bc7f7663757f5f8a350ea95ef23674aa528` share tree
 `38853919393d69ae787e5b2dee0828c6bc11c3d8`. Its scoped branch passed 679/679
 tests: 212 storage and 467 runtime
-(`cas-directory-publication-scoped-tests.log`). Hosted checks are pending.
+(`cas-directory-publication-scoped-tests.log`). Ubuntu and macOS CI passed
+in run `40501935903`; PR 100 is ready for review.
 
 The first P2 concurrency build found a missing `queryRangeUnlocked` helper.
 Comparison with `d66e064` also found its paired `seriesTimeBoundsUnlocked`
@@ -1335,3 +1337,75 @@ three tests, preserving 8, 7, and 10 assertions respectively. The complete
 candidate is under test in `native-p2-delivery`; it is not yet accepted or
 published. Source reports and patches are in
 `native-p2-read-lock-fix-artifacts` and `native-p2-missing-acceptance-artifacts`.
+
+### P2 runtime diagnosis and review corrections
+
+PR 100 passed Ubuntu and macOS CI in run `40501935903` and is ready for review.
+The complete P2 candidate compiled, but its runtime suite stalled. The manager
+verified test PID 57893's working directory and parent process, then captured
+`native-p2-stalled-runtime.sample.txt`. Its only thread waited in
+`beginExternalProducer` from the shutdown-drain fixture. The fixture retained
+`pauseWriterForMaintenance` before synchronous ingestion; `d66e064` uses
+`stopWriterWorker`. A worker restored that setup and the corresponding ordered
+ingest fixture without removing queued-data assertions. The manager terminated
+only the verified test PID. This run is incomplete and is not acceptance evidence.
+
+The flushed failure log also records three failed tests and an owned-result leak
+after an unexpected success in `expectError`. The exact-instance scheduler test
+omitted the reference fixture's cleanup of unrelated full-refresh work. The
+mixed-auto rollback test expected a visible identity with missing native data,
+but P2 hides unpublished identities. A worker is adapting those two fixtures
+while retaining WAL, rollback, reopen, retry, and value checks. The native writer
+acknowledgement test keeps its original assertions.
+
+Independent review in `native-p2-delivery-review-result.md` found three production
+issues. The port omitted pending-flush and stable-generation checks. The public
+`ingestBatch` wrapper does not hold producer admission through allocation and
+cleanup; that gap also exists in the current root. Worker restart failure can
+leave the port's admission gate in maintenance. Separate workers are restoring
+the drain checks, fixing batch lifetime with a causal test, and reusing the
+current root's retryable maintenance cleanup. No corrected P2 test run or scoped
+P2 publication is claimed yet.
+
+### P2 correction integration
+
+All three workers completed their assigned corrections. The manager applied
+their recorded incremental patches to `native-p2-delivery`: drain generation
+and pending-flush checks, full `ingestBatch` admission lifetime, and retryable
+worker-resume cleanup. The two contract fixtures retain data and recovery
+assertions. The writer-acknowledgement test remains unchanged. Formatting and
+`git diff --check` passed. The combined storage/runtime suite is running with a
+900-second timeout for its owned process group. No passing result is claimed.
+
+An independent worker is reviewing the corrected candidate. A separate worker
+is porting the batch-lifetime correction to checkpoint `7ad797c`, because the
+same wrapper gap exists there. A Git/source reviewer is checking the exact
+prerequisite tree and scoped PR boundaries. No product code was written by the
+manager, and no P2 branch has been published.
+
+### P2 second runtime stop and ownership evidence
+
+The corrected runtime run compiled but stalled in the first-registration
+snapshot test. A one-second sample of verified test PID 15518 shows the main
+thread blocked on a lock while the producer waits at the prequeue gate. The
+test matches `d66e064` byte-for-byte. The manager stopped only that test PID
+after checking its working directory and build parent. The build returned exit
+1. Its partial 696/699 total is not completed-suite acceptance evidence.
+
+`native-p2-corrected-tests.log` also records a double free on closed scalar
+queue rejection: `pushOwned` deinitializes the batch, then `pushBatch` runs its
+error cleanup. The current root has the same ownership pattern. A worker owns
+the shared queue correction. A separate worker owns the port's lock-boundary
+comparison. Two other assertion failures (zero-timeout drain and mixed native
+and scalar derived groups) have a read-only diagnostic owner. CAS source-mirror
+errors overlap the already-planned retained-history slice, which is being
+ported in its own checkout. No new P2 acceptance or publication is claimed.
+
+The independent correction review confirmed the queue ownership defect and a
+test gap: the new batch test observes the producer after append, not during
+allocation or free. The project port passed 592/592 runtime tests, but that
+result does not prove the missing boundary. A worker is strengthening the test
+before a new checkpoint. The lock audit found the port reserves `Queue.mu`
+before its prequeue gate, while both reference implementations reserve after
+the gate. That ordering blocks the unchanged test's `queue.wake()` call. The
+worker is restoring the reference ordering without changing assertions.
