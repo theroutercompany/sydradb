@@ -154,4 +154,3 @@ Implementation reference:
 - Labels: `sydraQL`, `perf`, `benchmarks`, `M2`
 - Milestone: `M2 Core`
 - Notes: Microbenchmarks for parser, planner, and operator throughput; end-to-end query p50/p95.
-

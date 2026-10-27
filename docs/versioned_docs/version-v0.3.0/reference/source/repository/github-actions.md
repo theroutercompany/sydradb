@@ -37,4 +37,3 @@ This repository uses GitHub Actions for two main concerns:
 Prerequisite setting:
 
 - In the repository: `Settings → Pages → Source = GitHub Actions`
-

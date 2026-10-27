@@ -11,4 +11,3 @@ This repository includes lightweight templates to standardize contributions:
 - `ISSUE_TEMPLATE/*` (bug/docs/feature)
 
 These are not required to build or run SydraDB, but they shape how changes and feature requests are communicated and reviewed.
-

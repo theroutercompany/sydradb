@@ -22,4 +22,3 @@ It also points to the project’s compatibility testing documentation for overal
   - `translator/cases.jsonl` (consumed by translator tests)
 - Planned (not yet present) subdirectories:
   - `traces/`, `fixtures/`, `orm/`, `regression/`
-

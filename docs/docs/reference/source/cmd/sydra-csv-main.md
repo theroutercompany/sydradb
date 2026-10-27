@@ -18,4 +18,3 @@ The file currently contains only a comment:
 ```
 
 No public API or executable entrypoint is implemented yet.
-

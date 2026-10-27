@@ -13,4 +13,3 @@ SydraDB is licensed under the Apache License 2.0.
 - If you distribute modified versions, preserve required notices and follow the license conditions.
 
 For the full text, see the `LICENSE` file at the repository root.
-

@@ -17,4 +17,3 @@ It is referenced by:
 - `tests/README.md` – test harness structure and roadmap
 - `tests/lexer/README.md` – placeholder for lexer golden cases
 - `tests/translator/cases.jsonl` – SQL→sydraQL translation fixtures (JSON Lines)
-

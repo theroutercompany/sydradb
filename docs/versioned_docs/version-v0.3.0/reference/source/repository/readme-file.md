@@ -23,4 +23,3 @@ Top-level introduction to SydraDB:
 If you copy config snippets from the README, prefer using the “known-good” configuration format documented here:
 
 - [Configuration (`sydradb.toml`)](../../configuration)
-

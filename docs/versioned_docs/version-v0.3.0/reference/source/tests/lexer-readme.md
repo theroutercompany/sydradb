@@ -17,4 +17,3 @@ The intent is to add “golden token streams” alongside lexer work so that:
 ## Current state
 
 No fixture files exist yet; the directory contains only this README.
-

@@ -39,4 +39,3 @@ Pipe into the CLI ingest subcommand:
 ```sh
 zig run examples/loadgen.zig | ./zig-out/bin/sydradb ingest
 ```
-

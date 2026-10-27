@@ -25,4 +25,3 @@ It mirrors the flake dev shell’s intent: expose Zig 0.15.x (when available) pl
   - `ZIG_GLOBAL_CACHE_DIR = ".zig-cache"`
   - `ZIG_LOCAL_CACHE_DIR = ".zig-local-cache"`
 - Prints the Zig version in `shellHook`.
-
