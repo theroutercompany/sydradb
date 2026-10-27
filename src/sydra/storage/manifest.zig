@@ -2,6 +2,7 @@ const std = @import("std");
 const types = @import("../types.zig");
 
 pub const manifest_path = "MANIFEST";
+pub const repair_intent_path = "MANIFEST.repair";
 
 pub const Entry = struct {
     series_id: types.SeriesId,
@@ -28,8 +29,18 @@ pub const Manifest = struct {
     repaired_torn_tail: bool = false,
 
     pub fn loadOrInit(alloc: std.mem.Allocator, data_dir: std.fs.Dir) !Manifest {
+        return try loadOrInitWithRepairIntent(alloc, data_dir, false);
+    }
+
+    pub fn loadOrInitWithRepairIntent(
+        alloc: std.mem.Allocator,
+        data_dir: std.fs.Dir,
+        persist_repair_intent: bool,
+    ) !Manifest {
         var mf = Manifest{ .alloc = alloc, .entries = .{} };
         errdefer mf.deinit();
+        mf.repaired_torn_tail = try repairIntentExists(data_dir);
+
         // create directory structure
         data_dir.makePath("segments") catch {};
         const OpenFlags = std.fs.File.OpenFlags;
@@ -70,11 +81,27 @@ pub const Manifest = struct {
         }
 
         if (complete_end != body.len) {
+            if (persist_repair_intent) try ensureRepairIntent(data_dir);
             try file.setEndPos(complete_end);
             try file.sync();
-            mf.repaired_torn_tail = true;
+            mf.repaired_torn_tail = mf.repaired_torn_tail or persist_repair_intent;
         }
         return mf;
+    }
+
+    pub fn repairIntentExists(data_dir: std.fs.Dir) !bool {
+        var file = data_dir.openFile(repair_intent_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        defer file.close();
+        if ((try file.stat()).size != 0) return error.InvalidManifestRepairIntent;
+        return true;
+    }
+
+    pub fn clearRepairIntent(data_dir: std.fs.Dir) !void {
+        try data_dir.deleteFile(repair_intent_path);
+        try syncDirectory(data_dir);
     }
 
     pub fn deinit(self: *Manifest) void {
@@ -195,8 +222,29 @@ pub const Manifest = struct {
         try writer_state.end();
         try file.sync();
         try data_dir.rename(temp_name, manifest_path);
+        try syncDirectory(data_dir);
     }
 };
+
+fn ensureRepairIntent(data_dir: std.fs.Dir) !void {
+    const OpenFlags = std.fs.File.OpenFlags;
+    const open_opts: OpenFlags = if (@hasField(OpenFlags, "write"))
+        OpenFlags{ .write = true, .read = true }
+    else
+        OpenFlags{ .mode = .read_write };
+    var file = data_dir.createFile(repair_intent_path, .{ .read = true, .exclusive = true }) catch |err| switch (err) {
+        error.PathAlreadyExists => try data_dir.openFile(repair_intent_path, open_opts),
+        else => return err,
+    };
+    defer file.close();
+    if ((try file.stat()).size != 0) return error.InvalidManifestRepairIntent;
+    try file.sync();
+    try syncDirectory(data_dir);
+}
+
+fn syncDirectory(data_dir: std.fs.Dir) !void {
+    try std.posix.fsync(data_dir.fd);
+}
 
 fn writeEntry(writer: *std.Io.AnyWriter, entry: Entry) !void {
     try writer.print(

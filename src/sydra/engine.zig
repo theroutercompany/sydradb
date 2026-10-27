@@ -393,7 +393,19 @@ pub const Engine = struct {
             cas_manager: ?*cas_mod.CasManager,
             new_catalog_builtin_mapping: market_catalog_mod.StorageMapping,
         ) !MetadataState {
-            var manifest = try manifest_mod.Manifest.loadOrInit(alloc, data_dir);
+            const has_cas_head = if (cas_manager) |cas|
+                (try cas.refs.readHead(cas_mod.main_ref)) != null
+            else
+                false;
+            if (try manifest_mod.Manifest.repairIntentExists(data_dir) and !has_cas_head) {
+                return error.ManifestRepairRequiresCasHead;
+            }
+            // Without a CAS head, the existing recovery source is the WAL.
+            var manifest = try manifest_mod.Manifest.loadOrInitWithRepairIntent(
+                alloc,
+                data_dir,
+                has_cas_head,
+            );
             errdefer manifest.deinit();
             var tags = try tags_mod.TagIndex.loadOrInit(alloc, data_dir);
             errdefer tags.deinit();
@@ -429,6 +441,7 @@ pub const Engine = struct {
             errdefer index.deinit();
             var manifest = try manifestFromSnapshot(alloc, index.snapshot.segment_descriptors);
             errdefer manifest.deinit();
+            manifest.repaired_torn_tail = try manifest_mod.Manifest.repairIntentExists(data_dir);
             var tags = try tagIndexFromSnapshot(alloc, index.snapshot.tag_snapshot);
             errdefer tags.deinit();
             var series_catalog = try seriesCatalogFromSnapshot(alloc, fsync, index.snapshot.series_catalog_snapshot);
@@ -5698,7 +5711,10 @@ pub const Engine = struct {
 
         self.metadata.cas_index_mu.lock();
         defer self.metadata.cas_index_mu.unlock();
-        const index = if (self.metadata.cas_index) |*snapshot_index| snapshot_index else return;
+        const index = if (self.metadata.cas_index) |*snapshot_index|
+            snapshot_index
+        else
+            return error.ManifestRepairRequiresCasHead;
 
         var replacement = try manifestFromSnapshot(
             self.alloc,
@@ -5706,8 +5722,12 @@ pub const Engine = struct {
         );
         errdefer replacement.deinit();
         try replacement.rewriteCheckpoint(self.data_dir);
-        self.metadata.manifest.deinit();
+        try manifest_mod.Manifest.clearRepairIntent(self.data_dir);
+
+        var previous_manifest = self.metadata.manifest;
         self.metadata.manifest = replacement;
+        replacement = .{ .alloc = self.alloc, .entries = .{} };
+        previous_manifest.deinit();
     }
 
     fn recover(self: *Engine) !void {
@@ -7273,6 +7293,18 @@ fn testConfig(talloc: std.mem.Allocator, data_path: []const u8) !cfg.Config {
     };
 }
 
+fn manifestRepairTestConfig(talloc: std.mem.Allocator, data_path: []const u8) !cfg.Config {
+    var config = try testConfig(talloc, data_path);
+    config.fsync = .always;
+    config.cas_mode = .dual_write;
+    config.metadata_read_mode = .shadow;
+    config.market_storage_mode = .dual_write_v1;
+    config.market_storage_read_mode = .shadow;
+    config.flush_interval_ms = std.math.maxInt(u32);
+    config.memtable_max_bytes = std.math.maxInt(usize);
+    return config;
+}
+
 fn writeTestRepositoryFormatMarker(data_path: []const u8, version: u16) !void {
     const magic = "SYDSTORE1";
     var bytes: [magic.len + @sizeOf(u16) + 1 + @sizeOf(u32)]u8 = undefined;
@@ -8395,6 +8427,166 @@ test "engine restores a torn dual-write scalar manifest from the CAS snapshot" {
         @as(u64, @bitCast(result.rows[0].values[1])),
     );
     try recovered.verifyCasState();
+}
+
+test "engine clears repair intent after checkpoint rewrite and recovers scalar and native data" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(
+        talloc,
+        ".zig-cache/tmp/{s}/market-torn-scalar-manifest",
+        .{tmp.sub_path},
+    );
+    defer talloc.free(data_path);
+
+    const scalar_series_id = types.hash64("manifest.repair.scalar");
+    var scalar_segment_count: usize = 0;
+    var native_segment_count: usize = 0;
+    {
+        const config = try manifestRepairTestConfig(talloc, data_path);
+        var engine_owner: ?*Engine = try Engine.init(talloc, config);
+        defer if (engine_owner) |owned| owned.deinit();
+        const engine = engine_owner.?;
+
+        const values = [_]f64{ 10.5, 100.0 };
+        const receipt = try engine.ingestMarketBatch(&.{.{
+            .metric = "market.trade",
+            .labels_json = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}",
+            .ts_ns = 1_000,
+            .values = &values,
+        }});
+        try std.testing.expectEqual(@as(usize, 1), receipt.accepted_rows);
+        _ = try engine.flushNow();
+
+        try engine.registerSeries("manifest.repair.scalar", "{}", scalar_series_id);
+        try engine.ingest(.{
+            .series_id = scalar_series_id,
+            .ts = 900,
+            .value = 42.25,
+            .tags_json = "{}",
+        });
+        _ = try engine.flushNow();
+
+        scalar_segment_count = engine.metadata.manifest.entries.items.len;
+        native_segment_count = engine.market_manifest.list().len;
+        try std.testing.expectEqual(@as(usize, 3), scalar_segment_count);
+        try std.testing.expectEqual(@as(usize, 1), native_segment_count);
+        engine.deinit();
+        engine_owner = null;
+    }
+
+    {
+        var root = try std.fs.cwd().openDir(data_path, .{});
+        defer root.close();
+        var size: u64 = 0;
+        {
+            var file = try root.openFile(manifest_mod.manifest_path, .{ .mode = .read_write });
+            defer file.close();
+            size = (try file.stat()).size;
+            try std.testing.expect(size > 8);
+            try file.setEndPos(size - 8);
+            try file.sync();
+        }
+
+        try root.makePath(manifest_mod.repair_intent_path);
+        var marker_failure_observed = false;
+        if (manifest_mod.Manifest.loadOrInitWithRepairIntent(talloc, root, true)) |unexpected| {
+            var loaded = unexpected;
+            loaded.deinit();
+        } else |_| {
+            marker_failure_observed = true;
+        }
+        try std.testing.expect(marker_failure_observed);
+
+        {
+            var file = try root.openFile(manifest_mod.manifest_path, .{});
+            defer file.close();
+            try std.testing.expectEqual(size - 8, (try file.stat()).size);
+        }
+        try root.deleteDir(manifest_mod.repair_intent_path);
+
+        var interrupted_repair = try manifest_mod.Manifest.loadOrInitWithRepairIntent(
+            talloc,
+            root,
+            true,
+        );
+        try std.testing.expect(interrupted_repair.repaired_torn_tail);
+        try std.testing.expectEqual(
+            scalar_segment_count - 1,
+            interrupted_repair.entries.items.len,
+        );
+        for (interrupted_repair.entries.items) |entry| {
+            try std.testing.expect(entry.series_id != scalar_series_id);
+        }
+        interrupted_repair.deinit();
+        try std.testing.expect(try manifest_mod.Manifest.repairIntentExists(root));
+    }
+
+    {
+        var root = try std.fs.cwd().openDir(data_path, .{});
+        defer root.close();
+        try root.makePath("MANIFEST.tmp");
+
+        const failed_config = try manifestRepairTestConfig(talloc, data_path);
+        var checkpoint_failure_observed = false;
+        if (Engine.init(talloc, failed_config)) |unexpected| {
+            unexpected.deinit();
+        } else |_| {
+            checkpoint_failure_observed = true;
+        }
+        try std.testing.expect(checkpoint_failure_observed);
+        try std.testing.expect(try manifest_mod.Manifest.repairIntentExists(root));
+        try root.deleteDir("MANIFEST.tmp");
+    }
+
+    {
+        const config = try manifestRepairTestConfig(talloc, data_path);
+        var recovered = try Engine.init(talloc, config);
+        defer recovered.deinit();
+
+        try std.testing.expectEqual(scalar_segment_count, recovered.metadata.manifest.entries.items.len);
+        try std.testing.expectEqual(native_segment_count, recovered.market_manifest.list().len);
+        try std.testing.expect(!(try manifest_mod.Manifest.repairIntentExists(recovered.data_dir)));
+
+        var scalar_points = std.array_list.Managed(types.Point).init(talloc);
+        defer scalar_points.deinit();
+        try recovered.queryRange(scalar_series_id, 900, 900, &scalar_points);
+        try std.testing.expectEqual(@as(usize, 1), scalar_points.items.len);
+        try std.testing.expectEqual(@as(f64, 42.25), scalar_points.items[0].value);
+
+        var result = try recovered.queryMarket(.{
+            .metric = "market.trade",
+            .label_filter_json = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}",
+            .start_ts_ns = 1_000,
+            .end_ts_ns = 1_000,
+        });
+        defer result.deinit();
+        try std.testing.expectEqualStrings("shadow", result.stats.storage_mode);
+        try std.testing.expectEqual(@as(u64, 0), result.stats.shadow_mismatches);
+        try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+        try std.testing.expectEqual(
+            @as(u64, @bitCast(@as(f64, 10.5))),
+            @as(u64, @bitCast(result.rows[0].values[0])),
+        );
+        try std.testing.expectEqual(
+            @as(u64, @bitCast(@as(f64, 100.0))),
+            @as(u64, @bitCast(result.rows[0].values[1])),
+        );
+        // Full CAS verification is valid after startup recovery, not during checkpoint restoration.
+        try recovered.verifyCasState();
+    }
+
+    {
+        const config = try manifestRepairTestConfig(talloc, data_path);
+        var reopened = try Engine.init(talloc, config);
+        defer reopened.deinit();
+
+        try std.testing.expectEqual(scalar_segment_count, reopened.metadata.manifest.entries.items.len);
+        try std.testing.expectEqual(native_segment_count, reopened.market_manifest.list().len);
+        try std.testing.expect(!(try manifest_mod.Manifest.repairIntentExists(reopened.data_dir)));
+    }
 }
 
 test "engine native market WAL recovery flushes row and advances sequence" {
