@@ -1,6 +1,7 @@
 pub const alloc = @import("alloc.zig");
 pub const cas = @import("storage/cas.zig");
 pub const config = @import("config.zig");
+pub const crash_injection = @import("storage/crash_injection.zig");
 pub const engine = @import("engine.zig");
 pub const http = @import("http.zig");
 pub const ingest_service = @import("ingest/service.zig");

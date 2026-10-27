@@ -1,6 +1,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const slab_shard = @import("alloc/slab_shard.zig");
+const monotime = @import("time.zig");
 
 const allocator_mode = build_options.allocator_mode;
 const use_mimalloc = std.mem.eql(u8, allocator_mode, "mimalloc");
@@ -83,7 +84,7 @@ const SmallPoolAllocator = if (use_small_pool) struct {
     const bucket_count = bucket_sizes.len;
     const fallback_bucket_bounds = [_]usize{ 64, 128, 256, 512, 1024, 2048, 4096, 8192 };
     const fallback_bucket_count = fallback_bucket_bounds.len + 1;
-    const lock_wait_threshold_ns: i64 = 1_000;
+    const lock_wait_threshold_ns: u64 = 1_000;
     const shard_classes_table = buildSlabClasses();
     pub const max_shard_size = shard_classes_table[shard_classes_table.len - 1].size;
 
@@ -342,26 +343,23 @@ const SmallPoolAllocator = if (use_small_pool) struct {
 
     fn allocBucket(self: *SmallPoolAllocator, idx: usize, ret_addr: usize) ?[*]u8 {
         var bucket = &self.buckets[idx];
-        const wait_start = std.time.nanoTimestamp();
+        var lock_timer = monotime.startTimer();
         bucket.mutex.lock();
-        const acquired_ns = std.time.nanoTimestamp();
-        const wait_ns = acquired_ns - wait_start;
+        const wait_ns = lock_timer.read();
         _ = bucket.lock_acquisitions.fetchAdd(1, .monotonic);
-        _ = bucket.lock_wait_ns_total.fetchAdd(@as(u64, @intCast(wait_ns)), .monotonic);
+        _ = bucket.lock_wait_ns_total.fetchAdd(wait_ns, .monotonic);
         if (wait_ns > lock_wait_threshold_ns) {
             _ = bucket.lock_contention.fetchAdd(1, .monotonic);
         }
-        var hold_start_ns = acquired_ns;
+        lock_timer.reset();
         defer {
-            const release_ns = std.time.nanoTimestamp();
-            const hold_ns = release_ns - hold_start_ns;
-            _ = bucket.lock_hold_ns_total.fetchAdd(@as(u64, @intCast(hold_ns)), .monotonic);
+            _ = bucket.lock_hold_ns_total.fetchAdd(lock_timer.read(), .monotonic);
             bucket.mutex.unlock();
         }
 
         if (bucket.free_list == null) {
             self.refillBucket(bucket, idx, ret_addr) catch return null;
-            hold_start_ns = std.time.nanoTimestamp();
+            lock_timer.reset();
         }
         const node = bucket.free_list orelse return null;
         bucket.free_list = node.next;
@@ -411,30 +409,25 @@ const SmallPoolAllocator = if (use_small_pool) struct {
         var idx: usize = 0;
         while (idx < bucket_count) : (idx += 1) {
             var bucket = &self.buckets[idx];
-            const wait_start = std.time.nanoTimestamp();
+            var lock_timer = monotime.startTimer();
             bucket.mutex.lock();
-            const acquired_ns = std.time.nanoTimestamp();
-            const wait_ns = acquired_ns - wait_start;
+            const wait_ns = lock_timer.read();
             _ = bucket.lock_acquisitions.fetchAdd(1, .monotonic);
-            _ = bucket.lock_wait_ns_total.fetchAdd(@as(u64, @intCast(wait_ns)), .monotonic);
+            _ = bucket.lock_wait_ns_total.fetchAdd(wait_ns, .monotonic);
             if (wait_ns > lock_wait_threshold_ns) {
                 _ = bucket.lock_contention.fetchAdd(1, .monotonic);
             }
-            const hold_start_ns = acquired_ns;
+            lock_timer.reset();
             if (pointerBelongsToBucket(bucket, ptr)) |block_ptr| {
                 const node = @as(*FreeNode, @ptrCast(@alignCast(block_ptr)));
                 node.* = .{ .next = bucket.free_list };
                 bucket.free_list = node;
                 if (bucket.in_use > 0) bucket.in_use -= 1;
-                const release_ns = std.time.nanoTimestamp();
-                const hold_ns = release_ns - hold_start_ns;
-                _ = bucket.lock_hold_ns_total.fetchAdd(@as(u64, @intCast(hold_ns)), .monotonic);
+                _ = bucket.lock_hold_ns_total.fetchAdd(lock_timer.read(), .monotonic);
                 bucket.mutex.unlock();
                 return true;
             }
-            const release_ns = std.time.nanoTimestamp();
-            const hold_ns = release_ns - hold_start_ns;
-            _ = bucket.lock_hold_ns_total.fetchAdd(@as(u64, @intCast(hold_ns)), .monotonic);
+            _ = bucket.lock_hold_ns_total.fetchAdd(lock_timer.read(), .monotonic);
             bucket.mutex.unlock();
         }
         return false;

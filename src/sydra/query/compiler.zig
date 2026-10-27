@@ -9,6 +9,7 @@ const ir = @import("compiler/ir.zig");
 const lowerer = @import("compiler/lowerer.zig");
 const parser = @import("parser.zig");
 const passes = @import("compiler/passes.zig");
+const monotime = @import("../time.zig");
 
 pub const ExecutionMode = cfg_mod.QueryCompilerMode;
 
@@ -51,10 +52,9 @@ pub fn compileSelectDetailed(
         return try unsupportedResult(allocator, .unsupported_statement, null, 0);
     }
 
-    const bind_start = std.time.microTimestamp();
+    var bind_timer = monotime.startTimer();
     const bind_result = try binder.bindSelector(allocator, engine, statement.select.selector);
-    const bind_end = std.time.microTimestamp();
-    const bind_us = durationMicros(bind_end - bind_start);
+    const bind_us = bind_timer.read() / std.time.ns_per_us;
 
     if (bind_result.fallback_reason) |reason| {
         return .{
@@ -139,10 +139,6 @@ pub fn fallbackReasonToError(reason: FallbackReason) CompileError {
         .ambiguous_selector => error.AmbiguousSelector,
         .shadow_mismatch => error.ShadowMismatch,
     };
-}
-
-fn durationMicros(value: i64) u64 {
-    return @intCast(@max(value, 0));
 }
 
 test "can compile constant select" {

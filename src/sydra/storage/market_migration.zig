@@ -1380,7 +1380,9 @@ fn validateFailureText(code: []const u8, message: []const u8) !void {
 }
 
 fn syncDir(dir: *std.fs.Dir) !void {
-    if (@hasDecl(std.fs.Dir, "sync")) try dir.sync();
+    var sync_dir = try dir.*.openDir(".", .{ .iterate = true });
+    defer sync_dir.close();
+    try std.posix.fsync(sync_dir.fd);
 }
 
 fn checkReconstructionAllocationFailures(alloc: std.mem.Allocator) !void {

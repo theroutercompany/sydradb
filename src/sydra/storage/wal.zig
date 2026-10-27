@@ -883,9 +883,9 @@ pub fn writeJournalRootForWalFile(
 ) !object_store.ObjectId {
     const path = try std.fmt.allocPrint(alloc, "wal/{s}", .{wal_name});
     defer alloc.free(path);
-    const bytes = try data_dir.readFileAlloc(alloc, path, 128 * 1024 * 1024);
-    defer alloc.free(bytes);
-    return try writeJournalRootFromBytes(alloc, store, bytes);
+    var file = try data_dir.openFile(path, .{});
+    defer file.close();
+    return try writeJournalRootFromFile(alloc, store, &file);
 }
 
 pub fn writeJournalRootFromBytes(
@@ -924,8 +924,76 @@ pub fn writeJournalRootFromBytes(
         offset += frame_len;
     }
 
+    return try finishJournalRoot(
+        alloc,
+        store,
+        &frame_entries,
+        &index_entries,
+        @intCast(bytes.len),
+    );
+}
+
+fn writeJournalRootFromFile(
+    alloc: std.mem.Allocator,
+    store: *object_store.ObjectStore,
+    file: *std.fs.File,
+) !object_store.ObjectId {
+    const stat = try file.stat();
+    var frame_entries = std.array_list.Managed(TreeEntry).init(alloc);
+    defer {
+        for (frame_entries.items) |*entry| entry.deinit(alloc);
+        frame_entries.deinit();
+    }
+
+    var index_entries = std.array_list.Managed(JournalFrameIndexEntry).init(alloc);
+    defer index_entries.deinit();
+
+    var offset: u64 = 0;
+    var frame_idx: usize = 0;
+    while (offset < stat.size) : (frame_idx += 1) {
+        const remaining = stat.size - offset;
+        if (remaining < 4) return error.CorruptWal;
+
+        var header: [4]u8 = undefined;
+        if (try file.readAll(header[0..]) != header.len) return error.CorruptWal;
+        const payload_len = std.mem.readInt(u32, &header, .little);
+        if (payload_len == 0 or payload_len > max_wal_payload_bytes) return error.CorruptWal;
+        const frame_len: usize = 4 + payload_len + 4;
+        const frame_len_u64: u64 = @intCast(frame_len);
+        if (frame_len_u64 > remaining) return error.CorruptWal;
+
+        const frame = try alloc.alloc(u8, frame_len);
+        defer alloc.free(frame);
+        @memcpy(frame[0..header.len], &header);
+        const frame_tail = frame[header.len..];
+        if (try file.readAll(frame_tail) != frame_tail.len) return error.CorruptWal;
+
+        const frame_id = try store.put(.blob, frame);
+        try frame_entries.append(.{
+            .name = try std.fmt.allocPrint(alloc, "{d:0>16}", .{frame_idx}),
+            .object_type = .blob,
+            .object_id = frame_id,
+        });
+        try index_entries.append(.{
+            .offset = offset,
+            .size_bytes = @intCast(frame_len),
+        });
+        offset += frame_len_u64;
+    }
+
+    if (offset != stat.size) return error.CorruptWal;
+    return try finishJournalRoot(alloc, store, &frame_entries, &index_entries, stat.size);
+}
+
+fn finishJournalRoot(
+    alloc: std.mem.Allocator,
+    store: *object_store.ObjectStore,
+    frame_entries: *std.array_list.Managed(TreeEntry),
+    index_entries: *std.array_list.Managed(JournalFrameIndexEntry),
+    file_size: u64,
+) !object_store.ObjectId {
     const meta_payload = try encodeJournalMeta(alloc, .{
-        .file_size = bytes.len,
+        .file_size = file_size,
         .frame_count = @intCast(index_entries.items.len),
     });
     defer alloc.free(meta_payload);
@@ -1675,6 +1743,10 @@ test "journal roots replay captured wal frames in order" {
     _ = try wal.append(77, 1_005, 4.5);
 
     const root_id = try writeJournalRootForWalFile(alloc, tmp.dir, &store, "current.wal");
+    const file_bytes = try tmp.dir.readFileAlloc(alloc, "wal/current.wal", 1024 * 1024);
+    defer alloc.free(file_bytes);
+    const bytes_root_id = try writeJournalRootFromBytes(alloc, &store, file_bytes);
+    try std.testing.expect(root_id.eql(bytes_root_id));
 
     var ctx = struct {
         registered: bool = false,

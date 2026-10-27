@@ -1,6 +1,7 @@
 const std = @import("std");
 const compat = @import("../compat.zig");
 const parser = @import("parser.zig");
+const monotime = @import("../time.zig");
 
 fn startsWithCaseInsensitive(text: []const u8, prefix: []const u8) bool {
     if (text.len < prefix.len) return false;
@@ -74,37 +75,33 @@ pub const Failure = struct {
     message: []const u8,
 };
 
-fn finishSuccess(alloc: std.mem.Allocator, sql: []const u8, start_ns: i128, sydraql: []u8) !Result {
+fn finishSuccess(alloc: std.mem.Allocator, sql: []const u8, timer: *std.time.Timer, sydraql: []u8) !Result {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
 
     var parser_inst = parser.Parser.init(arena.allocator(), sydraql);
     _ = parser_inst.parse() catch {
         alloc.free(sydraql);
-        return unsupportedResult(sql, start_ns);
+        return unsupportedResult(sql, timer);
     };
 
-    const duration = std.time.nanoTimestamp() - start_ns;
-    const duration_ns: u64 = @intCast(@max(duration, @as(i128, 0)));
-    compat.clog.global().record(sql, sydraql, false, false, duration_ns);
+    compat.clog.global().record(sql, sydraql, false, false, timer.read());
     return .{ .success = .{ .sydraql = sydraql } };
 }
 
-fn unsupportedResult(sql: []const u8, start_ns: i128) Result {
+fn unsupportedResult(sql: []const u8, timer: *std.time.Timer) Result {
     const payload = compat.sqlstate.buildPayload(.feature_not_supported, null, null, null);
-    const duration = std.time.nanoTimestamp() - start_ns;
-    const duration_ns: u64 = @intCast(@max(duration, @as(i128, 0)));
-    compat.clog.global().record(sql, "", false, true, duration_ns);
+    compat.clog.global().record(sql, "", false, true, timer.read());
     return .{ .failure = .{ .sqlstate = payload.sqlstate, .message = payload.message } };
 }
 
 pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
     const trimmed_input = std.mem.trim(u8, sql, " \t\r\n");
     const trimmed = std.mem.trimRight(u8, trimmed_input, " \t\r\n;");
-    const start = std.time.nanoTimestamp();
+    var timer = monotime.startTimer();
     if (std.ascii.eqlIgnoreCase(trimmed, "SELECT 1")) {
         const out = try alloc.dupe(u8, "select 1");
-        return try finishSuccess(alloc, trimmed, start, out);
+        return try finishSuccess(alloc, trimmed, &timer, out);
     }
 
     if (startsWithCaseInsensitive(trimmed, "SELECT ")) {
@@ -140,7 +137,7 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
                             try builder.appendSlice(cond);
                         }
                         const sydra_str = try builder.toOwnedSlice();
-                        return try finishSuccess(alloc, trimmed, start, sydra_str);
+                        return try finishSuccess(alloc, trimmed, &timer, sydra_str);
                     }
                 }
             }
@@ -197,10 +194,10 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
                                 try builder.appendSlice(values_inner);
                                 try builder.appendSlice(")");
                                 const sydra_str = try builder.toOwnedSlice();
-                                return try finishSuccess(alloc, trimmed, start, sydra_str);
+                                return try finishSuccess(alloc, trimmed, &timer, sydra_str);
                             }
                             if (startsWithCaseInsensitive(remainder, "RETURNING")) {
-                                return unsupportedResult(trimmed, start);
+                                return unsupportedResult(trimmed, &timer);
                             }
                         }
                     }
@@ -210,7 +207,7 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
     }
 
     if (startsWithCaseInsensitive(trimmed, "UPDATE ")) {
-        return unsupportedResult(trimmed, start);
+        return unsupportedResult(trimmed, &timer);
     }
 
     if (startsWithCaseInsensitive(trimmed, "DELETE FROM ")) {
@@ -221,7 +218,7 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
                 const after_idx = ret_idx + "RETURNING".len;
                 const after_ok = after_idx >= remainder.len or std.ascii.isWhitespace(remainder[after_idx]);
                 if (before_ok and after_idx <= remainder.len and after_ok) {
-                    return unsupportedResult(trimmed, start);
+                    return unsupportedResult(trimmed, &timer);
                 }
             }
             remainder = std.mem.trimRight(u8, remainder, " \t\r\n;");
@@ -250,13 +247,13 @@ pub fn translate(alloc: std.mem.Allocator, sql: []const u8) !Result {
                         try builder.appendSlice(wc);
                     }
                     const sydra_str = try builder.toOwnedSlice();
-                    return try finishSuccess(alloc, trimmed, start, sydra_str);
+                    return try finishSuccess(alloc, trimmed, &timer, sydra_str);
                 }
             }
         }
     }
 
-    return unsupportedResult(trimmed, start);
+    return unsupportedResult(trimmed, &timer);
 }
 
 test "translator fixtures" {
