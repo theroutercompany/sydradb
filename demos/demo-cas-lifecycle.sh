@@ -116,7 +116,7 @@ query_compiler_mode = "compiled"
 retention_days = 0
 EOF
 
-(cd "$src_dir" && "$SYDRADB_BIN" >server.log 2>&1) &
+(cd "$src_dir" && exec "$SYDRADB_BIN" >server.log 2>&1) &
 server_pid=$!
 
 wait_for_http "http://127.0.0.1:$PORT/metrics" "$src_dir/server.log"
@@ -142,7 +142,7 @@ log_output="$(cd "$src_dir" && "$SYDRADB_BIN" cas log 2>&1)"
 verify_output="$(cd "$src_dir" && "$SYDRADB_BIN" cas bundle verify "$bundle_dir" 2>&1)"
 (cd "$restore_dir" && "$SYDRADB_BIN" restore "$bundle_dir" >/dev/null)
 
-(cd "$restore_dir" && "$SYDRADB_BIN" >server.log 2>&1) &
+(cd "$restore_dir" && exec "$SYDRADB_BIN" >server.log 2>&1) &
 server_pid=$!
 
 wait_for_http "http://127.0.0.1:$PORT/metrics" "$restore_dir/server.log"

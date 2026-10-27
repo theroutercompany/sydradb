@@ -128,6 +128,10 @@ wait_for_pgwire() {
 
 workdir="$(mktemp -d "${TMPDIR:-/tmp}/sydra-demo-pgwire.XXXXXX")"
 cleanup() {
+  if [[ -n "${server_pid:-}" ]]; then
+    kill "$server_pid" >/dev/null 2>&1 || true
+    wait "$server_pid" >/dev/null 2>&1 || true
+  fi
   if [[ -n "${pgwire_pid:-}" ]]; then
     kill "$pgwire_pid" >/dev/null 2>&1 || true
     wait "$pgwire_pid" >/dev/null 2>&1 || true
@@ -152,7 +156,7 @@ query_compiler_mode = "compiled"
 retention_days = 0
 EOF
 
-(cd "$workdir" && "$SYDRADB_BIN" >server.log 2>&1) &
+(cd "$workdir" && exec "$SYDRADB_BIN" >server.log 2>&1) &
 server_pid=$!
 
 wait_for_http "http://127.0.0.1:$HTTP_PORT/metrics" "$workdir/server.log"
@@ -172,7 +176,7 @@ kill "$server_pid" >/dev/null 2>&1 || true
 wait "$server_pid" >/dev/null 2>&1 || true
 unset server_pid
 
-(cd "$workdir" && "$SYDRADB_BIN" pgwire "$PGHOST" "$PGPORT" >pgwire.log 2>&1) &
+(cd "$workdir" && exec "$SYDRADB_BIN" pgwire "$PGHOST" "$PGPORT" >pgwire.log 2>&1) &
 pgwire_pid=$!
 
 wait_for_pgwire "$workdir/pgwire.log"

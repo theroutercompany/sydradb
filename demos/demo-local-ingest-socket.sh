@@ -36,7 +36,7 @@ EOF
 
 (
   cd "$TMPDIR"
-  "$BIN" serve >"$TMPDIR/server.out" 2>"$TMPDIR/server.err"
+  exec "$BIN" serve >"$TMPDIR/server.out" 2>"$TMPDIR/server.err"
 ) &
 SERVER_PID=$!
 
@@ -61,6 +61,10 @@ if [[ -z "$SID" ]]; then
   echo "failed to resolve socket.demo series id" >&2
   exit 1
 fi
+
+kill "$SERVER_PID" >/dev/null 2>&1 || true
+wait "$SERVER_PID" 2>/dev/null || true
+unset SERVER_PID
 
 QUERY_OUT="$(cd "$TMPDIR" && "$BIN" query "$SID" 0 100 < /dev/null)"
 printf '%s\n' "$QUERY_OUT"
