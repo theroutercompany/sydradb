@@ -2040,6 +2040,43 @@ fn runSingleRequestServerWithHeaders(
     return try sendHttpRequestToPortWithHeaders(alloc, port, method, path, body, extra_headers);
 }
 
+test "market ingest accepts final records with and without a newline" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/http-final-record", .{tmp.sub_path});
+    defer alloc.free(data_path);
+    var eng = try Engine.init(alloc, try testConfig(alloc, data_path));
+    defer eng.deinit();
+
+    const labels = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}";
+    for ([_][]const u8{ "\n", "", "\n \t" }, 0..) |ending, index| {
+        const body = try std.fmt.allocPrint(alloc, "{{\"metric\":\"market.trade\",\"ts_ns\":{d},\"labels\":{s},\"columns\":{{\"price\":12.5,\"size\":2}}}}{s}", .{ index + 1, labels, ending });
+        defer alloc.free(body);
+        const request_bytes = try std.fmt.allocPrint(alloc, "POST /api/v1/market/ingest HTTP/1.1\r\nHost: localhost\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body });
+        defer alloc.free(request_bytes);
+        var request_reader = std.Io.Reader.fixed(request_bytes);
+        var response_writer = std.Io.Writer.Allocating.init(alloc);
+        defer response_writer.deinit();
+        var server = std.http.Server.init(&request_reader, &response_writer.writer);
+        var request = try server.receiveHead();
+        try handleMarketIngest(alloc, eng, &request);
+        try std.testing.expect(std.mem.startsWith(u8, response_writer.written(), "HTTP/1.1 200"));
+        try std.testing.expect(std.mem.indexOf(u8, response_writer.written(), "\"rows\":1") != null);
+    }
+
+    const sid = types.seriesIdFrom("market.trade.price", labels);
+    try eng.waitForQueryablePoints(alloc, sid, 3, 1_000);
+    var points = std.array_list.Managed(types.Point).init(alloc);
+    defer points.deinit();
+    try eng.queryRange(sid, 0, 4, &points);
+    try std.testing.expectEqual(@as(usize, 3), points.items.len);
+    for (points.items, 0..) |point, index| {
+        try std.testing.expectEqual(@as(i64, @intCast(index + 1)), point.ts);
+        try std.testing.expectEqual(@as(f64, 12.5), point.value);
+    }
+}
+
 test "parseIngestLine mirrors HTTP numeric and tags behavior" {
     const alloc = std.testing.allocator;
     const parsed = try parseIngestLine(alloc, "{\"series\":\"weather.room1\",\"ts\":10,\"fields\":{\"reading\":24,\"ignored\":\"x\"},\"tags\":{\"rack\":\"r1\",\"host\":\"web\"}}");
@@ -3027,12 +3064,15 @@ fn handleMarketIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Ser
     var rows: usize = 0;
     var writes: usize = 0;
 
-    while (true) {
+    var body_complete = false;
+    while (!body_complete) {
         const slice = body_reader.*.takeDelimiterExclusive('\n') catch |err| switch (err) {
             error.StreamTooLong => return respondJsonError(alloc, req, .payload_too_large, "line_too_long", "line too long"),
             error.EndOfStream => break,
             else => return err,
         };
+        // The final unterminated line can be returned together with EOF.
+        body_complete = req.server.reader.state == .ready;
         const trimmed = std.mem.trim(u8, slice, " \t\r\n");
         if (trimmed.len == 0) continue;
 
