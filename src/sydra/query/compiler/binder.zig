@@ -38,7 +38,7 @@ pub fn bindSelector(
 
     return switch (selector.?.series) {
         .by_id => |by_id| {
-            const resolution = engine.resolveSelector(.{ .by_id = @intCast(by_id.value) }) catch |err| switch (err) {
+            const resolution = engine.resolveSimpleSelectorOwned(allocator, .{ .by_id = @intCast(by_id.value) }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => unreachable,
             };
@@ -55,7 +55,7 @@ pub fn bindSelector(
             };
         },
         .name => |ident| {
-            const resolution = engine.resolveSelector(.{ .name = ident.value }) catch |err| switch (err) {
+            const resolution = engine.resolveSimpleSelectorOwned(allocator, .{ .name = ident.value }) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => unreachable,
             };
