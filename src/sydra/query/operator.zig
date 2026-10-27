@@ -9,6 +9,7 @@ const engine_mod = @import("../engine.zig");
 const metric_catalog_mod = @import("../storage/metric_catalog.zig");
 const expression = @import("expression.zig");
 const value_mod = @import("value.zig");
+const monotime = @import("../time.zig");
 
 const ManagedArrayList = std.array_list.Managed;
 
@@ -42,10 +43,9 @@ pub const Operator = struct {
     stats: Stats,
 
     pub fn next(self: *Operator) ExecuteError!?Row {
-        const start = std.time.microTimestamp();
+        var timer = monotime.startTimer();
         const result = self.next_fn(self);
-        const elapsed = std.time.microTimestamp() - start;
-        self.stats.elapsed_us += @as(u64, @intCast(elapsed));
+        self.stats.elapsed_us += timer.read() / std.time.ns_per_us;
         const maybe_row = result catch |err| return err;
         if (maybe_row) |_| {
             self.stats.rows_out += 1;

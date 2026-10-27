@@ -6,18 +6,18 @@ const ir = @import("ir.zig");
 const passes = @import("passes.zig");
 const physical = @import("../physical.zig");
 const plan = @import("../plan.zig");
+const monotime = @import("../../time.zig");
 
 pub fn lowerTypedQuery(
     allocator: std.mem.Allocator,
     typed_query: *const ir.TypedQuery,
 ) errors.CompileError!ir.BackendLoweringResult {
-    const physical_start = std.time.microTimestamp();
+    var physical_timer = monotime.startTimer();
     const physical_plan = try buildPhysicalPlan(allocator, typed_query);
-    const physical_end = std.time.microTimestamp();
 
     return .{
         .physical_plan = physical_plan,
-        .physical_us = durationMicros(physical_end - physical_start),
+        .physical_us = physical_timer.read() / std.time.ns_per_us,
     };
 }
 
@@ -170,8 +170,4 @@ fn makeNode(allocator: std.mem.Allocator, node: physical.Node) !*physical.Node {
     const ptr = try allocator.create(physical.Node);
     ptr.* = node;
     return ptr;
-}
-
-fn durationMicros(value: i64) u64 {
-    return @intCast(@max(value, 0));
 }

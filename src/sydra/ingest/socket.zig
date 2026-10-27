@@ -7,6 +7,7 @@ const cfg = @import("../config.zig");
 const Engine = @import("../engine.zig").Engine;
 const types = @import("../types.zig");
 const metric_catalog_mod = @import("../storage/metric_catalog.zig");
+const monotime = @import("../time.zig");
 const service = @import("service.zig");
 
 const log = std.log.scoped(.local_ingest);
@@ -808,7 +809,7 @@ fn handleHello(writer: *std.Io.Writer, max_frame_bytes: usize) !void {
 }
 
 fn handleDeclareBatch(eng: *Engine, session: *SessionState, payload: []const u8, writer: *std.Io.Writer) !void {
-    const start_ns = std.time.nanoTimestamp();
+    var timer = monotime.startTimer();
     var offset: usize = 0;
     const count = try takeInt(u32, payload, &offset);
     const ack_outcomes = try eng.alloc.alloc(DeclareAckOutcome, count);
@@ -950,9 +951,8 @@ fn handleDeclareBatch(eng: *Engine, session: *SessionState, payload: []const u8,
         try appendDeclareAckEntry(&response, ack.client_decl_id, ack.status, ack.code, ack.series_id);
     }
 
-    const elapsed_ns = std.time.nanoTimestamp() - start_ns;
     _ = eng.metrics.local_ingest_declare_batches_total.fetchAdd(1, .monotonic);
-    _ = eng.metrics.local_ingest_declare_ns_total.fetchAdd(@intCast(elapsed_ns), .monotonic);
+    _ = eng.metrics.local_ingest_declare_ns_total.fetchAdd(timer.read(), .monotonic);
     try writeFrame(writer, .declare_ack, 0, response.items);
 }
 
@@ -1006,7 +1006,7 @@ fn optionalBytesNormalized(value: ?[]const u8) ?[]const u8 {
 }
 
 fn handleAppendBatch(eng: *Engine, session: *SessionState, payload: []const u8, writer: *std.Io.Writer) !void {
-    const start_ns = std.time.nanoTimestamp();
+    var timer = monotime.startTimer();
     var offset: usize = 0;
     const count = try takeInt(u32, payload, &offset);
     var points = try eng.alloc.alloc(Engine.ResolvedIngestPoint, count);
@@ -1042,7 +1042,7 @@ fn handleAppendBatch(eng: *Engine, session: *SessionState, payload: []const u8, 
 
     _ = eng.metrics.local_ingest_append_points_total.fetchAdd(receipt.accepted_points, .monotonic);
     _ = eng.metrics.local_ingest_append_batches_total.fetchAdd(1, .monotonic);
-    _ = eng.metrics.local_ingest_append_ns_total.fetchAdd(@intCast(std.time.nanoTimestamp() - start_ns), .monotonic);
+    _ = eng.metrics.local_ingest_append_ns_total.fetchAdd(timer.read(), .monotonic);
     var current_max = eng.metrics.local_ingest_append_batch_points_max.load(.monotonic);
     while (receipt.accepted_points > current_max) {
         if (eng.metrics.local_ingest_append_batch_points_max.cmpxchgWeak(current_max, receipt.accepted_points, .monotonic, .monotonic)) |prev|
@@ -1465,16 +1465,18 @@ fn readFrameFromStream(alloc: std.mem.Allocator, stream: std.net.Stream, max_fra
     return try readFrameAlloc(alloc, reader, max_frame_bytes);
 }
 
-fn readDeclareAckResult(payload: []const u8) !struct {
+const DeclareAckResult = struct {
     client_decl_id: u32,
     status: DeclareStatus,
     code: ErrorCode,
     series_id: types.SeriesId,
-} {
+};
+
+fn readDeclareAckResult(payload: []const u8) !DeclareAckResult {
     var offset: usize = 0;
     const count = try takeInt(u32, payload, &offset);
     if (count != 1) return error.InvalidFrame;
-    const result = .{
+    const result: DeclareAckResult = .{
         .client_decl_id = try takeInt(u32, payload, &offset),
         .status = try takeEnum(DeclareStatus, u16, payload, &offset),
         .code = try takeEnum(ErrorCode, u16, payload, &offset),
@@ -1546,12 +1548,12 @@ test "socket declaration signatures distinguish descriptor metadata" {
 }
 
 test "socket error codes map to stable client-visible errors" {
-    try std.testing.expectError(error.ProtocolVersionMismatch, errorForCode(.unsupported_version));
-    try std.testing.expectError(error.DeclarationConflict, errorForCode(.decl_id_conflict));
-    try std.testing.expectError(error.UnknownDeclaration, errorForCode(.unknown_decl));
-    try std.testing.expectError(error.MemoryLimitExceeded, errorForCode(.memory_limit_exceeded));
-    try std.testing.expectError(error.Timeout, errorForCode(.timeout));
-    try std.testing.expectError(error.RemoteRejected, errorForCode(.protocol_error));
+    try std.testing.expect(errorForCode(.unsupported_version) == error.ProtocolVersionMismatch);
+    try std.testing.expect(errorForCode(.decl_id_conflict) == error.DeclarationConflict);
+    try std.testing.expect(errorForCode(.unknown_decl) == error.UnknownDeclaration);
+    try std.testing.expect(errorForCode(.memory_limit_exceeded) == error.MemoryLimitExceeded);
+    try std.testing.expect(errorForCode(.timeout) == error.Timeout);
+    try std.testing.expect(errorForCode(.protocol_error) == error.RemoteRejected);
 }
 
 test "socket listen path validation cleans stale sockets and rejects busy paths" {
@@ -1634,7 +1636,8 @@ test "socket client round trips declare append and flush" {
         .{ .client_decl_id = declared[1].client_decl_id, .ts = 20, .value = 2.5 },
     });
     try std.testing.expectEqual(@as(usize, 2), receipt.accepted_points);
-    try std.testing.expect(try client.flushAndDrain(1_000)).flushed;
+    const flush_ack = try client.flushAndDrain(1_000);
+    try std.testing.expect(flush_ack.flushed);
     client.deinit();
     server_thread.join();
 
@@ -1941,6 +1944,41 @@ test "socket connect retry bounds missing paths and connects after the path appe
         server_thread.join();
         return err;
     };
+    client.deinit();
+    server_thread.join();
+}
+
+test "socket flush_drain maps queue wake timeout to timeout error" {
+    if (!std.net.has_unix_sockets) return;
+
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/flush-wake-timeout", .{tmp.sub_path});
+    defer alloc.free(data_path);
+    const socket_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/flush-wake-timeout.sock", .{tmp.sub_path});
+    defer alloc.free(socket_path);
+
+    var eng = try Engine.init(alloc, try testConfig(alloc, data_path));
+    defer eng.deinit();
+
+    const server_thread = try std.Thread.spawn(.{}, testOneShotServer, .{ eng, socket_path, default_max_frame_bytes });
+    var client = try Client.connectWithRetry(alloc, socket_path, 20, 10);
+
+    eng.queue.mu.lock();
+    var queue_locked = true;
+    defer if (queue_locked) eng.queue.mu.unlock();
+
+    try std.testing.expectError(error.Timeout, client.flushAndDrain(1));
+
+    eng.queue.mu.unlock();
+    queue_locked = false;
+
+    const ack = try client.flushAndDrain(1_000);
+    try std.testing.expect(!ack.flushed);
+    try std.testing.expectEqual(@as(usize, 0), ack.queue_depth);
+
     client.deinit();
     server_thread.join();
 }
