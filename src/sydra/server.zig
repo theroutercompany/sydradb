@@ -10,6 +10,7 @@ const alloc_mod = @import("alloc.zig");
 const cas_mod = @import("storage/cas.zig");
 const object_store = @import("storage/object_store.zig");
 const repository_lock = @import("storage/repository_lock.zig");
+const market_storage_ops = @import("storage/market_storage_ops.zig");
 
 const cas_json_schema_version: u32 = 1;
 
@@ -106,6 +107,7 @@ pub fn run(handle: *alloc_mod.AllocatorHandle) !void {
     if (std.mem.eql(u8, cmd, "restore")) return cmdRestore(alloc, args);
     if (std.mem.eql(u8, cmd, "stats")) return cmdStats(handle, alloc, args);
     if (std.mem.eql(u8, cmd, "cas")) return cmdCas(alloc, args);
+    if (std.mem.eql(u8, cmd, "market")) return cmdMarketStorage(alloc, args);
 }
 
 fn loadConfigOrDefault(alloc: std.mem.Allocator) !config.Config {
@@ -385,6 +387,30 @@ fn cmdRestore(alloc: std.mem.Allocator, args: [][:0]u8) !void {
     var lock = try repository_lock.RepositoryLock.acquirePath(cfg.data_dir);
     defer lock.deinit();
     try @import("snapshot.zig").restore(alloc, cfg.data_dir, args[2], cfg.fsync);
+}
+
+fn cmdMarketStorage(alloc: std.mem.Allocator, args: [][:0]u8) !void {
+    if (args.len < 4 or !std.mem.eql(u8, std.mem.sliceTo(args[2], 0), "storage")) {
+        return error.InvalidMarketStorageCommand;
+    }
+
+    const command_args = try alloc.alloc([]const u8, args.len - 3);
+    defer alloc.free(command_args);
+    for (args[3..], 0..) |arg, index| {
+        command_args[index] = std.mem.sliceTo(arg, 0);
+    }
+    const command = try market_storage_ops.parseCommand(command_args);
+
+    var cfg = try loadConfigOrDefault(alloc);
+    var owned_engine = try initOwnedEngine(alloc, &cfg);
+    defer owned_engine.deinit();
+    const output = try market_storage_ops.executeAlloc(
+        alloc,
+        owned_engine.engine,
+        command,
+    );
+    defer alloc.free(output);
+    try writeJsonBufferToStdout(output);
 }
 
 fn writeJsonBufferToStdout(bytes: []const u8) !void {

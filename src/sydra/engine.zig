@@ -7,6 +7,7 @@ const market_catalog_mod = @import("storage/market_catalog.zig");
 const market_identity_mod = @import("storage/market_identity.zig");
 const market_manifest_mod = @import("storage/market_manifest.zig");
 const market_memtable_mod = @import("storage/market_memtable.zig");
+const market_migration_mod = @import("storage/market_migration.zig");
 const market_reader_mod = @import("storage/market_reader.zig");
 const market_runtime_mod = @import("storage/market_runtime.zig");
 const market_segment_mod = @import("storage/market_segment.zig");
@@ -29,6 +30,30 @@ fn sleepMs(ms: u64) void {
     } else {
         std.Thread.sleep(ms * std.time.ns_per_ms);
     }
+}
+
+fn recoverInterruptedMarketPromotionFiles(
+    alloc: std.mem.Allocator,
+    data_path: []const u8,
+    fsync: cfg.FsyncPolicy,
+) !void {
+    var data_dir = std.fs.cwd().openDir(data_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer data_dir.close();
+
+    var state = try market_migration_mod.MigrationState.loadOrInit(alloc, data_dir);
+    defer state.deinit();
+    if (state.phase != .promoting) return;
+
+    var catalog = try market_catalog_mod.Catalog.loadOrInit(alloc, data_dir, fsync);
+    defer catalog.deinit();
+    _ = try catalog.promoteAllSchemasToNative();
+
+    var cas = try cas_mod.CasManager.init(alloc, data_path, fsync);
+    defer cas.deinit();
+    _ = try cas.promoteFormatForNativeMarket();
 }
 
 const failed_ingest_quarantine_dir = "quarantine";
@@ -1157,6 +1182,11 @@ pub const Engine = struct {
         if (config.metadata_read_mode != .legacy and config.cas_mode == .off) {
             return error.CasReadModeRequiresCas;
         }
+        try recoverInterruptedMarketPromotionFiles(
+            alloc,
+            config.data_dir,
+            config.fsync,
+        );
         const repository_probe = try cas_mod.probeOrInitRepositoryFormatWithState(
             alloc,
             config.data_dir,
@@ -1252,10 +1282,75 @@ pub const Engine = struct {
             try engine.metadata.refreshCasIndex(cas);
         }
         try engine.recover();
+        try engine.finalizeInterruptedMarketPromotion();
         engine.writer_thread = try std.Thread.spawn(.{}, writerLoop, .{engine});
         engine.derived_thread = try std.Thread.spawn(.{}, derivedLoop, .{engine});
         engine.scheduleDerivedRefresh();
         return engine;
+    }
+
+    fn finalizeInterruptedMarketPromotion(self: *Engine) !void {
+        var state = try market_migration_mod.MigrationState.loadOrInit(
+            self.alloc,
+            self.data_dir,
+        );
+        defer state.deinit();
+        if (state.phase != .promoting) return;
+        if (self.repository_format.version != cas_mod.current_repository_format_version) {
+            return error.RepositoryFormatMismatch;
+        }
+
+        if (self.cas) |*cas| {
+            _ = try cas.syncLegacySnapshotWithNativeMarket(
+                self.data_dir,
+                &self.metadata.manifest,
+                &self.metadata.tags,
+                &self.metadata.series_catalog,
+                &self.metadata.metric_catalog,
+                &self.metadata.market_catalog,
+                &self.market_manifest,
+                "market-storage-promotion-recovery",
+            );
+            try cas.verifyHeadMatchesLegacyWithNativeMarket(
+                self.data_dir,
+                &self.metadata.manifest,
+                &self.metadata.tags,
+                &self.metadata.series_catalog,
+                &self.metadata.metric_catalog,
+                &self.metadata.market_catalog,
+                &self.market_manifest,
+            );
+            try self.metadata.refreshCasIndex(cas);
+        } else {
+            var cas = try cas_mod.CasManager.init(
+                self.alloc,
+                self.config.data_dir,
+                self.config.fsync,
+            );
+            defer cas.deinit();
+            _ = try cas.syncLegacySnapshotWithNativeMarket(
+                self.data_dir,
+                &self.metadata.manifest,
+                &self.metadata.tags,
+                &self.metadata.series_catalog,
+                &self.metadata.metric_catalog,
+                &self.metadata.market_catalog,
+                &self.market_manifest,
+                "market-storage-promotion-recovery",
+            );
+            try cas.verifyHeadMatchesLegacyWithNativeMarket(
+                self.data_dir,
+                &self.metadata.manifest,
+                &self.metadata.tags,
+                &self.metadata.series_catalog,
+                &self.metadata.metric_catalog,
+                &self.metadata.market_catalog,
+                &self.market_manifest,
+            );
+        }
+
+        _ = try state.advance(.promoted);
+        try state.saveAtomically(self.data_dir);
     }
 
     pub fn deinit(self: *Engine) void {

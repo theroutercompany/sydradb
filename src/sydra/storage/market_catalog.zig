@@ -677,6 +677,35 @@ pub const Catalog = struct {
         return try cloneEntrySlice(self.alloc, SignalDefinition, self.signals.items);
     }
 
+    /// Promote every stored schema mapping and registered-series digest in one
+    /// catalog rewrite. The operator migration state provides crash recovery
+    /// across this rewrite and the repository-format update.
+    pub fn promoteAllSchemasToNative(self: *Catalog) !usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var promoted: usize = 0;
+        for (self.schemas.items) |*schema| {
+            if (schema.storage_mapping == .native_v1) continue;
+            schema.storage_mapping = .native_v1;
+            promoted += 1;
+        }
+        for (self.market_series.items) |*entry| {
+            const schema = findSchema(self.schemas.items, entry.metric) orelse
+                return error.UnknownMarketSchema;
+            entry.schema_digest = schema.digest();
+        }
+        if (promoted == 0 or self.root == null) return promoted;
+
+        const previous_fsync = self.fsync;
+        self.fsync = .always;
+        defer self.fsync = previous_fsync;
+        try self.rewriteLocked();
+        var root = self.root.?;
+        try syncDir(&root);
+        return promoted;
+    }
+
     pub fn deleteRollup(self: *Catalog, id: []const u8) !bool {
         self.mutex.lock();
         defer self.mutex.unlock();
@@ -995,6 +1024,10 @@ pub const Catalog = struct {
         };
     }
 };
+
+fn syncDir(dir: *std.fs.Dir) !void {
+    if (@hasDecl(std.fs.Dir, "sync")) try dir.sync();
+}
 
 fn inputToSchema(alloc: std.mem.Allocator, input: MarketSchemaInput) !MarketSchema {
     try market_identity.validateSchemaShape(
@@ -1612,6 +1645,47 @@ test "fresh catalog can seed native builtins without promoting an existing catal
             try std.testing.expectEqual(StorageMapping.fanout_v1, schema.storage_mapping);
         }
     }
+}
+
+test "catalog promotion rewrites schema mappings and registered digests atomically" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var catalog = try Catalog.loadOrInit(alloc, tmp.dir, .none);
+    defer catalog.deinit();
+    var identity = try catalog.registerMarketSeries(
+        "market.trade",
+        "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}",
+    );
+    defer identity.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), try catalog.promoteAllSchemasToNative());
+    try std.testing.expectEqual(@as(usize, 0), try catalog.promoteAllSchemasToNative());
+
+    var promoted_schema = catalog.getSchema("market.trade").?;
+    defer promoted_schema.deinit(alloc);
+    try std.testing.expectEqual(StorageMapping.native_v1, promoted_schema.storage_mapping);
+    var promoted_identity = catalog.getMarketSeries(identity.series_id).?;
+    defer promoted_identity.deinit(alloc);
+    try std.testing.expectEqualSlices(
+        u8,
+        promoted_schema.digest()[0..],
+        promoted_identity.schema_digest[0..],
+    );
+
+    var reloaded = try Catalog.loadOrInit(alloc, tmp.dir, .none);
+    defer reloaded.deinit();
+    var reloaded_schema = reloaded.getSchema("market.trade").?;
+    defer reloaded_schema.deinit(alloc);
+    try std.testing.expectEqual(StorageMapping.native_v1, reloaded_schema.storage_mapping);
+    var reloaded_identity = reloaded.getMarketSeries(identity.series_id).?;
+    defer reloaded_identity.deinit(alloc);
+    try std.testing.expectEqualSlices(
+        u8,
+        reloaded_schema.digest()[0..],
+        reloaded_identity.schema_digest[0..],
+    );
 }
 
 test "storage mapping parses native mapping and rejects unknown mappings" {
