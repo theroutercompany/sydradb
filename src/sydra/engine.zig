@@ -920,7 +920,6 @@ pub const Engine = struct {
         }
         pub fn push(self: *Queue, point: ResolvedIngestPoint) !void {
             const owned_points = try self.alloc.alloc(ResolvedIngestPoint, 1);
-            errdefer self.alloc.free(owned_points);
             owned_points[0] = point;
             return self.pushOwned(.{
                 .payload = .{ .scalar = owned_points },
@@ -930,7 +929,6 @@ pub const Engine = struct {
         pub fn pushBatch(self: *Queue, points: []const ResolvedIngestPoint) !void {
             if (points.len == 0) return;
             const owned_points = try self.alloc.dupe(ResolvedIngestPoint, points);
-            errdefer self.alloc.free(owned_points);
             return self.pushOwned(.{
                 .payload = .{ .scalar = owned_points },
                 .bytes = points.len * @sizeOf(ResolvedIngestPoint),
@@ -1016,6 +1014,11 @@ pub const Engine = struct {
             try self.ensureCapacity(self.count + 1);
         }
         fn pushOwned(self: *Queue, batch: QueuedBatch) !void {
+            // Ownership transfers on entry; release rejected batches on error.
+            errdefer {
+                var rejected = batch;
+                rejected.deinit(self.alloc);
+            }
             var lock_timer = monotime.startTimer();
             self.mu.lock();
             const wait_ns = lock_timer.read();
@@ -1025,11 +1028,7 @@ pub const Engine = struct {
                 self.recordPushLockHold(lock_timer.read());
                 self.mu.unlock();
             }
-            if (self.closed) {
-                var rejected = batch;
-                rejected.deinit(self.alloc);
-                return error.Closed;
-            }
+            if (self.closed) return error.Closed;
             try self.ensureCapacity(self.count + 1);
             const next_pending_points = std.math.add(usize, self.pending_points, batch.payload.len()) catch return error.ResidentByteOverflow;
             const next_pending_bytes = std.math.add(usize, self.pending_bytes, batch.bytes) catch return error.ResidentByteOverflow;
@@ -7601,6 +7600,94 @@ test "engine queue lockBefore rejects a lock released after deadline" {
     const accepted_zero_timeout = queue.lockBefore(&zero_timer, 0);
     defer if (accepted_zero_timeout) queue.mu.unlock();
     try std.testing.expect(accepted_zero_timeout);
+}
+
+test "engine closed queue frees a rejected scalar single push" {
+    const talloc = std.testing.allocator;
+    var metrics = Engine.Metrics.init();
+    const queue = try Engine.Queue.init(talloc, &metrics);
+    defer {
+        queue.deinit();
+        talloc.destroy(queue);
+    }
+
+    queue.close();
+    try std.testing.expectError(error.Closed, queue.push(.{
+        .series_id = 1,
+        .ts = 1,
+        .value = 1,
+    }));
+    try std.testing.expectEqual(@as(usize, 0), queue.len());
+    try std.testing.expectEqual(@as(usize, 0), queue.pendingBytes());
+}
+
+test "engine closed queue frees a rejected scalar batch push" {
+    const talloc = std.testing.allocator;
+    var metrics = Engine.Metrics.init();
+    const queue = try Engine.Queue.init(talloc, &metrics);
+    defer {
+        queue.deinit();
+        talloc.destroy(queue);
+    }
+
+    const points = [_]Engine.ResolvedIngestPoint{
+        .{ .series_id = 1, .ts = 1, .value = 1 },
+        .{ .series_id = 2, .ts = 2, .value = 2 },
+    };
+    queue.close();
+    try std.testing.expectError(error.Closed, queue.pushBatch(points[0..]));
+    try std.testing.expectEqual(@as(usize, 0), queue.len());
+    try std.testing.expectEqual(@as(usize, 0), queue.pendingBytes());
+}
+
+test "engine closed queue frees a rejected market batch" {
+    const talloc = std.testing.allocator;
+    var metrics = Engine.Metrics.init();
+    const queue = try Engine.Queue.init(talloc, &metrics);
+    defer {
+        queue.deinit();
+        talloc.destroy(queue);
+    }
+
+    var payload_owned = true;
+    const values = try talloc.dupe(f64, &[_]f64{ 10.5, 100.0 });
+    errdefer if (payload_owned) talloc.free(values);
+    const metric = try talloc.dupe(u8, "market.trade");
+    errdefer if (payload_owned) talloc.free(metric);
+    const labels = try talloc.dupe(u8, "{\"symbol\":\"AAPL\"}");
+    errdefer if (payload_owned) talloc.free(labels);
+    const rows = try talloc.alloc(Engine.QueuedMarketRow, 1);
+    errdefer if (payload_owned) talloc.free(rows);
+    rows[0] = .{
+        .market_series_id = market_identity_mod.seriesId("market.trade", labels),
+        .schema_digest = @splat(0x11),
+        .mode = .dual_write_v1,
+        .metric = metric,
+        .canonical_labels = labels,
+        .ts_ns = 1_000,
+        .values = values,
+    };
+    const fanout_series_ids = try talloc.alloc([]types.SeriesId, 1);
+    errdefer if (payload_owned) talloc.free(fanout_series_ids);
+    fanout_series_ids[0] = try talloc.dupe(types.SeriesId, &[_]types.SeriesId{101});
+    errdefer if (payload_owned) talloc.free(fanout_series_ids[0]);
+    const fanout_values = try talloc.alloc([]f64, 1);
+    errdefer if (payload_owned) talloc.free(fanout_values);
+    fanout_values[0] = try talloc.dupe(f64, &[_]f64{10.5});
+    errdefer if (payload_owned) talloc.free(fanout_values[0]);
+
+    const batch = Engine.QueuedMarketBatch{
+        .rows = rows,
+        .mode = .dual_write_v1,
+        .fanout_series_ids = fanout_series_ids,
+        .fanout_values = fanout_values,
+    };
+    const bytes = try batch.queuedBytes();
+    queue.close();
+    payload_owned = false;
+    try std.testing.expectError(error.Closed, queue.pushMarketBatch(batch, bytes));
+    try std.testing.expectEqual(@as(usize, 0), queue.len());
+    try std.testing.expectEqual(@as(usize, 0), queue.pendingBytes());
 }
 
 test "engine market queue owns native batch payloads" {
