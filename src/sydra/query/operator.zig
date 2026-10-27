@@ -12,6 +12,43 @@ const value_mod = @import("value.zig");
 
 const ManagedArrayList = std.array_list.Managed;
 
+const AstSelectorSnapshotGate = struct {
+    mu: std.Thread.Mutex = .{},
+    cv: std.Thread.Condition = .{},
+    reached: bool = false,
+    released: bool = false,
+
+    fn block(self: *AstSelectorSnapshotGate) void {
+        self.mu.lock();
+        self.reached = true;
+        self.cv.broadcast();
+        while (!self.released) self.cv.wait(&self.mu);
+        self.mu.unlock();
+    }
+
+    fn waitUntilReached(self: *AstSelectorSnapshotGate, timeout_ns: u64) bool {
+        const deadline_ns = std.time.nanoTimestamp() + @as(i128, @intCast(timeout_ns));
+        self.mu.lock();
+        defer self.mu.unlock();
+        while (!self.reached) {
+            const now_ns = std.time.nanoTimestamp();
+            if (now_ns >= deadline_ns) return false;
+            const remaining_ns: u64 = @intCast(deadline_ns - now_ns);
+            self.cv.timedWait(&self.mu, remaining_ns) catch {};
+        }
+        return true;
+    }
+
+    fn release(self: *AstSelectorSnapshotGate) void {
+        self.mu.lock();
+        self.released = true;
+        self.mu.unlock();
+        self.cv.broadcast();
+    }
+};
+
+var ast_selector_snapshot_test_gate: if (builtin.is_test) ?*AstSelectorSnapshotGate else void = if (builtin.is_test) null else {};
+
 pub const Value = value_mod.Value;
 
 const empty_values = [_]Value{};
@@ -333,7 +370,8 @@ fn createScanOperator(allocator: std.mem.Allocator, engine: *engine_mod.Engine, 
         .ast => |ast_selector| switch (ast_selector.series) {
             .by_id => |id| try appendScanSeries(allocator, &payload, engine, @as(types.SeriesId, @intCast(id.value)), null, node.time_bounds),
             .name => |ident| {
-                const resolution = engine.resolveSelector(.{ .name = ident.value }) catch return error.UnsupportedPlan;
+                const resolution = try engine.resolveSimpleSelectorOwned(allocator, .{ .name = ident.value });
+                defer freeOwnedSelectorResolution(allocator, resolution);
                 switch (resolution.status) {
                     .resolved, .exact_match => try appendScanSeries(allocator, &payload, engine, resolution.series_id.?, resolution.canonical_tags, node.time_bounds),
                     .ambiguous => {
@@ -409,6 +447,11 @@ fn deinitScanPayload(allocator: std.mem.Allocator, payload: *Operator.Scan) void
     allocator.free(payload.buffer);
 }
 
+fn freeOwnedSelectorResolution(allocator: std.mem.Allocator, resolution: anytype) void {
+    if (resolution.series) |series| allocator.free(series);
+    if (resolution.canonical_tags) |canonical_tags| allocator.free(canonical_tags);
+}
+
 fn appendScanSeries(
     allocator: std.mem.Allocator,
     payload: *Operator.Scan,
@@ -423,11 +466,19 @@ fn appendScanSeries(
     const end_ts = bounds.max orelse std.math.maxInt(i64);
     try engine.queryRange(series_id, start_ts, end_ts, &points);
 
-    const tags_json = canonical_tags orelse blk: {
-        const resolution = engine.resolveSelector(.{ .by_id = series_id }) catch break :blk null;
-        break :blk resolution.canonical_tags;
+    const tag_fields = if (canonical_tags) |tags| blk: {
+        if (builtin.is_test) {
+            if (ast_selector_snapshot_test_gate) |gate| gate.block();
+        }
+        break :blk try parseTagFields(allocator, tags);
+    } else blk: {
+        const resolution = try engine.resolveSimpleSelectorOwned(allocator, .{ .by_id = series_id });
+        defer freeOwnedSelectorResolution(allocator, resolution);
+        if (builtin.is_test) {
+            if (ast_selector_snapshot_test_gate) |gate| gate.block();
+        }
+        break :blk try parseTagFields(allocator, resolution.canonical_tags orelse "{}");
     };
-    const tag_fields = try parseTagFields(allocator, tags_json orelse "{}");
     errdefer freeTagFields(allocator, tag_fields);
 
     const next = try allocator.realloc(payload.series, payload.series.len + 1);
@@ -588,8 +639,12 @@ fn projectDestroy(op: *Operator) void {
 fn createAggregateOperator(allocator: std.mem.Allocator, child: *Operator, node: physical.Aggregate, schema: []const plan.ColumnInfo) ExecuteError!*Operator {
     var aggregates = try analyseAggregates(allocator, node.output, node.groupings);
     defer aggregates.map.deinit();
+    errdefer allocator.free(aggregates.exprs);
     const column_meta = try buildColumnMeta(allocator, node.output, node.groupings, aggregates.exprs);
     errdefer allocator.free(column_meta);
+    const output_buffer = try allocator.alloc(Value, schema.len);
+    errdefer allocator.free(output_buffer);
+    const metric_kind = try inferMetricKind(child);
 
     const payload = Operator.Aggregate{
         .child = child,
@@ -598,9 +653,9 @@ fn createAggregateOperator(allocator: std.mem.Allocator, child: *Operator, node:
         .column_meta = column_meta,
         .groups = ManagedArrayList(Operator.GroupState).init(allocator),
         .key_buffer = ManagedArrayList(Value).init(allocator),
-        .output_buffer = try allocator.alloc(Value, schema.len),
+        .output_buffer = output_buffer,
         .fill = node.fill,
-        .metric_kind = inferMetricKind(child),
+        .metric_kind = metric_kind,
         .initialized = false,
         .index = 0,
     };
@@ -1324,12 +1379,15 @@ fn percentileValue(values: []const f64, quantile: f64) Value {
     return .{ .float = copy[lower] + (copy[upper] - copy[lower]) * weight };
 }
 
-fn inferMetricKind(child: *Operator) metric_catalog_mod.MetricKind {
+fn inferMetricKind(child: *Operator) ExecuteError!metric_catalog_mod.MetricKind {
     return switch (child.payload) {
-        .scan => |payload| if (payload.series.len != 0) child.payload.scan.engine.metricKindOrDefault(scanMetricName(child.payload.scan.engine, payload.series[0].series_id) orelse "") else .gauge,
-        .filter => |payload| inferMetricKind(payload.child),
-        .project => |payload| inferMetricKind(payload.child),
-        .limit => |payload| inferMetricKind(payload.child),
+        .scan => |payload| if (payload.series.len != 0)
+            try scanMetricKind(child.allocator, child.payload.scan.engine, payload.series[0].series_id)
+        else
+            .gauge,
+        .filter => |payload| try inferMetricKind(payload.child),
+        .project => |payload| try inferMetricKind(payload.child),
+        .limit => |payload| try inferMetricKind(payload.child),
         .sort,
         .aggregate,
         .one_row,
@@ -1338,9 +1396,10 @@ fn inferMetricKind(child: *Operator) metric_catalog_mod.MetricKind {
     };
 }
 
-fn scanMetricName(engine: *engine_mod.Engine, series_id: types.SeriesId) ?[]const u8 {
-    const resolution = engine.resolveSelector(.{ .by_id = series_id }) catch return null;
-    return resolution.series;
+fn scanMetricKind(allocator: std.mem.Allocator, engine: *engine_mod.Engine, series_id: types.SeriesId) ExecuteError!metric_catalog_mod.MetricKind {
+    const resolution = try engine.resolveSimpleSelectorOwned(allocator, .{ .by_id = series_id });
+    defer freeOwnedSelectorResolution(allocator, resolution);
+    return engine.metricKindOrDefault(resolution.series orelse "");
 }
 
 fn applyFill(allocator: std.mem.Allocator, payload: *Operator.Aggregate) ExecuteError!void {
@@ -1778,4 +1837,197 @@ test "operator stats track rows" {
     alloc.free(row2);
     alloc.destroy(value_expr);
     alloc.free(value_name);
+}
+
+test "AST scan retains CAS tags and propagates selector allocation failures" {
+    const PoisonFreeAllocator = struct {
+        backing: std.mem.Allocator,
+        nonzero_allocations: usize = 0,
+        fail_on_nonzero_allocation: ?usize = null,
+
+        const vtable = std.mem.Allocator.VTable{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        };
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        fn alloc(
+            context: *anyopaque,
+            len: usize,
+            alignment: std.mem.Alignment,
+            return_address: usize,
+        ) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            if (len != 0 and self.fail_on_nonzero_allocation != null) {
+                self.nonzero_allocations += 1;
+                if (self.fail_on_nonzero_allocation == self.nonzero_allocations) return null;
+            }
+            return self.backing.rawAlloc(len, alignment, return_address);
+        }
+
+        fn resize(
+            context: *anyopaque,
+            memory: []u8,
+            alignment: std.mem.Alignment,
+            new_len: usize,
+            return_address: usize,
+        ) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return self.backing.rawResize(memory, alignment, new_len, return_address);
+        }
+
+        fn remap(
+            context: *anyopaque,
+            memory: []u8,
+            alignment: std.mem.Alignment,
+            new_len: usize,
+            return_address: usize,
+        ) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return self.backing.rawRemap(memory, alignment, new_len, return_address);
+        }
+
+        fn free(
+            context: *anyopaque,
+            memory: []u8,
+            alignment: std.mem.Alignment,
+            return_address: usize,
+        ) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            @memset(memory, 0xa5);
+            self.backing.rawFree(memory, alignment, return_address);
+        }
+    };
+
+    var poison_allocator = PoisonFreeAllocator{ .backing = std.testing.allocator };
+    const alloc = poison_allocator.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/ast-selector-snapshot-lifetime", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .dual_write,
+        .metadata_read_mode = .primary,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    const series_name = "ast_selector_lifetime.room1";
+    const canonical_tags = "{\"host\":\"before\"}";
+    const series_id = types.seriesIdFrom(series_name, canonical_tags);
+    try engine.registerSeries(series_name, canonical_tags, series_id);
+    try engine.ingest(.{
+        .series_id = series_id,
+        .ts = 10,
+        .value = 1.0,
+        .tags_json = canonical_tags,
+    });
+    _ = try engine.flushNow();
+
+    const span = @import("common.zig").Span.init(0, 0);
+    const tag_expr = ast.Expr{ .identifier = .{ .value = "tag.host", .quoted = false, .span = span } };
+    const output = [_]plan.ColumnInfo{.{ .name = "host", .expr = &tag_expr }};
+    const selector = ast.Selector{
+        .series = .{ .name = .{ .value = series_name, .quoted = false, .span = span } },
+        .tag_filter = null,
+        .span = span,
+    };
+    var scan_node = physical.Node{ .scan = .{
+        .selector = .{ .ast = selector },
+        .output = &output,
+        .rollup_hint = null,
+        .time_bounds = .{},
+        .label_constraints = &.{},
+        .require_exact_series = true,
+    } };
+
+    var gate = AstSelectorSnapshotGate{};
+    ast_selector_snapshot_test_gate = &gate;
+    defer ast_selector_snapshot_test_gate = null;
+
+    const BuildContext = struct {
+        allocator: std.mem.Allocator,
+        engine: *engine_mod.Engine,
+        node: *physical.Node,
+        operator: ?*Operator = null,
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.operator = buildPipeline(self.allocator, self.engine, self.node) catch |err| {
+                self.failure = err;
+                return;
+            };
+        }
+    };
+    var build = BuildContext{
+        .allocator = alloc,
+        .engine = engine,
+        .node = &scan_node,
+    };
+    const thread = try std.Thread.spawn(.{}, BuildContext.run, .{&build});
+    var thread_joined = false;
+    var operator_owned = false;
+    defer {
+        gate.release();
+        if (!thread_joined) thread.join();
+        if (!operator_owned) {
+            if (build.operator) |operator| operator.destroy();
+        }
+    }
+
+    try std.testing.expect(gate.waitUntilReached(5 * std.time.ns_per_s));
+    const replacement_name = "ast_selector_lifetime.unrelated";
+    const replacement_tags = "{\"host\":\"after\"}";
+    try engine.registerSeries(
+        replacement_name,
+        replacement_tags,
+        types.seriesIdFrom(replacement_name, replacement_tags),
+    );
+    _ = try engine.flushNow();
+    gate.release();
+    thread.join();
+    thread_joined = true;
+
+    if (build.failure) |err| return err;
+    var scan = build.operator orelse return error.MissingScanOperator;
+    operator_owned = true;
+    defer scan.destroy();
+
+    const row = (try scan.next()) orelse return error.MissingScanRow;
+    try std.testing.expect(row.values[0] == .string);
+    try std.testing.expectEqualStrings("before", row.values[0].string);
+
+    var oom_scan_node = physical.Node{ .scan = .{
+        .selector = .{ .ast = selector },
+        .output = &.{},
+        .rollup_hint = null,
+        .time_bounds = .{},
+        .label_constraints = &.{},
+        .require_exact_series = true,
+    } };
+    // The name lookup clones the series then its tags; fail on tags to exercise cleanup of the partial result.
+    poison_allocator.nonzero_allocations = 0;
+    poison_allocator.fail_on_nonzero_allocation = 2;
+    const oom_result = buildPipeline(alloc, engine, &oom_scan_node);
+    poison_allocator.fail_on_nonzero_allocation = null;
+    try std.testing.expectError(error.OutOfMemory, oom_result);
+    try std.testing.expectEqual(@as(usize, 2), poison_allocator.nonzero_allocations);
 }

@@ -2944,6 +2944,7 @@ fn handleQueryGet(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.
 const null_series_id = std.math.maxInt(types.SeriesId);
 
 fn resolveUniqueSeriesId(eng: *Engine, name: []const u8) !?types.SeriesId {
+    // This endpoint only returns the scalar ID; it never reads the borrowed metadata strings.
     const resolution = try eng.resolveSelector(.{ .name = name });
     return switch (resolution.status) {
         .resolved, .exact_match => resolution.series_id.?,
@@ -2952,6 +2953,7 @@ fn resolveUniqueSeriesId(eng: *Engine, name: []const u8) !?types.SeriesId {
 }
 
 fn resolveExactSeriesId(eng: *Engine, name: []const u8, labels_json: []const u8) !?types.SeriesId {
+    // Exact lookup callers here only return the scalar ID and never read borrowed metadata strings.
     const resolution = try eng.resolveSelector(.{ .exact = .{ .series = name, .tags_json = labels_json } });
     return switch (resolution.status) {
         .resolved, .exact_match => resolution.series_id.?,
@@ -6279,7 +6281,9 @@ fn handleQueryCompare(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Ser
         return respondJsonError(alloc, req, .not_found, "series_not_found", "series not found");
     }
 
-    const resolution = try eng.resolveSelector(.{ .by_id = resolved_sid });
+    const resolution = try eng.resolveSimpleSelectorOwned(alloc, .{ .by_id = resolved_sid });
+    defer if (resolution.series) |series| alloc.free(series);
+    defer if (resolution.canonical_tags) |tags| alloc.free(tags);
     const metric_name: ?[]const u8 = if (resolution.series) |metric|
         metric
     else if (obj.get("metric")) |metric_value|
