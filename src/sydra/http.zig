@@ -2685,6 +2685,118 @@ test "market ingest reports dual write metadata and keeps fanout rows queryable"
     try eng.waitForQueryablePoints(talloc, bid_sid, 1, 1_000);
 }
 
+test "market ingest dual fanout preserves high unsigned derived ids across WAL reopen" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/http-market-dual-highid-reopen", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const metric = "market.http.dual.highid";
+    const bid_metric = "market.http.dual.highid.bid";
+    const ask_metric = "market.http.dual.highid.ask";
+    const high_id_floor: types.SeriesId = @intCast(std.math.maxInt(i64));
+    var symbol_buf: [64]u8 = undefined;
+    var labels_buf: [96]u8 = undefined;
+    var symbol: []const u8 = "";
+    var labels: []const u8 = "";
+    var bid_sid: types.SeriesId = 0;
+    var ask_sid: types.SeriesId = 0;
+    var candidate: u64 = 0;
+    var found = false;
+    while (candidate < 10_000) : (candidate += 1) {
+        symbol = try std.fmt.bufPrint(&symbol_buf, "HI{d}", .{candidate});
+        labels = try std.fmt.bufPrint(&labels_buf, "{{\"symbol\":\"{s}\"}}", .{symbol});
+        bid_sid = types.seriesIdFrom(bid_metric, labels);
+        ask_sid = types.seriesIdFrom(ask_metric, labels);
+        if (bid_sid > high_id_floor and ask_sid > high_id_floor) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+
+    const body = try std.fmt.allocPrint(
+        talloc,
+        "{{\"metric\":\"{s}\",\"ts_ns\":1000,\"labels\":{{\"symbol\":\"{s}\"}},\"columns\":{{\"bid\":20.0,\"ask\":20.1}}}}\n",
+        .{ metric, symbol },
+    );
+    defer talloc.free(body);
+
+    {
+        var conf = try testConfig(talloc, data_path);
+        conf.cas_mode = .dual_write;
+        conf.market_storage_mode = .dual_write_v1;
+        conf.flush_interval_ms = std.math.maxInt(u32);
+        conf.memtable_max_bytes = std.math.maxInt(usize);
+        var eng = try Engine.init(talloc, conf);
+        defer eng.deinit();
+
+        var schema = try eng.registerMarketSchema(.{
+            .metric = metric,
+            .ordered_columns = &.{ "bid", "ask" },
+            .required_labels = &.{"symbol"},
+            .storage_mapping = .native_v1,
+        });
+        defer schema.deinit(talloc);
+
+        var response = try runSingleRequestServer(
+            talloc,
+            eng,
+            "POST",
+            "/api/v1/market/ingest",
+            body,
+        );
+        defer response.deinit(talloc);
+        try std.testing.expectEqual(@as(u16, 200), response.status_code);
+        var parsed = try std.json.parseFromSlice(std.json.Value, talloc, response.body, .{});
+        defer parsed.deinit();
+        try expectJsonIntField(parsed.value.object, "rows", 1);
+        try expectJsonIntField(parsed.value.object, "writes", 2);
+        try expectJsonIntField(parsed.value.object, "native_rows", 1);
+        try expectJsonIntField(parsed.value.object, "fanout_writes", 2);
+
+        try std.testing.expect(eng.metadata.series_catalog.resolveBySeriesId(bid_sid).series != null);
+        try std.testing.expect(eng.metadata.series_catalog.resolveBySeriesId(ask_sid).series != null);
+        try std.testing.expect(eng.metrics.exact_series_declare_inserted_total.load(.monotonic) >= 2);
+        try std.testing.expectEqual(@as(u64, 1), eng.metrics.ingest_total.load(.monotonic));
+        try std.testing.expect(eng.metrics.wal_append_total.load(.monotonic) >= 1);
+        try std.testing.expect(eng.metrics.queue_push_lock_acquisitions.load(.monotonic) >= 1);
+    }
+
+    var conf = try testConfig(talloc, data_path);
+    conf.cas_mode = .dual_write;
+    conf.market_storage_mode = .dual_write_v1;
+    conf.market_storage_read_mode = .fanout;
+    conf.flush_interval_ms = std.math.maxInt(u32);
+    conf.memtable_max_bytes = std.math.maxInt(usize);
+    var recovered = try Engine.init(talloc, conf);
+    defer recovered.deinit();
+
+    try std.testing.expect(recovered.metadata.series_catalog.resolveBySeriesId(bid_sid).series != null);
+    try std.testing.expect(recovered.metadata.series_catalog.resolveBySeriesId(ask_sid).series != null);
+
+    var bid_points = std.array_list.Managed(types.Point).init(talloc);
+    defer bid_points.deinit();
+    try recovered.queryRange(bid_sid, 0, 2_000, &bid_points);
+    try std.testing.expectEqual(@as(usize, 1), bid_points.items.len);
+    try std.testing.expectEqual(@as(i64, 1_000), bid_points.items[0].ts);
+    try std.testing.expectApproxEqAbs(@as(f64, 20.0), bid_points.items[0].value, 1e-9);
+
+    const second_values = [_]f64{ 21.0, 21.1 };
+    _ = try recovered.ingestMarketBatch(&.{.{
+        .metric = metric,
+        .labels_json = labels,
+        .ts_ns = 2_000,
+        .values = &second_values,
+    }});
+    try std.testing.expect(try recovered.flushAndDrain(5_000));
+    try recovered.verifyCasState();
+    try std.testing.expect(recovered.metrics.flush_total.load(.monotonic) > 0);
+    try std.testing.expect(recovered.metrics.cas_sync_total.load(.monotonic) > 0);
+}
+
 test "market ingest maps format3 native failure without scalar fanout fallout" {
     const talloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
