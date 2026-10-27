@@ -11,6 +11,13 @@ const market_segment = @import("market_segment.zig");
 
 const hour_ns: i64 = 3600 * std.time.ns_per_s;
 
+const PromotionFault = enum {
+    after_format_promotion,
+    after_catalog_promotion,
+};
+
+var promotion_fault: ?PromotionFault = null;
+
 pub const Command = union(enum) {
     status,
     migrate_dry_run,
@@ -267,6 +274,7 @@ fn buildDataset(alloc: std.mem.Allocator, engine: *engine_mod.Engine) !Dataset {
 }
 
 fn dryRunAlloc(alloc: std.mem.Allocator, engine: *engine_mod.Engine) ![]u8 {
+    try establishFanoutBoundary(engine);
     var dataset = try buildDataset(alloc, engine);
     defer dataset.deinit();
     var report = try market_migration.inventoryFanout(alloc, dataset.inputs);
@@ -300,12 +308,14 @@ fn migrateApplyInner(
         try state.saveAtomically(engine.data_dir);
     } else if (state.phase == .reconstructing and !resume_failed) {
         return error.MarketMigrationResumeRequired;
-    } else if (resume_failed and state.phase != .reconstructing) {
+    } else if (resume_failed and state.phase == .inventory) {
         return error.MarketMigrationNotFailed;
     }
     switch (state.phase) {
         .inventory, .reconstructing => {},
         .native_complete, .verifying, .verified, .checkpointed => {
+            try establishFanoutBoundary(engine);
+            try engine.refreshNextMarketWriteSequenceFromPersistedSegments();
             try syncMigrationSnapshot(
                 alloc,
                 engine,
@@ -324,6 +334,7 @@ fn migrateApplyInner(
         .failed => unreachable,
     }
 
+    try establishFanoutBoundary(engine);
     var dataset = try buildDataset(alloc, engine);
     defer dataset.deinit();
     var inventory = try market_migration.inventoryFanout(alloc, dataset.inputs);
@@ -384,6 +395,7 @@ fn migrateApplyInner(
 
     _ = try state.advance(.native_complete);
     try state.saveAtomically(engine.data_dir);
+    try engine.refreshNextMarketWriteSequenceFromPersistedSegments();
     try syncMigrationSnapshot(alloc, engine, "market-migration-native-complete");
     return try writeMigrationResultJson(
         alloc,
@@ -514,6 +526,7 @@ fn verifyInner(alloc: std.mem.Allocator, engine: *engine_mod.Engine) ![]u8 {
         else => return error.InvalidMarketMigrationPhase,
     }
 
+    try establishFanoutBoundary(engine);
     const rows_verified = try verifyDatasetParity(alloc, engine);
     try syncMigrationSnapshot(alloc, engine, "market-migration-verified");
     if (state.phase == .verifying) {
@@ -683,27 +696,21 @@ fn promoteApplyAlloc(
 
     var rows_verified: u64 = 0;
     if (state.phase == .verified or state.phase == .checkpointed) {
+        try establishFanoutBoundary(engine);
         rows_verified = try verifyDatasetParity(alloc, engine);
-        try syncMigrationSnapshot(alloc, engine, "market-migration-pre-promotion");
     }
     if (state.phase == .verified) {
-        const checkpoint_ref = if (engine.cas) |*cas|
-            try cas.createCheckpoint("market-storage-promotion") orelse
-                return error.MissingCasHead
-        else blk: {
-            var cas = try cas_mod.CasManager.init(
-                alloc,
-                engine.config.data_dir,
-                engine.config.fsync,
-            );
-            defer cas.deinit();
-            break :blk try cas.createCheckpoint("market-storage-promotion") orelse
-                return error.MissingCasHead;
-        };
+        const checkpoint_ref = try promotionCheckpointRefAlloc(alloc, state.generation);
         defer alloc.free(checkpoint_ref);
+        if (!try checkpointRefExists(alloc, engine, checkpoint_ref)) {
+            try syncMigrationSnapshot(alloc, engine, "market-migration-pre-promotion");
+        }
+        _ = try createPromotionCheckpoint(alloc, engine, checkpoint_ref);
         _ = try state.recordCheckpointRef(checkpoint_ref);
         _ = try state.advance(.checkpointed);
         try state.saveAtomically(engine.data_dir);
+    } else if (state.phase == .checkpointed) {
+        _ = try createPromotionCheckpoint(alloc, engine, state.checkpoint_ref.?);
     }
 
     if (state.phase == .checkpointed) {
@@ -711,20 +718,10 @@ fn promoteApplyAlloc(
         try state.saveAtomically(engine.data_dir);
     }
 
+    try promoteRepositoryFormat(alloc, engine);
+    try hitPromotionFault(.after_format_promotion);
     const promoted_schemas = try engine.metadata.market_catalog.promoteAllSchemasToNative();
-    if (engine.cas) |*cas| {
-        _ = try cas.promoteFormatForNativeMarket();
-        engine.repository_format = cas.format;
-    } else {
-        var cas = try cas_mod.CasManager.init(
-            alloc,
-            engine.config.data_dir,
-            engine.config.fsync,
-        );
-        defer cas.deinit();
-        _ = try cas.promoteFormatForNativeMarket();
-        engine.repository_format = cas.format;
-    }
+    try hitPromotionFault(.after_catalog_promotion);
 
     try syncMigrationSnapshot(alloc, engine, "market-storage-promoted");
     try verifyMigrationSnapshot(alloc, engine);
@@ -738,6 +735,85 @@ fn promoteApplyAlloc(
         promoted_schemas,
         rows_verified,
     );
+}
+
+fn promoteRepositoryFormat(
+    alloc: std.mem.Allocator,
+    engine: *engine_mod.Engine,
+) !void {
+    if (engine.cas) |*cas| {
+        _ = try cas.promoteFormatForNativeMarket();
+        engine.repository_format = cas.format;
+        return;
+    }
+
+    var cas = try cas_mod.CasManager.init(
+        alloc,
+        engine.config.data_dir,
+        engine.config.fsync,
+    );
+    defer cas.deinit();
+    _ = try cas.promoteFormatForNativeMarket();
+    engine.repository_format = cas.format;
+}
+
+fn promotionCheckpointRefAlloc(
+    alloc: std.mem.Allocator,
+    verified_generation: u64,
+) ![]u8 {
+    return try std.fmt.allocPrint(
+        alloc,
+        "checkpoints/market-storage-promotion-g{d}",
+        .{verified_generation},
+    );
+}
+
+fn checkpointRefExists(
+    alloc: std.mem.Allocator,
+    engine: *engine_mod.Engine,
+    ref_name: []const u8,
+) !bool {
+    if (engine.cas) |*cas| return (try cas.refs.readRef(ref_name)) != null;
+
+    var cas = try cas_mod.CasManager.init(
+        alloc,
+        engine.config.data_dir,
+        engine.config.fsync,
+    );
+    defer cas.deinit();
+    return (try cas.refs.readRef(ref_name)) != null;
+}
+
+fn createPromotionCheckpoint(
+    alloc: std.mem.Allocator,
+    engine: *engine_mod.Engine,
+    ref_name: []const u8,
+) !bool {
+    if (engine.cas) |*cas| return try cas.createCheckpointAtRef(ref_name);
+
+    var cas = try cas_mod.CasManager.init(
+        alloc,
+        engine.config.data_dir,
+        engine.config.fsync,
+    );
+    defer cas.deinit();
+    return try cas.createCheckpointAtRef(ref_name);
+}
+
+fn hitPromotionFault(point: PromotionFault) !void {
+    if (promotion_fault != point) return;
+    promotion_fault = null;
+    return switch (point) {
+        .after_format_promotion => error.InjectedAfterMarketFormatPromotion,
+        .after_catalog_promotion => error.InjectedAfterMarketCatalogPromotion,
+    };
+}
+
+/// Capture a durable read boundary before inventorying fanout scalar series.
+/// This drains acknowledged queue work and flushes the matching segment, CAS,
+/// and WAL state while the repository still retains its format-3 mapping.
+fn establishFanoutBoundary(engine: *engine_mod.Engine) !void {
+    _ = try engine.flushNow();
 }
 
 fn syncMigrationSnapshot(
@@ -1094,6 +1170,80 @@ fn deinitSeries(
     alloc.free(series);
 }
 
+fn initializeFormat3TestRepository(data_path: []const u8) !void {
+    try std.fs.cwd().makePath(data_path);
+    var root = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer root.close();
+    const legacy_marker = try root.createFile("MANIFEST", .{ .truncate = true });
+    legacy_marker.close();
+    try root.makePath("objects/info");
+    var marker: [16]u8 = undefined;
+    @memcpy(marker[0..9], "SYDSTORE1");
+    std.mem.writeInt(
+        u16,
+        marker[9..11],
+        cas_mod.primary_repository_format_version,
+        .little,
+    );
+    marker[11] = @intFromEnum(cas_mod.RefBackend.reftable);
+    std.mem.writeInt(
+        u32,
+        marker[12..16],
+        cas_mod.default_extent_chunk_bytes,
+        .little,
+    );
+    try root.writeFile(.{
+        .sub_path = "objects/info/store-format",
+        .data = &marker,
+        .flags = .{},
+    });
+}
+
+fn format3FanoutTestConfig(
+    alloc: std.mem.Allocator,
+    data_path: []const u8,
+) !cfg.Config {
+    return .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .always,
+        .flush_interval_ms = 60_000,
+        .memtable_max_bytes = 1024 * 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 32 * 1024 * 1024,
+        .cas_mode = .dual_write,
+        .metadata_read_mode = .legacy,
+        .query_compiler_mode = .compiled,
+        .market_storage_mode = .fanout_v1,
+        .market_storage_read_mode = .fanout,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+}
+
+fn prepareEmptyVerifiedMigration(
+    alloc: std.mem.Allocator,
+    engine: *engine_mod.Engine,
+) !market_migration.MigrationState {
+    var schema = try engine.registerMarketSchema(.{
+        .metric = "market.promotion.atomicity",
+        .ordered_columns = &.{ "price", "size" },
+        .required_labels = &.{"symbol"},
+    });
+    schema.deinit(alloc);
+
+    var state = try market_migration.MigrationState.loadOrInit(alloc, engine.data_dir);
+    errdefer state.deinit();
+    _ = try state.advance(.reconstructing);
+    _ = try state.advance(.native_complete);
+    _ = try state.advance(.verifying);
+    _ = try state.advance(.verified);
+    try state.saveAtomically(engine.data_dir);
+    return state;
+}
+
 test "market storage command parser requires explicit mutating flags" {
     try std.testing.expectEqual(Command.status, try parseCommand(&.{"status"}));
     try std.testing.expectEqual(Command.migrate_dry_run, try parseCommand(&.{ "migrate", "--dry-run" }));
@@ -1119,6 +1269,116 @@ test "market storage command parser requires explicit mutating flags" {
         error.InvalidMarketStorageCommand,
         parseCommand(&.{"promote"}),
     );
+}
+
+test "promotion checkpoints retry deterministically at every durable boundary" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    inline for (.{
+        PromotionFault.after_format_promotion,
+        PromotionFault.after_catalog_promotion,
+    }) |fault| {
+        const data_path = try std.fmt.allocPrint(
+            alloc,
+            ".zig-cache/tmp/{s}/promotion-{s}",
+            .{ tmp.sub_path, @tagName(fault) },
+        );
+        defer alloc.free(data_path);
+        try initializeFormat3TestRepository(data_path);
+
+        var config = try format3FanoutTestConfig(alloc, data_path);
+        var engine = try engine_mod.Engine.init(alloc, config);
+        defer engine.deinit();
+        config = undefined;
+
+        var verified_state = try prepareEmptyVerifiedMigration(alloc, engine);
+        const checkpoint_ref = try promotionCheckpointRefAlloc(
+            alloc,
+            verified_state.generation,
+        );
+        defer alloc.free(checkpoint_ref);
+        verified_state.deinit();
+
+        if (fault == .after_format_promotion) {
+            try syncMigrationSnapshot(alloc, engine, "promotion-checkpoint-crash-window");
+            try std.testing.expect(try createPromotionCheckpoint(
+                alloc,
+                engine,
+                checkpoint_ref,
+            ));
+        }
+
+        promotion_fault = fault;
+        defer promotion_fault = null;
+        const expected_error = switch (fault) {
+            .after_format_promotion => error.InjectedAfterMarketFormatPromotion,
+            .after_catalog_promotion => error.InjectedAfterMarketCatalogPromotion,
+        };
+        try std.testing.expectError(
+            expected_error,
+            promoteApplyAlloc(alloc, engine),
+        );
+
+        var interrupted_state = try market_migration.MigrationState.loadOrInit(
+            alloc,
+            engine.data_dir,
+        );
+        defer interrupted_state.deinit();
+        try std.testing.expectEqual(
+            market_migration.Phase.promoting,
+            interrupted_state.phase,
+        );
+        try std.testing.expectEqualStrings(
+            checkpoint_ref,
+            interrupted_state.checkpoint_ref.?,
+        );
+        try std.testing.expectEqual(
+            cas_mod.current_repository_format_version,
+            engine.repository_format.version,
+        );
+        var interrupted_schema = engine.marketSchema("market.promotion.atomicity").?;
+        defer interrupted_schema.deinit(alloc);
+        try std.testing.expectEqual(
+            if (fault == .after_format_promotion)
+                market_catalog_mod.StorageMapping.fanout_v1
+            else
+                market_catalog_mod.StorageMapping.native_v1,
+            interrupted_schema.storage_mapping,
+        );
+
+        const completed = try promoteApplyAlloc(alloc, engine);
+        defer alloc.free(completed);
+        var completed_state = try market_migration.MigrationState.loadOrInit(
+            alloc,
+            engine.data_dir,
+        );
+        defer completed_state.deinit();
+        try std.testing.expectEqual(
+            market_migration.Phase.promoted,
+            completed_state.phase,
+        );
+        var completed_schema = engine.marketSchema("market.promotion.atomicity").?;
+        defer completed_schema.deinit(alloc);
+        try std.testing.expectEqual(
+            market_catalog_mod.StorageMapping.native_v1,
+            completed_schema.storage_mapping,
+        );
+
+        const refs = try engine.cas.?.listRefs();
+        defer {
+            for (refs) |*entry| entry.deinit(alloc);
+            alloc.free(refs);
+        }
+        var matching_checkpoints: usize = 0;
+        for (refs) |entry| {
+            if (std.mem.eql(u8, entry.name, checkpoint_ref)) {
+                matching_checkpoints += 1;
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 1), matching_checkpoints);
+    }
 }
 
 test "inventory JSON preserves exact gap coordinates" {
@@ -1150,7 +1410,7 @@ test "inventory JSON preserves exact gap coordinates" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"blocker_count\":1") != null);
 }
 
-test "format 3 fanout migration verifies checkpoints and promotes atomically" {
+test "format 3 migration flushes acknowledged tails and preserves write sequence" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1219,7 +1479,6 @@ test "format 3 fanout migration verifies checkpoints and promotes atomically" {
         .values = &values,
     }});
     try std.testing.expectEqual(@as(usize, 1), receipt.accepted_rows);
-    _ = try engine.flushNow();
 
     const dry_run = try dryRunAlloc(alloc, engine);
     defer alloc.free(dry_run);
@@ -1230,12 +1489,35 @@ test "format 3 fanout migration verifies checkpoints and promotes atomically" {
         std.mem.indexOf(u8, dry_run, "\"blocker_count\":0") != null,
     );
 
+    const second_values = [_]f64{ 102.5, 8.0 };
+    const second_receipt = try engine.appendMarketRows(&.{.{
+        .metric = "market.trade",
+        .labels_json = "{\"symbol\":\"XYZ\",\"venue\":\"XNYS\"}",
+        .ts_ns = 1_700_000_000_000_000_001,
+        .values = &second_values,
+    }});
+    try std.testing.expectEqual(@as(usize, 1), second_receipt.accepted_rows);
+
     const migrated = try migrateApplyAlloc(alloc, engine, false);
     defer alloc.free(migrated);
     try std.testing.expect(
         std.mem.indexOf(u8, migrated, "\"phase\":\"native_complete\"") != null,
     );
+    try std.testing.expect(
+        std.mem.indexOf(u8, migrated, "\"rows_written\":2") != null,
+    );
     try std.testing.expectEqual(@as(usize, 1), engine.market_manifest.list().len);
+    try std.testing.expectEqual(@as(u64, 3), engine.next_market_write_sequence);
+
+    engine.next_market_write_sequence = 1;
+    const resumed = try migrateApplyAlloc(alloc, engine, true);
+    defer alloc.free(resumed);
+    try std.testing.expect(
+        std.mem.indexOf(u8, resumed, "\"phase\":\"native_complete\"") != null,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, resumed, "\"rows_written\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resumed, "\"segments_written\":0") != null);
+    try std.testing.expectEqual(@as(u64, 3), engine.next_market_write_sequence);
 
     const verified = try verifyAlloc(alloc, engine);
     defer alloc.free(verified);
@@ -1245,6 +1527,13 @@ test "format 3 fanout migration verifies checkpoints and promotes atomically" {
     try std.testing.expect(
         std.mem.indexOf(u8, verified, "\"parity\":\"exact\"") != null,
     );
+    try std.testing.expect(
+        std.mem.indexOf(u8, verified, "\"rows_verified\":2") != null,
+    );
+    try std.testing.expectError(
+        error.RepositoryFormatMismatch,
+        engine.cas.?.exportHeadToLegacy(engine.data_dir),
+    );
 
     const promoted = try promoteApplyAlloc(alloc, engine);
     defer alloc.free(promoted);
@@ -1252,7 +1541,7 @@ test "format 3 fanout migration verifies checkpoints and promotes atomically" {
         std.mem.indexOf(u8, promoted, "\"phase\":\"promoted\"") != null,
     );
     try std.testing.expect(
-        std.mem.indexOf(u8, promoted, "\"rows_verified\":1") != null,
+        std.mem.indexOf(u8, promoted, "\"rows_verified\":2") != null,
     );
     const promoted_again = try promoteApplyAlloc(alloc, engine);
     defer alloc.free(promoted_again);
@@ -1276,17 +1565,35 @@ test "format 3 fanout migration verifies checkpoints and promotes atomically" {
     );
     try std.testing.expect(engine.metadata.manifest.entries.items.len != 0);
 
+    const corrected_values = [_]f64{ 104.25, 12.0 };
+    engine.config.market_storage_mode = .auto;
     engine.config.market_storage_read_mode = .native;
+    const correction_receipt = try engine.appendMarketRows(&.{.{
+        .metric = "market.trade",
+        .labels_json = "{\"symbol\":\"XYZ\",\"venue\":\"XNYS\"}",
+        .ts_ns = 1_700_000_000_000_000_000,
+        .values = &corrected_values,
+    }});
+    try std.testing.expectEqual(
+        engine_mod.Engine.MarketStorageWriteMode.native_v1,
+        correction_receipt.storage_mode,
+    );
+    try std.testing.expectEqual(@as(usize, 1), correction_receipt.native_rows);
+    try std.testing.expectEqual(@as(usize, 0), correction_receipt.fanout_writes);
+    try std.testing.expect(try engine.flushAndDrain(5_000));
+    try std.testing.expectEqual(@as(u64, 4), engine.next_market_write_sequence);
+
     var native_result = try engine.queryMarket(.{
         .metric = "market.trade",
         .label_filter_json = "{\"symbol\":\"XYZ\",\"venue\":\"XNYS\"}",
         .start_ts_ns = 1_700_000_000_000_000_000,
-        .end_ts_ns = 1_700_000_000_000_000_000,
+        .end_ts_ns = 1_700_000_000_000_000_001,
         .requested_columns = &.{ "price", "size" },
     });
     defer native_result.deinit();
-    try std.testing.expectEqual(@as(usize, 1), native_result.rows.len);
-    try std.testing.expectEqualSlices(f64, &values, native_result.rows[0].values);
+    try std.testing.expectEqual(@as(usize, 2), native_result.rows.len);
+    try std.testing.expectEqualSlices(f64, &corrected_values, native_result.rows[0].values);
+    try std.testing.expectEqualSlices(f64, &second_values, native_result.rows[1].values);
 }
 
 test "engine startup completes an interrupted market promotion" {

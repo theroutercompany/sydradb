@@ -36,24 +36,25 @@ fn recoverInterruptedMarketPromotionFiles(
     alloc: std.mem.Allocator,
     data_path: []const u8,
     fsync: cfg.FsyncPolicy,
-) !void {
+) !bool {
     var data_dir = std.fs.cwd().openDir(data_path, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return,
+        error.FileNotFound => return false,
         else => return err,
     };
     defer data_dir.close();
 
     var state = try market_migration_mod.MigrationState.loadOrInit(alloc, data_dir);
     defer state.deinit();
-    if (state.phase != .promoting) return;
-
-    var catalog = try market_catalog_mod.Catalog.loadOrInit(alloc, data_dir, fsync);
-    defer catalog.deinit();
-    _ = try catalog.promoteAllSchemasToNative();
+    if (state.phase != .promoting) return false;
 
     var cas = try cas_mod.CasManager.init(alloc, data_path, fsync);
     defer cas.deinit();
     _ = try cas.promoteFormatForNativeMarket();
+
+    var catalog = try market_catalog_mod.Catalog.loadOrInit(alloc, data_dir, fsync);
+    defer catalog.deinit();
+    _ = try catalog.promoteAllSchemasToNative();
+    return true;
 }
 
 const failed_ingest_quarantine_dir = "quarantine";
@@ -1182,16 +1183,22 @@ pub const Engine = struct {
         if (config.metadata_read_mode != .legacy and config.cas_mode == .off) {
             return error.CasReadModeRequiresCas;
         }
-        try recoverInterruptedMarketPromotionFiles(
+        var repository_probe = try cas_mod.probeOrInitRepositoryFormatWithState(
             alloc,
             config.data_dir,
             config.fsync,
         );
-        const repository_probe = try cas_mod.probeOrInitRepositoryFormatWithState(
+        if (try recoverInterruptedMarketPromotionFiles(
             alloc,
             config.data_dir,
             config.fsync,
-        );
+        )) {
+            repository_probe = try cas_mod.probeOrInitRepositoryFormatWithState(
+                alloc,
+                config.data_dir,
+                config.fsync,
+            );
+        }
         try validateConfiguredMarketStorage(config, repository_probe.format);
 
         const data_dir = try std.fs.cwd().openDir(config.data_dir, .{ .iterate = true });
@@ -5638,12 +5645,38 @@ pub const Engine = struct {
         } else {
             try self.wal.replay(self.alloc, &ctx);
         }
-        if (max_market_sequence >= self.next_market_write_sequence) {
-            self.next_market_write_sequence = std.math.add(u64, max_market_sequence, 1) catch return error.MarketWriteSequenceOverflow;
-        }
+        try self.advanceNextMarketWriteSequencePast(max_market_sequence);
         if (self.liveMemtableBytes() > 0) {
             const flushed = try flushMemtable(self);
             if (flushed) try self.syncCasSnapshot("recovery-flush");
+        }
+    }
+
+    /// Refresh the next sequence from native segments after the caller drains
+    /// queued writes and flushes live market memtable rows.
+    pub fn refreshNextMarketWriteSequenceFromPersistedSegments(self: *Engine) !void {
+        var maximum: u64 = 0;
+        for (self.market_manifest.list()) |descriptor| {
+            var segment = try market_segment_mod.readProjectedRange(
+                self.alloc,
+                self.data_dir,
+                descriptor.path,
+                std.math.minInt(i64),
+                std.math.maxInt(i64),
+                &.{},
+            );
+            defer segment.deinit(self.alloc);
+            for (segment.write_sequences) |sequence| {
+                if (sequence > maximum) maximum = sequence;
+            }
+        }
+        try self.advanceNextMarketWriteSequencePast(maximum);
+    }
+
+    fn advanceNextMarketWriteSequencePast(self: *Engine, maximum: u64) !void {
+        if (maximum >= self.next_market_write_sequence) {
+            self.next_market_write_sequence = std.math.add(u64, maximum, 1) catch
+                return error.MarketWriteSequenceOverflow;
         }
     }
 
@@ -7159,6 +7192,81 @@ test "engine rejects future repository markers before WAL or catalog mutation wi
     var root = try std.fs.cwd().openDir(data_path, .{});
     defer root.close();
     try std.testing.expectError(error.FileNotFound, root.access(market_catalog_mod.path, .{}));
+    try std.testing.expectError(error.FileNotFound, root.access("wal", .{}));
+}
+
+test "engine rejects future repository format before promoting recovery mutates state" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(
+        talloc,
+        ".zig-cache/tmp/{s}/market-format-future-promoting",
+        .{tmp.sub_path},
+    );
+    defer talloc.free(data_path);
+    try writeTestRepositoryFormatMarker(
+        data_path,
+        cas_mod.current_repository_format_version + 1,
+    );
+
+    const catalog_before =
+        \\{"schemas":[{"metric":"market.future_guard","ordered_columns":["price"],"required_labels":["symbol"],"storage_mapping":"fanout_v1"}],"market_series":[],"bar_policies":[],"rollups":[],"signals":[]}
+    ;
+    {
+        var root = try std.fs.cwd().openDir(data_path, .{});
+        defer root.close();
+        try root.writeFile(.{
+            .sub_path = market_catalog_mod.path,
+            .data = catalog_before,
+            .flags = .{},
+        });
+
+        var state = market_migration_mod.MigrationState.init(talloc);
+        defer state.deinit();
+        _ = try state.advance(.reconstructing);
+        _ = try state.advance(.native_complete);
+        _ = try state.advance(.verifying);
+        _ = try state.advance(.verified);
+        _ = try state.recordCheckpointRef("refs/checkpoints/future-format-guard");
+        _ = try state.advance(.checkpointed);
+        _ = try state.advance(.promoting);
+        try state.saveAtomically(root);
+    }
+
+    var root = try std.fs.cwd().openDir(data_path, .{});
+    defer root.close();
+    const state_before = try root.readFileAlloc(
+        talloc,
+        market_migration_mod.state_path,
+        1024 * 1024,
+    );
+    defer talloc.free(state_before);
+
+    var config = try testConfig(talloc, data_path);
+    defer config.deinit(talloc);
+    config.cas_mode = .dual_write;
+    try std.testing.expectError(
+        error.UnsupportedRepositoryFormatVersion,
+        Engine.init(talloc, config),
+    );
+
+    const catalog_after = try root.readFileAlloc(
+        talloc,
+        market_catalog_mod.path,
+        1024 * 1024,
+    );
+    defer talloc.free(catalog_after);
+    try std.testing.expectEqualStrings(catalog_before, catalog_after);
+
+    const state_after = try root.readFileAlloc(
+        talloc,
+        market_migration_mod.state_path,
+        1024 * 1024,
+    );
+    defer talloc.free(state_after);
+    try std.testing.expectEqualSlices(u8, state_before, state_after);
     try std.testing.expectError(error.FileNotFound, root.access("wal", .{}));
 }
 
