@@ -6,20 +6,19 @@ Persistent goal: active in this conversation; no deadline or token budget.
 
 ## Current checkpoint
 
-The signed root checkpoint remains `585cda2e9a680e0b47952f6ed0457f23b74ef185`
-with tree `f7d55b6ab001672abbfb83d3e99c8322ca1f0cc5`. It is unchanged. The
-checkout remains on `codex/native-market-storage` at
-`42fbd552d9382e862fb02535392c539e5ef7cd90`. The earlier 794/794 macOS result
-belongs to checkpoint `14290b9`. It does not establish acceptance for the newer
-delivery branches.
+The signed project checkpoint is `7ad797c0992ec57c7f52bde2849e628089a3805a`,
+tree `086df41aee27cf373255f8194d7829339ff48f20`. It passed 820/820 ReleaseSafe
+tests on macOS: 229 storage and 591 runtime. The root working source matches this
+checkpoint. The checkout remains on `codex/native-market-storage` at
+`42fbd552d9382e862fb02535392c539e5ef7cd90`; checkpoints remain on a separate
+branch. The earlier 794/794 result belongs to checkpoint `14290b9`.
 
 PRs 94 and 95 passed hosted CI and are ready for review. PR 96 is ready for
 review. Its CI run passed, while its Docs run failed because local-ingest pages
 were absent from that branch. PR 78 supplies those pages and is an explicit
-dependency. PRs 97 and 99 passed Ubuntu and macOS CI and are ready for review.
-PR 98's first CI run exposed three test compilation prerequisites that remained
-in the timing commit. Its correction passed 461/461 Debug runtime tests locally;
-hosted checks are running for the corrected head. No PR has merged.
+dependency. PRs 97, 98, and 99 passed Ubuntu and macOS CI and are ready for review.
+PR 100 contains the CAS directory and publication-error correction. Its scoped
+branch passed 679/679 tests; hosted checks are pending. No PR has merged.
 
 The application boundary, empty generic catalog, neutral API routes, query
 limits, and general label selection have current-root test evidence. Trading
@@ -40,7 +39,7 @@ Those results are smoke evidence. They do not establish long-soak acceptance.
 
 | Milestone | State | Acceptance evidence |
 | --- | --- | --- |
-| M1: native-storage stabilization | Open | PRs 94, 95, 97, and 99 passed hosted checks. PR 96 is ready with a PR 78 Docs dependency. Corrected PR 98 awaits CI. CAS publication and Engine concurrency corrections remain open. |
+| M1: native-storage stabilization | Open | PRs 94, 95, 97, 98, and 99 passed hosted checks. PR 96 has a PR 78 Docs dependency. PR 100 awaits CI. The complete Engine concurrency port is under validation. |
 | M2: application boundaries | Implemented locally; upstream delivery incomplete | Empty catalog, neutral routes, schema and transform extraction, and shared sensor, service, and trading lifecycle tests pass locally. |
 | M3: query limits | Implemented locally; upstream delivery incomplete | Accounting, exact-cap, overflow, cancellation, runtime, and wire checks pass locally. Original test-first chronology is not established. |
 | M4: general selection | Implemented locally; upstream delivery incomplete | Label filters, compiled families, ownership, and prepared-query lifecycle checks pass locally. |
@@ -1293,3 +1292,46 @@ primary error. New tests cover reflog failure, allocation failure, and candidate
 summary failure. These corrections await compilation and execution; the earlier
 225-test result does not validate them. The report is
 `cas-publication-error-correction-artifacts/report.md`.
+
+### CAS acceptance, workspace integration, and PR 100
+
+The corrected socket PR 98 passed Ubuntu and macOS in run `40498343512` and
+is ready. PR 99's dependency merge preserved its source tree and passed run
+`40499031131` at App head `26e8ff500174cf84f10b9047c015622631c0e461`.
+The signed local merge is `01c05af10504f9853ede19a55bc72c922cdfed7b`.
+
+The first CAS error-correction run passed 227/228 storage tests. Its fixed
+allocation index did not reach the assumed sync handler. A worker replaced
+that assumption with a bounded allocation-failure sweep. The sweep checks
+old/new ref visibility, reflog state, both sync attempts after publication,
+and completion before its finite bound. The corrected source passed 228/228
+storage tests (`cas-publication-allocation-sweep-storage-tests.log`).
+
+Independent review found no remaining confirmed defect in the corrected
+source. Summary rename failure after list publication remains covered by
+source inspection, not a direct injected test. The review hashes and limits
+are in `cas-final-publication-review-result.md`.
+
+Signed checkpoints `cfce74aa91dc5541cd6742880e705b74d5b4e74a` and
+`7ad797c0992ec57c7f52bde2849e628089a3805a` record the cache and directory
+corrections separately. The latter passed 820/820 tests: 229 storage and
+591 runtime (`native-hardening-cas-publication-integration-tests.log`). The
+manager copied only the two exact worker-authored CAS files into the root
+workspace after checking its other source files against that checkpoint.
+`root-cas-integration-receipt.json` records the comparison and source hashes.
+
+PR 100 is based on PR 97. Signed local commit
+`b87d3d23b0d2f81fece58cf2775d7059f1681ab0` and App commit
+`33806bc7f7663757f5f8a350ea95ef23674aa528` share tree
+`38853919393d69ae787e5b2dee0828c6bc11c3d8`. Its scoped branch passed 679/679
+tests: 212 storage and 467 runtime
+(`cas-directory-publication-scoped-tests.log`). Hosted checks are pending.
+
+The first P2 concurrency build found a missing `queryRangeUnlocked` helper.
+Comparison with `d66e064` also found its paired `seriesTimeBoundsUnlocked`
+helper and three original acceptance tests absent from the initial port.
+Workers restored the helpers with their lock-aware public wrappers and all
+three tests, preserving 8, 7, and 10 assertions respectively. The complete
+candidate is under test in `native-p2-delivery`; it is not yet accepted or
+published. Source reports and patches are in
+`native-p2-read-lock-fix-artifacts` and `native-p2-missing-acceptance-artifacts`.
