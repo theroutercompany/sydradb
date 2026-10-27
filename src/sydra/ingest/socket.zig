@@ -1465,16 +1465,18 @@ fn readFrameFromStream(alloc: std.mem.Allocator, stream: std.net.Stream, max_fra
     return try readFrameAlloc(alloc, reader, max_frame_bytes);
 }
 
-fn readDeclareAckResult(payload: []const u8) !struct {
+const DeclareAckResult = struct {
     client_decl_id: u32,
     status: DeclareStatus,
     code: ErrorCode,
     series_id: types.SeriesId,
-} {
+};
+
+fn readDeclareAckResult(payload: []const u8) !DeclareAckResult {
     var offset: usize = 0;
     const count = try takeInt(u32, payload, &offset);
     if (count != 1) return error.InvalidFrame;
-    const result = .{
+    const result: DeclareAckResult = .{
         .client_decl_id = try takeInt(u32, payload, &offset),
         .status = try takeEnum(DeclareStatus, u16, payload, &offset),
         .code = try takeEnum(ErrorCode, u16, payload, &offset),
@@ -1546,12 +1548,12 @@ test "socket declaration signatures distinguish descriptor metadata" {
 }
 
 test "socket error codes map to stable client-visible errors" {
-    try std.testing.expectError(error.ProtocolVersionMismatch, errorForCode(.unsupported_version));
-    try std.testing.expectError(error.DeclarationConflict, errorForCode(.decl_id_conflict));
-    try std.testing.expectError(error.UnknownDeclaration, errorForCode(.unknown_decl));
-    try std.testing.expectError(error.MemoryLimitExceeded, errorForCode(.memory_limit_exceeded));
-    try std.testing.expectError(error.Timeout, errorForCode(.timeout));
-    try std.testing.expectError(error.RemoteRejected, errorForCode(.protocol_error));
+    try std.testing.expect(errorForCode(.unsupported_version) == error.ProtocolVersionMismatch);
+    try std.testing.expect(errorForCode(.decl_id_conflict) == error.DeclarationConflict);
+    try std.testing.expect(errorForCode(.unknown_decl) == error.UnknownDeclaration);
+    try std.testing.expect(errorForCode(.memory_limit_exceeded) == error.MemoryLimitExceeded);
+    try std.testing.expect(errorForCode(.timeout) == error.Timeout);
+    try std.testing.expect(errorForCode(.protocol_error) == error.RemoteRejected);
 }
 
 test "socket listen path validation cleans stale sockets and rejects busy paths" {
@@ -1634,7 +1636,8 @@ test "socket client round trips declare append and flush" {
         .{ .client_decl_id = declared[1].client_decl_id, .ts = 20, .value = 2.5 },
     });
     try std.testing.expectEqual(@as(usize, 2), receipt.accepted_points);
-    try std.testing.expect(try client.flushAndDrain(1_000)).flushed;
+    const flush_ack = try client.flushAndDrain(1_000);
+    try std.testing.expect(flush_ack.flushed);
     client.deinit();
     server_thread.join();
 
