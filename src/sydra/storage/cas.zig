@@ -2774,7 +2774,9 @@ pub const CasManager = struct {
         _ = try self.fsck(data_dir, .{});
         try self.refs.migrateLooseToReftable();
         self.format.ref_backend = .reftable;
-        self.format.version = current_repository_format_version;
+        if (self.format.version < primary_repository_format_version) {
+            self.format.version = primary_repository_format_version;
+        }
         try writeRepositoryFormat(self.alloc, self.store.root, self.format, self.store.fsync);
         self.refs.setBackend(.reftable);
         try self.ensureHeadSymRef();
@@ -2785,11 +2787,13 @@ pub const CasManager = struct {
         const fsck_before = try self.fsck(data_dir, .{});
 
         var migrated_reftable = false;
-        if (self.format.ref_backend != .reftable or self.format.version < current_repository_format_version) {
+        if (self.format.ref_backend != .reftable or self.format.version < primary_repository_format_version) {
             try self.refs.migrateLooseToReftable();
             self.refs.setBackend(.reftable);
             self.format.ref_backend = .reftable;
-            self.format.version = current_repository_format_version;
+            if (self.format.version < primary_repository_format_version) {
+                self.format.version = primary_repository_format_version;
+            }
             try writeRepositoryFormat(self.alloc, self.store.root, self.format, self.store.fsync);
             migrated_reftable = true;
         }
@@ -3132,6 +3136,31 @@ pub const CasManager = struct {
         return ref_name;
     }
 
+    /// Create a checkpoint at a caller-selected ref. Repeating the operation
+    /// for the same head is a no-op. An existing ref to another commit is a
+    /// conflict and remains unchanged.
+    pub fn createCheckpointAtRef(self: *CasManager, ref_name: []const u8) !bool {
+        if (!std.mem.startsWith(u8, ref_name, "checkpoints/") or
+            ref_name.len == "checkpoints/".len)
+        {
+            return error.InvalidCheckpointRef;
+        }
+        const head = try self.refs.readHead(main_ref) orelse return error.MissingCasHead;
+        if (try self.refs.readRef(ref_name)) |existing| {
+            if (existing.eql(head)) return false;
+            return error.RefConflict;
+        }
+
+        self.refs.compareAndSwapRef(ref_name, null, head, "create-checkpoint") catch |err| {
+            if (err != error.RefConflict) return err;
+            const raced = try self.refs.readRef(ref_name) orelse return err;
+            if (raced.eql(head)) return false;
+            return err;
+        };
+        try self.refreshCommitGraph();
+        return true;
+    }
+
     pub fn rollbackMainTo(self: *CasManager, spec: []const u8) !void {
         const target = try self.resolveCommitSpec(spec);
         const current = try self.refs.readHead(main_ref);
@@ -3199,6 +3228,12 @@ pub const CasManager = struct {
     pub fn exportSpecToLegacy(self: *CasManager, spec: []const u8, data_dir: std.fs.Dir) !void {
         var snapshot = try self.loadSnapshotForSpec(spec);
         defer snapshot.deinit(self.alloc);
+
+        if (self.format.version == primary_repository_format_version and
+            snapshotHasNativeMarket(snapshot))
+        {
+            return error.RepositoryFormatMismatch;
+        }
 
         try materializeSnapshotMirrors(self.alloc, data_dir, &self.store, snapshot);
         try writeManifestFile(self.alloc, data_dir, snapshot.segment_descriptors);
@@ -3381,7 +3416,28 @@ pub const CasManager = struct {
             const loaded = try self.store.get(self.alloc, id_ptr.*);
             defer self.alloc.free(loaded.payload);
             switch (loaded.obj_type) {
-                .commit => report.commit_objects += 1,
+                .commit => {
+                    report.commit_objects += 1;
+                    if (options.mode == .full) {
+                        var reader = CommitReader{
+                            .alloc = self.alloc,
+                            .store = &self.store,
+                            .refs = &self.refs,
+                        };
+                        var snapshot = try reader.loadSnapshot(id_ptr.*);
+                        defer snapshot.deinit(self.alloc);
+                        try validateNativeMarketSnapshotCatalog(snapshot);
+                        for (snapshot.market_segment_descriptors) |descriptor| {
+                            try validateMarketSegmentDescriptor(self.alloc, descriptor);
+                            try validateMarketSegmentRootMatchesDescriptor(
+                                self.alloc,
+                                &self.store,
+                                descriptor,
+                            );
+                            report.market_segment_contents_checked += 1;
+                        }
+                    }
+                },
                 .tree => report.tree_objects += 1,
                 .blob => {
                     report.blob_objects += 1;
@@ -3488,8 +3544,6 @@ pub const CasManager = struct {
             }
 
             for (snapshot.snapshot.market_segment_descriptors) |descriptor| {
-                try validateMarketSegmentRootMatchesDescriptor(self.alloc, &self.store, descriptor);
-                report.market_segment_contents_checked += 1;
                 if (descriptor.mirrorPath().len != 0) {
                     _ = data_dir.statFile(descriptor.mirrorPath()) catch |err| switch (err) {
                         error.FileNotFound => report.missing_market_segment_mirrors += 1,
@@ -4811,6 +4865,9 @@ fn readBundleManifest(alloc: std.mem.Allocator, bundle_path: []const u8) !Bundle
         try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "repository_format_version")
     else
         legacy_repository_format_version;
+    if (repository_format_version > current_repository_format_version) {
+        return error.UnsupportedRepositoryFormatVersion;
+    }
     const ref_backend = if (format_version >= 2)
         std.meta.intToEnum(RefBackend, @as(u8, @intCast(try parseBundleCountLine(line_it.next() orelse return error.InvalidBundle, "ref_backend")))) catch return error.InvalidBundle
     else
@@ -5259,6 +5316,7 @@ pub fn applyBundle(alloc: std.mem.Allocator, bundle_path: []const u8, dst_path: 
 
     const verify = try verifyBundle(alloc, bundle_path);
     _ = verify;
+    try rejectRepositoryFormatAdvance(dst_path, manifest.repository_format_version);
 
     var bundle_root = try std.fs.cwd().openDir(bundle_path, .{ .iterate = true });
     defer bundle_root.close();
@@ -5403,6 +5461,7 @@ pub fn cloneLocalRepositoryWithOptions(
     if (options.borrow) {
         var source = try CasManager.init(alloc, src_path, fsync);
         defer source.deinit();
+        try rejectRepositoryFormatAdvance(dst_path, source.format.version);
         var dest = try CasManager.init(alloc, dst_path, fsync);
         defer dest.deinit();
 
@@ -5530,6 +5589,7 @@ pub fn pushLocalRepositoryWithOptions(
 ) !LocalExchangeResult {
     var source = try CasManager.init(alloc, src_path, fsync);
     defer source.deinit();
+    try rejectRepositoryFormatAdvance(dst_path, source.format.version);
     var dest = try CasManager.init(alloc, dst_path, fsync);
     defer dest.deinit();
 
@@ -5554,6 +5614,26 @@ pub fn pushLocalRepositoryWithOptions(
         .ref_count = 1,
         .borrowed_repositories = dest.store.alternates.repo_paths.len,
     };
+}
+
+fn rejectRepositoryFormatAdvance(
+    dst_path: []const u8,
+    incoming_version: u16,
+) !void {
+    var root = std.fs.cwd().openDir(dst_path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer root.close();
+    const existing = loadRepositoryFormat(root) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    if (incoming_version > existing.version and
+        existing.version >= primary_repository_format_version)
+    {
+        return error.RepositoryFormatMismatch;
+    }
 }
 
 fn mergeRepositoryPaths(alloc: std.mem.Allocator, existing: []const []const u8, additional: []const u8) ![][]u8 {
@@ -8126,6 +8206,16 @@ fn containsObjectId(entries: []const object_store.ObjectId, needle: object_store
     return false;
 }
 
+fn snapshotHasNativeMarket(snapshot: Snapshot) bool {
+    if (snapshot.market_segment_descriptors.len != 0) return true;
+    if (snapshot.market_catalog_snapshot) |catalog| {
+        for (catalog.schemas) |schema| {
+            if (schema.storage_mapping == .native_v1) return true;
+        }
+    }
+    return false;
+}
+
 fn validateMarketManifestDescriptorMatchesSegment(
     descriptor: market_manifest_mod.MarketSegmentDescriptor,
     metadata: *const market_segment_mod.Metadata,
@@ -8198,6 +8288,59 @@ fn validateMarketSegmentRootMatchesDescriptor(
         if (!std.mem.eql(u8, actual, expected)) return error.MarketSegmentDescriptorMismatch;
     }
     try market_segment_mod.validateSegmentRoot(alloc, store, root_id);
+}
+
+fn validateNativeMarketSnapshotCatalog(snapshot: Snapshot) !void {
+    if (snapshot.market_segment_descriptors.len == 0) return;
+    const catalog = snapshot.market_catalog_snapshot orelse
+        return error.MarketSegmentCatalogMismatch;
+    const market_series = catalog.market_series orelse
+        return error.MarketSegmentCatalogMismatch;
+
+    for (snapshot.market_segment_descriptors) |descriptor| {
+        var matching_series: ?market_catalog_mod.MarketSeriesIdentity = null;
+        for (market_series) |entry| {
+            if (entry.series_id == descriptor.market_series_id) {
+                matching_series = entry;
+                break;
+            }
+        }
+        const series = matching_series orelse
+            return error.MarketSegmentCatalogMismatch;
+        if (!std.mem.eql(u8, series.metric, descriptor.metric) or
+            !std.mem.eql(u8, series.canonical_labels, descriptor.canonical_labels))
+        {
+            return error.MarketSegmentCatalogMismatch;
+        }
+
+        var matching_schema: ?market_catalog_mod.MarketSchema = null;
+        for (catalog.schemas) |schema| {
+            if (std.mem.eql(u8, schema.metric, descriptor.metric)) {
+                matching_schema = schema;
+                break;
+            }
+        }
+        const schema = matching_schema orelse
+            return error.MarketSegmentCatalogMismatch;
+        const catalog_digest = schema.digest();
+        const native_digest = market_identity.schemaDigest(
+            schema.metric,
+            schema.ordered_columns,
+            schema.required_labels,
+            market_catalog_mod.StorageMapping.native_v1.text(),
+        );
+        if (!std.mem.eql(u8, series.schema_digest[0..], catalog_digest[0..]) or
+            !std.mem.eql(u8, native_digest[0..], descriptor.schema_digest[0..]) or
+            schema.ordered_columns.len != descriptor.column_names.len)
+        {
+            return error.MarketSegmentCatalogMismatch;
+        }
+        for (schema.ordered_columns, descriptor.column_names) |expected, actual| {
+            if (!std.mem.eql(u8, expected, actual)) {
+                return error.MarketSegmentCatalogMismatch;
+            }
+        }
+    }
 }
 
 fn checkpointStatesEql(lhs: CheckpointState, rhs: CheckpointState) bool {
@@ -10543,6 +10686,40 @@ test "cas manager opens format 3 repositories without rewriting the marker" {
     try std.testing.expectEqual(primary_repository_format_version, loaded.version);
 }
 
+test "generic reftable migration and upgrade preserve format 3" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    inline for (.{ "migrate", "upgrade" }) |operation| {
+        const data_path = try std.fmt.allocPrint(
+            alloc,
+            ".zig-cache/tmp/{s}/format3-{s}",
+            .{ tmp_dir.sub_path, operation },
+        );
+        defer alloc.free(data_path);
+
+        var manager = try CasManager.init(alloc, data_path, .none);
+        defer manager.deinit();
+        manager.format.version = primary_repository_format_version;
+        manager.format.ref_backend = .loose;
+        manager.refs.setBackend(.loose);
+        try writeRepositoryFormat(alloc, manager.store.root, manager.format, .none);
+
+        if (std.mem.eql(u8, operation, "migrate")) {
+            try manager.migrateToReftable(manager.store.root);
+        } else {
+            const result = try manager.upgradeRepository(manager.store.root);
+            try std.testing.expectEqual(primary_repository_format_version, result.format_version);
+        }
+
+        try std.testing.expectEqual(primary_repository_format_version, manager.format.version);
+        try std.testing.expectEqual(RefBackend.reftable, manager.format.ref_backend);
+        const loaded = try loadRepositoryFormat(manager.store.root);
+        try std.testing.expectEqual(primary_repository_format_version, loaded.version);
+    }
+}
+
 test "native market promotion advances only format 3 reftable repositories" {
     const alloc = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
@@ -10599,6 +10776,125 @@ test "cas manager rejects unsupported future repository formats before opening r
         CasManager.init(alloc, data_path, .none),
     );
     try std.testing.expectError(error.FileNotFound, root.access("refs", .{}));
+}
+
+test "repository format boundaries reject v4 transfers into format 3" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    const source_path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/format-boundary-source",
+        .{tmp_dir.sub_path},
+    );
+    defer alloc.free(source_path);
+    const bundle_path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/format-boundary-bundle",
+        .{tmp_dir.sub_path},
+    );
+    defer alloc.free(bundle_path);
+    const destination_path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/format-boundary-destination",
+        .{tmp_dir.sub_path},
+    );
+    defer alloc.free(destination_path);
+
+    try std.fs.cwd().makePath(source_path);
+    const source_probe = try probeOrInitRepositoryFormatWithState(alloc, source_path, .none);
+    try std.testing.expectEqual(current_repository_format_version, source_probe.format.version);
+    var source_dir = try std.fs.cwd().openDir(source_path, .{ .iterate = true });
+    defer source_dir.close();
+    var manifest = manifest_mod.Manifest{ .alloc = alloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = alloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(alloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(alloc, source_dir, .none);
+    defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(alloc, source_dir, .none);
+    defer metric_catalog.deinit();
+
+    {
+        var source = try CasManager.init(alloc, source_path, .none);
+        defer source.deinit();
+        try std.testing.expectEqual(current_repository_format_version, source.format.version);
+        _ = try source.bootstrapIfMissing(
+            source_dir,
+            &manifest,
+            &tags,
+            &series_catalog,
+            &metric_catalog,
+        );
+    }
+    _ = try createBundle(alloc, source_path, bundle_path, .none, null);
+
+    try std.fs.cwd().makePath(destination_path);
+    var destination_dir = try std.fs.cwd().openDir(destination_path, .{ .iterate = true });
+    defer destination_dir.close();
+    var destination_head: object_store.ObjectId = undefined;
+    var before_ids: []object_store.ObjectId = undefined;
+    {
+        var destination = try CasManager.init(alloc, destination_path, .none);
+        defer destination.deinit();
+        destination.format.version = primary_repository_format_version;
+        try writeRepositoryFormat(alloc, destination.store.root, destination.format, .none);
+        const destination_probe = try probeOrInitRepositoryFormatWithState(alloc, destination_path, .none);
+        try std.testing.expectEqual(primary_repository_format_version, destination_probe.format.version);
+        destination_head = try destination.bootstrapIfMissing(
+            destination_dir,
+            &manifest,
+            &tags,
+            &series_catalog,
+            &metric_catalog,
+        );
+        before_ids = try destination.store.listIds(alloc);
+    }
+    defer alloc.free(before_ids);
+
+    try std.testing.expectError(
+        error.RepositoryFormatMismatch,
+        applyBundle(alloc, bundle_path, destination_path, .none),
+    );
+    try std.testing.expectError(
+        error.RepositoryFormatMismatch,
+        pushLocalRepository(alloc, source_path, destination_path, .none),
+    );
+    try std.testing.expectError(
+        error.RepositoryFormatMismatch,
+        cloneLocalRepositoryWithOptions(
+            alloc,
+            source_path,
+            destination_path,
+            .none,
+            .{ .borrow = true },
+        ),
+    );
+
+    var future_bundle = try readBundleManifest(alloc, bundle_path);
+    defer future_bundle.deinit(alloc);
+    future_bundle.repository_format_version = current_repository_format_version + 1;
+    try writeBundleManifest(alloc, bundle_path, future_bundle);
+    try std.testing.expectError(
+        error.UnsupportedRepositoryFormatVersion,
+        verifyBundle(alloc, bundle_path),
+    );
+    try std.testing.expectError(
+        error.UnsupportedRepositoryFormatVersion,
+        applyBundle(alloc, bundle_path, destination_path, .none),
+    );
+
+    var preserved = try CasManager.init(alloc, destination_path, .none);
+    defer preserved.deinit();
+    try std.testing.expectEqual(primary_repository_format_version, preserved.format.version);
+    const preserved_head = try preserved.refs.readHead(main_ref) orelse
+        return error.MissingCasHead;
+    try std.testing.expect(preserved_head.eql(destination_head));
+    const after_ids = try preserved.store.listIds(alloc);
+    defer alloc.free(after_ids);
+    try std.testing.expectEqual(before_ids.len, after_ids.len);
+    try std.testing.expectEqual(@as(usize, 0), preserved.store.alternates.repo_paths.len);
 }
 
 test "market catalog snapshots preserve market series identities through head and bundle" {
@@ -10841,6 +11137,137 @@ test "native market segment descriptors roundtrip through CAS snapshot and check
     );
 }
 
+test "full fsck accepts pre-promotion catalogs and rejects native schema shape drift" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    const data_path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/native-fsck-pre-promotion",
+        .{tmp_dir.sub_path},
+    );
+    defer alloc.free(data_path);
+    try std.fs.cwd().makePath(data_path);
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var manifest = manifest_mod.Manifest{ .alloc = alloc, .entries = .{} };
+    defer manifest.deinit();
+    var market_manifest = market_manifest_mod.Manifest.init(alloc);
+    defer market_manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = alloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(alloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(alloc, data_dir, .none);
+    defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(alloc, data_dir, .none);
+    defer metric_catalog.deinit();
+    var market_catalog = try market_catalog_mod.Catalog.loadOrInit(alloc, data_dir, .none);
+    defer market_catalog.deinit();
+
+    const columns = [_][]const u8{ "price", "size" };
+    var schema = try market_catalog.registerSchema(.{
+        .metric = "market.migration",
+        .ordered_columns = &columns,
+        .required_labels = &.{"symbol"},
+        .storage_mapping = .fanout_v1,
+    });
+    defer schema.deinit(alloc);
+    var identity = try market_catalog.registerMarketSeries(
+        schema.metric,
+        "{\"symbol\":\"AAPL\"}",
+    );
+    defer identity.deinit(alloc);
+
+    const native_digest = market_identity.schemaDigest(
+        schema.metric,
+        schema.ordered_columns,
+        schema.required_labels,
+        market_catalog_mod.StorageMapping.native_v1.text(),
+    );
+    const values = [_]f64{ 101.5, 7.0 };
+    const rows = [_]market_segment_mod.MarketRowView{.{
+        .ts_ns = 10,
+        .write_sequence = 1,
+        .values = &values,
+    }};
+    const segment_path = try market_segment_mod.write(alloc, data_dir, .{
+        .market_series_id = identity.series_id,
+        .schema_digest = native_digest,
+        .metric = schema.metric,
+        .canonical_labels = identity.canonical_labels,
+        .hour = 0,
+        .column_names = schema.ordered_columns,
+    }, rows[0..]);
+    defer alloc.free(segment_path);
+    const file_bytes = try data_dir.readFileAlloc(alloc, segment_path, 16 * 1024 * 1024);
+    defer alloc.free(file_bytes);
+    const digest = market_manifest_mod.contentDigest(file_bytes);
+    try market_manifest.addBatch(data_dir, &.{.{
+        .path = segment_path,
+        .market_series_id = identity.series_id,
+        .schema_digest = native_digest,
+        .metric = schema.metric,
+        .canonical_labels = identity.canonical_labels,
+        .hour_bucket = 0,
+        .start_ts_ns = rows[0].ts_ns,
+        .end_ts_ns = rows[0].ts_ns,
+        .row_count = rows.len,
+        .block_count = 1,
+        .column_names = schema.ordered_columns,
+        .content_id = digest,
+        .file_hash = digest,
+        .file_size = file_bytes.len,
+    }});
+
+    var manager = try CasManager.init(alloc, data_path, .none);
+    defer manager.deinit();
+    manager.format.version = primary_repository_format_version;
+    try writeRepositoryFormat(alloc, manager.store.root, manager.format, .none);
+    _ = try manager.bootstrapIfMissingWithNativeMarket(
+        data_dir,
+        &manifest,
+        &tags,
+        &series_catalog,
+        &metric_catalog,
+        &market_catalog,
+        &market_manifest,
+    );
+    _ = try manager.fsck(data_dir, .{ .mode = .full });
+
+    var invalid_digest: ?market_identity.SchemaDigest = null;
+    for (market_catalog.schemas.items) |*entry| {
+        if (!std.mem.eql(u8, entry.metric, schema.metric)) continue;
+        alloc.free(entry.ordered_columns[0]);
+        entry.ordered_columns[0] = try alloc.dupe(u8, "corrupt_price");
+        invalid_digest = entry.digest();
+        break;
+    }
+    const changed_digest = invalid_digest orelse return error.MissingMarketSchema;
+    var series_updated = false;
+    for (market_catalog.market_series.items) |*entry| {
+        if (entry.series_id != identity.series_id) continue;
+        entry.schema_digest = changed_digest;
+        series_updated = true;
+        break;
+    }
+    try std.testing.expect(series_updated);
+    _ = try manager.syncLegacySnapshotWithNativeMarket(
+        data_dir,
+        &manifest,
+        &tags,
+        &series_catalog,
+        &metric_catalog,
+        &market_catalog,
+        &market_manifest,
+        "corrupt-native-catalog-shape",
+    );
+    try std.testing.expectError(
+        error.MarketSegmentCatalogMismatch,
+        manager.fsck(data_dir, .{ .mode = .full }),
+    );
+}
+
 test "market catalog snapshot decode accepts old payloads without market series" {
     const alloc = std.testing.allocator;
     const payload =
@@ -11064,7 +11491,7 @@ test "upgrade repository migrates legacy refs to reftable and refreshes format" 
 
     const result = try cas_manager.upgradeRepository(data_dir);
     try std.testing.expect(result.migrated_reftable);
-    try std.testing.expectEqual(current_repository_format_version, result.format_version);
+    try std.testing.expectEqual(primary_repository_format_version, result.format_version);
     try std.testing.expectEqual(RefBackend.reftable, result.ref_backend);
 
     const upgraded_head = try cas_manager.refs.readHead(main_ref) orelse return error.MissingCasHead;
@@ -11168,7 +11595,7 @@ test "upgrade normalizes active commits to canonical roots and clears compatibil
 
     const upgraded = try cas_manager.upgradeRepository(data_dir);
     try std.testing.expect(upgraded.normalized_commits > 0);
-    try std.testing.expectEqual(current_repository_format_version, upgraded.format_version);
+    try std.testing.expectEqual(primary_repository_format_version, upgraded.format_version);
 
     const after = try cas_manager.fsck(data_dir, .{});
     try std.testing.expectEqual(@as(usize, 0), after.compatibility_debt.legacy_segment_descriptors);
@@ -12097,6 +12524,13 @@ test "checkpoints support diffing and rollback" {
     var cas_manager = try CasManager.init(talloc, data_path, .none);
     defer cas_manager.deinit();
     const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
+    const deterministic_checkpoint = "checkpoints/market-migration";
+    try std.testing.expect(try cas_manager.createCheckpointAtRef(deterministic_checkpoint));
+    try std.testing.expect(!(try cas_manager.createCheckpointAtRef(deterministic_checkpoint)));
+    try std.testing.expectError(
+        error.InvalidCheckpointRef,
+        cas_manager.createCheckpointAtRef("heads/not-a-checkpoint"),
+    );
     const checkpoint_ref = (try cas_manager.createCheckpoint("manual")) orelse return error.MissingCasHead;
     defer talloc.free(checkpoint_ref);
 
@@ -12107,6 +12541,13 @@ test "checkpoints support diffing and rollback" {
 
     const advanced = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, &metric_catalog, "advance");
     try std.testing.expect(!advanced.eql(initial));
+    try std.testing.expectError(
+        error.RefConflict,
+        cas_manager.createCheckpointAtRef(deterministic_checkpoint),
+    );
+    const preserved_checkpoint = try cas_manager.refs.readRef(deterministic_checkpoint) orelse
+        return error.MissingCasHead;
+    try std.testing.expect(preserved_checkpoint.eql(initial));
 
     const diff = try cas_manager.diffSnapshots(checkpoint_ref, main_ref);
     try std.testing.expect(diff.segments_added > 0);
