@@ -10,4 +10,3 @@ This directory contains standalone command-line utilities that are not part of t
 Current contents:
 
 - `cmd/sydra-csv/main.zig` – placeholder for a future CSV→HTTP ingest tool
-

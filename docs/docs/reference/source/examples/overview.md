@@ -13,4 +13,3 @@ This directory contains small, reusable demos and fixtures intended to:
 Current contents:
 
 - `examples/loadgen.zig` – prints NDJSON ingest lines to stdout
-

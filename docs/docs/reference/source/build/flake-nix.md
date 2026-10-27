@@ -75,4 +75,3 @@ The `shellHook` prints the Zig version on entry.
 ## `formatter`
 
 Exports `nixfmt` as the flake formatter (preferring `nixfmt-classic` when present).
-

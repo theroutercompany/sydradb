@@ -18,4 +18,3 @@ At minimum, projects typically document:
 - Which branches/tags receive security fixes
 - A private reporting channel (email or a security advisory workflow)
 - Expected response windows (acknowledgement, triage, fix timeline)
-

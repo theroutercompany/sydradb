@@ -30,4 +30,3 @@ If you add new local state directories (bench outputs, scratch data), ensure the
 
 - placed under an already-ignored path (like `data/`), or
 - added to `.gitignore` explicitly.
-

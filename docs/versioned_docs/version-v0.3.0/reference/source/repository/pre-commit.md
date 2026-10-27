@@ -38,4 +38,3 @@ Run on demand:
 ```sh
 pre-commit run --all-files --show-diff-on-failure
 ```
-

@@ -100,7 +100,7 @@ query_compiler_mode = "compiled"
 retention_days = 0
 EOF
 
-(cd "$workdir" && "$SYDRADB_BIN" >server.log 2>&1) &
+(cd "$workdir" && exec "$SYDRADB_BIN" >server.log 2>&1) &
 server_pid=$!
 
 wait_for_http "http://127.0.0.1:$PORT/metrics" "$workdir/server.log"

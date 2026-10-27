@@ -28,4 +28,3 @@ Notable pinned inputs in this project include:
 
 - `nixpkgs` (nixos-unstable)
 - `zig-overlay`
-

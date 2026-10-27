@@ -42,4 +42,3 @@ See also:
 
 - [ ] “Start Here” docs explain sydraQL usage at a practical level
 - [ ] “Source Reference” docs cover the query pipeline modules and link them together
-

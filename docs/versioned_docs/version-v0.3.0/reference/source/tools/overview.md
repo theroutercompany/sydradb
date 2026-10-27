@@ -10,4 +10,3 @@ This directory contains developer tools used for profiling, benchmarking, and di
 Current contents:
 
 - `tools/bench_alloc.zig` – concurrent ingest benchmark with allocator and queue metrics reporting
-
