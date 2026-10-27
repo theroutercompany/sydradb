@@ -15,6 +15,10 @@ const label_sets = [_][]const u8{
     "{\"symbol\":\"AMD\",\"venue\":\"XNAS\"}",
 };
 
+fn startTimer() std.time.Timer {
+    return std.time.Timer.start() catch unreachable;
+}
+
 const trade_columns = [_][]const u8{ "price", "size" };
 const trade_selected_columns = [_][]const u8{"price"};
 const quote_columns = [_][]const u8{ "bid", "ask", "bid_size", "ask_size" };
@@ -80,8 +84,15 @@ const BenchmarkMetrics = struct {
     expected_physical_writes: u64,
     wal_bytes: u64,
     wal_payload_bytes: u64,
+    wal_append_elapsed_ns: u64,
+    memtable_append_elapsed_ns: u64,
     segment_bytes: u64,
     storage_bytes: u64,
+    flush_elapsed_ns: u64,
+    flush_segment_write_elapsed_ns: u64,
+    flush_manifest_elapsed_ns: u64,
+    cas_sync_elapsed_ns: u64,
+    drain_wait_elapsed_ns: u64,
     peak_resident_estimate_bytes: u64,
     query: QueryMetrics,
 };
@@ -229,7 +240,7 @@ fn ingestFanoutRows(
     const batch = try alloc.alloc(Engine.IngestItem, max_batch_points);
     defer alloc.free(batch);
 
-    const start_ns = std.time.nanoTimestamp();
+    var timer = startTimer();
     var batch_len: usize = 0;
     for (0..rows) |row_idx| {
         const label_idx = row_idx % label_sets.len;
@@ -250,14 +261,13 @@ fn ingestFanoutRows(
         }
     }
     if (batch_len != 0) try engine.ingestBatch(batch[0..batch_len]);
-    const enqueue_end_ns = std.time.nanoTimestamp();
+    const enqueue_elapsed_ns = timer.read();
 
     _ = try engine.flushAndDrain(120_000);
     try engine.waitForDrained(120_000);
-    const ingest_or_drain_end_ns = std.time.nanoTimestamp();
     return .{
-        .enqueue_elapsed_ns = @intCast(enqueue_end_ns - start_ns),
-        .ingest_or_drain_elapsed_ns = @intCast(ingest_or_drain_end_ns - start_ns),
+        .enqueue_elapsed_ns = enqueue_elapsed_ns,
+        .ingest_or_drain_elapsed_ns = timer.read(),
     };
 }
 
@@ -318,9 +328,9 @@ fn measureQueries(
     defer alloc.free(latencies);
     var returned_points: u64 = 0;
     for (latencies) |*latency| {
-        const start_ns = std.time.nanoTimestamp();
+        var timer = startTimer();
         returned_points = try runProjectedQuery(alloc, engine, scenario, series_ids);
-        latency.* = @intCast(std.time.nanoTimestamp() - start_ns);
+        latency.* = timer.read();
         if (returned_points != expected_points) return error.BenchmarkQueryMismatch;
     }
     std.sort.block(u64, latencies, {}, std.sort.asc(u64));
@@ -503,10 +513,24 @@ fn emitResult(
     try jw.write(metrics.wal_bytes);
     try jw.objectField("wal_payload_bytes");
     try jw.write(metrics.wal_payload_bytes);
+    try jw.objectField("wal_append_elapsed_ns");
+    try jw.write(metrics.wal_append_elapsed_ns);
+    try jw.objectField("memtable_append_elapsed_ns");
+    try jw.write(metrics.memtable_append_elapsed_ns);
     try jw.objectField("segment_bytes");
     try jw.write(metrics.segment_bytes);
     try jw.objectField("storage_bytes");
     try jw.write(metrics.storage_bytes);
+    try jw.objectField("flush_elapsed_ns");
+    try jw.write(metrics.flush_elapsed_ns);
+    try jw.objectField("flush_segment_write_elapsed_ns");
+    try jw.write(metrics.flush_segment_write_elapsed_ns);
+    try jw.objectField("flush_manifest_elapsed_ns");
+    try jw.write(metrics.flush_manifest_elapsed_ns);
+    try jw.objectField("cas_sync_elapsed_ns");
+    try jw.write(metrics.cas_sync_elapsed_ns);
+    try jw.objectField("drain_wait_elapsed_ns");
+    try jw.write(metrics.drain_wait_elapsed_ns);
     try jw.objectField("query_latency_p50_ns");
     try jw.write(metrics.query.latency_p50_ns);
     try jw.objectField("query_latency_p95_ns");
@@ -621,8 +645,15 @@ fn runScenario(
             .expected_physical_writes = expected_writes,
             .wal_bytes = wal_bytes,
             .wal_payload_bytes = engine.metrics.wal_bytes_total.load(.monotonic),
+            .wal_append_elapsed_ns = engine.metrics.wal_append_ns_total.load(.monotonic),
+            .memtable_append_elapsed_ns = engine.metrics.memtable_append_ns_total.load(.monotonic),
             .segment_bytes = segment_bytes,
             .storage_bytes = wal_bytes + segment_bytes,
+            .flush_elapsed_ns = engine.metrics.flush_ns_total.load(.monotonic),
+            .flush_segment_write_elapsed_ns = engine.metrics.flush_segment_write_ns_total.load(.monotonic),
+            .flush_manifest_elapsed_ns = engine.metrics.flush_manifest_ns_total.load(.monotonic),
+            .cas_sync_elapsed_ns = engine.metrics.cas_sync_ns_total.load(.monotonic),
+            .drain_wait_elapsed_ns = engine.metrics.flush_queue_drain_wait_ns_total.load(.monotonic),
             .peak_resident_estimate_bytes = resident_estimate,
             .query = query,
         },

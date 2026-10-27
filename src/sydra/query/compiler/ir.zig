@@ -22,6 +22,8 @@ pub const BoundSelectorSource = enum {
     exact_match,
 };
 
+/// The binder copies resolved names and tags into its allocator.
+/// Lowered plans retain those slices for the lifetime of the compile arena.
 pub const BoundSelector = struct {
     source: BoundSelectorSource,
     series_id: types.SeriesId,
