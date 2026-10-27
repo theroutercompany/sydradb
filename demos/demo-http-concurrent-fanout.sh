@@ -46,7 +46,7 @@ done
 
 (
   cd "$TMPDIR"
-  "$BIN" serve >"$TMPDIR/server.out" 2>"$TMPDIR/server.err"
+  exec "$BIN" serve >"$TMPDIR/server.out" 2>"$TMPDIR/server.err"
 ) &
 SERVER_PID=$!
 
