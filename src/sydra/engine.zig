@@ -4964,6 +4964,8 @@ pub const Engine = struct {
         return .gauge;
     }
 
+    /// Compatibility resolver; in primary mode its string fields may borrow the CAS snapshot.
+    /// Callers that read those strings across further engine work must keep the index stable.
     pub fn resolveSelector(self: *Engine, lookup: SelectorLookup) !series_catalog_mod.Resolution {
         const legacy_view = self.metadata.legacyView();
         switch (lookup) {
@@ -5018,7 +5020,7 @@ pub const Engine = struct {
         }
     }
 
-    /// Resolves a simple selector into allocator-owned metadata for compiled plans.
+    /// Resolves a simple selector into allocator-owned metadata; the caller frees each non-null string.
     pub fn resolveSimpleSelectorOwned(
         self: *Engine,
         allocator: std.mem.Allocator,
@@ -5059,10 +5061,12 @@ pub const Engine = struct {
         };
     }
 
+    /// This compatibility wrapper reduces the resolution to value IDs and discards its strings.
     pub fn resolveUniqueSeriesName(self: *Engine, series: []const u8) series_catalog_mod.Match {
         return (self.resolveSelector(.{ .name = series }) catch return .not_found).toMatch();
     }
 
+    /// This compatibility wrapper reduces the resolution to value IDs and discards its strings.
     pub fn resolveExactSeries(self: *Engine, series: []const u8, tags_json: []const u8) !series_catalog_mod.Match {
         return (try self.resolveSelector(.{ .exact = .{ .series = series, .tags_json = tags_json } })).toMatch();
     }
