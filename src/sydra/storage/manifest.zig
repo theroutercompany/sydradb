@@ -25,44 +25,54 @@ pub const Manifest = struct {
     alloc: std.mem.Allocator,
     // Use Unmanaged to be stable across Zig versions; pass allocator on mutation
     entries: std.ArrayListUnmanaged(Entry),
+    repaired_torn_tail: bool = false,
 
     pub fn loadOrInit(alloc: std.mem.Allocator, data_dir: std.fs.Dir) !Manifest {
         var mf = Manifest{ .alloc = alloc, .entries = .{} };
+        errdefer mf.deinit();
         // create directory structure
         data_dir.makePath("segments") catch {};
-        var file = data_dir.openFile(manifest_path, .{}) catch |e| switch (e) {
+        const OpenFlags = std.fs.File.OpenFlags;
+        const open_opts: OpenFlags = if (@hasField(OpenFlags, "write"))
+            OpenFlags{ .write = true, .read = true }
+        else
+            OpenFlags{ .mode = .read_write };
+        var file = data_dir.openFile(manifest_path, open_opts) catch |e| switch (e) {
             error.FileNotFound => blk: {
                 var f = try data_dir.createFile(manifest_path, .{ .read = true });
                 f.close();
-                break :blk try data_dir.openFile(manifest_path, .{});
+                break :blk try data_dir.openFile(manifest_path, open_opts);
             },
             else => return e,
         };
         defer file.close();
-        // Read entire file (reasonable upper bound) and split by lines
+        // Only newline-terminated records were completely appended. A crash can
+        // leave one final fragment; drop it so WAL replay can rebuild the entry.
         const body = try file.readToEndAlloc(alloc, 1024 * 1024 * 64);
         defer alloc.free(body);
-        var it = std.mem.tokenizeScalar(u8, body, '\n');
+
+        const complete_end = if (body.len == 0 or body[body.len - 1] == '\n')
+            body.len
+        else if (std.mem.lastIndexOfScalar(u8, body, '\n')) |newline_index|
+            newline_index + 1
+        else
+            0;
+
+        var it = std.mem.splitScalar(u8, body[0..complete_end], '\n');
         while (it.next()) |raw_line| {
             const s = std.mem.trim(u8, raw_line, " \t\r\n");
             if (s.len == 0) continue;
-            var parsed = try std.json.parseFromSlice(std.json.Value, alloc, s, .{});
-            defer parsed.deinit();
-            const obj = parsed.value.object;
-            const sid = try jsonSeriesId(obj.get("series_id") orelse return error.InvalidCharacter);
-            const hour = try jsonI64(obj.get("hour_bucket") orelse return error.InvalidCharacter);
-            const start_ts = try jsonI64(obj.get("start_ts") orelse return error.InvalidCharacter);
-            const end_ts = try jsonI64(obj.get("end_ts") orelse return error.InvalidCharacter);
-            const count = try jsonU32(obj.get("count") orelse return error.InvalidCharacter);
-            const path = obj.get("path").?.string;
-            try mf.entries.append(alloc, .{
-                .series_id = @intCast(sid),
-                .hour_bucket = @intCast(hour),
-                .start_ts = @intCast(start_ts),
-                .end_ts = @intCast(end_ts),
-                .count = @intCast(count),
-                .path = try alloc.dupe(u8, path),
-            });
+            const entry = try parseEntry(alloc, s);
+            mf.entries.append(alloc, entry) catch |err| {
+                alloc.free(entry.path);
+                return err;
+            };
+        }
+
+        if (complete_end != body.len) {
+            try file.setEndPos(complete_end);
+            try file.sync();
+            mf.repaired_torn_tail = true;
         }
         return mf;
     }
@@ -207,6 +217,27 @@ fn anyWriter(writer: *std.Io.Writer) std.Io.AnyWriter {
     };
 }
 
+fn parseEntry(alloc: std.mem.Allocator, line: []const u8) !Entry {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, line, .{});
+    defer parsed.deinit();
+    const obj = switch (parsed.value) {
+        .object => |object| object,
+        else => return error.InvalidCharacter,
+    };
+    const path = switch (obj.get("path") orelse return error.InvalidCharacter) {
+        .string => |string| string,
+        else => return error.InvalidCharacter,
+    };
+    return .{
+        .series_id = try jsonSeriesId(obj.get("series_id") orelse return error.InvalidCharacter),
+        .hour_bucket = try jsonI64(obj.get("hour_bucket") orelse return error.InvalidCharacter),
+        .start_ts = try jsonI64(obj.get("start_ts") orelse return error.InvalidCharacter),
+        .end_ts = try jsonI64(obj.get("end_ts") orelse return error.InvalidCharacter),
+        .count = try jsonU32(obj.get("count") orelse return error.InvalidCharacter),
+        .path = try alloc.dupe(u8, path),
+    };
+}
+
 fn jsonI64(value: std.json.Value) !i64 {
     return switch (value) {
         .integer => |integer| integer,
@@ -217,7 +248,7 @@ fn jsonI64(value: std.json.Value) !i64 {
 
 fn jsonU32(value: std.json.Value) !u32 {
     return switch (value) {
-        .integer => |integer| @intCast(integer),
+        .integer => |integer| std.math.cast(u32, integer) orelse error.InvalidCharacter,
         .number_string => |digits| try std.fmt.parseInt(u32, digits, 10),
         else => error.InvalidCharacter,
     };
@@ -225,7 +256,7 @@ fn jsonU32(value: std.json.Value) !u32 {
 
 fn jsonSeriesId(value: std.json.Value) !types.SeriesId {
     return switch (value) {
-        .integer => |integer| @intCast(integer),
+        .integer => |integer| std.math.cast(types.SeriesId, integer) orelse error.InvalidCharacter,
         .number_string => |digits| try std.fmt.parseInt(types.SeriesId, digits, 10),
         else => error.InvalidCharacter,
     };
@@ -269,4 +300,51 @@ test "single and batched additions append without overwriting prior entries" {
     try std.testing.expectEqualStrings("segments/second.seg", reloaded.entries.items[1].path);
     try std.testing.expectEqual(@as(types.SeriesId, 3), reloaded.entries.items[2].series_id);
     try std.testing.expectEqualStrings("segments/third.seg", reloaded.entries.items[2].path);
+}
+
+test "load repairs an unterminated tail before later appends" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var manifest = try Manifest.loadOrInit(talloc, tmp.dir);
+    try manifest.add(tmp.dir, 1, 10, 100, 101, 2, "segments/first.seg");
+    manifest.deinit();
+
+    var file = try tmp.dir.openFile(manifest_path, .{ .mode = .read_write });
+    const end_pos = try file.getEndPos();
+    try file.seekTo(end_pos);
+    try file.writeAll("{\"series_id\"");
+    file.close();
+
+    var repaired = try Manifest.loadOrInit(talloc, tmp.dir);
+    try std.testing.expectEqual(@as(usize, 1), repaired.entries.items.len);
+    try repaired.add(tmp.dir, 2, 20, 200, 202, 3, "segments/second.seg");
+    repaired.deinit();
+
+    var reloaded = try Manifest.loadOrInit(talloc, tmp.dir);
+    defer reloaded.deinit();
+    try std.testing.expectEqual(@as(usize, 2), reloaded.entries.items.len);
+    try std.testing.expectEqualStrings("segments/first.seg", reloaded.entries.items[0].path);
+    try std.testing.expectEqualStrings("segments/second.seg", reloaded.entries.items[1].path);
+
+    const body = try tmp.dir.readFileAlloc(talloc, manifest_path, 4096);
+    defer talloc.free(body);
+    try std.testing.expect(std.mem.endsWith(u8, body, "\n"));
+    try std.testing.expect(std.mem.indexOf(u8, body, "{\"series_id\"") != null);
+}
+
+test "load rejects malformed newline terminated records" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = manifest_path,
+        .data = "{\"series_id\"\n",
+    });
+    try std.testing.expectError(
+        error.UnexpectedEndOfInput,
+        Manifest.loadOrInit(talloc, tmp.dir),
+    );
 }

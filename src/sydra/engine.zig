@@ -1355,6 +1355,7 @@ pub const Engine = struct {
                 &engine.market_manifest,
             );
             try engine.metadata.refreshCasIndex(cas);
+            try engine.restoreRepairedScalarManifestFromCas();
         }
         try engine.recover();
         try engine.finalizeInterruptedMarketPromotion();
@@ -5692,6 +5693,23 @@ pub const Engine = struct {
         _ = self.metrics.cas_shadow_mismatch_total.fetchAdd(1, .monotonic);
     }
 
+    fn restoreRepairedScalarManifestFromCas(self: *Engine) !void {
+        if (!self.metadata.manifest.repaired_torn_tail) return;
+
+        self.metadata.cas_index_mu.lock();
+        defer self.metadata.cas_index_mu.unlock();
+        const index = if (self.metadata.cas_index) |*snapshot_index| snapshot_index else return;
+
+        var replacement = try manifestFromSnapshot(
+            self.alloc,
+            index.snapshot.segment_descriptors,
+        );
+        errdefer replacement.deinit();
+        try replacement.rewriteCheckpoint(self.data_dir);
+        self.metadata.manifest.deinit();
+        self.metadata.manifest = replacement;
+    }
+
     fn recover(self: *Engine) !void {
         var highwater = std.AutoHashMap(types.SeriesId, i64).init(self.alloc);
         defer highwater.deinit();
@@ -8298,6 +8316,85 @@ test "engine dual market WAL recovery derives fanout from logical market rows" {
     try std.testing.expectEqual(@as(usize, 0), counts.scalar_rows);
     try std.testing.expectEqual(@as(usize, 1), counts.market_registrations);
     try std.testing.expectEqual(@as(usize, 1), counts.market_rows);
+}
+
+test "engine restores a torn dual-write scalar manifest from the CAS snapshot" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(
+        talloc,
+        ".zig-cache/tmp/{s}/market-torn-scalar-manifest",
+        .{tmp.sub_path},
+    );
+    defer talloc.free(data_path);
+
+    {
+        var config = try testConfig(talloc, data_path);
+        config.fsync = .always;
+        config.cas_mode = .dual_write;
+        config.market_storage_mode = .dual_write_v1;
+        config.market_storage_read_mode = .shadow;
+        config.flush_interval_ms = std.math.maxInt(u32);
+        config.memtable_max_bytes = std.math.maxInt(usize);
+        var engine_owner: ?*Engine = try Engine.init(talloc, config);
+        defer if (engine_owner) |owned| owned.deinit();
+        const engine = engine_owner.?;
+
+        const values = [_]f64{ 10.5, 100.0 };
+        const receipt = try engine.ingestMarketBatch(&.{.{
+            .metric = "market.trade",
+            .labels_json = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}",
+            .ts_ns = 1_000,
+            .values = &values,
+        }});
+        try std.testing.expectEqual(@as(usize, 1), receipt.accepted_rows);
+        _ = try engine.flushNow();
+        try std.testing.expectEqual(@as(usize, 2), engine.metadata.manifest.entries.items.len);
+        engine.deinit();
+        engine_owner = null;
+    }
+
+    {
+        var root = try std.fs.cwd().openDir(data_path, .{});
+        defer root.close();
+        var file = try root.openFile(manifest_mod.manifest_path, .{ .mode = .read_write });
+        defer file.close();
+        const size = (try file.stat()).size;
+        try std.testing.expect(size > 8);
+        try file.setEndPos(size - 8);
+        try file.sync();
+    }
+
+    var config = try testConfig(talloc, data_path);
+    config.fsync = .always;
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .dual_write_v1;
+    config.market_storage_read_mode = .shadow;
+    var recovered = try Engine.init(talloc, config);
+    defer recovered.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), recovered.metadata.manifest.entries.items.len);
+    var result = try recovered.queryMarket(.{
+        .metric = "market.trade",
+        .label_filter_json = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}",
+        .start_ts_ns = 1_000,
+        .end_ts_ns = 1_000,
+    });
+    defer result.deinit();
+    try std.testing.expectEqualStrings("shadow", result.stats.storage_mode);
+    try std.testing.expectEqual(@as(u64, 0), result.stats.shadow_mismatches);
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqual(
+        @as(u64, @bitCast(@as(f64, 10.5))),
+        @as(u64, @bitCast(result.rows[0].values[0])),
+    );
+    try std.testing.expectEqual(
+        @as(u64, @bitCast(@as(f64, 100.0))),
+        @as(u64, @bitCast(result.rows[0].values[1])),
+    );
+    try recovered.verifyCasState();
 }
 
 test "engine native market WAL recovery flushes row and advances sequence" {
