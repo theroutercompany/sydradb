@@ -2,6 +2,7 @@ const std = @import("std");
 const cfg = @import("config.zig");
 const types = @import("types.zig");
 const AtomicU64 = @import("atomic_util.zig").AtomicU64;
+const crash_injection = @import("storage/crash_injection.zig");
 const manifest_mod = @import("storage/manifest.zig");
 const market_catalog_mod = @import("storage/market_catalog.zig");
 const market_compact_mod = @import("storage/market_compact.zig");
@@ -2179,13 +2180,24 @@ pub const Engine = struct {
         var mem_rows = try self.alloc.alloc(market_memtable_mod.MarketRowInput, batch.rows.len);
         defer self.alloc.free(mem_rows);
 
+        var registration_count: usize = 0;
         for (batch.rows, 0..) |row, idx| {
-            registrations[idx] = .{
-                .market_series_id = row.market_series_id,
-                .schema_digest = row.schema_digest,
-                .metric = row.metric,
-                .canonical_labels = row.canonical_labels,
-            };
+            var registration_seen = false;
+            for (registrations[0..registration_count]) |registration| {
+                if (registration.market_series_id == row.market_series_id) {
+                    registration_seen = true;
+                    break;
+                }
+            }
+            if (!registration_seen) {
+                registrations[registration_count] = .{
+                    .market_series_id = row.market_series_id,
+                    .schema_digest = row.schema_digest,
+                    .metric = row.metric,
+                    .canonical_labels = row.canonical_labels,
+                };
+                registration_count += 1;
+            }
             const sequence = self.next_market_write_sequence;
             self.next_market_write_sequence = std.math.add(u64, self.next_market_write_sequence, 1) catch return error.MarketWriteSequenceOverflow;
             wal_rows[idx] = .{
@@ -2222,8 +2234,12 @@ pub const Engine = struct {
 
         if (self.market_writer_fault == .wal_append) return error.InjectedMarketWalAppendFailure;
         const wal_start_ns = std.time.nanoTimestamp();
-        const registration_bytes = try self.wal.appendMarketSeriesRegistrationBatch(registrations);
+        const registration_bytes = try self.wal.appendMarketSeriesRegistrationBatch(
+            registrations[0..registration_count],
+        );
+        crash_injection.hit(.after_registration);
         const row_bytes = try self.wal.appendMarketRowBatch(wal_rows);
+        crash_injection.hit(.after_wal_append);
         const wal_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - wal_start_ns);
         _ = self.metrics.wal_append_total.fetchAdd(@intCast(batch.rows.len), .monotonic);
         _ = self.metrics.wal_append_ns_total.fetchAdd(wal_elapsed_ns, .monotonic);
@@ -2242,6 +2258,7 @@ pub const Engine = struct {
             }
         }
         try self.market_mem.appendBatch(mem_rows);
+        crash_injection.hit(.after_memtable_append);
         fanout_applied = false;
         self.market_mem_allocated_bytes.store(self.market_mem.allocatedBytes(), .monotonic);
         self.market_mem_resident_bytes.store(self.market_mem.residentBytes(), .monotonic);
@@ -3698,6 +3715,7 @@ pub const Engine = struct {
                 .hour = group.hour_bucket,
                 .column_names = schema.ordered_columns,
             }, row_views);
+            crash_injection.hit(.after_segment_creation);
             segment_write_ns_total += @intCast(std.time.nanoTimestamp() - write_start_ns);
             errdefer self.alloc.free(path);
 
@@ -3741,6 +3759,7 @@ pub const Engine = struct {
 
         const manifest_start_ns = std.time.nanoTimestamp();
         try self.market_manifest.addBatch(self.data_dir, additions.items);
+        crash_injection.hit(.after_manifest_update);
         const manifest_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - manifest_start_ns);
 
         self.market_mem.clearRetainingCapacity();
@@ -7718,16 +7737,25 @@ test "engine dual market writer emits one durable market row without scalar WAL"
     try std.testing.expectEqual(market_catalog_mod.StorageMapping.native_v1, schema.storage_mapping);
 
     const values = [_]f64{ 10.5, 100.0 };
-    const receipt = try engine.ingestMarketBatch(&.{.{
-        .metric = "market.test_dual_trade",
-        .labels_json = "{\"symbol\":\"AAPL\"}",
-        .ts_ns = 1_000,
-        .values = &values,
-    }});
+    const next_values = [_]f64{ 11.5, 120.0 };
+    const receipt = try engine.ingestMarketBatch(&.{
+        .{
+            .metric = "market.test_dual_trade",
+            .labels_json = "{\"symbol\":\"AAPL\"}",
+            .ts_ns = 1_000,
+            .values = &values,
+        },
+        .{
+            .metric = "market.test_dual_trade",
+            .labels_json = "{\"symbol\":\"AAPL\"}",
+            .ts_ns = 2_000,
+            .values = &next_values,
+        },
+    });
     try std.testing.expectEqual(Engine.MarketStorageWriteMode.dual_write_v1, receipt.storage_mode);
     try std.testing.expectEqual(@as(usize, 0), engine.queue.len());
     _ = try engine.flushNow();
-    try std.testing.expectEqual(@as(u64, 2), engine.next_market_write_sequence);
+    try std.testing.expectEqual(@as(u64, 3), engine.next_market_write_sequence);
     try std.testing.expectEqual(@as(usize, 1), engine.market_manifest.list().len);
     try std.testing.expectEqual(@as(usize, 2), engine.metadata.manifest.entries.items.len);
 
@@ -7777,7 +7805,7 @@ test "engine dual market writer emits one durable market row without scalar WAL"
     try engine.wal.replay(talloc, &counts);
     try std.testing.expectEqual(@as(usize, 0), counts.scalar_rows);
     try std.testing.expectEqual(@as(usize, 1), counts.market_registrations);
-    try std.testing.expectEqual(@as(usize, 1), counts.market_rows);
+    try std.testing.expectEqual(@as(usize, 2), counts.market_rows);
 }
 
 test "engine propagates ordered market writer WAL failures to the caller" {

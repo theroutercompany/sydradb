@@ -1,4 +1,5 @@
 const std = @import("std");
+const crash_injection = @import("crash_injection.zig");
 const cfg = @import("../config.zig");
 const types = @import("../types.zig");
 const manifest_mod = @import("manifest.zig");
@@ -2697,7 +2698,9 @@ pub const CasManager = struct {
         const parent = try self.refs.readHead(main_ref);
         var writer = CommitWriter{ .alloc = self.alloc, .store = &self.store, .extent_chunk_bytes = self.format.extent_chunk_bytes };
         const commit_id = try writer.writeSnapshotWithNativeMarket(data_dir, manifest, tags, series_catalog, metric_catalog, market_catalog, market_manifest, parent, reason);
+        crash_injection.hit(.after_cas_object_write);
         try self.refs.compareAndSwapRef(main_ref, parent, commit_id, reason);
+        crash_injection.hit(.after_ref_update);
         try self.refreshCommitGraph();
         return commit_id;
     }
