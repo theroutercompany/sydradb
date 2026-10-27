@@ -2293,6 +2293,8 @@ pub const SnapshotDiff = struct {
     segments_removed: usize,
     market_segments_added: usize = 0,
     market_segments_removed: usize = 0,
+    market_schemas_changed: usize = 0,
+    market_series_entries_changed: usize = 0,
     tags_changed: usize,
     series_entries_changed: usize,
     wal_chunks_added: usize,
@@ -3189,6 +3191,8 @@ pub const CasManager = struct {
                         .segments_removed = 0,
                         .market_segments_added = 0,
                         .market_segments_removed = 0,
+                        .market_schemas_changed = 0,
+                        .market_series_entries_changed = 0,
                         .tags_changed = 0,
                         .series_entries_changed = 0,
                         .wal_chunks_added = 0,
@@ -3214,6 +3218,8 @@ pub const CasManager = struct {
             .segments_removed = countDescriptorsNotIn(lhs.segment_descriptors, rhs.segment_descriptors),
             .market_segments_added = countMarketSegmentDescriptorsNotIn(rhs.market_segment_descriptors, lhs.market_segment_descriptors),
             .market_segments_removed = countMarketSegmentDescriptorsNotIn(lhs.market_segment_descriptors, rhs.market_segment_descriptors),
+            .market_schemas_changed = countMarketSchemasChanged(lhs.market_catalog_snapshot, rhs.market_catalog_snapshot),
+            .market_series_entries_changed = countMarketSeriesEntriesChanged(lhs.market_catalog_snapshot, rhs.market_catalog_snapshot),
             .tags_changed = countTagEntriesChanged(lhs.tag_snapshot.entries, rhs.tag_snapshot.entries),
             .series_entries_changed = countSeriesEntriesChanged(lhs.series_catalog_snapshot.entries, rhs.series_catalog_snapshot.entries),
             .wal_chunks_added = countWalChunksNotIn(rhs.wal_index.entries, lhs.wal_index.entries),
@@ -8149,6 +8155,68 @@ fn countMarketSegmentDescriptorsNotIn(lhs: []const MarketSegmentDescriptor, rhs:
         if (!found) count += 1;
     }
     return count;
+}
+
+fn countMarketSchemasChanged(
+    lhs_snapshot: ?market_catalog_mod.Snapshot,
+    rhs_snapshot: ?market_catalog_mod.Snapshot,
+) usize {
+    const lhs = if (lhs_snapshot) |snapshot| snapshot.schemas else &[_]market_catalog_mod.MarketSchema{};
+    const rhs = if (rhs_snapshot) |snapshot| snapshot.schemas else &[_]market_catalog_mod.MarketSchema{};
+    var count: usize = 0;
+    for (lhs) |entry| {
+        var found = false;
+        for (rhs) |other| {
+            if (entry.eql(other)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) count += 1;
+    }
+    for (rhs) |entry| {
+        var found = false;
+        for (lhs) |other| {
+            if (entry.eql(other)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) count += 1;
+    }
+    return count;
+}
+
+fn countMarketSeriesEntriesChanged(
+    lhs_snapshot: ?market_catalog_mod.Snapshot,
+    rhs_snapshot: ?market_catalog_mod.Snapshot,
+) usize {
+    const lhs = if (lhs_snapshot) |snapshot|
+        snapshot.market_series orelse &[_]market_catalog_mod.MarketSeriesIdentity{}
+    else
+        &[_]market_catalog_mod.MarketSeriesIdentity{};
+    const rhs = if (rhs_snapshot) |snapshot|
+        snapshot.market_series orelse &[_]market_catalog_mod.MarketSeriesIdentity{}
+    else
+        &[_]market_catalog_mod.MarketSeriesIdentity{};
+    var count: usize = 0;
+    for (lhs) |entry| {
+        if (!containsMarketSeriesEntry(rhs, entry)) count += 1;
+    }
+    for (rhs) |entry| {
+        if (!containsMarketSeriesEntry(lhs, entry)) count += 1;
+    }
+    return count;
+}
+
+fn containsMarketSeriesEntry(
+    entries: []const market_catalog_mod.MarketSeriesIdentity,
+    needle: market_catalog_mod.MarketSeriesIdentity,
+) bool {
+    for (entries) |entry| {
+        if (marketSeriesEntryEql(entry, needle)) return true;
+    }
+    return false;
 }
 
 fn countWalChunksNotIn(lhs: []const WalChunkDescriptor, rhs: []const WalChunkDescriptor) usize {

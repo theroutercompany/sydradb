@@ -577,8 +577,14 @@ fn writeCasReflogJson(alloc: std.mem.Allocator, ref_name: []const u8, limit: usi
 }
 
 fn writeCasDiffJson(alloc: std.mem.Allocator, lhs: []const u8, rhs: []const u8, diff: cas_mod.SnapshotDiff) !void {
+    const bytes = try formatCasDiffJsonAlloc(alloc, lhs, rhs, diff);
+    defer alloc.free(bytes);
+    try writeJsonBufferToStdout(bytes);
+}
+
+fn formatCasDiffJsonAlloc(alloc: std.mem.Allocator, lhs: []const u8, rhs: []const u8, diff: cas_mod.SnapshotDiff) ![]u8 {
     var buf = std.array_list.Managed(u8).init(alloc);
-    defer buf.deinit();
+    errdefer buf.deinit();
     var writer = buf.writer();
     var tmp: [512]u8 = undefined;
     var adapter = writer.adaptToNewApi(&tmp);
@@ -593,6 +599,14 @@ fn writeCasDiffJson(alloc: std.mem.Allocator, lhs: []const u8, rhs: []const u8, 
     try jw.write(diff.segments_added);
     try jw.objectField("segments_removed");
     try jw.write(diff.segments_removed);
+    try jw.objectField("market_segments_added");
+    try jw.write(diff.market_segments_added);
+    try jw.objectField("market_segments_removed");
+    try jw.write(diff.market_segments_removed);
+    try jw.objectField("market_schemas_changed");
+    try jw.write(diff.market_schemas_changed);
+    try jw.objectField("market_series_entries_changed");
+    try jw.write(diff.market_series_entries_changed);
     try jw.objectField("tags_changed");
     try jw.write(diff.tags_changed);
     try jw.objectField("series_entries_changed");
@@ -604,7 +618,28 @@ fn writeCasDiffJson(alloc: std.mem.Allocator, lhs: []const u8, rhs: []const u8, 
     try jw.endObject();
     try iface.flush();
     if (adapter.err) |err| return err;
-    try writeJsonBufferToStdout(buf.items);
+    return try buf.toOwnedSlice();
+}
+
+fn formatCasDiffTextAlloc(alloc: std.mem.Allocator, lhs: []const u8, rhs: []const u8, diff: cas_mod.SnapshotDiff) ![]u8 {
+    return try std.fmt.allocPrint(
+        alloc,
+        "cas diff {s}..{s} segments_added={d} segments_removed={d} market_segments_added={d} market_segments_removed={d} market_schemas_changed={d} market_series_entries_changed={d} tags_changed={d} series_entries_changed={d} wal_added={d} wal_removed={d}\n",
+        .{
+            lhs,
+            rhs,
+            diff.segments_added,
+            diff.segments_removed,
+            diff.market_segments_added,
+            diff.market_segments_removed,
+            diff.market_schemas_changed,
+            diff.market_series_entries_changed,
+            diff.tags_changed,
+            diff.series_entries_changed,
+            diff.wal_chunks_added,
+            diff.wal_chunks_removed,
+        },
+    );
 }
 
 fn writeCasBundleJson(alloc: std.mem.Allocator, command: []const u8, action: ?[]const u8, result: cas_mod.BundleResult) !void {
@@ -1182,20 +1217,9 @@ fn cmdCas(alloc: std.mem.Allocator, args: [][:0]u8) !void {
         if (json_output) {
             try writeCasDiffJson(alloc, lhs, rhs, diff);
         } else {
-            try printStdout(
-                alloc,
-                "cas diff {s}..{s} segments_added={d} segments_removed={d} tags_changed={d} series_entries_changed={d} wal_added={d} wal_removed={d}\n",
-                .{
-                    lhs,
-                    rhs,
-                    diff.segments_added,
-                    diff.segments_removed,
-                    diff.tags_changed,
-                    diff.series_entries_changed,
-                    diff.wal_chunks_added,
-                    diff.wal_chunks_removed,
-                },
-            );
+            const text = try formatCasDiffTextAlloc(alloc, lhs, rhs, diff);
+            defer alloc.free(text);
+            try printStdout(alloc, "{s}", .{text});
         }
         return;
     }
@@ -1562,6 +1586,34 @@ fn waitForTestFile(path: []const u8) !void {
         return;
     }
     return error.TestTimedOut;
+}
+
+test "cas diff JSON and text expose native market changes" {
+    const diff = cas_mod.SnapshotDiff{
+        .segments_added = 1,
+        .segments_removed = 2,
+        .market_segments_added = 3,
+        .market_segments_removed = 4,
+        .market_schemas_changed = 5,
+        .market_series_entries_changed = 6,
+        .tags_changed = 7,
+        .series_entries_changed = 8,
+        .wal_chunks_added = 9,
+        .wal_chunks_removed = 10,
+    };
+    const json = try formatCasDiffJsonAlloc(std.testing.allocator, "left", "right", diff);
+    defer std.testing.allocator.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"market_segments_added\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"market_segments_removed\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"market_schemas_changed\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"market_series_entries_changed\":6") != null);
+
+    const text = try formatCasDiffTextAlloc(std.testing.allocator, "left", "right", diff);
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "market_segments_added=3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "market_segments_removed=4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "market_schemas_changed=5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "market_series_entries_changed=6") != null);
 }
 
 test "Engine-owning processes contend for one repository writer lease" {
