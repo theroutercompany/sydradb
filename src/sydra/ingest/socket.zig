@@ -851,7 +851,6 @@ fn handleDeclareBatch(eng: *Engine, session: *SessionState, payload: []const u8,
                 _ = eng.metrics.local_ingest_rejected_total.fetchAdd(1, .monotonic);
             }
             eng.alloc.free(canonical_tags);
-            eng.alloc.free(signature);
             continue;
         }
 
