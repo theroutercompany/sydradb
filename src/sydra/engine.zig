@@ -106,6 +106,7 @@ pub const Engine = struct {
     const MetricSeriesGroup = struct {
         labels_json: []u8,
         series_ids: []types.SeriesId,
+        has_market_identity: bool = false,
 
         fn deinit(self: *MetricSeriesGroup, alloc: std.mem.Allocator) void {
             alloc.free(self.labels_json);
@@ -3034,7 +3035,9 @@ pub const Engine = struct {
         family_metric: []const u8,
         columns: []const []const u8,
     ) ![]MetricSeriesGroup {
+        const scalar_groups = try self.collectMetricSeriesGroups(family_metric, columns);
         if (self.marketSchema(family_metric)) |owned_schema| {
+            defer self.freeMetricSeriesGroups(scalar_groups);
             var schema = owned_schema;
             defer schema.deinit(self.alloc);
 
@@ -3051,33 +3054,57 @@ pub const Engine = struct {
             }
             for (identities) |identity| {
                 if (!std.mem.eql(u8, identity.metric, family_metric)) continue;
-                var already_present = false;
-                for (groups.items) |group| {
+                var existing_index: ?usize = null;
+                for (groups.items, 0..) |group, idx| {
                     if (std.mem.eql(u8, group.labels_json, identity.canonical_labels)) {
-                        already_present = true;
+                        existing_index = idx;
                         break;
                     }
                 }
-                if (already_present) continue;
-                {
-                    const labels = try self.alloc.dupe(u8, identity.canonical_labels);
-                    errdefer self.alloc.free(labels);
-                    // An empty scalar-id set marks a logical market series.
-                    const series_ids = try self.alloc.alloc(types.SeriesId, 0);
-                    errdefer self.alloc.free(series_ids);
-                    try groups.append(.{
-                        .labels_json = labels,
-                        .series_ids = series_ids,
-                    });
+                if (existing_index) |idx| {
+                    groups.items[idx].has_market_identity = true;
+                    continue;
                 }
+                const labels = try self.alloc.dupe(u8, identity.canonical_labels);
+                errdefer self.alloc.free(labels);
+                const series_ids = try self.alloc.alloc(types.SeriesId, 0);
+                errdefer self.alloc.free(series_ids);
+                try groups.append(.{
+                    .labels_json = labels,
+                    .series_ids = series_ids,
+                    .has_market_identity = true,
+                });
             }
-            if (groups.items.len != 0) return try groups.toOwnedSlice();
-            groups.deinit();
+
+            for (scalar_groups) |scalar_group| {
+                var existing_index: ?usize = null;
+                for (groups.items, 0..) |group, idx| {
+                    if (std.mem.eql(u8, group.labels_json, scalar_group.labels_json)) {
+                        existing_index = idx;
+                        break;
+                    }
+                }
+                if (existing_index) |idx| {
+                    const series_ids = try self.alloc.dupe(types.SeriesId, scalar_group.series_ids);
+                    self.alloc.free(groups.items[idx].series_ids);
+                    groups.items[idx].series_ids = series_ids;
+                    continue;
+                }
+                const labels = try self.alloc.dupe(u8, scalar_group.labels_json);
+                errdefer self.alloc.free(labels);
+                const series_ids = try self.alloc.dupe(types.SeriesId, scalar_group.series_ids);
+                errdefer self.alloc.free(series_ids);
+                try groups.append(.{
+                    .labels_json = labels,
+                    .series_ids = series_ids,
+                });
+            }
+            return try groups.toOwnedSlice();
         }
 
         // Compatibility for custom and pre-native derived series that have no
         // logical market-series registration.
-        return try self.collectMetricSeriesGroups(family_metric, columns);
+        return scalar_groups;
     }
 
     fn queryDerivedColumns(
@@ -3088,7 +3115,8 @@ pub const Engine = struct {
         start_ts: i64,
         end_ts: i64,
     ) ![][]types.Point {
-        if (group.series_ids.len != 0) {
+        if (!group.has_market_identity) {
+            if (group.series_ids.len == 0) return error.IncompleteMarketRow;
             if (group.series_ids.len != columns.len) return error.IncompleteMarketRow;
             const points_by_column = try self.alloc.alloc([]types.Point, columns.len);
             var initialized: usize = 0;
@@ -3117,13 +3145,13 @@ pub const Engine = struct {
             if (std.mem.eql(u8, row.canonical_labels, group.labels_json)) exact_row_count += 1;
         }
 
-        const points_by_column = try self.alloc.alloc([]types.Point, columns.len);
+        const native_columns = try self.alloc.alloc([]types.Point, columns.len);
         var initialized: usize = 0;
         errdefer {
-            for (points_by_column[0..initialized]) |points| self.alloc.free(points);
-            self.alloc.free(points_by_column);
+            for (native_columns[0..initialized]) |points| self.alloc.free(points);
+            self.alloc.free(native_columns);
         }
-        for (points_by_column) |*points| {
+        for (native_columns) |*points| {
             points.* = try self.alloc.alloc(types.Point, exact_row_count);
             initialized += 1;
         }
@@ -3132,12 +3160,65 @@ pub const Engine = struct {
         for (result.rows) |row| {
             if (!std.mem.eql(u8, row.canonical_labels, group.labels_json)) continue;
             if (row.values.len != columns.len) return error.IncompleteMarketRow;
-            for (points_by_column, row.values) |points, value| {
+            for (native_columns, row.values) |points, value| {
                 points[row_idx] = .{ .ts = row.ts_ns, .value = value };
             }
             row_idx += 1;
         }
-        return points_by_column;
+
+        if (group.series_ids.len == 0) return native_columns;
+        if (group.series_ids.len != columns.len) return error.IncompleteMarketRow;
+
+        var scalar_columns = try self.alloc.alloc([]types.Point, columns.len);
+        var scalar_initialized: usize = 0;
+        errdefer {
+            for (scalar_columns[0..scalar_initialized]) |points| self.alloc.free(points);
+            self.alloc.free(scalar_columns);
+        }
+        for (group.series_ids, 0..) |series_id, idx| {
+            scalar_columns[idx] = try self.querySeriesPoints(series_id, start_ts, end_ts);
+            scalar_initialized += 1;
+        }
+
+        const merged_columns = try self.alloc.alloc([]types.Point, columns.len);
+        var merged_initialized: usize = 0;
+        errdefer {
+            for (merged_columns[0..merged_initialized]) |points| self.alloc.free(points);
+            self.alloc.free(merged_columns);
+        }
+        for (columns, 0..) |_, idx| {
+            merged_columns[idx] = try self.mergeDerivedPoints(scalar_columns[idx], native_columns[idx]);
+            merged_initialized += 1;
+        }
+        self.freePointColumns(native_columns);
+        self.freePointColumns(scalar_columns);
+        return merged_columns;
+    }
+
+    fn mergeDerivedPoints(self: *Engine, scalar: []const types.Point, native: []const types.Point) ![]types.Point {
+        var by_timestamp = std.AutoHashMap(i64, f64).init(self.alloc);
+        defer by_timestamp.deinit();
+
+        for (scalar) |point| try by_timestamp.put(point.ts, point.value);
+        // Market reads resolve corrections according to the selected storage
+        // mapping, so their row takes precedence over legacy scalar history at
+        // the same timestamp.
+        for (native) |point| try by_timestamp.put(point.ts, point.value);
+
+        const points = try self.alloc.alloc(types.Point, by_timestamp.count());
+        errdefer self.alloc.free(points);
+        var idx: usize = 0;
+        var it = by_timestamp.iterator();
+        while (it.next()) |entry| {
+            points[idx] = .{ .ts = entry.key_ptr.*, .value = entry.value_ptr.* };
+            idx += 1;
+        }
+        std.sort.block(types.Point, points, {}, struct {
+            fn lessThan(_: void, lhs: types.Point, rhs: types.Point) bool {
+                return lhs.ts < rhs.ts;
+            }
+        }.lessThan);
+        return points;
     }
 
     fn freePointColumns(self: *Engine, columns: [][]types.Point) void {
@@ -10091,4 +10172,193 @@ test "engine native market rows drive rollups and signals without scalar fanout"
     );
     try std.testing.expectEqual(@as(u64, 2), quote_report.rows_processed);
     try std.testing.expectEqual(@as(u64, 4), quote_report.emissions_total);
+}
+
+fn ingestLegacyBarScalars(
+    engine: *Engine,
+    alloc: std.mem.Allocator,
+    labels_json: []const u8,
+    ts_ns: i64,
+    values: [6]f64,
+) !void {
+    const columns = [_][]const u8{ "open", "high", "low", "close", "volume", "vwap" };
+    for (columns, values) |column, value| {
+        const metric = try std.fmt.allocPrint(alloc, "market.bar.{s}", .{column});
+        defer alloc.free(metric);
+        _ = try engine.ingestExactMetric(metric, labels_json, ts_ns, value, null);
+    }
+}
+
+test "engine derived processors include native and legacy scalar bar groups" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(
+        talloc,
+        ".zig-cache/tmp/{s}/mixed-derived-groups",
+        .{tmp.sub_path},
+    );
+    defer talloc.free(data_path);
+    var config = try testConfig(talloc, data_path);
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .native_v1;
+    config.market_storage_read_mode = .auto;
+    config.flush_interval_ms = std.math.maxInt(u32);
+    config.memtable_max_bytes = std.math.maxInt(usize);
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    engine.stop_flag = true;
+    engine.derived_mu.lock();
+    engine.derived_pending = true;
+    engine.derived_mu.unlock();
+    engine.derived_cv.broadcast();
+    if (engine.derived_thread) |thread| {
+        thread.join();
+        engine.derived_thread = null;
+    }
+    engine.stop_flag = false;
+
+    var policy = try engine.registerBarPolicy(.{
+        .id = "mixed-groups-5m",
+        .source_metric = "market.bar",
+        .interval_ns = 5 * 60 * std.time.ns_per_s,
+        .session_rule = "all_sessions",
+        .no_trade_rule = "skip_empty",
+        .halt_rule = "skip_halts",
+        .correction_policy = "append_only",
+        .trade_filter = null,
+    });
+    defer policy.deinit(talloc);
+    var rollup = try engine.registerRollup(.{
+        .id = "mixed-groups-rollup",
+        .source_metric = "market.bar",
+        .target_metric = "market.bar",
+        .policy_id = policy.id,
+        .transform_kind = .bar_to_bar,
+    });
+    defer rollup.deinit(talloc);
+    var signal = try engine.registerSignal(.{
+        .id = "mixed-groups-signal",
+        .input_metric = "market.bar",
+        .policy_id = policy.id,
+        .expression_kind = .ema,
+        .params_json = "{\"column\":\"close\",\"period\":1}",
+        .emit_rule = "on_close",
+    });
+    defer signal.deinit(talloc);
+
+    const native_labels = "{\"bar_policy_id\":\"legacy-1m\",\"interval\":\"60000000000\",\"symbol\":\"NATIVE\",\"venue\":\"XNAS\"}";
+    const legacy_labels = "{\"bar_policy_id\":\"legacy-1m\",\"interval\":\"60000000000\",\"symbol\":\"LEGACY\",\"venue\":\"XNAS\"}";
+    const native_values_0 = [_]f64{ 20.0, 22.0, 19.0, 21.0, 4.0, 20.5 };
+    const native_values_1 = [_]f64{ 21.0, 24.0, 20.0, 23.0, 6.0, 22.5 };
+    _ = try engine.ingestMarketBatch(&.{
+        .{ .metric = "market.bar", .labels_json = native_labels, .ts_ns = 0, .values = &native_values_0 },
+        .{ .metric = "market.bar", .labels_json = native_labels, .ts_ns = 5 * 60 * std.time.ns_per_s, .values = &native_values_1 },
+    });
+    try ingestLegacyBarScalars(engine, talloc, legacy_labels, 0, .{ 30.0, 32.0, 29.0, 31.0, 2.0, 30.5 });
+    try ingestLegacyBarScalars(engine, talloc, legacy_labels, 5 * 60 * std.time.ns_per_s, .{ 31.0, 34.0, 30.0, 33.0, 3.0, 32.5 });
+    _ = try engine.flushNow();
+
+    const signal_report = try engine.processSignalDefinitionFiltered(signal, null);
+    try std.testing.expectEqual(@as(u64, 4), signal_report.rows_processed);
+    try std.testing.expectEqual(@as(u64, 4), signal_report.emissions_total);
+
+    const rollup_report = try engine.processRollupDefinitionFiltered(rollup, null);
+    try std.testing.expectEqual(@as(u64, 4), rollup_report.rows_processed);
+    try std.testing.expectEqual(@as(u64, 12), rollup_report.emissions_total);
+
+    var rolled = try engine.queryMarket(.{
+        .metric = "market.bar",
+        .label_filter_json = "{\"bar_policy_id\":\"mixed-groups-5m\",\"interval\":\"300000000000\"}",
+        .start_ts_ns = 0,
+        .end_ts_ns = 0,
+    });
+    defer rolled.deinit();
+    try std.testing.expectEqual(@as(usize, 2), rolled.rows.len);
+}
+
+test "engine derived native rows retain scalar history and override overlapping corrections" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(
+        talloc,
+        ".zig-cache/tmp/{s}/mixed-derived-correction",
+        .{tmp.sub_path},
+    );
+    defer talloc.free(data_path);
+    var config = try testConfig(talloc, data_path);
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .native_v1;
+    config.market_storage_read_mode = .auto;
+    config.flush_interval_ms = std.math.maxInt(u32);
+    config.memtable_max_bytes = std.math.maxInt(usize);
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    engine.stop_flag = true;
+    engine.derived_mu.lock();
+    engine.derived_pending = true;
+    engine.derived_mu.unlock();
+    engine.derived_cv.broadcast();
+    if (engine.derived_thread) |thread| {
+        thread.join();
+        engine.derived_thread = null;
+    }
+    engine.stop_flag = false;
+
+    var policy = try engine.registerBarPolicy(.{
+        .id = "mixed-correction-5m",
+        .source_metric = "market.bar",
+        .interval_ns = 5 * 60 * std.time.ns_per_s,
+        .session_rule = "all_sessions",
+        .no_trade_rule = "skip_empty",
+        .halt_rule = "skip_halts",
+        .correction_policy = "append_only",
+        .trade_filter = null,
+    });
+    defer policy.deinit(talloc);
+    var rollup = try engine.registerRollup(.{
+        .id = "mixed-correction-rollup",
+        .source_metric = "market.bar",
+        .target_metric = "market.bar",
+        .policy_id = policy.id,
+        .transform_kind = .bar_to_bar,
+    });
+    defer rollup.deinit(talloc);
+
+    const labels = "{\"bar_policy_id\":\"legacy-1m\",\"interval\":\"60000000000\",\"symbol\":\"MIXED\",\"venue\":\"XNAS\"}";
+    try ingestLegacyBarScalars(engine, talloc, labels, 0, .{ 100.0, 101.0, 99.0, 100.0, 2.0, 100.0 });
+    try ingestLegacyBarScalars(engine, talloc, labels, 60 * std.time.ns_per_s, .{ 10.0, 11.0, 9.0, 10.0, 1.0, 10.0 });
+    const native_values_initial = [_]f64{ 20.0, 21.0, 19.0, 20.0, 3.0, 20.0 };
+    const native_values_correction = [_]f64{ 30.0, 32.0, 29.0, 31.0, 4.0, 30.0 };
+    const native_values_next_bucket = [_]f64{ 31.0, 35.0, 30.0, 34.0, 5.0, 33.0 };
+    _ = try engine.ingestMarketBatch(&.{
+        .{ .metric = "market.bar", .labels_json = labels, .ts_ns = 60 * std.time.ns_per_s, .values = &native_values_initial },
+        .{ .metric = "market.bar", .labels_json = labels, .ts_ns = 60 * std.time.ns_per_s, .values = &native_values_correction },
+        .{ .metric = "market.bar", .labels_json = labels, .ts_ns = 5 * 60 * std.time.ns_per_s, .values = &native_values_next_bucket },
+    });
+    _ = try engine.flushNow();
+
+    const report = try engine.processRollupDefinitionFiltered(rollup, null);
+    try std.testing.expectEqual(@as(u64, 3), report.rows_processed);
+    try std.testing.expectEqual(@as(u64, 6), report.emissions_total);
+
+    var rolled = try engine.queryMarket(.{
+        .metric = "market.bar",
+        .label_filter_json = "{\"bar_policy_id\":\"mixed-correction-5m\",\"interval\":\"300000000000\",\"symbol\":\"MIXED\"}",
+        .start_ts_ns = 0,
+        .end_ts_ns = 0,
+    });
+    defer rolled.deinit();
+    try std.testing.expectEqual(@as(usize, 1), rolled.rows.len);
+    try std.testing.expectApproxEqAbs(@as(f64, 100.0), rolled.rows[0].values[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 101.0), rolled.rows[0].values[1], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 29.0), rolled.rows[0].values[2], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 31.0), rolled.rows[0].values[3], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 6.0), rolled.rows[0].values[4], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 320.0 / 6.0), rolled.rows[0].values[5], 1e-9);
 }
