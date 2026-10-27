@@ -16,6 +16,7 @@ const executor = @import("executor.zig");
 const vm = @import("vm.zig");
 const cfg = @import("../config.zig");
 const engine_mod = @import("../engine.zig");
+const monotime = @import("../time.zig");
 
 pub const ExecuteError = parser.ParseError || validator.AnalyzeError || frontend.normalize.NormalizeError || plan_builder.BuildError || optimizer.OptimizeError || physical.BuildError || executor.ExecuteError || compiler.CompileError || codegen.CodegenError || vm.VmError || std.mem.Allocator.Error || error{ValidationFailed};
 
@@ -41,19 +42,17 @@ pub fn executeWithMode(
         }
     }
 
-    const t_start = std.time.microTimestamp();
+    var phase_timer = monotime.startTimer();
     var parser_inst = parser.Parser.init(arena_ptr.allocator(), query);
     var statement = try parser_inst.parse();
-    const t_parse = std.time.microTimestamp();
+    const parse_us = phase_timer.read() / std.time.ns_per_us;
+    phase_timer.reset();
 
     var analyzer = validator.Analyzer.init(arena_ptr.allocator());
     var analysis = try analyzer.analyze(&statement);
     defer analyzer.deinit(&analysis);
     if (!analysis.is_valid) return error.ValidationFailed;
-    const t_validate = std.time.microTimestamp();
-
-    const parse_us = durationMicros(t_parse - t_start);
-    const validate_us = durationMicros(t_validate - t_parse);
+    const validate_us = phase_timer.read() / std.time.ns_per_us;
 
     const prepared = Prepared{
         .allocator = allocator,
@@ -116,20 +115,22 @@ fn executeLegacy(
     legacy_fallback: bool,
     fallback_reason: []const u8,
 ) ExecuteError!executor.ExecutionCursor {
-    const logical_start = std.time.microTimestamp();
+    var phase_timer = monotime.startTimer();
     var builder = plan_builder.Builder.init(prepared.arena_ptr.allocator());
     const logical_plan = try builder.build(prepared.statement);
-    const logical_end = std.time.microTimestamp();
+    const logical_us = phase_timer.read() / std.time.ns_per_us;
+    phase_timer.reset();
     const optimized_plan = try optimizer.optimize(prepared.arena_ptr.allocator(), logical_plan);
-    const optimize_end = std.time.microTimestamp();
+    const optimize_us = phase_timer.read() / std.time.ns_per_us;
+    phase_timer.reset();
     const physical_plan = try physical.build(prepared.arena_ptr.allocator(), optimized_plan);
-    const physical_end = std.time.microTimestamp();
+    const physical_us = phase_timer.read() / std.time.ns_per_us;
 
     var exec_inst = executor.Executor.init(prepared.allocator, prepared.engine, physical_plan);
     defer exec_inst.deinit();
-    const pipeline_start = std.time.microTimestamp();
+    phase_timer.reset();
     var cursor = try exec_inst.run();
-    const pipeline_end = std.time.microTimestamp();
+    const pipeline_us = phase_timer.read() / std.time.ns_per_us;
 
     try finalizeCursor(
         prepared,
@@ -139,10 +140,10 @@ fn executeLegacy(
         fallback_reason,
         0,
         0,
-        durationMicros(logical_end - logical_start),
-        durationMicros(optimize_end - logical_end),
-        durationMicros(physical_end - optimize_end),
-        durationMicros(pipeline_end - pipeline_start),
+        logical_us,
+        optimize_us,
+        physical_us,
+        pipeline_us,
     );
     return cursor;
 }
@@ -151,13 +152,12 @@ fn executeCompiled(
     prepared: Prepared,
     mode: ExecutionMode,
 ) ExecuteError!executor.ExecutionCursor {
-    const compile_start = std.time.microTimestamp();
+    var compile_timer = monotime.startTimer();
     recordCompileAttempt(prepared.engine);
     const detailed = try compiler.compileSelectDetailed(prepared.arena_ptr.allocator(), prepared.engine, prepared.statement);
-    const compile_end = std.time.microTimestamp();
     const compiled = detailed.compiled orelse return compiler.fallbackReasonToError(detailed.fallback_reason.?);
     recordCompileSuccess(prepared.engine);
-    const total_compile_us = durationMicros(compile_end - compile_start);
+    const total_compile_us = compile_timer.read() / std.time.ns_per_us;
     const backend_us = compiled.backend.logical_us + compiled.backend.optimize_us + compiled.backend.physical_us;
     const frontend_compile_us = total_compile_us -| backend_us;
 
@@ -178,9 +178,9 @@ fn executeCompiledPhysical(
 ) ExecuteError!executor.ExecutionCursor {
     var exec_inst = executor.Executor.init(prepared.allocator, prepared.engine, compiled.backend.physical_plan);
     defer exec_inst.deinit();
-    const pipeline_start = std.time.microTimestamp();
+    var pipeline_timer = monotime.startTimer();
     var cursor = try exec_inst.run();
-    const pipeline_end = std.time.microTimestamp();
+    const pipeline_us = pipeline_timer.read() / std.time.ns_per_us;
 
     try finalizeCursor(
         prepared,
@@ -193,7 +193,7 @@ fn executeCompiledPhysical(
         compiled.backend.logical_us,
         compiled.backend.optimize_us,
         compiled.backend.physical_us,
-        durationMicros(pipeline_end - pipeline_start),
+        pipeline_us,
     );
     return cursor;
 }
@@ -218,7 +218,7 @@ fn executeCompiledBytecode(
     defer row_list.deinit();
 
     const arena = prepared.arena_ptr.allocator();
-    const pipeline_start = std.time.microTimestamp();
+    var pipeline_timer = monotime.startTimer();
     while (true) {
         const step = try machine.step();
         switch (step) {
@@ -235,7 +235,7 @@ fn executeCompiledBytecode(
     const columns = try arena.dupe(plan_builder.ColumnInfo, lowered_program.columns);
     var cursor = try executor.cursorFromRows(prepared.allocator, columns, rows);
     cursor.arena = prepared.arena_ptr;
-    const pipeline_end = std.time.microTimestamp();
+    const pipeline_us = pipeline_timer.read() / std.time.ns_per_us;
 
     try finalizeCursor(
         prepared,
@@ -248,7 +248,7 @@ fn executeCompiledBytecode(
         compiled.backend.logical_us,
         compiled.backend.optimize_us,
         compiled.backend.physical_us,
-        durationMicros(pipeline_end - pipeline_start),
+        pipeline_us,
     );
     return cursor;
 }
@@ -283,7 +283,7 @@ fn executeExplainBytecode(
     mode: ExecutionMode,
     explain: *const ast.Explain,
 ) ExecuteError!executor.ExecutionCursor {
-    const compile_start = std.time.microTimestamp();
+    var compile_timer = monotime.startTimer();
     recordCompileAttempt(prepared.engine);
 
     const compiled = compiler.compileSelect(prepared.arena_ptr.allocator(), prepared.engine, explain.target) catch |err| {
@@ -310,7 +310,7 @@ fn executeExplainBytecode(
     const columns = try buildExplainBytecodeColumns(prepared.arena_ptr.allocator());
     const rows = try buildExplainBytecodeRows(prepared.arena_ptr.allocator(), lines);
     var cursor = try executor.cursorFromRows(prepared.allocator, columns, rows);
-    const compile_end = std.time.microTimestamp();
+    const compile_us = compile_timer.read() / std.time.ns_per_us;
 
     try finalizeCursor(
         prepared,
@@ -319,7 +319,7 @@ fn executeExplainBytecode(
         false,
         "",
         compiled.bind_us,
-        durationMicros(compile_end - compile_start) -| compiled.bind_us,
+        compile_us -| compiled.bind_us,
         0,
         0,
         0,
@@ -343,7 +343,7 @@ fn executeExplainTablesUsed(
     var physical_us: u64 = 0;
 
     if (explain.target.* == .select) {
-        const compile_start = std.time.microTimestamp();
+        var compile_timer = monotime.startTimer();
         recordCompileAttempt(prepared.engine);
         const detailed = compiler.compileSelectDetailed(prepared.arena_ptr.allocator(), prepared.engine, explain.target) catch |err| {
             if (compiler_diagnostics.fromCompileError(err)) |reason| {
@@ -351,7 +351,6 @@ fn executeExplainTablesUsed(
             }
             return err;
         };
-        const compile_end = std.time.microTimestamp();
         bind_us = detailed.bind_us;
         if (detailed.compiled) |compiled| {
             recordCompileSuccess(prepared.engine);
@@ -360,10 +359,10 @@ fn executeExplainTablesUsed(
             optimize_us = compiled.backend.optimize_us;
             physical_us = compiled.backend.physical_us;
             const backend_us = logical_us + optimize_us + physical_us;
-            compile_us = durationMicros(compile_end - compile_start) -| backend_us;
+            compile_us = (compile_timer.read() / std.time.ns_per_us) -| backend_us;
         } else if (detailed.fallback_reason) |reason| {
             recordCompileFallback(prepared.engine, reason);
-            compile_us = durationMicros(compile_end - compile_start) -| bind_us;
+            compile_us = (compile_timer.read() / std.time.ns_per_us) -| bind_us;
         }
     }
 
@@ -580,10 +579,6 @@ fn recordCompileFallback(engine: *engine_mod.Engine, reason: compiler.FallbackRe
         .shadow_mismatch => _ = engine.metrics.query_compile_shadow_mismatch_total.fetchAdd(1, .monotonic),
         else => _ = engine.metrics.query_compile_unsupported_total.fetchAdd(1, .monotonic),
     }
-}
-
-fn durationMicros(value: i64) u64 {
-    return @intCast(@max(value, 0));
 }
 
 fn columnsMatch(lhs: []const plan_builder.ColumnInfo, rhs: []const plan_builder.ColumnInfo) bool {
@@ -1457,17 +1452,21 @@ test "execution snapshots stay stable for supported and fallback query classes" 
 }
 
 fn waitForFlushForTest(engine: *engine_mod.Engine, min_flushes: u64, timeout_ms: u64) !void {
-    const start = std.time.milliTimestamp();
-    while (std.time.milliTimestamp() - start < timeout_ms) {
+    var wait_timer = monotime.startTimer();
+    const timeout_ns = monotime.timeoutNanos(timeout_ms);
+    var first_attempt = true;
+    while (true) {
+        const elapsed_ns = wait_timer.read();
+        if (!first_attempt and elapsed_ns >= timeout_ns) return error.Timeout;
+        first_attempt = false;
+        const remaining_ms = (timeout_ns -| elapsed_ns) / std.time.ns_per_ms;
+        _ = try engine.flushAndDrain(remaining_ms);
         if (engine.metrics.flush_total.load(.monotonic) >= min_flushes) {
             if (engine.config.cas_mode == .dual_write) {
-                const elapsed_ms: u64 = @intCast(std.time.milliTimestamp() - start);
-                const remaining_ms = timeout_ms -| elapsed_ms;
-                if (remaining_ms == 0) return error.Timeout;
-                _ = try engine.flushAndDrain(remaining_ms);
                 try engine.verifyCasState();
                 if (engine.cas) |*cas| {
                     engine.metadata.refreshCasIndexIfStale(cas) catch {
+                        if (wait_timer.read() >= timeout_ns) return error.Timeout;
                         std.Thread.sleep(5 * std.time.ns_per_ms);
                         continue;
                     };
@@ -1475,13 +1474,51 @@ fn waitForFlushForTest(engine: *engine_mod.Engine, min_flushes: u64, timeout_ms:
             }
             return;
         }
+        if (wait_timer.read() >= timeout_ns) return error.Timeout;
         if (@hasDecl(std.time, "sleep")) {
             std.Thread.sleep(5 * std.time.ns_per_ms);
         } else {
             std.Thread.sleep(5 * std.time.ns_per_ms);
         }
     }
-    return error.Timeout;
+}
+
+test "waitForFlushForTest accepts already drained false flush result" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/query-flush-barrier-false", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    const config = cfg.Config{
+        .data_dir = try talloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 512,
+        .retention_days = 0,
+        .auth_token = try talloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .off,
+        .query_compiler_mode = .compiled,
+        .retention_ns = std.StringHashMap(u32).init(talloc),
+    };
+
+    var engine = try engine_mod.Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const types = @import("../types.zig");
+    const sid = types.seriesIdFrom("query.barrier.false", "{}");
+    try engine.registerSeries("query.barrier.false", "{}", sid);
+    try engine.ingest(.{ .series_id = sid, .ts = 1, .value = 1.0, .tags_json = "{}" });
+    try waitForFlushForTest(engine, 1, 1_000);
+
+    const flushed_total = engine.metrics.flush_total.load(.monotonic);
+    try std.testing.expect(!(try engine.flushAndDrain(0)));
+    try waitForFlushForTest(engine, flushed_total, 0);
 }
 
 test "waitForFlushForTest waits through CAS snapshot publication" {
