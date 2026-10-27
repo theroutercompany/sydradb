@@ -394,6 +394,10 @@ pub const FanoutValue = struct {
 
 pub const FanoutColumnInput = struct {
     name: []const u8,
+    /// Values with the same timestamp are ordered from oldest to newest
+    /// publication. Legacy scalar fanout has no logical-row write sequence, so
+    /// reconstruction uses the last published value just as the public fanout
+    /// reader does. An explicit write_sequence, when present, takes precedence.
     values: []const FanoutValue,
 };
 
@@ -482,6 +486,11 @@ const NormalizedValue = struct {
     value_bits: u64,
     write_sequence: ?u64,
     conflicted: bool,
+};
+
+const IndexedFanoutValue = struct {
+    value: FanoutValue,
+    publication_ordinal: usize,
 };
 
 const NormalizedColumn = struct {
@@ -876,23 +885,30 @@ fn normalizeColumn(
     source: FanoutColumnInput,
     diagnostics: *std.array_list.Managed(ReconstructionDiagnostic),
 ) !NormalizedColumn {
-    const sorted = try alloc.dupe(FanoutValue, source.values);
+    const sorted = try alloc.alloc(IndexedFanoutValue, source.values.len);
     defer alloc.free(sorted);
-    std.mem.sort(FanoutValue, sorted, {}, fanoutValueLessThan);
+    for (source.values, 0..) |value, publication_ordinal| {
+        sorted[publication_ordinal] = .{
+            .value = value,
+            .publication_ordinal = publication_ordinal,
+        };
+    }
+    std.mem.sort(IndexedFanoutValue, sorted, {}, indexedFanoutValueLessThan);
 
     var normalized = std.array_list.Managed(NormalizedValue).init(alloc);
     errdefer normalized.deinit();
     var cursor: usize = 0;
     while (cursor < sorted.len) {
         const start = cursor;
-        const ts_ns = sorted[cursor].ts_ns;
-        while (cursor < sorted.len and sorted[cursor].ts_ns == ts_ns) : (cursor += 1) {}
+        const ts_ns = sorted[cursor].value.ts_ns;
+        while (cursor < sorted.len and sorted[cursor].value.ts_ns == ts_ns) : (cursor += 1) {}
         const group = sorted[start..cursor];
         var conflicted = false;
         var saw_sequence = false;
         var saw_missing_sequence = false;
         var highest_sequence: ?u64 = null;
-        for (group) |candidate| {
+        for (group) |indexed| {
+            const candidate = indexed.value;
             if (candidate.write_sequence) |sequence| {
                 saw_sequence = true;
                 if (highest_sequence == null or sequence > highest_sequence.?) {
@@ -903,7 +919,7 @@ fn normalizeColumn(
             }
         }
 
-        var selected_bits = group[0].value_bits;
+        var selected_bits = group[0].value.value_bits;
         if (saw_sequence and saw_missing_sequence) {
             try appendDiagnostic(
                 alloc,
@@ -922,7 +938,8 @@ fn normalizeColumn(
             highest_sequence = null;
         } else if (saw_sequence) {
             var winner_found = false;
-            for (group) |candidate| {
+            for (group) |indexed| {
+                const candidate = indexed.value;
                 if (candidate.write_sequence.? != highest_sequence.?) continue;
                 if (!winner_found) {
                     selected_bits = candidate.value_bits;
@@ -946,24 +963,7 @@ fn normalizeColumn(
                 }
             }
         } else {
-            for (group[1..]) |candidate| {
-                if (candidate.value_bits == selected_bits) continue;
-                try appendDiagnostic(
-                    alloc,
-                    diagnostics,
-                    input,
-                    .blocker,
-                    .conflicting_duplicate_bits,
-                    ts_ns,
-                    source.name,
-                    &.{},
-                    selected_bits,
-                    candidate.value_bits,
-                    1,
-                );
-                conflicted = true;
-                break;
-            }
+            selected_bits = group[group.len - 1].value.value_bits;
         }
         try normalized.append(.{
             .ts_ns = ts_ns,
@@ -1106,10 +1106,9 @@ fn seriesInventoryLessThan(_: void, a: SeriesInventory, b: SeriesInventory) bool
     return ProgressKey.lessThan({}, a.key, b.key);
 }
 
-fn fanoutValueLessThan(_: void, a: FanoutValue, b: FanoutValue) bool {
-    if (a.ts_ns != b.ts_ns) return a.ts_ns < b.ts_ns;
-    if (a.value_bits != b.value_bits) return a.value_bits < b.value_bits;
-    return optionalU64Order(a.write_sequence, b.write_sequence) == .lt;
+fn indexedFanoutValueLessThan(_: void, a: IndexedFanoutValue, b: IndexedFanoutValue) bool {
+    if (a.value.ts_ns != b.value.ts_ns) return a.value.ts_ns < b.value.ts_ns;
+    return a.publication_ordinal < b.publication_ordinal;
 }
 
 fn diagnosticLessThan(_: void, a: ReconstructionDiagnostic, b: ReconstructionDiagnostic) bool {
@@ -1130,13 +1129,6 @@ fn diagnosticLessThan(_: void, a: ReconstructionDiagnostic, b: ReconstructionDia
 }
 
 fn optionalI64Order(a: ?i64, b: ?i64) std.math.Order {
-    if (a == null and b == null) return .eq;
-    if (a == null) return .lt;
-    if (b == null) return .gt;
-    return std.math.order(a.?, b.?);
-}
-
-fn optionalU64Order(a: ?u64, b: ?u64) std.math.Order {
     if (a == null and b == null) return .eq;
     if (a == null) return .lt;
     if (b == null) return .gt;
@@ -1496,7 +1488,7 @@ test "fanout reconstruction forms complete rows and coalesces exact duplicate bi
     try std.testing.expectEqual(@as(usize, 0), result.diagnostics.len);
 }
 
-test "fanout reconstruction reports exact gaps conflicts and sequence limitation" {
+test "fanout reconstruction reports exact gaps and sequence limitation" {
     const alloc = std.testing.allocator;
     const labels = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}";
     const metric = "market.trade";
@@ -1527,10 +1519,14 @@ test "fanout reconstruction reports exact gaps conflicts and sequence limitation
     });
     defer result.deinit();
 
-    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
-    try std.testing.expectEqual(@as(u64, 2), result.blockerCount());
+    try std.testing.expectEqual(@as(usize, 2), result.rows.len);
+    try std.testing.expectEqual(@as(u64, 1), result.blockerCount());
+    try std.testing.expectEqual(@as(i64, 20), result.rows[1].ts_ns);
+    try std.testing.expectEqual(
+        @as(u64, @bitCast(@as(f64, 102.0))),
+        result.rows[1].value_bits[0],
+    );
     var found_gap = false;
-    var found_conflict = false;
     var found_sequence_limitation = false;
     for (result.diagnostics) |diagnostic| switch (diagnostic.kind) {
         .missing_columns => {
@@ -1541,11 +1537,7 @@ test "fanout reconstruction reports exact gaps conflicts and sequence limitation
             try std.testing.expectEqual(@as(usize, 1), diagnostic.missing_columns.len);
             try std.testing.expectEqualStrings("size", diagnostic.missing_columns[0]);
         },
-        .conflicting_duplicate_bits => {
-            found_conflict = true;
-            try std.testing.expectEqual(@as(?i64, 20), diagnostic.ts_ns);
-            try std.testing.expectEqualStrings("price", diagnostic.column.?);
-        },
+        .conflicting_duplicate_bits => {},
         .sequence_history_unavailable => {
             found_sequence_limitation = true;
             try std.testing.expectEqual(.limitation, diagnostic.severity);
@@ -1554,8 +1546,65 @@ test "fanout reconstruction reports exact gaps conflicts and sequence limitation
         .inconsistent_write_sequence => {},
     };
     try std.testing.expect(found_gap);
-    try std.testing.expect(found_conflict);
     try std.testing.expect(found_sequence_limitation);
+}
+
+test "fanout reconstruction deterministically preserves last-published corrections" {
+    const alloc = std.testing.allocator;
+    const labels = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}";
+    const metric = "market.trade";
+    const ordered = [_][]const u8{ "price", "size" };
+    const digest = market_identity.schemaDigest(metric, &ordered, &.{ "symbol", "venue" }, "fanout_v1");
+    const price = [_]FanoutValue{
+        FanoutValue.fromF64(20, 200),
+        FanoutValue.fromF64(10, 100),
+        FanoutValue.fromF64(20, 201),
+        FanoutValue.fromF64(10, 101),
+    };
+    const size = [_]FanoutValue{
+        FanoutValue.fromF64(10, 5),
+        FanoutValue.fromF64(20, 7),
+        FanoutValue.fromF64(10, 6),
+        FanoutValue.fromF64(20, 8),
+    };
+    const columns = [_]FanoutColumnInput{
+        .{ .name = "price", .values = &price },
+        .{ .name = "size", .values = &size },
+    };
+    const input = FanoutSeriesInput{
+        .schema_digest = digest,
+        .market_series_id = market_identity.seriesId(metric, labels),
+        .metric = metric,
+        .canonical_labels = labels,
+        .ordered_columns = &ordered,
+        .columns = &columns,
+    };
+
+    var first = try reconstructFanoutSeries(alloc, input);
+    defer first.deinit();
+    var second = try reconstructFanoutSeries(alloc, input);
+    defer second.deinit();
+
+    try std.testing.expectEqual(@as(u64, 0), first.blockerCount());
+    try std.testing.expectEqual(@as(usize, 2), first.rows.len);
+    try std.testing.expectEqual(@as(usize, first.rows.len), second.rows.len);
+    const expected = [_][2]u64{
+        .{ @bitCast(@as(f64, 101)), @bitCast(@as(f64, 6)) },
+        .{ @bitCast(@as(f64, 201)), @bitCast(@as(f64, 8)) },
+    };
+    for (first.rows, second.rows, expected, 0..) |first_row, second_row, row_bits, index| {
+        try std.testing.expectEqual(@as(i64, @intCast((index + 1) * 10)), first_row.ts_ns);
+        try std.testing.expectEqual(first_row.ts_ns, second_row.ts_ns);
+        try std.testing.expectEqualSlices(u64, &row_bits, first_row.value_bits);
+        try std.testing.expectEqualSlices(u64, first_row.value_bits, second_row.value_bits);
+        try std.testing.expectEqual(@as(?u64, null), first_row.write_sequence);
+    }
+    try std.testing.expectEqual(@as(usize, 1), first.diagnostics.len);
+    try std.testing.expectEqual(
+        DiagnosticKind.sequence_history_unavailable,
+        first.diagnostics[0].kind,
+    );
+    try std.testing.expectEqual(@as(u64, 2), first.diagnostics[0].affected_rows);
 }
 
 test "fanout reconstruction selects the highest complete write sequence" {
