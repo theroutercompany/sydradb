@@ -113,7 +113,8 @@ pub const State = struct {
 
     pub fn loadOrInit(alloc: std.mem.Allocator, data_dir: std.fs.Dir, fsync: cfg.FsyncPolicy) !State {
         var root = try data_dir.openDir(".", .{ .iterate = true });
-        errdefer root.close();
+        var root_transferred = false;
+        errdefer if (!root_transferred) root.close();
         var state = State{
             .alloc = alloc,
             .fsync = fsync,
@@ -121,6 +122,7 @@ pub const State = struct {
             .checkpoints = std.array_list.Managed(Checkpoint).init(alloc),
             .runtimes = std.array_list.Managed(DefinitionRuntime).init(alloc),
         };
+        root_transferred = true;
         errdefer state.deinit();
 
         const body = state.root.readFileAlloc(alloc, path, 4 * 1024 * 1024) catch |err| switch (err) {
@@ -711,4 +713,21 @@ test "market runtime persists lifecycle state across reload" {
         try std.testing.expect(reloaded.runtimeFor("rollup", "bars-1m", 2) == null);
         try std.testing.expect(reloaded.getHighwater("rollup", "bars-1m", 2, "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}") == null);
     }
+}
+
+test "market runtime malformed reload does not double close root" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try tmp.dir.createFile(path, .{});
+    try file.writeAll("{");
+    file.close();
+
+    const result = State.loadOrInit(alloc, tmp.dir, .none);
+    if (result) |loaded| {
+        var state = loaded;
+        state.deinit();
+        return error.TestUnexpectedResult;
+    } else |_| {}
 }

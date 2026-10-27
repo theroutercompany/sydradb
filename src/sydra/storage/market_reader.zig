@@ -80,7 +80,9 @@ pub const MarketReader = struct {
 
     const LocalSource = struct {
         data_dir: std.fs.Dir,
-        catalog: *market_catalog.Catalog,
+        catalog: ?*market_catalog.Catalog,
+        schema_snapshot: ?*const market_catalog.MarketSchema = null,
+        series_snapshot: ?[]const market_catalog.MarketSeriesIdentity = null,
         manifest: *const market_manifest.Manifest,
         memtable: ?*const market_memtable.MarketMemtable = null,
     };
@@ -92,6 +94,19 @@ pub const MarketReader = struct {
     const Source = union(enum) {
         local: LocalSource,
         revision: RevisionSource,
+    };
+
+    const RegisteredSeriesView = struct {
+        entries: []const market_catalog.MarketSeriesIdentity,
+        owned: ?[]market_catalog.MarketSeriesIdentity = null,
+
+        fn deinit(self: *RegisteredSeriesView, alloc: std.mem.Allocator) void {
+            if (self.owned) |entries| {
+                for (entries) |*entry| entry.deinit(alloc);
+                alloc.free(entries);
+            }
+            self.* = undefined;
+        }
     };
 
     pub fn init(
@@ -106,6 +121,29 @@ pub const MarketReader = struct {
             .source = .{ .local = .{
                 .data_dir = data_dir,
                 .catalog = catalog,
+                .manifest = manifest,
+                .memtable = memtable,
+            } },
+        };
+    }
+
+    /// Bind a live read to an Engine-owned catalog snapshot while continuing
+    /// to decode the Engine's manifest and memtable under its data lock.
+    pub fn initLocalSnapshot(
+        allocator: std.mem.Allocator,
+        data_dir: std.fs.Dir,
+        schema: *const market_catalog.MarketSchema,
+        registered_series: []const market_catalog.MarketSeriesIdentity,
+        manifest: *const market_manifest.Manifest,
+        memtable: ?*const market_memtable.MarketMemtable,
+    ) MarketReader {
+        return .{
+            .allocator = allocator,
+            .source = .{ .local = .{
+                .data_dir = data_dir,
+                .catalog = null,
+                .schema_snapshot = schema,
+                .series_snapshot = registered_series,
                 .manifest = manifest,
                 .memtable = memtable,
             } },
@@ -144,11 +182,8 @@ pub const MarketReader = struct {
         var filter = try LabelFilter.init(self.allocator, request.label_filter_json);
         defer filter.deinit(self.allocator);
 
-        const registered = try self.registeredSeries();
-        defer {
-            for (registered) |*entry| entry.deinit(self.allocator);
-            self.allocator.free(registered);
-        }
+        var registered = try self.registeredSeriesForMetric(request.metric);
+        defer registered.deinit(self.allocator);
 
         var candidates = ManagedArrayList(CandidateRow).init(self.allocator);
         defer {
@@ -162,7 +197,7 @@ pub const MarketReader = struct {
         var saw_matching_series = false;
         var saw_native_source = false;
 
-        for (registered) |series| {
+        for (registered.entries) |series| {
             if (!std.mem.eql(u8, series.metric, request.metric)) continue;
             if (!try filter.matches(self.allocator, series.canonical_labels)) continue;
             saw_matching_series = true;
@@ -227,8 +262,13 @@ pub const MarketReader = struct {
         metric: []const u8,
     ) !market_catalog.MarketSchema {
         return switch (self.source) {
-            .local => |local| local.catalog.getSchema(metric) orelse
-                error.UnknownMarketSchema,
+            .local => |local| if (local.schema_snapshot) |schema|
+                if (std.mem.eql(u8, schema.metric, metric))
+                    try schema.clone(self.allocator)
+                else
+                    error.UnknownMarketSchema
+            else
+                local.catalog.?.getSchema(metric) orelse error.UnknownMarketSchema,
             .revision => |revision| blk: {
                 const snapshot = revision.snapshot_index.snapshot.market_catalog_snapshot orelse
                     return error.NativeMarketDataUnavailable;
@@ -242,28 +282,23 @@ pub const MarketReader = struct {
         };
     }
 
-    fn registeredSeries(self: *const MarketReader) ![]market_catalog.MarketSeriesIdentity {
+    fn registeredSeriesForMetric(
+        self: *const MarketReader,
+        metric: []const u8,
+    ) !RegisteredSeriesView {
         return switch (self.source) {
-            .local => |local| try local.catalog.listMarketSeries(),
+            .local => |local| if (local.series_snapshot) |entries|
+                .{ .entries = entries }
+            else blk: {
+                const entries = try local.catalog.?.listMarketSeriesForMetric(metric);
+                break :blk .{ .entries = entries, .owned = entries };
+            },
             .revision => |revision| blk: {
                 const snapshot = revision.snapshot_index.snapshot.market_catalog_snapshot orelse
                     return error.NativeMarketDataUnavailable;
                 const entries = snapshot.market_series orelse
                     return error.NativeMarketDataUnavailable;
-                const cloned = try self.allocator.alloc(
-                    market_catalog.MarketSeriesIdentity,
-                    entries.len,
-                );
-                errdefer self.allocator.free(cloned);
-                var initialized: usize = 0;
-                errdefer {
-                    for (cloned[0..initialized]) |*entry| entry.deinit(self.allocator);
-                }
-                for (entries, 0..) |entry, idx| {
-                    cloned[idx] = try entry.clone(self.allocator);
-                    initialized += 1;
-                }
-                break :blk cloned;
+                break :blk .{ .entries = entries };
             },
         };
     }
@@ -313,7 +348,7 @@ pub const MarketReader = struct {
 
             try market_segment.validateExpectedSchema(&segment_result.metadata, .{
                 .market_series_id = series.series_id,
-                .schema_digest = series.schema_digest,
+                .schema_digest = nativeSchemaDigest(schema),
                 .metric = series.metric,
                 .canonical_labels = series.canonical_labels,
                 .hour = descriptor.hour_bucket,
@@ -418,7 +453,7 @@ pub const MarketReader = struct {
 
             market_segment.validateExpectedSchema(&segment_result.metadata, .{
                 .market_series_id = series.series_id,
-                .schema_digest = series.schema_digest,
+                .schema_digest = nativeSchemaDigest(schema),
                 .metric = series.metric,
                 .canonical_labels = series.canonical_labels,
                 .hour = descriptor.hour_bucket,
@@ -722,13 +757,25 @@ fn hasAnyManifestDescriptorForSeries(
     return false;
 }
 
+fn nativeSchemaDigest(schema: market_catalog.MarketSchema) SchemaDigest {
+    return market_identity.schemaDigest(
+        schema.metric,
+        schema.ordered_columns,
+        schema.required_labels,
+        market_catalog.StorageMapping.native_v1.text(),
+    );
+}
+
 fn validateDescriptorAgainstSchema(
     descriptor: market_manifest.MarketSegmentDescriptor,
     series: market_catalog.MarketSeriesIdentity,
     schema: market_catalog.MarketSchema,
 ) !void {
+    const catalog_digest = schema.digest();
+    const segment_digest = nativeSchemaDigest(schema);
     if (descriptor.market_series_id != series.series_id or
-        !std.mem.eql(u8, &descriptor.schema_digest, &series.schema_digest) or
+        !std.mem.eql(u8, &series.schema_digest, &catalog_digest) or
+        !std.mem.eql(u8, &descriptor.schema_digest, &segment_digest) or
         !std.mem.eql(u8, descriptor.metric, series.metric) or
         !std.mem.eql(u8, descriptor.canonical_labels, series.canonical_labels) or
         !stringSlicesEql(descriptor.column_names, schema.ordered_columns))
@@ -756,8 +803,11 @@ fn validateCasDescriptorAgainstSchema(
     series: market_catalog.MarketSeriesIdentity,
     schema: market_catalog.MarketSchema,
 ) !void {
+    const catalog_digest = schema.digest();
+    const segment_digest = nativeSchemaDigest(schema);
     if (descriptor.market_series_id != series.series_id or
-        !std.mem.eql(u8, &descriptor.schema_digest, &series.schema_digest) or
+        !std.mem.eql(u8, &series.schema_digest, &catalog_digest) or
+        !std.mem.eql(u8, &descriptor.schema_digest, &segment_digest) or
         !std.mem.eql(u8, descriptor.metric, series.metric) or
         !std.mem.eql(u8, descriptor.canonical_labels, series.canonical_labels) or
         !stringSlicesEql(descriptor.column_names, schema.ordered_columns))
@@ -1191,6 +1241,57 @@ test "native reader projects and prunes segment blocks" {
     try std.testing.expectEqual(@as(u64, 1), result.stats.blocks_scanned);
     try std.testing.expectEqual(@as(u64, 1), result.stats.columns_read);
     try std.testing.expect(result.stats.bytes_decoded > 0);
+}
+
+test "native reader accepts migration catalogs for native segments" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const column_names = [_][]const u8{ "price", "size" };
+    var catalog = market_catalog.Catalog.initEmpty(alloc, .none);
+    defer catalog.deinit();
+    var schema = try catalog.registerSchema(.{
+        .metric = "market.migration",
+        .ordered_columns = &column_names,
+        .required_labels = &.{"symbol"},
+        .storage_mapping = .fanout_v1,
+    });
+    defer schema.deinit(alloc);
+    var series = try catalog.registerMarketSeries(
+        "market.migration",
+        "{\"symbol\":\"AAPL\"}",
+    );
+    defer series.deinit(alloc);
+
+    var native_identity = series;
+    native_identity.schema_digest = nativeSchemaDigest(schema);
+    var manifest = market_manifest.Manifest.init(alloc);
+    defer manifest.deinit();
+    const values = [_]f64{ 101.5, 7.0 };
+    const rows = [_]market_segment.MarketRowView{
+        .{ .ts_ns = 10, .write_sequence = 1, .values = &values },
+    };
+    try addSegmentToManifest(
+        alloc,
+        tmp.dir,
+        &manifest,
+        native_identity,
+        &column_names,
+        &rows,
+    );
+
+    var reader = MarketReader.init(alloc, tmp.dir, &catalog, &manifest, null);
+    var result = try reader.query(.{
+        .metric = "market.migration",
+        .label_filter_json = "{\"symbol\":\"AAPL\"}",
+        .start_ts_ns = 0,
+        .end_ts_ns = 20,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.rows.len);
+    try std.testing.expectEqualSlices(f64, &values, result.rows[0].values);
 }
 
 test "native reader applies highest write sequence across segment and memtable" {

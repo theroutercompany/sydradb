@@ -825,17 +825,17 @@ fn resolveDeleteWriteTarget(
     selector: ast.Selector,
 ) PrepareError!bytecode.WriteTarget {
     const resolution = switch (selector.series) {
-        .name => |name| engine.resolveSelector(.{ .name = name.value }) catch return error.NotImplemented,
-        .by_id => |by_id| engine.resolveSelector(.{ .by_id = @intCast(by_id.value) }) catch return error.NotImplemented,
+        .name => |name| try engine.resolveSimpleSelectorOwned(allocator, .{ .name = name.value }),
+        .by_id => |by_id| try engine.resolveSimpleSelectorOwned(allocator, .{ .by_id = @intCast(by_id.value) }),
     };
     return switch (resolution.status) {
         .resolved, .exact_match => .{
             .series_id = resolution.series_id.?,
-            .series_name = try allocator.dupe(u8, resolution.series orelse switch (selector.series) {
+            .series_name = resolution.series orelse switch (selector.series) {
                 .name => |name| name.value,
                 .by_id => "by_id",
-            }),
-            .tags_json = try allocator.dupe(u8, resolution.canonical_tags orelse "{}"),
+            },
+            .tags_json = resolution.canonical_tags orelse "{}",
         },
         .not_found, .ambiguous => error.NotImplemented,
     };
@@ -2180,6 +2180,128 @@ test "prepared statement evaluates selector tags through the tag cursor" {
     try std.testing.expectEqualStrings("a", grouped_row.row[0].string);
     try std.testing.expectApproxEqAbs(@as(f64, 2.0), grouped_row.row[1].float, 1e-9);
     try std.testing.expect((try grouped_stmt.step()) == .done);
+}
+
+test "prepared VM retains selector metadata across CAS index replacement" {
+    // Refresh must make any slice into the old snapshot unusable for this test to stay causal.
+    const PoisonFreeAllocator = struct {
+        backing: std.mem.Allocator,
+
+        const vtable = std.mem.Allocator.VTable{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        };
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &vtable };
+        }
+
+        fn alloc(
+            context: *anyopaque,
+            len: usize,
+            alignment: std.mem.Alignment,
+            return_address: usize,
+        ) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return self.backing.rawAlloc(len, alignment, return_address);
+        }
+
+        fn resize(
+            context: *anyopaque,
+            memory: []u8,
+            alignment: std.mem.Alignment,
+            new_len: usize,
+            return_address: usize,
+        ) bool {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return self.backing.rawResize(memory, alignment, new_len, return_address);
+        }
+
+        fn remap(
+            context: *anyopaque,
+            memory: []u8,
+            alignment: std.mem.Alignment,
+            new_len: usize,
+            return_address: usize,
+        ) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            return self.backing.rawRemap(memory, alignment, new_len, return_address);
+        }
+
+        fn free(
+            context: *anyopaque,
+            memory: []u8,
+            alignment: std.mem.Alignment,
+            return_address: usize,
+        ) void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            @memset(memory, 0xa5);
+            self.backing.rawFree(memory, alignment, return_address);
+        }
+    };
+
+    var poison_allocator = PoisonFreeAllocator{ .backing = std.testing.allocator };
+    const alloc = poison_allocator.allocator();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/prepared-selector-snapshot-lifetime", .{tmp.sub_path});
+    defer alloc.free(data_path);
+
+    const config: @import("../config.zig").Config = .{
+        .data_dir = try alloc.dupe(u8, data_path),
+        .http_port = 0,
+        .fsync = .none,
+        .flush_interval_ms = 5,
+        .memtable_max_bytes = 1024,
+        .retention_days = 0,
+        .auth_token = try alloc.dupe(u8, ""),
+        .enable_influx = false,
+        .enable_prom = false,
+        .mem_limit_bytes = 1024 * 1024,
+        .cas_mode = .dual_write,
+        .metadata_read_mode = .primary,
+        .retention_ns = std.StringHashMap(u32).init(alloc),
+    };
+    var engine = try engine_mod.Engine.init(alloc, config);
+    defer engine.deinit();
+
+    const series_name = "selector_lifetime.room1";
+    const canonical_tags = "{\"host\":\"before\"}";
+    const series_id = types.seriesIdFrom(series_name, canonical_tags);
+    try engine.registerSeries(series_name, canonical_tags, series_id);
+    try engine.ingest(.{
+        .series_id = series_id,
+        .ts = 10,
+        .value = 1.0,
+        .tags_json = canonical_tags,
+    });
+    _ = try engine.flushNow();
+
+    var stmt = try prepareSqlCore(
+        alloc,
+        engine,
+        "SELECT tag.host AS host, value FROM selector_lifetime.room1 WHERE time >= 0 ORDER BY time ASC LIMIT 1",
+        .{},
+    );
+    defer stmt.finalize();
+
+    const replacement_name = "selector_lifetime.unrelated";
+    const replacement_tags = "{\"host\":\"after\"}";
+    try engine.registerSeries(
+        replacement_name,
+        replacement_tags,
+        types.seriesIdFrom(replacement_name, replacement_tags),
+    );
+    _ = try engine.flushNow();
+
+    const row = try stmt.step();
+    try std.testing.expect(row == .row);
+    try std.testing.expectEqualStrings("before", row.row[0].string);
+    try std.testing.expectApproxEqAbs(@as(f64, 1.0), row.row[1].float, 1e-9);
+    try std.testing.expect((try stmt.step()) == .done);
 }
 
 test "binding context tracks named parameter slots" {

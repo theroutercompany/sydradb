@@ -149,12 +149,22 @@ pub const ObjectStore = struct {
 
     pub fn init(allocator: std.mem.Allocator, path: []const u8, fsync: cfg.FsyncPolicy) !ObjectStore {
         var cwd = std.fs.cwd();
-        try cwd.makePath(path);
-        const root = try cwd.openDir(path, .{ .iterate = true });
+        const existing_parent = if (shouldSync(fsync)) try nearestExistingParent(cwd, path) else null;
+        const path_status = try cwd.makePathStatus(path);
+        var root = try cwd.openDir(path, .{ .iterate = true });
+        errdefer root.close();
         try root.makePath("objects");
         try root.makePath("objects/packs");
         try root.makePath("objects/info");
         try root.makePath("refs");
+        if (shouldSync(fsync)) {
+            try syncParentDirs(root, "objects/packs");
+            try syncParentDirs(root, "objects/info");
+            try syncParentDirs(root, "refs");
+            if (path_status == .created) {
+                try syncCreatedPathParents(cwd, path, existing_parent.?);
+            }
+        }
         return .{
             .allocator = allocator,
             .root = root,
@@ -207,7 +217,8 @@ pub const ObjectStore = struct {
             else => return err,
         };
         if (shouldSync(self.fsync)) {
-            try syncDir(&bucket_dir);
+            try syncDir(bucket_dir);
+            try syncDir(objects_dir);
         }
         return id;
     }
@@ -380,7 +391,7 @@ pub const ObjectStore = struct {
             else => return err,
         };
         if (shouldSync(self.fsync)) {
-            try syncDir(&bucket_dir);
+            try syncDir(bucket_dir);
         }
     }
 
@@ -525,7 +536,7 @@ pub const ObjectStore = struct {
         try self.root.rename(tmp_rev_rel, rev_rel);
         try self.root.rename(tmp_manifest_rel, manifest_rel);
         if (shouldSync(self.fsync)) {
-            try syncDir(&self.root);
+            try syncParentDirs(self.root, pack_rel);
         }
         if (refresh_active_indexes) {
             try self.rebuildMultiPackIndex(allocator);
@@ -810,10 +821,12 @@ pub const ObjectStore = struct {
         defer freeOwnedStrings(allocator, idx_paths);
 
         if (idx_paths.len == 0) {
+            var deleted = true;
             self.root.deleteFile(midxPath) catch |err| switch (err) {
-                error.FileNotFound => {},
+                error.FileNotFound => deleted = false,
                 else => return err,
             };
+            if (deleted and shouldSync(self.fsync)) try syncParentDirs(self.root, midxPath);
             return;
         }
 
@@ -885,7 +898,7 @@ pub const ObjectStore = struct {
             else => return err,
         };
         if (shouldSync(self.fsync)) {
-            try syncDir(&self.root);
+            try syncParentDirs(self.root, midxPath);
         }
     }
 
@@ -940,9 +953,67 @@ fn shouldSync(policy: cfg.FsyncPolicy) bool {
     return policy != .none;
 }
 
-fn syncDir(dir: *std.fs.Dir) !void {
-    if (@hasDecl(std.fs.Dir, "sync")) {
-        try dir.sync();
+fn syncDir(dir: std.fs.Dir) !void {
+    // Linux opens non-iterable Dir handles with O_PATH, which fsync rejects.
+    var sync_dir = try dir.openDir(".", .{ .iterate = true });
+    defer sync_dir.close();
+    try std.posix.fsync(sync_dir.fd);
+}
+
+fn syncParentDirs(root: std.fs.Dir, path: []const u8) !void {
+    // Sync the deepest containing directory first, then its ancestors.
+    const parent_path = std.fs.path.dirname(path) orelse "";
+    var parent_end = parent_path.len;
+    while (parent_end > 0) {
+        const prefix = parent_path[0..parent_end];
+        {
+            var parent = try root.openDir(prefix, .{});
+            defer parent.close();
+            try syncDir(parent);
+        }
+        parent_end = (std.mem.lastIndexOfScalar(u8, prefix, '/') orelse break);
+    }
+
+    var root_dir = try root.openDir(".", .{});
+    defer root_dir.close();
+    try syncDir(root_dir);
+}
+
+fn nearestExistingParent(root: std.fs.Dir, path: []const u8) ![]const u8 {
+    var existing_target = root.openDir(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (existing_target) |*target| {
+        target.close();
+        // The existing target's parent is the anchor; it does not need opening.
+        return std.fs.path.dirname(path) orelse ".";
+    }
+
+    var parent_path = std.fs.path.dirname(path) orelse ".";
+    while (true) {
+        var parent = root.openDir(parent_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => {
+                parent_path = std.fs.path.dirname(parent_path) orelse ".";
+                continue;
+            },
+            else => return err,
+        };
+        parent.close();
+        return parent_path;
+    }
+}
+
+fn syncCreatedPathParents(root: std.fs.Dir, path: []const u8, existing_parent: []const u8) !void {
+    var parent_path = std.fs.path.dirname(path) orelse ".";
+    while (true) {
+        {
+            var parent = try root.openDir(parent_path, .{});
+            defer parent.close();
+            try syncDir(parent);
+        }
+        if (std.mem.eql(u8, parent_path, existing_parent)) return;
+        parent_path = std.fs.path.dirname(parent_path) orelse ".";
     }
 }
 
@@ -1351,8 +1422,7 @@ fn writePackReverseIndexFile(
         else => return err,
     };
     if (shouldSync(fsync)) {
-        var root_for_sync = root;
-        try syncDir(&root_for_sync);
+        try syncParentDirs(root, rev_path);
     }
 }
 
@@ -1547,8 +1617,7 @@ fn writePackManifestFile(
         else => return err,
     };
     if (shouldSync(fsync)) {
-        var root_for_sync = root;
-        try syncDir(&root_for_sync);
+        try syncParentDirs(root, manifest_path);
     }
 }
 
@@ -1674,8 +1743,7 @@ fn writePackInventory(
         else => return err,
     };
     if (shouldSync(fsync)) {
-        var root_for_sync = root;
-        try syncDir(&root_for_sync);
+        try syncParentDirs(root, packInventoryPath);
     }
 }
 
@@ -1747,8 +1815,7 @@ fn writeAlternatesFile(
         else => return err,
     };
     if (shouldSync(fsync)) {
-        var root_for_sync = root;
-        try syncDir(&root_for_sync);
+        try syncParentDirs(root, alternatesPath);
     }
 }
 
@@ -1769,7 +1836,7 @@ test "object store write/read round-trip" {
 
     const store_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/object-store", .{tmp_dir.sub_path});
     defer std.testing.allocator.free(store_path);
-    var store = try ObjectStore.init(std.testing.allocator, store_path, .none);
+    var store = try ObjectStore.init(std.testing.allocator, store_path, .always);
     defer store.deinit();
 
     const payload = "hello world";
@@ -1822,7 +1889,7 @@ test "object store can read packed objects after loose copies are pruned" {
 
     const store_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/object-store-pack", .{tmp_dir.sub_path});
     defer std.testing.allocator.free(store_path);
-    var store = try ObjectStore.init(std.testing.allocator, store_path, .none);
+    var store = try ObjectStore.init(std.testing.allocator, store_path, .always);
     defer store.deinit();
 
     const blob_id = try store.put(.blob, "packed blob");
