@@ -149,7 +149,50 @@ pub fn build(b: *std.Build) void {
     }
 
     const test_run = b.addRunArtifact(unit_tests);
-    b.step("test", "Run tests").dependOn(&test_run.step);
+    const aggregate_test_step = b.step("test", "Run application, storage, and runtime tests");
+    aggregate_test_step.dependOn(&test_run.step);
+
+    const runtime_tests = if (is015) blk_runtime_tests: {
+        const root_mod = b.createModule(.{ .root_source_file = b.path("src/runtime_tests.zig"), .target = target, .optimize = optimize });
+        root_mod.addImport("build_options", build_options_module);
+        if (use_mimalloc) {
+            root_mod.addIncludePath(mimalloc_include);
+            root_mod.addIncludePath(mimalloc_src_dir);
+        }
+        break :blk_runtime_tests b.addTest(.{ .root_module = root_mod });
+    } else blk_runtime_tests: {
+        const test_step = b.addTest(.{ .root_source_file = b.path("src/runtime_tests.zig"), .target = target, .optimize = optimize });
+        test_step.root_module.addImport("build_options", build_options_module);
+        if (use_mimalloc) {
+            test_step.addIncludePath(mimalloc_include);
+            test_step.addIncludePath(mimalloc_src_dir);
+            test_step.addCSourceFile(.{ .file = mimalloc_c_file, .flags = mimalloc_flags });
+            test_step.linkLibC();
+            test_step.linkSystemLibrary("pthread");
+        }
+        break :blk_runtime_tests test_step;
+    };
+    if (use_mimalloc and is015) {
+        runtime_tests.addCSourceFile(.{ .file = mimalloc_c_file, .flags = mimalloc_flags });
+        runtime_tests.linkLibC();
+        runtime_tests.linkSystemLibrary("pthread");
+    } else if (!use_mimalloc) {
+        runtime_tests.linkLibC();
+        if (os_tag == .linux) runtime_tests.linkSystemLibrary("pthread");
+    }
+    const runtime_test_run = b.addRunArtifact(runtime_tests);
+    b.step("runtime-test", "Run engine and HTTP runtime tests").dependOn(&runtime_test_run.step);
+    aggregate_test_step.dependOn(&runtime_test_run.step);
+
+    const storage_tests = if (is015) blk_storage_tests: {
+        const root_mod = b.createModule(.{ .root_source_file = b.path("src/storage_tests.zig"), .target = target, .optimize = optimize });
+        break :blk_storage_tests b.addTest(.{ .root_module = root_mod });
+    } else blk_storage_tests: {
+        break :blk_storage_tests b.addTest(.{ .root_source_file = b.path("src/storage_tests.zig"), .target = target, .optimize = optimize });
+    };
+    const storage_test_run = b.addRunArtifact(storage_tests);
+    b.step("storage-test", "Run Phase 1 native market storage tests").dependOn(&storage_test_run.step);
+    aggregate_test_step.dependOn(&storage_test_run.step);
 
     const pgwire_tests = if (is015) blk3: {
         const mod = b.createModule(.{ .root_source_file = b.path("src/compat_wire_tests.zig"), .target = target, .optimize = optimize });
@@ -267,6 +310,46 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| bench_sydraql_run.addArgs(args);
     b.step("bench-sydraql", "Run compiled SydraQL benchmark scenarios").dependOn(&bench_sydraql_run.step);
     bench_smoke.dependOn(&bench_sydraql_run.step);
+
+    const bench_market_storage_exe = if (is015) blk_market: {
+        const root_mod = b.createModule(.{ .root_source_file = b.path("tools/bench_market_storage.zig"), .target = target, .optimize = optimize });
+        root_mod.addImport("sydra_tooling", tooling_module);
+        if (use_mimalloc) {
+            root_mod.addIncludePath(mimalloc_include);
+            root_mod.addIncludePath(mimalloc_src_dir);
+        }
+        break :blk_market b.addExecutable(.{ .name = "bench_market_storage", .root_module = root_mod });
+    } else blk_market: {
+        const exe_inner = b.addExecutable(.{ .name = "bench_market_storage", .root_source_file = b.path("tools/bench_market_storage.zig"), .target = target, .optimize = optimize });
+        exe_inner.root_module.addImport("sydra_tooling", tooling_module);
+        if (use_mimalloc) {
+            exe_inner.addIncludePath(mimalloc_include);
+            exe_inner.addIncludePath(mimalloc_src_dir);
+            exe_inner.addCSourceFile(.{ .file = mimalloc_c_file, .flags = mimalloc_flags });
+            exe_inner.linkLibC();
+            exe_inner.linkSystemLibrary("pthread");
+        }
+        break :blk_market exe_inner;
+    };
+
+    if (use_mimalloc and is015) {
+        bench_market_storage_exe.addCSourceFile(.{ .file = mimalloc_c_file, .flags = mimalloc_flags });
+        bench_market_storage_exe.linkLibC();
+        bench_market_storage_exe.linkSystemLibrary("pthread");
+    } else if (!use_mimalloc) {
+        bench_market_storage_exe.linkLibC();
+        if (os_tag == .linux) bench_market_storage_exe.linkSystemLibrary("pthread");
+    }
+
+    const bench_market_storage_run = b.addRunArtifact(bench_market_storage_exe);
+    if (b.args) |args| bench_market_storage_run.addArgs(args);
+    b.step("bench-market-storage", "Run native market storage comparison scenarios").dependOn(&bench_market_storage_run.step);
+
+    const bench_market_storage_smoke_run = b.addRunArtifact(bench_market_storage_exe);
+    bench_market_storage_smoke_run.addArgs(&.{ "--rows", "256", "--query-iterations", "3", "--batch-rows", "64", "--fsync", "none", "--assert-smoke" });
+    const bench_market_storage_smoke = b.step("bench-market-storage-smoke", "Run smoke-sized market storage scenarios");
+    bench_market_storage_smoke.dependOn(&bench_market_storage_smoke_run.step);
+    bench_smoke.dependOn(&bench_market_storage_smoke_run.step);
 
     const bench_cas_exe = if (is015) blk6: {
         const root_mod = b.createModule(.{ .root_source_file = b.path("tools/bench_cas.zig"), .target = target, .optimize = optimize });

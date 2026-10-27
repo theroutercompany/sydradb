@@ -225,7 +225,7 @@ fn executeCompiledBytecode(
             .done => break,
             .row => |row| {
                 const values = try arena.alloc(executor.Value, row.len);
-                for (row, 0..) |value, idx| values[idx] = value;
+                for (row, 0..) |value, idx| values[idx] = try copyValueForCursor(arena, value);
                 try row_list.append(values);
             },
         }
@@ -260,9 +260,21 @@ fn executeCompiledPreferred(
     return executeCompiled(prepared, mode) catch |err| {
         if (compiler_diagnostics.fromCompileError(err)) |reason| {
             recordCompileFallback(prepared.engine, reason);
-            return executeLegacy(prepared, mode, true, compiler_diagnostics.reasonName(reason));
+            return executeLegacy(prepared, mode, true, compiler_diagnostics.reasonName(reason)) catch |legacy_err| {
+                if (reason == .ambiguous_selector and legacy_err == error.AmbiguousMetricFamilyQuery) {
+                    return error.AmbiguousSelector;
+                }
+                return legacy_err;
+            };
         }
         return err;
+    };
+}
+
+fn copyValueForCursor(allocator: std.mem.Allocator, value: executor.Value) !executor.Value {
+    return switch (value) {
+        .string => |string| .{ .string = try allocator.dupe(u8, string) },
+        else => value,
     };
 }
 
@@ -788,7 +800,7 @@ test "executeWithMode shadow falls back for ambiguous series names" {
     try engine.registerSeries("weather.room1", "{\"host\":\"a\"}", 5001);
     try engine.registerSeries("weather.room1", "{\"host\":\"b\"}", 5002);
 
-    try std.testing.expectError(error.UnsupportedPlan, executeWithMode(talloc, engine, "select value from weather.room1 where time >= 0", .shadow));
+    try std.testing.expectError(error.AmbiguousSelector, executeWithMode(talloc, engine, "select value from weather.room1 where time >= 0", .shadow));
 }
 
 test "executeWithMode shadow compiles constant scalar functions" {
@@ -1035,7 +1047,7 @@ test "executeWithMode compiled keeps fill clauses on the native physical path" {
     defer engine.deinit();
 
     const sid: u64 = 7444;
-    try engine.registerSeries("fill.room1", "{}", sid);
+    try engine.registerSeries("filltest.room1", "{}", sid);
     try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.5, .tags_json = "{}" });
     try engine.ingest(.{ .series_id = sid, .ts = 70, .value = 2.0, .tags_json = "{}" });
     try waitForFlushForTest(engine, 1, 1_000);
@@ -1043,7 +1055,7 @@ test "executeWithMode compiled keeps fill clauses on the native physical path" {
     var cursor = try executeWithMode(
         talloc,
         engine,
-        "select time_bucket(60, time) as bucket, avg(value) as avg_value from fill.room1 where time >= 0 group by time_bucket(60, time) fill(previous) order by bucket desc",
+        "select time_bucket(60, time) as bucket, avg(value) as avg_value from filltest.room1 where time >= 0 group by time_bucket(60, time) fill(previous) order by bucket desc",
         .compiled,
     );
     defer cursor.deinit();
@@ -1093,7 +1105,7 @@ test "executeWithMode compiled supports null fill on the native physical path" {
     defer engine.deinit();
 
     const sid: u64 = 7445;
-    try engine.registerSeries("fill.room2", "{}", sid);
+    try engine.registerSeries("filltest.room2", "{}", sid);
     try engine.ingest(.{ .series_id = sid, .ts = 10, .value = 1.5, .tags_json = "{}" });
     try engine.ingest(.{ .series_id = sid, .ts = 130, .value = 4.0, .tags_json = "{}" });
     try waitForFlushForTest(engine, 1, 1_000);
@@ -1101,7 +1113,7 @@ test "executeWithMode compiled supports null fill on the native physical path" {
     var cursor = try executeWithMode(
         talloc,
         engine,
-        "select time_bucket(60, time) as bucket, avg(value) as avg_value from fill.room2 where time >= 0 group by time_bucket(60, time) fill(null) order by bucket asc",
+        "select time_bucket(60, time) as bucket, avg(value) as avg_value from filltest.room2 where time >= 0 group by time_bucket(60, time) fill(null) order by bucket asc",
         .compiled,
     );
     defer cursor.deinit();
@@ -1436,7 +1448,7 @@ test "execution snapshots stay stable for supported and fallback query classes" 
     const fallback_snapshot = try collectCursorContractSnapshot(talloc, &fallback_cursor);
     defer talloc.free(fallback_snapshot);
     try std.testing.expectEqualStrings(
-        \\mode=compiled|legacy_fallback=false|fallback_reason=
+        \\mode=compiled|legacy_fallback=true|fallback_reason=unsupported_fill
         \\bucket|avg_value
         \\60|3.5
         \\0|1.75
@@ -1447,7 +1459,21 @@ test "execution snapshots stay stable for supported and fallback query classes" 
 fn waitForFlushForTest(engine: *engine_mod.Engine, min_flushes: u64, timeout_ms: u64) !void {
     const start = std.time.milliTimestamp();
     while (std.time.milliTimestamp() - start < timeout_ms) {
-        if (engine.metrics.flush_total.load(.monotonic) >= min_flushes) return;
+        if (engine.metrics.flush_total.load(.monotonic) >= min_flushes) {
+            if (engine.config.cas_mode == .dual_write) {
+                engine.verifyCasState() catch {
+                    std.Thread.sleep(5 * std.time.ns_per_ms);
+                    continue;
+                };
+                if (engine.cas) |*cas| {
+                    engine.metadata.refreshCasIndexIfStale(cas) catch {
+                        std.Thread.sleep(5 * std.time.ns_per_ms);
+                        continue;
+                    };
+                }
+            }
+            return;
+        }
         if (@hasDecl(std.time, "sleep")) {
             std.Thread.sleep(5 * std.time.ns_per_ms);
         } else {

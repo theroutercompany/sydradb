@@ -1,0 +1,59 @@
+{
+  "schema_version": 2,
+  "suite": "bench-market-storage",
+  "output_format": "jsonl",
+  "storage_modes": ["fanout_v1", "native_v1"],
+  "default_dimensions": {
+    "logical_rows": 1024,
+    "label_series": 4,
+    "query_iterations": 5,
+    "batch_rows": 256,
+    "fsync_policy": "none"
+  },
+  "fsync_policies": ["none", "interval", "always"],
+  "scale_dimensions": {
+    "logical_rows": [100000, 1000000]
+  },
+  "scenarios": [
+    {
+      "name": "trade",
+      "metric": "market.trade",
+      "ordered_columns": ["price", "size"],
+      "selected_columns": ["price"]
+    },
+    {
+      "name": "quote",
+      "metric": "market.quote",
+      "ordered_columns": ["bid", "ask", "bid_size", "ask_size"],
+      "selected_columns": ["bid", "ask"]
+    },
+    {
+      "name": "synthetic_8",
+      "metric": "bench.market.synthetic_8",
+      "ordered_columns": ["c0", "c1", "c2", "c3", "c4", "c5", "c6", "c7"],
+      "selected_columns": ["c0", "c7"]
+    }
+  ],
+  "metrics": [
+    "logical_rows_per_second",
+    "ingest_or_drain_logical_rows_per_second",
+    "enqueue_logical_rows_per_second",
+    "ingest_or_drain_elapsed_ns",
+    "physical_writes",
+    "wal_bytes",
+    "wal_payload_bytes",
+    "segment_bytes",
+    "storage_bytes",
+    "query_latency_p50_ns",
+    "query_latency_p95_ns",
+    "bytes_decoded",
+    "returned_point_bytes_estimate",
+    "peak_resident_estimate_bytes"
+  ],
+  "conditional_metrics": {
+    "fsync_always": [
+      "durable_elapsed_ns",
+      "durable_logical_rows_per_second"
+    ]
+  }
+}

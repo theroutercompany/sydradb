@@ -60,8 +60,21 @@ pub const Select = struct {
     selector: ?Selector = null,
     predicate: ?*const Expr = null,
     groupings: []const Grouping = &.{},
+    fill: ?FillClause = null,
     ordering: []const Ordering = &.{},
     limit: ?LimitClause = null,
+    span: common.Span,
+};
+
+pub const FillStrategy = union(enum) {
+    previous,
+    linear,
+    null_value,
+    constant: *const Expr,
+};
+
+pub const FillClause = struct {
+    strategy: FillStrategy,
     span: common.Span,
 };
 
@@ -190,6 +203,13 @@ pub const NormalizeError = std.mem.Allocator.Error || error{
 
 pub fn normalizeFrontendStmt(allocator: std.mem.Allocator, stmt: stmt_mod.FrontendStmt) NormalizeError!NormalizedStmt {
     const normalized_stmt = try normalizeStatement(allocator, stmt);
+    return collectNormalizedStatementParameters(allocator, normalized_stmt);
+}
+
+fn collectNormalizedStatementParameters(
+    allocator: std.mem.Allocator,
+    normalized_stmt: Statement,
+) NormalizeError!NormalizedStmt {
     var parameters = std.array_list.Managed(ParameterBinding).init(allocator);
     errdefer parameters.deinit();
     var named_parameters = std.array_list.Managed(NamedParameterBinding).init(allocator);
@@ -240,6 +260,13 @@ pub fn cloneNormalizedStmt(allocator: std.mem.Allocator, normalized: NormalizedS
 }
 
 pub fn normalizeAstStatement(allocator: std.mem.Allocator, statement: *const ast.Statement) NormalizeError!NormalizedStmt {
+    if (statement.* == .select) {
+        return collectNormalizedStatementParameters(
+            allocator,
+            .{ .select = try normalizeAstSelect(allocator, statement.select) },
+        );
+    }
+
     const frontend_stmt = try frontendStmtFromAstStatement(allocator, statement);
     return normalizeFrontendStmt(allocator, frontend_stmt);
 }
@@ -271,9 +298,70 @@ pub fn toAstStatementWithBindings(
     };
 }
 
-fn fromAstSelect(allocator: std.mem.Allocator, select: *const ast.Select) NormalizeError!stmt_mod.Select {
-    if (select.fill != null) return error.UnsupportedFill;
+fn normalizeAstSelect(allocator: std.mem.Allocator, select: *const ast.Select) NormalizeError!Select {
+    const projections = try allocator.alloc(Projection, select.projections.len);
+    for (select.projections, 0..) |projection, idx| {
+        projections[idx] = .{
+            .expr = try normalizeAstExpr(allocator, projection.expr),
+            .alias = if (projection.alias) |alias| try cloneIdentifier(allocator, alias) else null,
+            .span = projection.span,
+        };
+    }
 
+    const groupings = try allocator.alloc(Grouping, select.groupings.len);
+    for (select.groupings, 0..) |grouping, idx| {
+        groupings[idx] = .{
+            .expr = try normalizeAstExpr(allocator, grouping.expr),
+            .span = grouping.span,
+        };
+    }
+
+    const ordering = try allocator.alloc(Ordering, select.ordering.len);
+    for (select.ordering, 0..) |item, idx| {
+        ordering[idx] = .{
+            .expr = try normalizeAstExpr(allocator, item.expr),
+            .direction = switch (item.direction) {
+                .asc => .asc,
+                .desc => .desc,
+            },
+            .span = item.span,
+        };
+    }
+
+    return .{
+        .projections = projections,
+        .selector = if (select.selector) |selector| try normalizeSelector(allocator, try fromAstSelector(allocator, selector)) else null,
+        .predicate = if (select.predicate) |predicate| try normalizeAstExpr(allocator, predicate) else null,
+        .groupings = groupings,
+        .fill = if (select.fill) |fill| try normalizeAstFillClause(allocator, fill) else null,
+        .ordering = ordering,
+        .limit = if (select.limit) |limit| .{
+            .limit = limit.limit,
+            .offset = limit.offset,
+            .span = limit.span,
+        } else null,
+        .span = select.span,
+    };
+}
+
+fn normalizeAstExpr(allocator: std.mem.Allocator, expr: *const ast.Expr) NormalizeError!*const Expr {
+    const frontend_expr = try fromAstExpr(allocator, expr);
+    return try normalizeExpr(allocator, frontend_expr);
+}
+
+fn normalizeAstFillClause(allocator: std.mem.Allocator, fill: ast.FillClause) NormalizeError!FillClause {
+    return .{
+        .strategy = switch (fill.strategy) {
+            .previous => .previous,
+            .linear => .linear,
+            .null_value => .null_value,
+            .constant => |expr| .{ .constant = try normalizeAstExpr(allocator, expr) },
+        },
+        .span = fill.span,
+    };
+}
+
+fn fromAstSelect(allocator: std.mem.Allocator, select: *const ast.Select) NormalizeError!stmt_mod.Select {
     const projections = try allocator.alloc(stmt_mod.Projection, select.projections.len);
     for (select.projections, 0..) |projection, idx| {
         projections[idx] = .{
@@ -359,9 +447,22 @@ fn cloneSelect(allocator: std.mem.Allocator, select: Select) NormalizeError!Sele
         .selector = if (select.selector) |selector| try cloneSelector(allocator, selector) else null,
         .predicate = if (select.predicate) |predicate| try cloneExpr(allocator, predicate) else null,
         .groupings = groupings,
+        .fill = if (select.fill) |fill| try cloneFillClause(allocator, fill) else null,
         .ordering = ordering,
         .limit = select.limit,
         .span = select.span,
+    };
+}
+
+fn cloneFillClause(allocator: std.mem.Allocator, fill: FillClause) NormalizeError!FillClause {
+    return .{
+        .strategy = switch (fill.strategy) {
+            .previous => .previous,
+            .linear => .linear,
+            .null_value => .null_value,
+            .constant => |expr| .{ .constant = try cloneExpr(allocator, expr) },
+        },
+        .span = fill.span,
     };
 }
 
@@ -655,6 +756,7 @@ fn normalizeSelect(allocator: std.mem.Allocator, select: stmt_mod.Select) Normal
         .selector = if (select.selector) |selector| try normalizeSelector(allocator, selector) else null,
         .predicate = if (select.predicate) |predicate| try normalizeExpr(allocator, predicate) else null,
         .groupings = groupings,
+        .fill = null,
         .ordering = ordering,
         .limit = select.limit,
         .span = select.span,
@@ -781,6 +883,10 @@ fn collectStatementParameters(
             for (select.projections) |projection| try collectExprParameters(allocator, projection.expr, parameters, named_parameters, next_slot);
             if (select.predicate) |predicate| try collectExprParameters(allocator, predicate, parameters, named_parameters, next_slot);
             for (select.groupings) |grouping| try collectExprParameters(allocator, grouping.expr, parameters, named_parameters, next_slot);
+            if (select.fill) |fill| switch (fill.strategy) {
+                .constant => |expr| try collectExprParameters(allocator, expr, parameters, named_parameters, next_slot),
+                .previous, .linear, .null_value => {},
+            };
             for (select.ordering) |ordering| try collectExprParameters(allocator, ordering.expr, parameters, named_parameters, next_slot);
         },
         .insert => |insert| {
@@ -942,7 +1048,7 @@ fn lowerSelect(
         .selector = if (select.selector) |selector| try lowerSelector(selector) else null,
         .predicate = if (select.predicate) |predicate| try lowerExpr(allocator, predicate, parameters, named_parameters, bindings) else null,
         .groupings = groupings,
-        .fill = null,
+        .fill = if (select.fill) |fill| try lowerFillClause(allocator, fill, parameters, named_parameters, bindings) else null,
         .ordering = ordering,
         .limit = if (select.limit) |limit| .{
             .limit = limit.limit,
@@ -952,6 +1058,24 @@ fn lowerSelect(
         .span = select.span,
     };
     return node;
+}
+
+fn lowerFillClause(
+    allocator: std.mem.Allocator,
+    fill: FillClause,
+    parameters: []const ParameterBinding,
+    named_parameters: []const NamedParameterBinding,
+    bindings: []const ?value_mod.Value,
+) NormalizeError!ast.FillClause {
+    return .{
+        .strategy = switch (fill.strategy) {
+            .previous => .previous,
+            .linear => .linear,
+            .null_value => .null_value,
+            .constant => |expr| .{ .constant = try lowerExpr(allocator, expr, parameters, named_parameters, bindings) },
+        },
+        .span = fill.span,
+    };
 }
 
 fn lowerInsert(

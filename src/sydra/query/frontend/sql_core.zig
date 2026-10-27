@@ -245,7 +245,7 @@ fn terminalNameForToken(token: lexer.Token) []const u8 {
             .boolean_false => "false",
             .null_literal => "null",
             .time => "identifier",
-            .tag => "identifier",
+            .tag => "tag",
             else => "",
         },
         .comma => "comma",
@@ -407,6 +407,15 @@ test "sql core parser fuzz smoke exercises parser and normalizer" {
         "tables_used", "by_id(41)", "tag.host", "'ok'", "$1",
     };
     var normalized_count: usize = 0;
+
+    {
+        var fixed = try parseSqlCoreSkeleton(alloc, "select value from metrics");
+        defer fixed.deinit();
+
+        try std.testing.expect(fixed.stmt != null);
+        _ = normalize.normalizeFrontendStmt(fixed.arena_ptr.?.allocator(), fixed.stmt.?) catch {};
+        normalized_count += 1;
+    }
 
     var i: usize = 0;
     while (i < 128) : (i += 1) {

@@ -94,6 +94,7 @@ pub const Program = struct {
     exprs: []const *const ast.Expr = &.{},
     selectors: []const ir.BoundSelector = &.{},
     schemas: []const []const plan.ColumnInfo = &.{},
+    owned_schema_columns: []const []const plan.ColumnInfo = &.{},
     orderings: []const []const ast.OrderExpr = &.{},
     aggregates: []const ir.AggregateSpec = &.{},
     cursors: []const CursorDecl = &.{},
@@ -109,6 +110,12 @@ pub const Program = struct {
         if (self.exprs.len != 0) self.allocator.free(self.exprs);
         if (self.selectors.len != 0) self.allocator.free(self.selectors);
         if (self.schemas.len != 0) self.allocator.free(self.schemas);
+        if (self.owned_schema_columns.len != 0) {
+            for (self.owned_schema_columns) |schema_columns| {
+                if (schema_columns.len != 0) self.allocator.free(schema_columns);
+            }
+            self.allocator.free(self.owned_schema_columns);
+        }
         if (self.orderings.len != 0) {
             for (self.orderings) |ordering_list| {
                 for (ordering_list) |ordering| freeOwnedOrderingExpr(self.allocator, ordering);

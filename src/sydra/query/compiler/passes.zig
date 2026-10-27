@@ -386,6 +386,16 @@ fn ensureTimeBucketSupported(expr: *const ast.Expr) errors.CompileError!void {
     if (!std.ascii.eqlIgnoreCase(call.callee.value, "time_bucket")) return error.UnsupportedFunction;
     if (call.args.len != 2 and call.args.len != 3) return error.UnsupportedFunction;
     if (call.args[0].* == .identifier) return error.UnsupportedFunction;
+    const bucket_width = expression.evaluateConstant(call.args[0]) catch
+        return error.UnsupportedFunction;
+    const bucket_width_number: f64 = switch (bucket_width) {
+        .integer => |value| @floatFromInt(value),
+        .float => |value| value,
+        else => return error.UnsupportedFunction,
+    };
+    if (!std.math.isFinite(bucket_width_number) or bucket_width_number <= 0) {
+        return error.UnsupportedFunction;
+    }
     if (!infer.expressionHasTime(call.args[1])) return error.UnsupportedFunction;
     for (call.args, 0..) |arg, idx| {
         if (idx == 1) {

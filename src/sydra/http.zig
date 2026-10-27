@@ -7,6 +7,7 @@ const compat = @import("compat.zig");
 const cas_mod = @import("storage/cas.zig");
 const annotations_mod = @import("storage/annotations.zig");
 const market_catalog_mod = @import("storage/market_catalog.zig");
+const market_identity_mod = @import("storage/market_identity.zig");
 const market_runtime_mod = @import("storage/market_runtime.zig");
 const metric_catalog_mod = @import("storage/metric_catalog.zig");
 const query_exec = @import("query/exec.zig");
@@ -546,6 +547,7 @@ const StatusSnapshot = struct {
     query_compile_series_not_found_total: u64,
     query_compile_ambiguous_selector_total: u64,
     query_compile_shadow_mismatch_total: u64,
+    market_shadow_mismatch_total: u64,
     cas_shadow_mismatch_total: u64,
 };
 
@@ -618,6 +620,7 @@ fn buildStatusSnapshot(eng: *Engine) StatusSnapshot {
         .query_compile_series_not_found_total = eng.metrics.query_compile_series_not_found_total.load(.monotonic),
         .query_compile_ambiguous_selector_total = eng.metrics.query_compile_ambiguous_selector_total.load(.monotonic),
         .query_compile_shadow_mismatch_total = eng.metrics.query_compile_shadow_mismatch_total.load(.monotonic),
+        .market_shadow_mismatch_total = eng.metrics.market_shadow_mismatch_total.load(.monotonic),
         .cas_shadow_mismatch_total = eng.metrics.cas_shadow_mismatch_total.load(.monotonic),
     };
 }
@@ -782,6 +785,8 @@ fn writeStatusPayload(jw: *std.json.Stringify, snapshot: StatusSnapshot) !void {
     try jw.write(snapshot.query_compile_ambiguous_selector_total);
     try jw.objectField("query_compile_shadow_mismatch_total");
     try jw.write(snapshot.query_compile_shadow_mismatch_total);
+    try jw.objectField("market_shadow_mismatch_total");
+    try jw.write(snapshot.market_shadow_mismatch_total);
     try jw.objectField("cas_shadow_mismatch_total");
     try jw.write(snapshot.cas_shadow_mismatch_total);
     try jw.endObject();
@@ -1090,6 +1095,7 @@ test "buildStatusPayload emits extended runtime counters" {
         .query_compile_series_not_found_total = 1,
         .query_compile_ambiguous_selector_total = 1,
         .query_compile_shadow_mismatch_total = 1,
+        .market_shadow_mismatch_total = 2,
         .cas_shadow_mismatch_total = 5,
     });
     defer alloc.free(payload);
@@ -1155,6 +1161,7 @@ test "buildStatusPayload emits extended runtime counters" {
     try std.testing.expectApproxEqAbs(@as(f64, 0.25), runtime.get("cas_sync_seconds_total").?.float, 0.0001);
     try std.testing.expectEqual(@as(i64, 9), runtime.get("query_compile_attempts_total").?.integer);
     try std.testing.expectEqual(@as(i64, 1), runtime.get("query_compile_shadow_mismatch_total").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), runtime.get("market_shadow_mismatch_total").?.integer);
     try std.testing.expectEqual(@as(i64, 5), runtime.get("cas_shadow_mismatch_total").?.integer);
 }
 
@@ -1185,6 +1192,8 @@ test "queryMarketRows reconstructs rows from fanout series" {
         .enable_prom = false,
         .mem_limit_bytes = 1024 * 1024,
         .cas_mode = .off,
+        .market_storage_mode = .fanout_v1,
+        .market_storage_read_mode = .fanout,
         .retention_ns = std.StringHashMap(u32).init(talloc),
     };
 
@@ -1193,10 +1202,23 @@ test "queryMarketRows reconstructs rows from fanout series" {
 
     const labels_json = try canonicalLabelsForMarket(talloc, "AAPL", "XNAS", null, null);
     defer talloc.free(labels_json);
-    _ = try eng.ingestExactMetric("market.trade.price", labels_json, 100, 10.5, null);
-    _ = try eng.ingestExactMetric("market.trade.size", labels_json, 100, 5.0, null);
-    _ = try eng.ingestExactMetric("market.trade.price", labels_json, 200, 11.0, null);
-    _ = try eng.ingestExactMetric("market.trade.size", labels_json, 200, 7.0, null);
+    const values_100 = [_]f64{ 10.5, 5.0 };
+    const values_200 = [_]f64{ 11.0, 7.0 };
+    _ = try eng.ingestMarketBatch(&.{
+        .{
+            .metric = "market.trade",
+            .labels_json = labels_json,
+            .ts_ns = 100,
+            .values = &values_100,
+        },
+        .{
+            .metric = "market.trade",
+            .labels_json = labels_json,
+            .ts_ns = 200,
+            .values = &values_200,
+        },
+    });
+    _ = try eng.flushAndDrain(1_000);
 
     var labels_value = std.json.Value{ .object = std.json.ObjectMap.init(talloc) };
     defer labels_value.object.deinit();
@@ -1233,6 +1255,8 @@ test "querySignalHistoryRows strips provenance labels" {
         .enable_prom = false,
         .mem_limit_bytes = 1024 * 1024,
         .cas_mode = .off,
+        .market_storage_mode = .fanout_v1,
+        .market_storage_read_mode = .fanout,
         .retention_ns = std.StringHashMap(u32).init(talloc),
     };
 
@@ -1246,6 +1270,7 @@ test "querySignalHistoryRows strips provenance labels" {
     defer talloc.free(signal_labels);
     _ = try eng.ingestExactMetric("_signal.ema", signal_labels, 100, 1.0, null);
     _ = try eng.ingestExactMetric("_signal.ema", signal_labels, 200, 0.0, null);
+    _ = try eng.flushAndDrain(1_000);
 
     const rows = try querySignalHistoryRows(talloc, eng, "ema", 1, 0, 500, null);
     defer freeSignalHistoryRows(talloc, rows);
@@ -1276,6 +1301,8 @@ test "writeMarkoutAnalysisResult groups by venue" {
         .enable_prom = false,
         .mem_limit_bytes = 1024 * 1024,
         .cas_mode = .off,
+        .market_storage_mode = .fanout_v1,
+        .market_storage_read_mode = .fanout,
         .retention_ns = std.StringHashMap(u32).init(talloc),
     };
 
@@ -1284,17 +1311,19 @@ test "writeMarkoutAnalysisResult groups by venue" {
 
     const xnas_labels = try canonicalLabelsForMarket(talloc, "AAPL", "XNAS", null, null);
     defer talloc.free(xnas_labels);
-    _ = try eng.ingestExactMetric("market.trade.price", xnas_labels, 100, 10.0, null);
-    _ = try eng.ingestExactMetric("market.trade.size", xnas_labels, 100, 1.0, null);
-    _ = try eng.ingestExactMetric("market.trade.price", xnas_labels, 110, 11.0, null);
-    _ = try eng.ingestExactMetric("market.trade.size", xnas_labels, 110, 1.0, null);
-
     const bats_labels = try canonicalLabelsForMarket(talloc, "AAPL", "BATS", null, null);
     defer talloc.free(bats_labels);
-    _ = try eng.ingestExactMetric("market.trade.price", bats_labels, 100, 20.0, null);
-    _ = try eng.ingestExactMetric("market.trade.size", bats_labels, 100, 1.0, null);
-    _ = try eng.ingestExactMetric("market.trade.price", bats_labels, 110, 22.0, null);
-    _ = try eng.ingestExactMetric("market.trade.size", bats_labels, 110, 1.0, null);
+    const xnas_100 = [_]f64{ 10.0, 1.0 };
+    const xnas_110 = [_]f64{ 11.0, 1.0 };
+    const bats_100 = [_]f64{ 20.0, 1.0 };
+    const bats_110 = [_]f64{ 22.0, 1.0 };
+    _ = try eng.ingestMarketBatch(&.{
+        .{ .metric = "market.trade", .labels_json = xnas_labels, .ts_ns = 100, .values = &xnas_100 },
+        .{ .metric = "market.trade", .labels_json = xnas_labels, .ts_ns = 110, .values = &xnas_110 },
+        .{ .metric = "market.trade", .labels_json = bats_labels, .ts_ns = 100, .values = &bats_100 },
+        .{ .metric = "market.trade", .labels_json = bats_labels, .ts_ns = 110, .values = &bats_110 },
+    });
+    _ = try eng.flushAndDrain(1_000);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, talloc,
         \\{"symbol":"AAPL","start_ts_ns":100,"end_ts_ns":110,"group_by":"venue","horizons_ns":[10]}
@@ -1328,10 +1357,10 @@ test "writeMarkoutAnalysisResult groups by venue" {
         try std.testing.expectEqual(@as(i64, 1), metric.get("sample_count").?.integer);
         if (std.mem.eql(u8, key.get("venue").?.string, "XNAS")) {
             saw_xnas = true;
-            try std.testing.expectApproxEqAbs(@as(f64, 1.0), metric.get("value").?.float, 1e-9);
+            try expectJsonNumberApprox(metric.get("value").?, 1.0, 1e-9);
         } else if (std.mem.eql(u8, key.get("venue").?.string, "BATS")) {
             saw_bats = true;
-            try std.testing.expectApproxEqAbs(@as(f64, 2.0), metric.get("value").?.float, 1e-9);
+            try expectJsonNumberApprox(metric.get("value").?, 2.0, 1e-9);
         }
     }
     try std.testing.expect(saw_xnas);
@@ -1358,6 +1387,8 @@ test "writeSlippageAnalysisResult groups by symbol" {
         .enable_prom = false,
         .mem_limit_bytes = 1024 * 1024,
         .cas_mode = .off,
+        .market_storage_mode = .fanout_v1,
+        .market_storage_read_mode = .fanout,
         .retention_ns = std.StringHashMap(u32).init(talloc),
     };
 
@@ -1366,17 +1397,19 @@ test "writeSlippageAnalysisResult groups by symbol" {
 
     const aapl_labels = try canonicalLabelsForMarket(talloc, "AAPL", "XNAS", null, null);
     defer talloc.free(aapl_labels);
-    _ = try eng.ingestExactMetric("market.trade.price", aapl_labels, 100, 10.0, null);
-    _ = try eng.ingestExactMetric("market.trade.size", aapl_labels, 100, 1.0, null);
-    _ = try eng.ingestExactMetric("market.quote.bid", aapl_labels, 100, 9.0, null);
-    _ = try eng.ingestExactMetric("market.quote.ask", aapl_labels, 100, 11.0, null);
-
     const tsla_labels = try canonicalLabelsForMarket(talloc, "TSLA", "XNAS", null, null);
     defer talloc.free(tsla_labels);
-    _ = try eng.ingestExactMetric("market.trade.price", tsla_labels, 100, 20.0, null);
-    _ = try eng.ingestExactMetric("market.trade.size", tsla_labels, 100, 1.0, null);
-    _ = try eng.ingestExactMetric("market.quote.bid", tsla_labels, 100, 19.0, null);
-    _ = try eng.ingestExactMetric("market.quote.ask", tsla_labels, 100, 21.0, null);
+    const aapl_trade = [_]f64{ 10.0, 1.0 };
+    const aapl_quote = [_]f64{ 9.0, 11.0, 100.0, 100.0 };
+    const tsla_trade = [_]f64{ 20.0, 1.0 };
+    const tsla_quote = [_]f64{ 19.0, 21.0, 100.0, 100.0 };
+    _ = try eng.ingestMarketBatch(&.{
+        .{ .metric = "market.trade", .labels_json = aapl_labels, .ts_ns = 100, .values = &aapl_trade },
+        .{ .metric = "market.quote", .labels_json = aapl_labels, .ts_ns = 100, .values = &aapl_quote },
+        .{ .metric = "market.trade", .labels_json = tsla_labels, .ts_ns = 100, .values = &tsla_trade },
+        .{ .metric = "market.quote", .labels_json = tsla_labels, .ts_ns = 100, .values = &tsla_quote },
+    });
+    _ = try eng.flushAndDrain(1_000);
 
     var parsed = try std.json.parseFromSlice(std.json.Value, talloc,
         \\{"venue":"XNAS","start_ts_ns":100,"end_ts_ns":100,"group_by":"symbol"}
@@ -1404,7 +1437,7 @@ test "writeSlippageAnalysisResult groups by symbol" {
         const key = group.object.get("key").?.object;
         const sample_count = group.object.get("sample_count").?.integer;
         try std.testing.expectEqual(@as(i64, 1), sample_count);
-        try std.testing.expectApproxEqAbs(@as(f64, 0.0), group.object.get("signed_avg").?.float, 1e-9);
+        try expectJsonNumberApprox(group.object.get("signed_avg").?, 0.0, 1e-9);
         try std.testing.expect(key.get("symbol") != null);
     }
 }
@@ -1435,6 +1468,7 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     const query_compile_series_not_found_total = eng.metrics.query_compile_series_not_found_total.load(.monotonic);
     const query_compile_ambiguous_selector_total = eng.metrics.query_compile_ambiguous_selector_total.load(.monotonic);
     const query_compile_shadow_mismatch_total = eng.metrics.query_compile_shadow_mismatch_total.load(.monotonic);
+    const market_shadow_mismatch_total = eng.metrics.market_shadow_mismatch_total.load(.monotonic);
     const cas_shadow_mismatch_total = eng.metrics.cas_shadow_mismatch_total.load(.monotonic);
     const local_ingest_connections_current = eng.metrics.local_ingest_connections_current.load(.monotonic);
     const local_ingest_connections_total = eng.metrics.local_ingest_connections_total.load(.monotonic);
@@ -1528,6 +1562,7 @@ fn handleMetrics(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.R
     try writer.print("# HELP sydradb_query_compile_series_not_found_total Total query compiler fallbacks caused by unresolved selectors\n# TYPE sydradb_query_compile_series_not_found_total counter\nsydradb_query_compile_series_not_found_total {d}\n", .{query_compile_series_not_found_total});
     try writer.print("# HELP sydradb_query_compile_ambiguous_selector_total Total query compiler fallbacks caused by ambiguous selectors\n# TYPE sydradb_query_compile_ambiguous_selector_total counter\nsydradb_query_compile_ambiguous_selector_total {d}\n", .{query_compile_ambiguous_selector_total});
     try writer.print("# HELP sydradb_query_compile_shadow_mismatch_total Total query compiler fallbacks caused by shadow mismatches\n# TYPE sydradb_query_compile_shadow_mismatch_total counter\nsydradb_query_compile_shadow_mismatch_total {d}\n", .{query_compile_shadow_mismatch_total});
+    try writer.print("# HELP sydradb_market_shadow_mismatch_total Total exact-bit market row mismatches between fanout and native reads\n# TYPE sydradb_market_shadow_mismatch_total counter\nsydradb_market_shadow_mismatch_total {d}\n", .{market_shadow_mismatch_total});
     try writer.print("# HELP sydradb_cas_shadow_mismatch_total Total CAS shadow mismatches observed in runtime verification paths\n# TYPE sydradb_cas_shadow_mismatch_total counter\nsydradb_cas_shadow_mismatch_total {d}\n", .{cas_shadow_mismatch_total});
     try writer.print("# HELP sydradb_local_ingest_connections_total Total accepted local ingest socket connections\n# TYPE sydradb_local_ingest_connections_total counter\nsydradb_local_ingest_connections_total {d}\n", .{local_ingest_connections_total});
     try writer.print("# HELP sydradb_local_ingest_connections_current Current active local ingest socket connections\n# TYPE sydradb_local_ingest_connections_current gauge\nsydradb_local_ingest_connections_current {d}\n", .{local_ingest_connections_current});
@@ -1910,9 +1945,29 @@ const HttpTestResponse = struct {
 fn serveSingleHttpConnection(ctx: *OneShotHttpServer) void {
     defer ctx.server.deinit();
     const connection = ctx.server.accept() catch return;
-    handleConnection(ctx.handle, std.heap.c_allocator, ctx.eng, connection) catch |err| switch (err) {
-        error.HttpConnectionClosing, error.HttpRequestTruncated => {},
+    defer connection.stream.close();
+
+    var in_buf: [4096]u8 = undefined;
+    var out_buf: [4096]u8 = undefined;
+    var reader_state = connection.stream.reader(&in_buf);
+    var writer_state = connection.stream.writer(&out_buf);
+    var http_server = std.http.Server.init(reader_state.interface(), &writer_state.interface);
+
+    var req = http_server.receiveHead() catch |err| switch (err) {
+        error.HttpConnectionClosing, error.HttpRequestTruncated => return,
+        else => {
+            std.log.warn("http one-shot test server receive failed: {s}", .{@errorName(err)});
+            return;
+        },
+    };
+    handleRequest(ctx.handle, std.heap.c_allocator, ctx.eng, &req) catch |err| switch (err) {
+        error.HttpExpectationFailed => {
+            _ = req.respond("expectation failed", .{ .status = .expectation_failed, .keep_alive = false }) catch {};
+        },
         else => std.log.warn("http one-shot test server error: {s}", .{@errorName(err)}),
+    };
+    writer_state.interface.flush() catch |err| {
+        std.log.warn("http one-shot test server flush failed: {s}", .{@errorName(err)});
     };
 }
 
@@ -1958,7 +2013,6 @@ fn sendHttpRequestToPortWithHeaders(
     var response = std.array_list.Managed(u8).init(alloc);
     defer response.deinit();
     var chunk: [4096]u8 = undefined;
-    var target_total: ?usize = null;
     while (true) {
         const n = reader.read(chunk[0..]) catch |err| switch (err) {
             error.EndOfStream => 0,
@@ -1966,32 +2020,40 @@ fn sendHttpRequestToPortWithHeaders(
         };
         if (n == 0) break;
         try response.appendSlice(chunk[0..n]);
-
-        if (target_total == null) {
-            if (std.mem.indexOf(u8, response.items, "\r\n\r\n")) |header_end| {
-                const header_bytes = response.items[0..header_end];
-                if (parseContentLengthHeader(header_bytes)) |content_length| {
-                    target_total = header_end + 4 + content_length;
-                }
-            }
-        }
-        if (target_total) |target| {
-            if (response.items.len >= target) break;
-        }
     }
 
-    const header_end = std.mem.indexOf(u8, response.items, "\r\n\r\n") orelse return error.InvalidHttpResponse;
-    const header_bytes = response.items[0..header_end];
-    const status_end = std.mem.indexOf(u8, header_bytes, "\r\n") orelse return error.InvalidHttpResponse;
-    const status_line = header_bytes[0..status_end];
-    if (!std.mem.startsWith(u8, status_line, "HTTP/1.1 ")) return error.InvalidHttpResponse;
-    const status_code = try std.fmt.parseInt(u16, status_line["HTTP/1.1 ".len .. "HTTP/1.1 ".len + 3], 10);
-    if (target_total) |target| {
-        if (response.items.len < target) return error.InvalidHttpResponse;
+    var offset: usize = 0;
+    var status_code: u16 = 0;
+    var header_bytes: []const u8 = "";
+    var body_bytes: []const u8 = "";
+    while (true) {
+        const header_end_rel = std.mem.indexOf(u8, response.items[offset..], "\r\n\r\n") orelse return error.InvalidHttpResponse;
+        const header_end = offset + header_end_rel;
+        header_bytes = response.items[offset..header_end];
+        const status_end = std.mem.indexOf(u8, header_bytes, "\r\n") orelse header_bytes.len;
+        const status_line = header_bytes[0..status_end];
+        if (!std.mem.startsWith(u8, status_line, "HTTP/1.1 ")) return error.InvalidHttpResponse;
+        status_code = try std.fmt.parseInt(u16, status_line["HTTP/1.1 ".len .. "HTTP/1.1 ".len + 3], 10);
+        offset = header_end + 4;
+        if (status_code < 100 or status_code >= 200) {
+            body_bytes = response.items[offset..];
+            break;
+        }
+        if (offset >= response.items.len) return error.InvalidHttpResponse;
     }
+
+    if (parseContentLengthHeader(header_bytes)) |content_length| {
+        if (body_bytes.len < content_length) return error.InvalidHttpResponse;
+        body_bytes = body_bytes[0..content_length];
+    }
+    const response_body = if (hasChunkedTransferEncoding(header_bytes))
+        try decodeChunkedHttpBody(alloc, body_bytes)
+    else
+        try alloc.dupe(u8, body_bytes);
+    errdefer alloc.free(response_body);
     return .{
         .status_code = status_code,
-        .body = try alloc.dupe(u8, response.items[header_end + 4 ..]),
+        .body = response_body,
     };
 }
 
@@ -2006,6 +2068,43 @@ fn parseContentLengthHeader(header_bytes: []const u8) ?usize {
         return std.fmt.parseInt(usize, value, 10) catch null;
     }
     return null;
+}
+
+fn hasChunkedTransferEncoding(header_bytes: []const u8) bool {
+    var lines = std.mem.splitSequence(u8, header_bytes, "\r\n");
+    _ = lines.next();
+    while (lines.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " \t");
+        if (!std.ascii.eqlIgnoreCase(name, "Transfer-Encoding")) continue;
+        const value = std.mem.trim(u8, line[colon + 1 ..], " \t");
+        var encodings = std.mem.splitScalar(u8, value, ',');
+        while (encodings.next()) |encoding| {
+            if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, encoding, " \t"), "chunked")) return true;
+        }
+    }
+    return false;
+}
+
+fn decodeChunkedHttpBody(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+    var out = std.array_list.Managed(u8).init(alloc);
+    errdefer out.deinit();
+
+    var offset: usize = 0;
+    while (true) {
+        const line_end_rel = std.mem.indexOf(u8, body[offset..], "\r\n") orelse return error.InvalidHttpResponse;
+        const line_end = offset + line_end_rel;
+        const raw_size = std.mem.trim(u8, body[offset..line_end], " \t");
+        const size_text = if (std.mem.indexOfScalar(u8, raw_size, ';')) |semicolon| raw_size[0..semicolon] else raw_size;
+        const size = std.fmt.parseInt(usize, size_text, 16) catch return error.InvalidHttpResponse;
+        offset = line_end + 2;
+        if (size == 0) return try out.toOwnedSlice();
+        if (body.len < offset + size + 2) return error.InvalidHttpResponse;
+        try out.appendSlice(body[offset .. offset + size]);
+        offset += size;
+        if (!std.mem.eql(u8, body[offset .. offset + 2], "\r\n")) return error.InvalidHttpResponse;
+        offset += 2;
+    }
 }
 
 fn runSingleRequestServer(
@@ -2038,6 +2137,27 @@ fn runSingleRequestServerWithHeaders(
     const thread = try std.Thread.spawn(.{}, serveSingleHttpConnection, .{&ctx});
     defer thread.join();
     return try sendHttpRequestToPortWithHeaders(alloc, port, method, path, body, extra_headers);
+}
+
+fn expectJsonIntField(obj: std.json.ObjectMap, field: []const u8, expected: i64) !void {
+    const value = obj.get(field) orelse return error.MissingJsonField;
+    try std.testing.expect(value == .integer);
+    try std.testing.expectEqual(expected, value.integer);
+}
+
+fn expectJsonStringField(obj: std.json.ObjectMap, field: []const u8, expected: []const u8) !void {
+    const value = obj.get(field) orelse return error.MissingJsonField;
+    try std.testing.expect(value == .string);
+    try std.testing.expectEqualStrings(expected, value.string);
+}
+
+fn expectJsonNumberApprox(value: std.json.Value, expected: f64, tolerance: f64) !void {
+    const actual: f64 = switch (value) {
+        .integer => |integer| @floatFromInt(integer),
+        .float => |float| float,
+        else => return error.ExpectedJsonNumber,
+    };
+    try std.testing.expectApproxEqAbs(expected, actual, tolerance);
 }
 
 test "parseIngestLine mirrors HTTP numeric and tags behavior" {
@@ -2160,7 +2280,7 @@ test "handleIngest accepts large multiline NDJSON over a live HTTP connection" {
     try std.testing.expectEqualStrings("{\"ingested\":400}", response.body);
 
     const sid = types.seriesIdFrom("http.live.large", "{}");
-    try eng.waitForQueryablePoints(talloc, sid, 400, 1_000);
+    _ = try eng.flushAndDrain(1_000);
 
     var points = std.array_list.Managed(types.Point).init(talloc);
     defer points.deinit();
@@ -2228,7 +2348,12 @@ test "handleIngest accepts live HTTP uploads with Expect: 100-continue" {
     try std.testing.expectEqualStrings("{\"ingested\":1000}", response.body);
 
     const sid = types.seriesIdFrom("http.live.expect", "{}");
-    try eng.waitForQueryablePoints(talloc, sid, 1_000, 1_000);
+    _ = try eng.flushAndDrain(1_000);
+
+    var points = std.array_list.Managed(types.Point).init(talloc);
+    defer points.deinit();
+    try eng.queryRange(sid, 0, 2_000, &points);
+    try std.testing.expectEqual(@as(usize, 1_000), points.items.len);
 }
 
 test "handleIngest returns deterministic 409 for descriptor conflicts over live HTTP" {
@@ -2289,6 +2414,405 @@ test "handleIngest returns deterministic 503 for ingest backpressure over live H
 
     try std.testing.expectEqual(@as(u16, 503), response.status_code);
     try std.testing.expect(std.mem.indexOf(u8, response.body, "\"code\":\"ingest_backpressure\"") != null);
+}
+
+test "market schema registration omits storage mapping to native for fresh auto repositories" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/http-market-schema-default-native", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var conf = try testConfig(talloc, data_path);
+    conf.cas_mode = .dual_write;
+    var eng = try Engine.init(talloc, conf);
+    defer eng.deinit();
+
+    var response = try runSingleRequestServer(
+        talloc,
+        eng,
+        "POST",
+        "/api/v1/market/schema/register",
+        "{\"metric\":\"market.http.default\",\"ordered_columns\":[\"price\"],\"required_labels\":[\"symbol\"]}",
+    );
+    defer response.deinit(talloc);
+
+    try std.testing.expectEqual(@as(u16, 201), response.status_code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, talloc, response.body, .{});
+    defer parsed.deinit();
+    try expectJsonStringField(parsed.value.object, "storage_mapping", "native_v1");
+}
+
+test "market schema registration preserves explicit fanout mapping under auto" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/http-market-schema-explicit-fanout", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var eng = try Engine.init(talloc, try testConfig(talloc, data_path));
+    defer eng.deinit();
+
+    var response = try runSingleRequestServer(
+        talloc,
+        eng,
+        "POST",
+        "/api/v1/market/schema/register",
+        "{\"metric\":\"market.http.explicit.fanout\",\"ordered_columns\":[\"price\"],\"required_labels\":[\"symbol\"],\"storage_mapping\":\"fanout_v1\"}",
+    );
+    defer response.deinit(talloc);
+
+    try std.testing.expectEqual(@as(u16, 201), response.status_code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, talloc, response.body, .{});
+    defer parsed.deinit();
+    try expectJsonStringField(parsed.value.object, "storage_mapping", "fanout_v1");
+}
+
+test "market ingest preserves fanout response shape with additive storage metadata" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/http-market-fanout-ingest", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var conf = try testConfig(talloc, data_path);
+    conf.market_storage_mode = .fanout_v1;
+    var eng = try Engine.init(talloc, conf);
+    defer eng.deinit();
+    var schema = try eng.registerMarketSchema(.{
+        .metric = "market.http.trade",
+        .ordered_columns = &.{ "price", "size" },
+        .required_labels = &.{ "symbol", "venue" },
+        .storage_mapping = .fanout_v1,
+    });
+    defer schema.deinit(talloc);
+
+    var response = try runSingleRequestServer(
+        talloc,
+        eng,
+        "POST",
+        "/api/v1/market/ingest",
+        "{\"metric\":\"market.http.trade\",\"ts_ns\":1000,\"labels\":{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"},\"columns\":{\"price\":10.5,\"size\":100}}\n",
+    );
+    defer response.deinit(talloc);
+
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, talloc, response.body, .{});
+    defer parsed.deinit();
+    try expectJsonIntField(parsed.value.object, "rows", 1);
+    try expectJsonIntField(parsed.value.object, "writes", 2);
+    try expectJsonStringField(parsed.value.object, "storage_mode", "fanout_v1");
+    try expectJsonIntField(parsed.value.object, "native_rows", 0);
+    try expectJsonIntField(parsed.value.object, "fanout_writes", 2);
+
+    const price_sid = types.seriesIdFrom("market.http.trade.price", "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}");
+    try eng.waitForQueryablePoints(talloc, price_sid, 1, 1_000);
+}
+
+test "market query preserves row shape adds stats and refuses explicit native fallback" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/http-market-query-contract", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var conf = try testConfig(talloc, data_path);
+    conf.market_storage_mode = .fanout_v1;
+    conf.market_storage_read_mode = .fanout;
+    var eng = try Engine.init(talloc, conf);
+    defer eng.deinit();
+    var schema = try eng.registerMarketSchema(.{
+        .metric = "market.http.query",
+        .ordered_columns = &.{ "price", "size" },
+        .required_labels = &.{ "symbol", "venue" },
+        .storage_mapping = .fanout_v1,
+    });
+    defer schema.deinit(talloc);
+
+    var ingest = try runSingleRequestServer(
+        talloc,
+        eng,
+        "POST",
+        "/api/v1/market/ingest",
+        "{\"metric\":\"market.http.query\",\"ts_ns\":1000,\"labels\":{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"},\"columns\":{\"price\":10.5,\"size\":100}}\n",
+    );
+    defer ingest.deinit(talloc);
+    try std.testing.expectEqual(@as(u16, 200), ingest.status_code);
+
+    const price_sid = types.seriesIdFrom("market.http.query.price", "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}");
+    try eng.waitForQueryablePoints(talloc, price_sid, 1, 1_000);
+
+    const query_body =
+        "{\"metric\":\"market.http.query\",\"labels\":{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}," ++
+        "\"start_ts_ns\":0,\"end_ts_ns\":2000,\"columns\":[\"price\"]}";
+    var response = try runSingleRequestServer(
+        talloc,
+        eng,
+        "POST",
+        "/api/v1/market/query",
+        query_body,
+    );
+    defer response.deinit(talloc);
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, talloc, response.body, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+    const rows = root.get("rows").?.array;
+    try std.testing.expectEqual(@as(usize, 1), rows.items.len);
+    try expectJsonIntField(rows.items[0].object, "ts_ns", 1000);
+    const columns = rows.items[0].object.get("columns").?.object;
+    try std.testing.expectEqual(@as(usize, 1), columns.count());
+    try expectJsonNumberApprox(columns.get("price").?, 10.5, 1e-9);
+    const stats = root.get("stats").?.object;
+    try expectJsonStringField(stats, "storage_mode", "fanout");
+    try std.testing.expect(stats.get("series_scanned") != null);
+    try std.testing.expect(stats.get("blocks_scanned") != null);
+    try std.testing.expect(stats.get("blocks_pruned") != null);
+    try std.testing.expect(stats.get("columns_read") != null);
+    try std.testing.expect(stats.get("bytes_decoded") != null);
+    try std.testing.expect(stats.get("shadow_mismatches") != null);
+
+    eng.config.market_storage_read_mode = .native;
+    var unavailable = try runSingleRequestServer(
+        talloc,
+        eng,
+        "POST",
+        "/api/v1/market/query",
+        query_body,
+    );
+    defer unavailable.deinit(talloc);
+    try std.testing.expectEqual(@as(u16, 503), unavailable.status_code);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        unavailable.body,
+        "\"code\":\"native_market_data_unavailable\"",
+    ) != null);
+}
+
+test "market ingest reports native receipts and canonicalizes labels at HTTP boundary" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/http-market-native-ingest", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var conf = try testConfig(talloc, data_path);
+    conf.cas_mode = .dual_write;
+    conf.market_storage_mode = .native_v1;
+    var eng = try Engine.init(talloc, conf);
+    defer eng.deinit();
+    var schema = try eng.registerMarketSchema(.{
+        .metric = "market.http.native",
+        .ordered_columns = &.{ "price", "size" },
+        .required_labels = &.{ "symbol", "venue" },
+        .storage_mapping = .native_v1,
+    });
+    defer schema.deinit(talloc);
+
+    var response = try runSingleRequestServer(
+        talloc,
+        eng,
+        "POST",
+        "/api/v1/market/ingest",
+        "{\"metric\":\"market.http.native\",\"ts_ns\":1000,\"labels\":{\"venue\":\"XNAS\",\"symbol\":\"AAPL\"},\"columns\":{\"size\":100,\"price\":10.5}}\n",
+    );
+    defer response.deinit(talloc);
+
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, talloc, response.body, .{});
+    defer parsed.deinit();
+    try expectJsonIntField(parsed.value.object, "rows", 1);
+    try expectJsonIntField(parsed.value.object, "writes", 0);
+    try expectJsonStringField(parsed.value.object, "storage_mode", "native_v1");
+    try expectJsonIntField(parsed.value.object, "native_rows", 1);
+    try expectJsonIntField(parsed.value.object, "fanout_writes", 0);
+
+    const identities = try eng.metadata.market_catalog.listMarketSeries();
+    defer {
+        for (identities) |*identity| identity.deinit(talloc);
+        talloc.free(identities);
+    }
+    try std.testing.expectEqual(@as(usize, 1), identities.len);
+    try std.testing.expectEqualStrings("{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}", identities[0].canonical_labels);
+}
+
+test "market ingest reports dual write metadata and keeps fanout rows queryable" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/http-market-dual-ingest", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var conf = try testConfig(talloc, data_path);
+    conf.cas_mode = .dual_write;
+    conf.market_storage_mode = .dual_write_v1;
+    var eng = try Engine.init(talloc, conf);
+    defer eng.deinit();
+    var schema = try eng.registerMarketSchema(.{
+        .metric = "market.http.dual",
+        .ordered_columns = &.{ "bid", "ask" },
+        .required_labels = &.{"symbol"},
+        .storage_mapping = .native_v1,
+    });
+    defer schema.deinit(talloc);
+
+    var response = try runSingleRequestServer(
+        talloc,
+        eng,
+        "POST",
+        "/api/v1/market/ingest",
+        "{\"metric\":\"market.http.dual\",\"ts_ns\":2000,\"labels\":{\"symbol\":\"MSFT\"},\"columns\":{\"bid\":20.0,\"ask\":20.1}}\n",
+    );
+    defer response.deinit(talloc);
+
+    try std.testing.expectEqual(@as(u16, 200), response.status_code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, talloc, response.body, .{});
+    defer parsed.deinit();
+    try expectJsonIntField(parsed.value.object, "rows", 1);
+    try expectJsonIntField(parsed.value.object, "writes", 2);
+    try expectJsonStringField(parsed.value.object, "storage_mode", "dual_write_v1");
+    try expectJsonIntField(parsed.value.object, "native_rows", 1);
+    try expectJsonIntField(parsed.value.object, "fanout_writes", 2);
+
+    const bid_sid = types.seriesIdFrom("market.http.dual.bid", "{\"symbol\":\"MSFT\"}");
+    try eng.waitForQueryablePoints(talloc, bid_sid, 1, 1_000);
+}
+
+test "market ingest maps format3 native failure without scalar fanout fallout" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/http-market-format3-native", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var conf = try testConfig(talloc, data_path);
+    conf.cas_mode = .dual_write;
+    conf.market_storage_mode = .native_v1;
+    var eng = try Engine.init(talloc, conf);
+    defer eng.deinit();
+    var schema = try eng.registerMarketSchema(.{
+        .metric = "market.http.format3",
+        .ordered_columns = &.{ "price", "size" },
+        .required_labels = &.{"symbol"},
+        .storage_mapping = .native_v1,
+    });
+    defer schema.deinit(talloc);
+    if (eng.cas) |*cas| cas.format.version = cas_mod.primary_repository_format_version;
+
+    var response = try runSingleRequestServer(
+        talloc,
+        eng,
+        "POST",
+        "/api/v1/market/ingest",
+        "{\"metric\":\"market.http.format3\",\"ts_ns\":1000,\"labels\":{\"symbol\":\"AAPL\"},\"columns\":{\"price\":10.5,\"size\":100}}\n",
+    );
+    defer response.deinit(talloc);
+
+    try std.testing.expectEqual(@as(u16, 409), response.status_code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"code\":\"repository_format_mismatch\"") != null);
+    try std.testing.expectEqual(@as(usize, 0), eng.queue.len());
+    const identities = try eng.metadata.market_catalog.listMarketSeries();
+    defer {
+        for (identities) |*identity| identity.deinit(talloc);
+        talloc.free(identities);
+    }
+    try std.testing.expectEqual(@as(usize, 0), identities.len);
+}
+
+test "market ingest rejects malformed labels and columns before queueing rows" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/http-market-invalid-ingest", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var conf = try testConfig(talloc, data_path);
+    conf.market_storage_mode = .fanout_v1;
+    var eng = try Engine.init(talloc, conf);
+    defer eng.deinit();
+    var schema = try eng.registerMarketSchema(.{
+        .metric = "market.http.invalid",
+        .ordered_columns = &.{ "price", "size" },
+        .required_labels = &.{"symbol"},
+        .storage_mapping = .fanout_v1,
+    });
+    defer schema.deinit(talloc);
+
+    var bad_labels = try runSingleRequestServer(
+        talloc,
+        eng,
+        "POST",
+        "/api/v1/market/ingest",
+        "{\"metric\":\"market.http.invalid\",\"ts_ns\":1000,\"labels\":{\"venue\":\"XNAS\"},\"columns\":{\"price\":10.5,\"size\":100}}\n",
+    );
+    defer bad_labels.deinit(talloc);
+    try std.testing.expectEqual(@as(u16, 400), bad_labels.status_code);
+    try std.testing.expect(std.mem.indexOf(u8, bad_labels.body, "\"code\":\"invalid_market_labels\"") != null);
+
+    var bad_columns = try runSingleRequestServer(
+        talloc,
+        eng,
+        "POST",
+        "/api/v1/market/ingest",
+        "{\"metric\":\"market.http.invalid\",\"ts_ns\":1000,\"labels\":{\"symbol\":\"AAPL\"},\"columns\":{\"price\":10.5,\"size\":\"big\"}}\n",
+    );
+    defer bad_columns.deinit(talloc);
+    try std.testing.expectEqual(@as(u16, 400), bad_columns.status_code);
+    try std.testing.expect(std.mem.indexOf(u8, bad_columns.body, "\"code\":\"invalid_market_columns\"") != null);
+    try std.testing.expectEqual(@as(usize, 0), eng.queue.len());
+}
+
+test "market ingest rejects mixed resolved storage modes for one NDJSON request" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(talloc, ".zig-cache/tmp/{s}/http-market-mixed-modes", .{tmp.sub_path});
+    defer talloc.free(data_path);
+
+    var conf = try testConfig(talloc, data_path);
+    conf.cas_mode = .dual_write;
+    var eng = try Engine.init(talloc, conf);
+    defer eng.deinit();
+    eng.config.market_storage_mode = .fanout_v1;
+    var fanout_schema = try eng.registerMarketSchema(.{
+        .metric = "market.http.mixed.fanout",
+        .ordered_columns = &.{"price"},
+        .required_labels = &.{"symbol"},
+        .storage_mapping = .fanout_v1,
+    });
+    defer fanout_schema.deinit(talloc);
+    eng.config.market_storage_mode = .native_v1;
+    var native_schema = try eng.registerMarketSchema(.{
+        .metric = "market.http.mixed.native",
+        .ordered_columns = &.{"price"},
+        .required_labels = &.{"symbol"},
+        .storage_mapping = .native_v1,
+    });
+    defer native_schema.deinit(talloc);
+    eng.config.market_storage_mode = .auto;
+
+    var response = try runSingleRequestServer(
+        talloc,
+        eng,
+        "POST",
+        "/api/v1/market/ingest",
+        "{\"metric\":\"market.http.mixed.fanout\",\"ts_ns\":1000,\"labels\":{\"symbol\":\"AAPL\"},\"columns\":{\"price\":10.5}}\n{\"metric\":\"market.http.mixed.native\",\"ts_ns\":1000,\"labels\":{\"symbol\":\"AAPL\"},\"columns\":{\"price\":10.5}}\n",
+    );
+    defer response.deinit(talloc);
+
+    try std.testing.expectEqual(@as(u16, 409), response.status_code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "\"code\":\"mixed_market_storage_modes\"") != null);
+    try std.testing.expectEqual(@as(usize, 0), eng.queue.len());
 }
 
 fn handleQuery(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
@@ -2526,21 +3050,24 @@ fn handleMarketSchemaRegister(alloc: std.mem.Allocator, eng: *Engine, req: *std.
     defer alloc.free(ordered_columns);
     const required_labels = try jsonStringArrayConst(alloc, labels_value);
     defer alloc.free(required_labels);
-    const storage_mapping = if (obj.get("storage_mapping")) |value|
+    const explicit_storage_mapping: ?market_catalog_mod.StorageMapping = if (obj.get("storage_mapping")) |value|
         if (value == .string)
             market_catalog_mod.StorageMapping.parse(value.string) orelse return respondJsonError(alloc, req, .bad_request, "invalid_storage_mapping", "invalid storage_mapping")
         else
             return respondJsonError(alloc, req, .bad_request, "invalid_storage_mapping", "invalid storage_mapping")
     else
-        market_catalog_mod.StorageMapping.fanout_v1;
+        null;
 
-    var stored = eng.registerMarketSchema(.{
-        .metric = metric_value.string,
-        .ordered_columns = ordered_columns,
-        .required_labels = required_labels,
-        .storage_mapping = storage_mapping,
-    }) catch |err| switch (err) {
+    var stored = eng.registerMarketSchemaWithStorageMappingOverride(
+        .{
+            .metric = metric_value.string,
+            .ordered_columns = ordered_columns,
+            .required_labels = required_labels,
+        },
+        explicit_storage_mapping,
+    ) catch |err| switch (err) {
         error.MarketSchemaConflict => return respondJsonError(alloc, req, .conflict, "market_schema_conflict", "market schema conflict"),
+        error.RepositoryFormatMismatch => return respondJsonError(alloc, req, .conflict, "repository_format_mismatch", "repository format mismatch"),
         else => return respondJsonError(alloc, req, .internal_server_error, "market_schema_register_failed", @errorName(err)),
     };
     defer stored.deinit(eng.alloc);
@@ -3024,8 +3551,11 @@ fn writeRuntimeState(
 fn handleMarketIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
     var body_buf: [4096]u8 = undefined;
     const body_reader = req.readerExpectNone(&body_buf);
-    var rows: usize = 0;
-    var writes: usize = 0;
+    var rows = std.array_list.Managed(HttpMarketIngestRow).init(alloc);
+    errdefer {
+        for (rows.items) |*row| row.deinit(alloc);
+        rows.deinit();
+    }
 
     while (true) {
         const slice = body_reader.*.takeDelimiterExclusive('\n') catch |err| switch (err) {
@@ -3036,61 +3566,26 @@ fn handleMarketIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Ser
         const trimmed = std.mem.trim(u8, slice, " \t\r\n");
         if (trimmed.len == 0) continue;
 
-        var parsed = std.json.parseFromSlice(std.json.Value, alloc, trimmed, .{}) catch {
-            return respondJsonError(alloc, req, .bad_request, "invalid_market_record", "invalid market record");
+        var row = parseMarketIngestLine(alloc, eng, trimmed) catch |err| {
+            return respondMarketIngestError(alloc, req, err);
         };
-        defer parsed.deinit();
-        if (parsed.value != .object) return respondJsonError(alloc, req, .bad_request, "invalid_market_record", "invalid market record");
-        const obj = parsed.value.object;
-
-        const metric_value = obj.get("metric") orelse return respondJsonError(alloc, req, .bad_request, "missing_metric", "missing metric");
-        const ts_value = obj.get("ts_ns") orelse return respondJsonError(alloc, req, .bad_request, "missing_ts_ns", "missing ts_ns");
-        const columns_value = obj.get("columns") orelse return respondJsonError(alloc, req, .bad_request, "missing_columns", "missing columns");
-        const labels_value = obj.get("labels") orelse return respondJsonError(alloc, req, .bad_request, "missing_labels", "missing labels");
-        if (metric_value != .string or ts_value != .integer or columns_value != .object or labels_value != .object) {
-            return respondJsonError(alloc, req, .bad_request, "invalid_market_record", "invalid market record");
-        }
-
-        var schema = eng.marketSchema(metric_value.string) orelse return respondJsonError(alloc, req, .not_found, "market_schema_not_found", "market schema not found");
-        defer schema.deinit(eng.alloc);
-        if (!marketLabelsSatisfySchema(labels_value, schema)) {
-            return respondJsonError(alloc, req, .bad_request, "invalid_market_labels", "invalid market labels");
-        }
-        if (!marketColumnsMatchSchema(columns_value, schema)) {
-            return respondJsonError(alloc, req, .bad_request, "invalid_market_columns", "invalid market columns");
-        }
-
-        const labels_json = try extractTagsJson(alloc, labels_value);
-        defer if (labels_json.owned) |owned| alloc.free(owned);
-        const batch = try alloc.alloc(Engine.IngestItem, schema.ordered_columns.len);
-        defer alloc.free(batch);
-        var batch_len: usize = 0;
-        for (schema.ordered_columns) |column| {
-            const value = numericValue(columns_value.object.get(column).?) catch return respondJsonError(alloc, req, .bad_request, "invalid_market_columns", "invalid market columns");
-            const derived_metric = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ metric_value.string, column });
-            defer alloc.free(derived_metric);
-            _ = try eng.registerMetricDescriptor(.{
-                .metric = derived_metric,
-                .kind = .gauge,
-                .source_metric = metric_value.string,
-                .source_field = column,
-            });
-            const sid = types.seriesIdFrom(derived_metric, labels_json.value);
-            try eng.registerSeries(derived_metric, labels_json.value, sid);
-            batch[batch_len] = .{
-                .series_id = sid,
-                .ts = ts_value.integer,
-                .value = value,
-                .tags_json = labels_json.value,
-            };
-            batch_len += 1;
-            writes += 1;
-        }
-        try eng.ingestBatch(batch[0..batch_len]);
-        for (batch[0..batch_len]) |item| eng.noteTags(item.series_id, labels_json.value);
-        try eng.scheduleDerivedMetric(metric_value.string, labels_json.value);
-        rows += 1;
+        rows.append(row) catch |err| {
+            row.deinit(alloc);
+            return err;
+        };
     }
+
+    const owned_rows = try rows.toOwnedSlice();
+    defer freeHttpMarketIngestRows(alloc, owned_rows);
+
+    var inputs = try alloc.alloc(Engine.MarketIngestInput, owned_rows.len);
+    defer alloc.free(inputs);
+    for (owned_rows, 0..) |*row, idx| inputs[idx] = row.input();
+
+    const receipt = eng.ingestMarketBatch(inputs) catch |err| {
+        return respondMarketIngestError(alloc, req, err);
+    };
+    for (owned_rows) |row| try eng.scheduleDerivedMetric(row.metric, row.labels_json);
 
     var send_buffer: [256]u8 = undefined;
     var response = try req.respondStreaming(&send_buffer, .{
@@ -3100,11 +3595,117 @@ fn handleMarketIngest(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Ser
     var jw = std.json.Stringify{ .writer = &response.writer };
     try jw.beginObject();
     try jw.objectField("rows");
-    try jw.write(rows);
+    try jw.write(receipt.accepted_rows);
     try jw.objectField("writes");
-    try jw.write(writes);
+    try jw.write(receipt.fanout_writes);
+    try jw.objectField("storage_mode");
+    try jw.write(@tagName(receipt.storage_mode));
+    try jw.objectField("native_rows");
+    try jw.write(receipt.native_rows);
+    try jw.objectField("fanout_writes");
+    try jw.write(receipt.fanout_writes);
     try jw.endObject();
     try response.end();
+}
+
+const HttpMarketIngestRow = struct {
+    metric: []u8,
+    labels_json: []u8,
+    ts_ns: i64,
+    values: []f64,
+
+    fn input(self: *const HttpMarketIngestRow) Engine.MarketIngestInput {
+        return .{
+            .metric = self.metric,
+            .labels_json = self.labels_json,
+            .ts_ns = self.ts_ns,
+            .values = self.values,
+        };
+    }
+
+    fn deinit(self: *HttpMarketIngestRow, alloc: std.mem.Allocator) void {
+        alloc.free(self.metric);
+        alloc.free(self.labels_json);
+        alloc.free(self.values);
+        self.* = undefined;
+    }
+};
+
+fn freeHttpMarketIngestRows(alloc: std.mem.Allocator, rows: []HttpMarketIngestRow) void {
+    for (rows) |*row| row.deinit(alloc);
+    alloc.free(rows);
+}
+
+fn parseMarketIngestLine(alloc: std.mem.Allocator, eng: *Engine, raw_line: []const u8) !HttpMarketIngestRow {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, raw_line, .{}) catch return error.InvalidMarketRecord;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidMarketRecord;
+    const obj = parsed.value.object;
+
+    const metric_value = obj.get("metric") orelse return error.MissingMetric;
+    const ts_value = obj.get("ts_ns") orelse return error.MissingTsNs;
+    const columns_value = obj.get("columns") orelse return error.MissingColumns;
+    const labels_value = obj.get("labels") orelse return error.MissingLabels;
+    if (metric_value != .string or ts_value != .integer or columns_value != .object or labels_value != .object) {
+        return error.InvalidMarketRecord;
+    }
+
+    var schema = eng.marketSchema(metric_value.string) orelse return error.UnknownMarketSchema;
+    defer schema.deinit(eng.alloc);
+    if (!marketLabelsSatisfySchema(labels_value, schema)) return error.InvalidMarketLabels;
+    if (!marketColumnsMatchSchema(columns_value, schema)) return error.InvalidMarketColumns;
+
+    const labels_json = try extractTagsJson(alloc, labels_value);
+    defer if (labels_json.owned) |owned| alloc.free(owned);
+    const canonical_labels = try market_identity_mod.canonicalizeLabels(alloc, labels_json.value);
+    errdefer alloc.free(canonical_labels);
+
+    const metric = try alloc.dupe(u8, metric_value.string);
+    errdefer alloc.free(metric);
+    const values = try alloc.alloc(f64, schema.ordered_columns.len);
+    errdefer alloc.free(values);
+    for (schema.ordered_columns, 0..) |column, idx| {
+        values[idx] = numericValue(columns_value.object.get(column).?) catch return error.InvalidMarketColumns;
+    }
+
+    return .{
+        .metric = metric,
+        .labels_json = canonical_labels,
+        .ts_ns = ts_value.integer,
+        .values = values,
+    };
+}
+
+fn respondMarketIngestError(alloc: std.mem.Allocator, req: *std.http.Server.Request, err: anyerror) !void {
+    return switch (err) {
+        error.InvalidMarketRecord => respondJsonError(alloc, req, .bad_request, "invalid_market_record", "invalid market record"),
+        error.MissingMetric => respondJsonError(alloc, req, .bad_request, "missing_metric", "missing metric"),
+        error.MissingTsNs => respondJsonError(alloc, req, .bad_request, "missing_ts_ns", "missing ts_ns"),
+        error.MissingColumns => respondJsonError(alloc, req, .bad_request, "missing_columns", "missing columns"),
+        error.MissingLabels => respondJsonError(alloc, req, .bad_request, "missing_labels", "missing labels"),
+        error.UnknownMarketSchema => respondJsonError(alloc, req, .not_found, "market_schema_not_found", "market schema not found"),
+        error.InvalidMarketLabels,
+        error.InvalidTagsJson,
+        error.MissingRequiredMarketLabel,
+        error.NonCanonicalMarketLabels,
+        => respondJsonError(alloc, req, .bad_request, "invalid_market_labels", "invalid market labels"),
+        error.InvalidMarketColumns,
+        error.InvalidMarketColumnCount,
+        error.MarketValueCountMismatch,
+        => respondJsonError(alloc, req, .bad_request, "invalid_market_columns", "invalid market columns"),
+        error.MarketSeriesConflict => respondJsonError(alloc, req, .conflict, "market_series_conflict", "market series conflict"),
+        error.MarketSchemaConflict => respondJsonError(alloc, req, .conflict, "market_schema_mismatch", "market schema mismatch"),
+        error.RepositoryFormatMismatch => respondJsonError(alloc, req, .conflict, "repository_format_mismatch", "repository format mismatch"),
+        error.NativeMarketRequiresCas => respondJsonError(alloc, req, .conflict, "native_market_requires_cas", "native market storage requires CAS"),
+        error.MixedMarketStorageModes => respondJsonError(alloc, req, .conflict, "mixed_market_storage_modes", "mixed market storage modes"),
+        error.NativeMarketDataUnavailable => respondJsonError(alloc, req, .service_unavailable, "native_market_data_unavailable", "native market data unavailable"),
+        error.ShadowMismatch,
+        error.CasShadowMismatch,
+        => respondJsonError(alloc, req, .service_unavailable, "shadow_mismatch", "shadow mismatch"),
+        error.MemoryLimitExceeded => respondJsonError(alloc, req, .service_unavailable, "ingest_backpressure", "ingest backpressure: memory limit exceeded"),
+        error.MetricDescriptorConflict => respondJsonError(alloc, req, .conflict, "metric_descriptor_conflict", "metric descriptor conflict"),
+        else => respondJsonError(alloc, req, .internal_server_error, "market_ingest_failed", @errorName(err)),
+    };
 }
 
 fn handleMarketQuery(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request) !void {
@@ -3125,8 +3726,19 @@ fn handleMarketQuery(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Serv
     const requested_columns = if (obj.get("columns")) |value| try jsonStringArrayConst(alloc, value) else null;
     defer if (requested_columns) |columns| alloc.free(columns);
 
-    const rows = try queryMarketRows(alloc, eng, metric, labels, start_ts_ns, end_ts_ns, requested_columns, revision);
-    defer freeMarketQueryRows(alloc, rows);
+    var market_result = queryMarketRowsDetailed(
+        alloc,
+        eng,
+        metric,
+        labels,
+        start_ts_ns,
+        end_ts_ns,
+        requested_columns,
+        revision,
+    ) catch |err| {
+        return respondMarketQueryError(alloc, req, err);
+    };
+    defer market_result.deinit();
     const revision_label = try resolvedRevisionLabel(alloc, eng, revision);
     defer alloc.free(revision_label);
 
@@ -3143,10 +3755,45 @@ fn handleMarketQuery(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Serv
     try jw.write(revision_label);
     try jw.objectField("rows");
     try jw.beginArray();
-    for (rows) |row| try writeMarketQueryRow(&jw, row);
+    for (market_result.rows) |row| try writeMarketQueryRow(&jw, row);
     try jw.endArray();
+    try jw.objectField("stats");
+    try writeMarketQueryStats(&jw, market_result.stats);
     try jw.endObject();
     try response.end();
+}
+
+fn respondMarketQueryError(
+    alloc: std.mem.Allocator,
+    req: *std.http.Server.Request,
+    err: anyerror,
+) !void {
+    return switch (err) {
+        error.UnknownMarketSchema,
+        error.MarketSchemaNotFound,
+        => respondJsonError(alloc, req, .not_found, "market_schema_not_found", "market schema not found"),
+        error.InvalidMarketLabels,
+        error.InvalidTagsJson,
+        error.NonCanonicalMarketLabels,
+        => respondJsonError(alloc, req, .bad_request, "invalid_market_labels", "invalid market labels"),
+        error.InvalidProjection,
+        error.InvalidMarketColumns,
+        => respondJsonError(alloc, req, .bad_request, "invalid_market_columns", "invalid market columns"),
+        error.InvalidTimeRange => respondJsonError(alloc, req, .bad_request, "invalid_time_range", "invalid market time range"),
+        error.InvalidRevisionSpec => respondJsonError(alloc, req, .bad_request, "invalid_revision", "invalid revision"),
+        error.NativeRevisionUnavailable,
+        error.CasDisabled,
+        => respondJsonError(alloc, req, .service_unavailable, "native_revision_unavailable", "native revision unavailable"),
+        error.NativeMarketDataUnavailable => respondJsonError(alloc, req, .service_unavailable, "native_market_data_unavailable", "native market data unavailable"),
+        error.NativeMarketDataCorrupt => respondJsonError(alloc, req, .internal_server_error, "native_market_data_corrupt", "native market data corrupt"),
+        error.MarketSchemaMismatch,
+        error.MarketSegmentSchemaMismatch,
+        => respondJsonError(alloc, req, .conflict, "market_schema_mismatch", "market schema mismatch"),
+        error.RepositoryFormatMismatch => respondJsonError(alloc, req, .conflict, "repository_format_mismatch", "repository format mismatch"),
+        error.IncompleteMarketRow => respondJsonError(alloc, req, .conflict, "incomplete_market_row", "incomplete fanout market row"),
+        error.ShadowMismatch => respondJsonError(alloc, req, .service_unavailable, "shadow_mismatch", "shadow mismatch"),
+        else => respondJsonError(alloc, req, .internal_server_error, "market_query_failed", @errorName(err)),
+    };
 }
 
 fn handleSignalHistory(alloc: std.mem.Allocator, eng: *Engine, req: *std.http.Server.Request, query: []const u8) !void {
@@ -3747,6 +4394,17 @@ const MarketQueryRow = struct {
     }
 };
 
+const MarketQueryRowsResult = struct {
+    alloc: std.mem.Allocator,
+    rows: []MarketQueryRow,
+    stats: Engine.MarketQueryStats,
+
+    fn deinit(self: *MarketQueryRowsResult) void {
+        if (self.rows.len != 0) freeMarketQueryRows(self.alloc, self.rows);
+        self.* = undefined;
+    }
+};
+
 const SignalHistoryRow = struct {
     ts_ns: i64,
     value: f64,
@@ -3904,6 +4562,28 @@ fn writeMarketQueryRow(jw: *std.json.Stringify, row: MarketQueryRow) !void {
     try jw.endObject();
 }
 
+fn writeMarketQueryStats(
+    jw: *std.json.Stringify,
+    stats: Engine.MarketQueryStats,
+) !void {
+    try jw.beginObject();
+    try jw.objectField("storage_mode");
+    try jw.write(stats.storage_mode);
+    try jw.objectField("series_scanned");
+    try jw.write(stats.series_scanned);
+    try jw.objectField("blocks_scanned");
+    try jw.write(stats.blocks_scanned);
+    try jw.objectField("blocks_pruned");
+    try jw.write(stats.blocks_pruned);
+    try jw.objectField("columns_read");
+    try jw.write(stats.columns_read);
+    try jw.objectField("bytes_decoded");
+    try jw.write(stats.bytes_decoded);
+    try jw.objectField("shadow_mismatches");
+    try jw.write(stats.shadow_mismatches);
+    try jw.endObject();
+}
+
 fn writeSignalHistoryRow(jw: *std.json.Stringify, row: SignalHistoryRow) !void {
     try jw.beginObject();
     try jw.objectField("ts_ns");
@@ -3967,117 +4647,84 @@ fn queryMarketRows(
     requested_columns: ?[]const []const u8,
     revision: ?[]const u8,
 ) ![]MarketQueryRow {
-    var schema = eng.marketSchema(metric) orelse return error.MarketSchemaNotFound;
-    defer schema.deinit(eng.alloc);
+    var result = try queryMarketRowsDetailed(
+        alloc,
+        eng,
+        metric,
+        labels_value,
+        start_ts_ns,
+        end_ts_ns,
+        requested_columns,
+        revision,
+    );
+    const rows = result.rows;
+    result.rows = &.{};
+    result.deinit();
+    return rows;
+}
 
-    const columns = if (requested_columns) |value| blk: {
-        for (value) |column| {
-            var found = false;
-            for (schema.ordered_columns) |allowed| {
-                if (std.mem.eql(u8, column, allowed)) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) return error.InvalidMarketColumns;
-        }
-        break :blk value;
-    } else blk: {
-        var all_columns = try alloc.alloc([]const u8, schema.ordered_columns.len);
-        for (schema.ordered_columns, 0..) |column, idx| all_columns[idx] = column;
-        break :blk all_columns;
-    };
-    defer if (requested_columns == null) alloc.free(columns);
+fn queryMarketRowsDetailed(
+    alloc: std.mem.Allocator,
+    eng: *Engine,
+    metric: []const u8,
+    labels_value: std.json.Value,
+    start_ts_ns: i64,
+    end_ts_ns: i64,
+    requested_columns: ?[]const []const u8,
+    revision: ?[]const u8,
+) !MarketQueryRowsResult {
+    const labels_json = try extractTagsJson(alloc, labels_value);
+    defer if (labels_json.owned) |owned| alloc.free(owned);
 
-    var snapshot_index: ?cas_mod.SnapshotIndex = null;
-    if (revision) |spec| {
-        var cas = eng.cas orelse return error.CasDisabled;
-        const snapshot = try cas.loadSnapshotForSpec(spec);
-        snapshot_index = cas_mod.SnapshotIndex.init(cas.alloc, &cas.store, snapshot);
-    }
-    defer if (snapshot_index) |*index| index.deinit();
-
-    var descriptor_sets = try alloc.alloc([]QuerySeriesDescriptor, columns.len);
-    defer {
-        for (descriptor_sets) |set| {
-            for (set) |*entry| entry.deinit(alloc);
-            alloc.free(set);
-        }
-        alloc.free(descriptor_sets);
-    }
-
-    for (columns, 0..) |column, idx| {
-        const metric_name = try std.fmt.allocPrint(alloc, "{s}.{s}", .{ metric, column });
-        defer alloc.free(metric_name);
-        descriptor_sets[idx] = try querySeriesDescriptors(alloc, eng, snapshot_index, metric_name, labels_value, revision);
-    }
-    if (descriptor_sets.len == 0 or descriptor_sets[0].len == 0) return try alloc.alloc(MarketQueryRow, 0);
+    var engine_result = try eng.queryMarket(.{
+        .metric = metric,
+        .label_filter_json = labels_json.value,
+        .start_ts_ns = start_ts_ns,
+        .end_ts_ns = end_ts_ns,
+        .requested_columns = requested_columns orelse &.{},
+        .revision = revision,
+    });
+    defer engine_result.deinit();
 
     const default_revision = try resolvedRevisionLabel(alloc, eng, revision);
     defer alloc.free(default_revision);
 
     var rows = std.array_list.Managed(MarketQueryRow).init(alloc);
-    errdefer freeMarketQueryRows(alloc, rows.items);
-    for (descriptor_sets[0]) |anchor| {
-        var info = try extractClientLabelInfo(alloc, anchor.labels_json);
+    errdefer {
+        for (rows.items) |*row| row.deinit(alloc);
+        rows.deinit();
+    }
+    try rows.ensureTotalCapacity(engine_result.rows.len);
+    for (engine_result.rows) |engine_row| {
+        var info = try extractClientLabelInfo(alloc, engine_row.canonical_labels);
         defer info.deinit(alloc);
 
-        var series_ids = try alloc.alloc(types.SeriesId, columns.len);
-        defer alloc.free(series_ids);
-        series_ids[0] = anchor.series_id;
-        var complete = true;
-        for (columns[1..], 1..) |_, column_idx| {
-            const match = findDescriptorByLabels(descriptor_sets[column_idx], anchor.labels_json) orelse {
-                complete = false;
-                break;
-            };
-            series_ids[column_idx] = match.series_id;
-        }
-        if (!complete) continue;
-
-        var column_points = try alloc.alloc([]types.Point, columns.len);
-        defer {
-            for (column_points) |points| alloc.free(points);
-            alloc.free(column_points);
-        }
-        for (series_ids, 0..) |sid, idx| {
-            column_points[idx] = try queryPointsForSeriesId(alloc, eng, snapshot_index, sid, start_ts_ns, end_ts_ns);
-        }
-        if (column_points[0].len == 0) continue;
-
-        var offsets = try alloc.alloc(usize, columns.len);
-        defer alloc.free(offsets);
-        @memset(offsets, 0);
-        var values = try alloc.alloc(f64, columns.len);
-        defer alloc.free(values);
-
-        for (column_points[0]) |anchor_point| {
-            values[0] = anchor_point.value;
-            var row_complete = true;
-            for (1..columns.len) |column_idx| {
-                while (offsets[column_idx] < column_points[column_idx].len and column_points[column_idx][offsets[column_idx]].ts < anchor_point.ts) : (offsets[column_idx] += 1) {}
-                if (offsets[column_idx] >= column_points[column_idx].len or column_points[column_idx][offsets[column_idx]].ts != anchor_point.ts) {
-                    row_complete = false;
-                    break;
-                }
-                values[column_idx] = column_points[column_idx][offsets[column_idx]].value;
-            }
-            if (!row_complete) continue;
-            try rows.append(.{
-                .ts_ns = anchor_point.ts,
-                .columns_json = try buildColumnsJson(alloc, columns, values),
-                .labels_json = try alloc.dupe(u8, info.labels_json),
-                .data_revision = try alloc.dupe(u8, info.data_revision orelse default_revision),
-            });
-        }
+        const columns_json = try buildColumnsJson(
+            alloc,
+            engine_result.requested_columns,
+            engine_row.values,
+        );
+        errdefer alloc.free(columns_json);
+        const client_labels = try alloc.dupe(u8, info.labels_json);
+        errdefer alloc.free(client_labels);
+        const data_revision = try alloc.dupe(
+            u8,
+            info.data_revision orelse default_revision,
+        );
+        errdefer alloc.free(data_revision);
+        rows.appendAssumeCapacity(.{
+            .ts_ns = engine_row.ts_ns,
+            .columns_json = columns_json,
+            .labels_json = client_labels,
+            .data_revision = data_revision,
+        });
     }
-    std.sort.block(MarketQueryRow, rows.items, {}, struct {
-        fn lessThan(_: void, lhs: MarketQueryRow, rhs: MarketQueryRow) bool {
-            if (lhs.ts_ns != rhs.ts_ns) return lhs.ts_ns < rhs.ts_ns;
-            return std.mem.lessThan(u8, lhs.labels_json, rhs.labels_json);
-        }
-    }.lessThan);
-    return try rows.toOwnedSlice();
+
+    return .{
+        .alloc = alloc,
+        .rows = try rows.toOwnedSlice(),
+        .stats = engine_result.stats,
+    };
 }
 
 fn querySignalHistoryRows(
@@ -4189,7 +4836,8 @@ fn querySeriesDescriptors(
             });
         }
     } else {
-        const live = try eng.seriesDescriptorsForMetric(alloc, metric, labels_value, true, null);
+        const live_labels: ?std.json.Value = if (labels_value == .object and labels_value.object.count() == 0) null else labels_value;
+        const live = try eng.seriesDescriptorsForMetric(alloc, metric, live_labels, true, null);
         defer alloc.free(live);
         for (live) |entry| {
             try descriptors.append(.{
@@ -4361,29 +5009,24 @@ fn analysisGroupKeyFromLabels(alloc: std.mem.Allocator, labels_json: []const u8,
     errdefer if (symbol) |value| alloc.free(value);
     const venue = try labelValueFromJson(alloc, labels_json, "venue");
     errdefer if (venue) |value| alloc.free(value);
-    return switch (group_by) {
-        .none => if (symbol != null and venue != null)
-            .{ .symbol = symbol, .venue = venue }
-        else blk: {
+    switch (group_by) {
+        .none => {
+            if (symbol != null and venue != null) return .{ .symbol = symbol, .venue = venue };
             if (symbol) |value| alloc.free(value);
             if (venue) |value| alloc.free(value);
-            break :blk null;
+            return null;
         },
-        .venue => if (venue != null)
-            .{ .venue = venue }
-        else blk: {
+        .venue => {
             if (symbol) |value| alloc.free(value);
-            if (venue) |value| alloc.free(value);
-            break :blk null;
+            if (venue != null) return .{ .venue = venue };
+            return null;
         },
-        .symbol => if (symbol != null)
-            .{ .symbol = symbol }
-        else blk: {
-            if (symbol) |value| alloc.free(value);
+        .symbol => {
             if (venue) |value| alloc.free(value);
-            break :blk null;
+            if (symbol != null) return .{ .symbol = symbol };
+            return null;
         },
-    };
+    }
 }
 
 fn freeAnalysisRowGroups(alloc: std.mem.Allocator, groups: []AnalysisRowGroup) void {

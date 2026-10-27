@@ -6,6 +6,9 @@ const compact_mod = @import("compact.zig");
 const object_store = @import("object_store.zig");
 const extents = @import("extents.zig");
 const market_catalog_mod = @import("market_catalog.zig");
+const market_identity = @import("market_identity.zig");
+const market_manifest_mod = @import("market_manifest.zig");
+const market_segment_mod = @import("market_segment.zig");
 const metric_catalog_mod = @import("metric_catalog.zig");
 const segment_mod = @import("segment.zig");
 const series_catalog_mod = @import("series_catalog.zig");
@@ -16,12 +19,17 @@ const wal_mod = @import("wal.zig");
 pub const current_format_version: u16 = 1;
 pub const main_ref = "heads/main";
 pub const legacy_repository_format_version: u16 = 1;
-pub const current_repository_format_version: u16 = 3;
+pub const current_repository_format_version: u16 = 4;
+pub const primary_repository_format_version: u16 = 3;
 pub const default_extent_chunk_bytes: u32 = 64 * 1024;
 const store_format_path = "objects/info/store-format";
 const store_format_magic = "SYDSTORE1";
 const repository_id_path = "objects/info/repository-id";
 const repository_id_magic = "SYDREPO1";
+const segment_descriptor_magic = "SYSEGD1";
+const market_segment_descriptor_magic = "SYMKTD1";
+const checkpoint_state_magic = "SYCKPT1";
+const wal_index_magic = "SYWIDX1";
 
 pub const RefBackend = enum(u8) {
     loose = 1,
@@ -32,6 +40,15 @@ pub const RepositoryFormat = struct {
     version: u16 = current_repository_format_version,
     ref_backend: RefBackend = .reftable,
     extent_chunk_bytes: u32 = default_extent_chunk_bytes,
+};
+
+pub const RepositoryFormatProbe = struct {
+    format: RepositoryFormat,
+    /// True when the repository contains no application, populated ref, or
+    /// object state. Format/identity markers, empty CAS directories, and the
+    /// process lock are initialization infrastructure so an interrupted first
+    /// startup remains fresh.
+    fresh_repository: bool,
 };
 
 pub const RepositoryIdentity = struct {
@@ -144,6 +161,66 @@ pub const SegmentDescriptor = struct {
             self.count == other.count and
             self.ts_codec == other.ts_codec and
             self.val_codec == other.val_codec;
+    }
+};
+
+pub const MarketSegmentDescriptor = struct {
+    path: []u8,
+    market_segment_root: ?object_store.ObjectId = null,
+    market_series_id: market_identity.MarketSeriesId,
+    schema_digest: market_identity.SchemaDigest,
+    metric: []u8,
+    canonical_labels: []u8,
+    hour_bucket: i64,
+    start_ts_ns: i64,
+    end_ts_ns: i64,
+    row_count: u64,
+    block_count: u32,
+    column_names: [][]u8,
+    content_id: [32]u8,
+    file_hash: [32]u8,
+    file_size: u64,
+
+    pub fn deinit(self: *MarketSegmentDescriptor, alloc: std.mem.Allocator) void {
+        alloc.free(self.path);
+        alloc.free(self.metric);
+        alloc.free(self.canonical_labels);
+        for (self.column_names) |name| alloc.free(name);
+        alloc.free(self.column_names);
+        self.* = undefined;
+    }
+
+    pub fn segmentRoot(self: MarketSegmentDescriptor) ?object_store.ObjectId {
+        return self.market_segment_root;
+    }
+
+    pub fn mirrorPath(self: MarketSegmentDescriptor) []const u8 {
+        return self.path;
+    }
+
+    pub fn eql(self: MarketSegmentDescriptor, other: MarketSegmentDescriptor) bool {
+        if (!std.mem.eql(u8, self.mirrorPath(), other.mirrorPath())) return false;
+        if (!optionalObjectIdEql(self.segmentRoot(), other.segmentRoot())) return false;
+        if (self.market_series_id != other.market_series_id) return false;
+        if (!std.mem.eql(u8, self.schema_digest[0..], other.schema_digest[0..])) return false;
+        if (!std.mem.eql(u8, self.metric, other.metric)) return false;
+        if (!std.mem.eql(u8, self.canonical_labels, other.canonical_labels)) return false;
+        if (self.hour_bucket != other.hour_bucket or
+            self.start_ts_ns != other.start_ts_ns or
+            self.end_ts_ns != other.end_ts_ns or
+            self.row_count != other.row_count or
+            self.block_count != other.block_count or
+            self.file_size != other.file_size)
+        {
+            return false;
+        }
+        if (!std.mem.eql(u8, self.content_id[0..], other.content_id[0..])) return false;
+        if (!std.mem.eql(u8, self.file_hash[0..], other.file_hash[0..])) return false;
+        if (self.column_names.len != other.column_names.len) return false;
+        for (self.column_names, other.column_names) |lhs_name, rhs_name| {
+            if (!std.mem.eql(u8, lhs_name, rhs_name)) return false;
+        }
+        return true;
     }
 };
 
@@ -373,6 +450,7 @@ pub const Commit = struct {
 
 pub const LegacySnapshot = struct {
     segment_descriptors: []SegmentDescriptor,
+    market_segment_descriptors: []MarketSegmentDescriptor,
     tag_snapshot: TagSnapshot,
     series_catalog_snapshot: SeriesCatalogSnapshot,
     metric_catalog_snapshot: MetricCatalogSnapshot,
@@ -383,6 +461,8 @@ pub const LegacySnapshot = struct {
     pub fn deinit(self: *LegacySnapshot, alloc: std.mem.Allocator) void {
         for (self.segment_descriptors) |*descriptor| descriptor.deinit(alloc);
         alloc.free(self.segment_descriptors);
+        for (self.market_segment_descriptors) |*descriptor| descriptor.deinit(alloc);
+        alloc.free(self.market_segment_descriptors);
         self.tag_snapshot.deinit(alloc);
         self.series_catalog_snapshot.deinit(alloc);
         self.metric_catalog_snapshot.deinit(alloc);
@@ -397,6 +477,7 @@ pub const Snapshot = struct {
     root_id: object_store.ObjectId,
     commit: Commit,
     segment_descriptors: []SegmentDescriptor,
+    market_segment_descriptors: []MarketSegmentDescriptor,
     tag_snapshot: TagSnapshot,
     series_catalog_snapshot: SeriesCatalogSnapshot,
     metric_catalog_snapshot: MetricCatalogSnapshot,
@@ -408,6 +489,8 @@ pub const Snapshot = struct {
         self.commit.deinit(alloc);
         for (self.segment_descriptors) |*descriptor| descriptor.deinit(alloc);
         alloc.free(self.segment_descriptors);
+        for (self.market_segment_descriptors) |*descriptor| descriptor.deinit(alloc);
+        alloc.free(self.market_segment_descriptors);
         self.tag_snapshot.deinit(alloc);
         self.series_catalog_snapshot.deinit(alloc);
         self.metric_catalog_snapshot.deinit(alloc);
@@ -515,6 +598,9 @@ pub const SnapshotIndex = struct {
         for (self.snapshot.segment_descriptors) |descriptor| {
             if (descriptor.segmentRoot() == null) report.legacy_segment_descriptors += 1;
         }
+        for (self.snapshot.market_segment_descriptors) |descriptor| {
+            if (descriptor.segmentRoot() == null) report.legacy_market_segment_descriptors += 1;
+        }
         for (self.snapshot.wal_index.entries) |entry| {
             if (entry.journalRoot() == null) report.legacy_wal_descriptors += 1;
         }
@@ -582,6 +668,7 @@ test "snapshot index compatibility debt counts legacy descriptors" {
     const tag_snapshot = try TagSnapshot.empty(alloc);
     const series_catalog_snapshot = try SeriesCatalogSnapshot.empty(alloc);
     const metric_catalog_snapshot = try MetricCatalogSnapshot.empty(alloc);
+    const market_segment_descriptors = try alloc.alloc(MarketSegmentDescriptor, 0);
     const checkpoint_state = try CheckpointState.empty(alloc);
     const parents = try alloc.alloc(object_store.ObjectId, 0);
     const reason = try alloc.dupe(u8, "test");
@@ -598,6 +685,7 @@ test "snapshot index compatibility debt counts legacy descriptors" {
             .reason = reason,
         },
         .segment_descriptors = segment_descriptors,
+        .market_segment_descriptors = market_segment_descriptors,
         .tag_snapshot = tag_snapshot,
         .series_catalog_snapshot = series_catalog_snapshot,
         .metric_catalog_snapshot = metric_catalog_snapshot,
@@ -1517,7 +1605,22 @@ pub const CommitWriter = struct {
         parent: ?object_store.ObjectId,
         reason: []const u8,
     ) !object_store.ObjectId {
-        var snapshot = try buildLegacySnapshotWithMarket(self.alloc, data_dir, manifest, tags, series_catalog, metric_catalog, market_catalog, self.store, self.extent_chunk_bytes);
+        return try self.writeSnapshotWithNativeMarket(data_dir, manifest, tags, series_catalog, metric_catalog, market_catalog, null, parent, reason);
+    }
+
+    pub fn writeSnapshotWithNativeMarket(
+        self: *CommitWriter,
+        data_dir: std.fs.Dir,
+        manifest: *const manifest_mod.Manifest,
+        tags: *const tags_mod.TagIndex,
+        series_catalog: *const series_catalog_mod.SeriesCatalog,
+        metric_catalog: *const metric_catalog_mod.MetricCatalog,
+        market_catalog: ?*market_catalog_mod.Catalog,
+        market_manifest: ?*const market_manifest_mod.Manifest,
+        parent: ?object_store.ObjectId,
+        reason: []const u8,
+    ) !object_store.ObjectId {
+        var snapshot = try buildLegacySnapshotWithNativeMarket(self.alloc, data_dir, manifest, tags, series_catalog, metric_catalog, market_catalog, market_manifest, self.store, self.extent_chunk_bytes);
         defer snapshot.deinit(self.alloc);
         return try self.writePreparedSnapshot(&snapshot, parent, reason);
     }
@@ -1577,6 +1680,7 @@ pub const CommitWriter = struct {
         const checkpoint_blob_id = try self.store.put(.blob, checkpoint_payload);
 
         const segments_tree_id = try self.writeSegmentTree(snapshot.segment_descriptors);
+        const market_segments_tree_id = try self.writeMarketSegmentTree(snapshot.market_segment_descriptors);
 
         var metadata_entries = std.array_list.Managed(TreeEntry).init(self.alloc);
         defer {
@@ -1587,6 +1691,11 @@ pub const CommitWriter = struct {
             .name = try self.alloc.dupe(u8, "segments"),
             .object_type = .tree,
             .object_id = segments_tree_id,
+        });
+        try metadata_entries.append(.{
+            .name = try self.alloc.dupe(u8, "market_segments"),
+            .object_type = .tree,
+            .object_id = market_segments_tree_id,
         });
         try metadata_entries.append(.{
             .name = try self.alloc.dupe(u8, "series_catalog"),
@@ -1600,7 +1709,7 @@ pub const CommitWriter = struct {
         });
         if (market_blob_id) |blob_id| {
             try metadata_entries.append(.{
-                .name = try self.alloc.dupe(u8, "market_catalog"),
+                .name = try self.alloc.dupe(u8, "market_series_catalog"),
                 .object_type = .blob,
                 .object_id = blob_id,
             });
@@ -1827,6 +1936,121 @@ pub const CommitWriter = struct {
 
         return try self.putTree(segment_entries.items);
     }
+
+    fn writeMarketSegmentTree(self: *CommitWriter, descriptors: []const MarketSegmentDescriptor) !object_store.ObjectId {
+        const HourGroup = struct {
+            hour_bucket: i64,
+            entries: std.array_list.Managed(TreeEntry),
+        };
+
+        const SeriesGroup = struct {
+            market_series_id: market_identity.MarketSeriesId,
+            hours: std.array_list.Managed(HourGroup),
+        };
+
+        var series_groups = std.array_list.Managed(SeriesGroup).init(self.alloc);
+        defer {
+            for (series_groups.items) |*series_group| {
+                for (series_group.hours.items) |*hour_group| {
+                    for (hour_group.entries.items) |*entry| entry.deinit(self.alloc);
+                    hour_group.entries.deinit();
+                }
+                series_group.hours.deinit();
+            }
+            series_groups.deinit();
+        }
+
+        for (descriptors) |descriptor| {
+            const descriptor_payload = try encodeMarketSegmentDescriptor(self.alloc, descriptor);
+            defer self.alloc.free(descriptor_payload);
+            const descriptor_id = try self.store.put(.blob, descriptor_payload);
+
+            var series_group: ?*SeriesGroup = null;
+            for (series_groups.items) |*existing| {
+                if (existing.market_series_id == descriptor.market_series_id) {
+                    series_group = existing;
+                    break;
+                }
+            }
+            if (series_group == null) {
+                try series_groups.append(.{
+                    .market_series_id = descriptor.market_series_id,
+                    .hours = std.array_list.Managed(HourGroup).init(self.alloc),
+                });
+                series_group = &series_groups.items[series_groups.items.len - 1];
+            }
+
+            var hour_group: ?*HourGroup = null;
+            for (series_group.?.hours.items) |*existing| {
+                if (existing.hour_bucket == descriptor.hour_bucket) {
+                    hour_group = existing;
+                    break;
+                }
+            }
+            if (hour_group == null) {
+                try series_group.?.hours.append(.{
+                    .hour_bucket = descriptor.hour_bucket,
+                    .entries = std.array_list.Managed(TreeEntry).init(self.alloc),
+                });
+                hour_group = &series_group.?.hours.items[series_group.?.hours.items.len - 1];
+            }
+
+            try hour_group.?.entries.append(.{
+                .name = try self.alloc.dupe(u8, std.fs.path.basename(descriptor.mirrorPath())),
+                .object_type = .blob,
+                .object_id = descriptor_id,
+            });
+        }
+
+        var market_segment_entries = std.array_list.Managed(TreeEntry).init(self.alloc);
+        defer {
+            for (market_segment_entries.items) |*entry| entry.deinit(self.alloc);
+            market_segment_entries.deinit();
+        }
+
+        std.sort.block(SeriesGroup, series_groups.items, {}, struct {
+            fn lessThan(_: void, lhs: SeriesGroup, rhs: SeriesGroup) bool {
+                return lhs.market_series_id < rhs.market_series_id;
+            }
+        }.lessThan);
+
+        for (series_groups.items) |*series_group| {
+            std.sort.block(HourGroup, series_group.hours.items, {}, struct {
+                fn lessThan(_: void, lhs: HourGroup, rhs: HourGroup) bool {
+                    return lhs.hour_bucket < rhs.hour_bucket;
+                }
+            }.lessThan);
+
+            var series_entries = std.array_list.Managed(TreeEntry).init(self.alloc);
+            defer {
+                for (series_entries.items) |*entry| entry.deinit(self.alloc);
+                series_entries.deinit();
+            }
+
+            for (series_group.hours.items) |*hour_group| {
+                std.sort.block(TreeEntry, hour_group.entries.items, {}, struct {
+                    fn lessThan(_: void, lhs: TreeEntry, rhs: TreeEntry) bool {
+                        return std.mem.lessThan(u8, lhs.name, rhs.name);
+                    }
+                }.lessThan);
+                const hour_tree_id = try self.putTree(hour_group.entries.items);
+                try series_entries.append(.{
+                    .name = try std.fmt.allocPrint(self.alloc, "{d}", .{hour_group.hour_bucket}),
+                    .object_type = .tree,
+                    .object_id = hour_tree_id,
+                });
+            }
+
+            const series_tree_id = try self.putTree(series_entries.items);
+            try market_segment_entries.append(.{
+                .name = try std.fmt.allocPrint(self.alloc, "{x}", .{series_group.market_series_id}),
+                .object_type = .tree,
+                .object_id = series_tree_id,
+            });
+        }
+
+        return try self.putTree(market_segment_entries.items);
+    }
 };
 
 pub const CommitReader = struct {
@@ -1871,6 +2095,11 @@ pub const CommitReader = struct {
             for (descriptors.items) |*descriptor| descriptor.deinit(self.alloc);
             descriptors.deinit();
         }
+        var market_descriptors = std.array_list.Managed(MarketSegmentDescriptor).init(self.alloc);
+        errdefer {
+            for (market_descriptors.items) |*descriptor| descriptor.deinit(self.alloc);
+            market_descriptors.deinit();
+        }
 
         {
             var metadata_tree = try self.loadTreeObject(metadata_tree_id);
@@ -1900,8 +2129,9 @@ pub const CommitReader = struct {
                 metric_catalog_snapshot = try decodeMetricCatalogSnapshot(self.alloc, loaded.payload);
             }
 
-            if (findBlobEntry(metadata_tree.entries, "market_catalog")) |market_blob_id| {
-                const loaded = try self.store.get(self.alloc, market_blob_id);
+            const market_blob_id = findMarketSeriesCatalogBlob(metadata_tree.entries);
+            if (market_blob_id) |blob_id| {
+                const loaded = try self.store.get(self.alloc, blob_id);
                 defer self.alloc.free(loaded.payload);
                 if (loaded.obj_type != .blob) return error.InvalidMetricCatalogSnapshotObject;
                 if (market_catalog_snapshot) |*snapshot| snapshot.deinit(self.alloc);
@@ -1910,6 +2140,9 @@ pub const CommitReader = struct {
 
             if (findTreeEntry(metadata_tree.entries, "segments")) |segments_tree_id| {
                 try self.loadSegmentDescriptorsRecursive(segments_tree_id, &descriptors);
+            }
+            if (findTreeEntry(metadata_tree.entries, "market_segments")) |market_segments_tree_id| {
+                try self.loadMarketSegmentDescriptorsRecursive(market_segments_tree_id, &market_descriptors);
             }
         }
 
@@ -1938,6 +2171,7 @@ pub const CommitReader = struct {
         }
 
         sortDescriptors(descriptors.items);
+        sortMarketSegmentDescriptors(market_descriptors.items);
         sortSeriesCatalogEntries(series_catalog_snapshot.entries);
 
         return .{
@@ -1945,6 +2179,7 @@ pub const CommitReader = struct {
             .root_id = commit.root,
             .commit = commit,
             .segment_descriptors = try descriptors.toOwnedSlice(),
+            .market_segment_descriptors = try market_descriptors.toOwnedSlice(),
             .tag_snapshot = tag_snapshot,
             .series_catalog_snapshot = series_catalog_snapshot,
             .metric_catalog_snapshot = metric_catalog_snapshot,
@@ -1974,7 +2209,20 @@ pub const CommitReader = struct {
         metric_catalog: *const metric_catalog_mod.MetricCatalog,
         market_catalog: ?*market_catalog_mod.Catalog,
     ) !void {
-        var live = try buildLegacySnapshotWithMarket(self.alloc, data_dir, manifest, tags, series_catalog, metric_catalog, market_catalog, self.store, default_extent_chunk_bytes);
+        return try self.verifyHeadMatchesLegacyWithNativeMarket(data_dir, manifest, tags, series_catalog, metric_catalog, market_catalog, null);
+    }
+
+    pub fn verifyHeadMatchesLegacyWithNativeMarket(
+        self: *CommitReader,
+        data_dir: std.fs.Dir,
+        manifest: *const manifest_mod.Manifest,
+        tags: *const tags_mod.TagIndex,
+        series_catalog: *const series_catalog_mod.SeriesCatalog,
+        metric_catalog: *const metric_catalog_mod.MetricCatalog,
+        market_catalog: ?*market_catalog_mod.Catalog,
+        market_manifest: ?*const market_manifest_mod.Manifest,
+    ) !void {
+        var live = try buildLegacySnapshotWithNativeMarket(self.alloc, data_dir, manifest, tags, series_catalog, metric_catalog, market_catalog, market_manifest, self.store, default_extent_chunk_bytes);
         defer live.deinit(self.alloc);
 
         var stored = try self.loadHeadSnapshot();
@@ -1982,6 +2230,7 @@ pub const CommitReader = struct {
 
         try verifyLegacySnapshot(live, stored);
         try verifyWalFiles(self.alloc, stored.wal_index, data_dir, self.store);
+        try verifyMarketSegmentFiles(self.alloc, stored.market_segment_descriptors, data_dir, self.store);
     }
 
     fn loadTreeObject(self: *CommitReader, id: object_store.ObjectId) !Tree {
@@ -2008,6 +2257,24 @@ pub const CommitReader = struct {
             }
         }
     }
+
+    fn loadMarketSegmentDescriptorsRecursive(self: *CommitReader, tree_id: object_store.ObjectId, descriptors: *std.array_list.Managed(MarketSegmentDescriptor)) !void {
+        var tree = try self.loadTreeObject(tree_id);
+        defer tree.deinit(self.alloc);
+
+        for (tree.entries) |entry| {
+            switch (entry.object_type) {
+                .tree => try self.loadMarketSegmentDescriptorsRecursive(entry.object_id, descriptors),
+                .blob => {
+                    const loaded = try self.store.get(self.alloc, entry.object_id);
+                    defer self.alloc.free(loaded.payload);
+                    if (loaded.obj_type != .blob) return error.InvalidMarketSegmentDescriptorObject;
+                    try descriptors.append(try decodeMarketSegmentDescriptor(self.alloc, loaded.payload));
+                },
+                else => return error.InvalidSegmentTreeEntry,
+            }
+        }
+    }
 };
 
 pub const LogEntry = struct {
@@ -2024,6 +2291,8 @@ pub const LogEntry = struct {
 pub const SnapshotDiff = struct {
     segments_added: usize,
     segments_removed: usize,
+    market_segments_added: usize = 0,
+    market_segments_removed: usize = 0,
     tags_changed: usize,
     series_entries_changed: usize,
     wal_chunks_added: usize,
@@ -2089,8 +2358,10 @@ pub const FsckReport = struct {
     blob_objects: usize,
     commit_graph_entries_checked: usize,
     segment_contents_checked: usize,
+    market_segment_contents_checked: usize,
     wal_contents_checked: usize,
     missing_segment_mirrors: usize,
+    missing_market_segment_mirrors: usize,
     missing_wal_mirrors: usize,
     reflog_files_checked: usize,
     stale_reflog_files: usize,
@@ -2119,6 +2390,7 @@ const ObjectLogicalRole = enum(u8) {
     segment_descriptor = 3,
     wal_index = 4,
     checkpoint_state = 5,
+    market_segment_descriptor = 6,
 };
 
 const ObjectRefsIndexRecord = struct {
@@ -2290,11 +2562,12 @@ pub const CasManager = struct {
     refs: RefStore,
     format: RepositoryFormat,
     repository_id: RepositoryIdentity,
+    mu: std.Thread.Mutex = .{},
 
     pub fn init(alloc: std.mem.Allocator, path: []const u8, fsync: cfg.FsyncPolicy) !CasManager {
+        const format = try probeOrInitRepositoryFormat(alloc, path, fsync);
         var store = try object_store.ObjectStore.init(alloc, path, fsync);
         errdefer store.deinit();
-        const format = try loadOrInitRepositoryFormat(alloc, store.root, fsync);
         const repository_id = try loadOrInitRepositoryId(store.root, fsync);
         var refs = try RefStore.init(alloc, path, fsync);
         refs.setBackend(format.ref_backend);
@@ -2334,9 +2607,22 @@ pub const CasManager = struct {
         metric_catalog: *const metric_catalog_mod.MetricCatalog,
         market_catalog: ?*market_catalog_mod.Catalog,
     ) !object_store.ObjectId {
+        return try self.bootstrapIfMissingWithNativeMarket(data_dir, manifest, tags, series_catalog, metric_catalog, market_catalog, null);
+    }
+
+    pub fn bootstrapIfMissingWithNativeMarket(
+        self: *CasManager,
+        data_dir: std.fs.Dir,
+        manifest: *const manifest_mod.Manifest,
+        tags: *const tags_mod.TagIndex,
+        series_catalog: *const series_catalog_mod.SeriesCatalog,
+        metric_catalog: *const metric_catalog_mod.MetricCatalog,
+        market_catalog: ?*market_catalog_mod.Catalog,
+        market_manifest: ?*const market_manifest_mod.Manifest,
+    ) !object_store.ObjectId {
         if (try self.refs.readHead(main_ref)) |head| return head;
         var writer = CommitWriter{ .alloc = self.alloc, .store = &self.store, .extent_chunk_bytes = self.format.extent_chunk_bytes };
-        const commit_id = try writer.writeSnapshotWithMarket(data_dir, manifest, tags, series_catalog, metric_catalog, market_catalog, null, "bootstrap");
+        const commit_id = try writer.writeSnapshotWithNativeMarket(data_dir, manifest, tags, series_catalog, metric_catalog, market_catalog, market_manifest, null, "bootstrap");
         try self.refs.compareAndSwapRef(main_ref, null, commit_id, "bootstrap");
         try self.ensureHeadSymRef();
         try self.refreshCommitGraph();
@@ -2365,9 +2651,26 @@ pub const CasManager = struct {
         market_catalog: ?*market_catalog_mod.Catalog,
         reason: []const u8,
     ) !object_store.ObjectId {
+        return try self.syncLegacySnapshotWithNativeMarket(data_dir, manifest, tags, series_catalog, metric_catalog, market_catalog, null, reason);
+    }
+
+    pub fn syncLegacySnapshotWithNativeMarket(
+        self: *CasManager,
+        data_dir: std.fs.Dir,
+        manifest: *const manifest_mod.Manifest,
+        tags: *const tags_mod.TagIndex,
+        series_catalog: *const series_catalog_mod.SeriesCatalog,
+        metric_catalog: *const metric_catalog_mod.MetricCatalog,
+        market_catalog: ?*market_catalog_mod.Catalog,
+        market_manifest: ?*const market_manifest_mod.Manifest,
+        reason: []const u8,
+    ) !object_store.ObjectId {
+        self.mu.lock();
+        defer self.mu.unlock();
+
         const parent = try self.refs.readHead(main_ref);
         var writer = CommitWriter{ .alloc = self.alloc, .store = &self.store, .extent_chunk_bytes = self.format.extent_chunk_bytes };
-        const commit_id = try writer.writeSnapshotWithMarket(data_dir, manifest, tags, series_catalog, metric_catalog, market_catalog, parent, reason);
+        const commit_id = try writer.writeSnapshotWithNativeMarket(data_dir, manifest, tags, series_catalog, metric_catalog, market_catalog, market_manifest, parent, reason);
         try self.refs.compareAndSwapRef(main_ref, parent, commit_id, reason);
         try self.refreshCommitGraph();
         return commit_id;
@@ -2393,11 +2696,27 @@ pub const CasManager = struct {
         metric_catalog: *const metric_catalog_mod.MetricCatalog,
         market_catalog: ?*market_catalog_mod.Catalog,
     ) !void {
+        return try self.verifyHeadMatchesLegacyWithNativeMarket(data_dir, manifest, tags, series_catalog, metric_catalog, market_catalog, null);
+    }
+
+    pub fn verifyHeadMatchesLegacyWithNativeMarket(
+        self: *CasManager,
+        data_dir: std.fs.Dir,
+        manifest: *const manifest_mod.Manifest,
+        tags: *const tags_mod.TagIndex,
+        series_catalog: *const series_catalog_mod.SeriesCatalog,
+        metric_catalog: *const metric_catalog_mod.MetricCatalog,
+        market_catalog: ?*market_catalog_mod.Catalog,
+        market_manifest: ?*const market_manifest_mod.Manifest,
+    ) !void {
         var reader = CommitReader{ .alloc = self.alloc, .store = &self.store, .refs = &self.refs };
-        try reader.verifyHeadMatchesLegacyWithMarket(data_dir, manifest, tags, series_catalog, metric_catalog, market_catalog);
+        try reader.verifyHeadMatchesLegacyWithNativeMarket(data_dir, manifest, tags, series_catalog, metric_catalog, market_catalog, market_manifest);
     }
 
     pub fn loadHeadIndex(self: *CasManager) !SnapshotIndex {
+        self.mu.lock();
+        defer self.mu.unlock();
+
         var reader = CommitReader{ .alloc = self.alloc, .store = &self.store, .refs = &self.refs };
         return SnapshotIndex.init(self.alloc, &self.store, try reader.loadHeadSnapshot());
     }
@@ -2782,6 +3101,8 @@ pub const CasManager = struct {
                     if (lhs_root.eql(rhs_root)) return .{
                         .segments_added = 0,
                         .segments_removed = 0,
+                        .market_segments_added = 0,
+                        .market_segments_removed = 0,
                         .tags_changed = 0,
                         .series_entries_changed = 0,
                         .wal_chunks_added = 0,
@@ -2805,6 +3126,8 @@ pub const CasManager = struct {
         return .{
             .segments_added = countDescriptorsNotIn(rhs.segment_descriptors, lhs.segment_descriptors),
             .segments_removed = countDescriptorsNotIn(lhs.segment_descriptors, rhs.segment_descriptors),
+            .market_segments_added = countMarketSegmentDescriptorsNotIn(rhs.market_segment_descriptors, lhs.market_segment_descriptors),
+            .market_segments_removed = countMarketSegmentDescriptorsNotIn(lhs.market_segment_descriptors, rhs.market_segment_descriptors),
             .tags_changed = countTagEntriesChanged(lhs.tag_snapshot.entries, rhs.tag_snapshot.entries),
             .series_entries_changed = countSeriesEntriesChanged(lhs.series_catalog_snapshot.entries, rhs.series_catalog_snapshot.entries),
             .wal_chunks_added = countWalChunksNotIn(rhs.wal_index.entries, lhs.wal_index.entries),
@@ -2822,6 +3145,7 @@ pub const CasManager = struct {
 
         try materializeSnapshotMirrors(self.alloc, data_dir, &self.store, snapshot);
         try writeManifestFile(self.alloc, data_dir, snapshot.segment_descriptors);
+        try writeMarketManifestFile(self.alloc, data_dir, snapshot.market_segment_descriptors);
         try writeTagsFile(self.alloc, data_dir, snapshot.tag_snapshot);
         try writeSeriesCatalogFile(self.alloc, data_dir, snapshot.series_catalog_snapshot);
         try writeMetricCatalogFile(self.alloc, data_dir, snapshot.metric_catalog_snapshot);
@@ -2966,8 +3290,10 @@ pub const CasManager = struct {
             .blob_objects = 0,
             .commit_graph_entries_checked = 0,
             .segment_contents_checked = 0,
+            .market_segment_contents_checked = 0,
             .wal_contents_checked = 0,
             .missing_segment_mirrors = 0,
+            .missing_market_segment_mirrors = 0,
             .missing_wal_mirrors = 0,
             .reflog_files_checked = 0,
             .stale_reflog_files = 0,
@@ -3010,6 +3336,12 @@ pub const CasManager = struct {
                                     defer descriptor.deinit(self.alloc);
                                     if (descriptor.segmentRoot() == null) report.compatibility_debt.legacy_segment_descriptors += 1;
                                 },
+                                .market_segment_descriptor => {
+                                    var descriptor = try decodeMarketSegmentDescriptor(self.alloc, loaded.payload);
+                                    defer descriptor.deinit(self.alloc);
+                                    if (descriptor.segmentRoot() == null) report.compatibility_debt.legacy_market_segment_descriptors += 1;
+                                    try validateMarketSegmentRootMatchesDescriptor(self.alloc, &self.store, descriptor);
+                                },
                                 .wal_index => {
                                     var wal_index = try decodeWalIndex(self.alloc, loaded.payload);
                                     defer wal_index.deinit(self.alloc);
@@ -3026,7 +3358,7 @@ pub const CasManager = struct {
             }
         }
 
-        if (self.format.version >= current_repository_format_version and self.format.ref_backend == .reftable) {
+        if (self.format.version >= primary_repository_format_version and self.format.ref_backend == .reftable) {
             const loose_refs = try self.refs.listLooseRefs(self.alloc);
             defer {
                 for (loose_refs) |*entry| entry.deinit(self.alloc);
@@ -3093,6 +3425,17 @@ pub const CasManager = struct {
                 if (descriptor.mirrorPath().len != 0) {
                     _ = data_dir.statFile(descriptor.mirrorPath()) catch |err| switch (err) {
                         error.FileNotFound => report.missing_segment_mirrors += 1,
+                        else => return err,
+                    };
+                }
+            }
+
+            for (snapshot.snapshot.market_segment_descriptors) |descriptor| {
+                try validateMarketSegmentRootMatchesDescriptor(self.alloc, &self.store, descriptor);
+                report.market_segment_contents_checked += 1;
+                if (descriptor.mirrorPath().len != 0) {
+                    _ = data_dir.statFile(descriptor.mirrorPath()) catch |err| switch (err) {
+                        error.FileNotFound => report.missing_market_segment_mirrors += 1,
                         else => return err,
                     };
                 }
@@ -3201,7 +3544,11 @@ pub const CasManager = struct {
         defer self.alloc.free(reachable_ids);
         try writeReachabilityBitmap(self.alloc, self.store.root, refs, reachable_ids, self.store.fsync);
 
-        var refs_index = try buildObjectRefsIndex(self.alloc, &self.store);
+        var refs_index = try buildObjectRefsIndex(
+            self.alloc,
+            &self.store,
+            self.format.version <= primary_repository_format_version,
+        );
         defer refs_index.deinit(self.alloc);
         try writeObjectRefsIndex(self.alloc, self.store.root, refs_index, self.store.fsync);
     }
@@ -3291,7 +3638,11 @@ pub const CasManager = struct {
                 }
             }
 
-            const loaded = try self.store.get(self.alloc, id);
+            const loaded = self.store.get(self.alloc, id) catch |err| {
+                const hex = id.toHex();
+                std.log.err("CAS reachability references missing object {s}", .{hex[0..]});
+                return err;
+            };
             defer self.alloc.free(loaded.payload);
 
             switch (loaded.obj_type) {
@@ -3310,7 +3661,11 @@ pub const CasManager = struct {
                         try stack.append(entry.object_id);
                     }
                 },
-                .blob => try appendReferencedBlobObjects(&stack, loaded.payload),
+                .blob => try appendReferencedBlobObjects(
+                    &stack,
+                    loaded.payload,
+                    self.format.version <= primary_repository_format_version,
+                ),
                 else => return error.UnsupportedCasObjectType,
             }
         }
@@ -3372,10 +3727,9 @@ pub const CasManager = struct {
         var changed = false;
 
         const descriptors = try self.alloc.alloc(SegmentDescriptor, snapshot.segment_descriptors.len);
+        var descriptors_initialized: usize = 0;
         errdefer {
-            for (descriptors[0..]) |*descriptor| {
-                if (descriptor.path.len != 0) descriptor.deinit(self.alloc);
-            }
+            for (descriptors[0..descriptors_initialized]) |*descriptor| descriptor.deinit(self.alloc);
             self.alloc.free(descriptors);
         }
         for (snapshot.segment_descriptors, 0..) |descriptor, idx| {
@@ -3385,6 +3739,23 @@ pub const CasManager = struct {
                 changed = true;
             }
             descriptors[idx] = next;
+            descriptors_initialized += 1;
+        }
+
+        const market_descriptors = try self.alloc.alloc(MarketSegmentDescriptor, snapshot.market_segment_descriptors.len);
+        var market_descriptors_initialized: usize = 0;
+        errdefer {
+            for (market_descriptors[0..market_descriptors_initialized]) |*descriptor| descriptor.deinit(self.alloc);
+            self.alloc.free(market_descriptors);
+        }
+        for (snapshot.market_segment_descriptors, 0..) |descriptor, idx| {
+            var next = try cloneMarketSegmentDescriptor(self.alloc, descriptor);
+            if (next.segmentRoot() == null) {
+                next.market_segment_root = try self.canonicalMarketSegmentRoot(data_dir, descriptor);
+                changed = true;
+            }
+            market_descriptors[idx] = next;
+            market_descriptors_initialized += 1;
         }
 
         var tag_snapshot = try cloneTagSnapshot(self.alloc, snapshot.tag_snapshot);
@@ -3398,12 +3769,16 @@ pub const CasManager = struct {
         else
             null;
         errdefer if (market_catalog_snapshot) |*catalog_snapshot| catalog_snapshot.deinit(self.alloc);
+        if (market_catalog_snapshot) |*catalog_snapshot| {
+            if (catalog_snapshot.market_series) |entries| {
+                if (try sortMarketSeriesEntriesCanonical(self.alloc, entries)) changed = true;
+            }
+        }
 
         const wal_entries = try self.alloc.alloc(WalChunkDescriptor, snapshot.wal_index.entries.len);
+        var wal_entries_initialized: usize = 0;
         errdefer {
-            for (wal_entries[0..]) |*entry| {
-                if (entry.name.len != 0) entry.deinit(self.alloc);
-            }
+            for (wal_entries[0..wal_entries_initialized]) |*entry| entry.deinit(self.alloc);
             self.alloc.free(wal_entries);
         }
         for (snapshot.wal_index.entries, 0..) |entry, idx| {
@@ -3413,6 +3788,7 @@ pub const CasManager = struct {
                 changed = true;
             }
             wal_entries[idx] = next;
+            wal_entries_initialized += 1;
         }
 
         var wal_index = WalIndex{ .entries = wal_entries };
@@ -3424,6 +3800,7 @@ pub const CasManager = struct {
         return .{
             .snapshot = .{
                 .segment_descriptors = descriptors,
+                .market_segment_descriptors = market_descriptors,
                 .tag_snapshot = tag_snapshot,
                 .series_catalog_snapshot = series_catalog_snapshot,
                 .metric_catalog_snapshot = metric_catalog_snapshot,
@@ -3449,6 +3826,14 @@ pub const CasManager = struct {
             .val_codec = descriptor.val_codec,
             .selector = null,
         }, points, self.format.extent_chunk_bytes);
+    }
+
+    fn canonicalMarketSegmentRoot(self: *CasManager, data_dir: std.fs.Dir, descriptor: MarketSegmentDescriptor) !object_store.ObjectId {
+        if (descriptor.segmentRoot()) |root_id| return root_id;
+        if (descriptor.mirrorPath().len != 0 and pathExists(data_dir, descriptor.mirrorPath()) catch false) {
+            return try market_segment_mod.writeSegmentRootForFile(self.alloc, data_dir, &self.store, descriptor.mirrorPath(), self.format.extent_chunk_bytes);
+        }
+        return error.MissingMarketSegmentRoot;
     }
 
     fn canonicalJournalRoot(self: *CasManager, data_dir: std.fs.Dir, entry: WalChunkDescriptor) !object_store.ObjectId {
@@ -3500,22 +3885,31 @@ fn reachableMapToSortedIds(
 fn appendReferencedBlobObjects(
     stack: *std.array_list.Managed(object_store.ObjectId),
     payload: []const u8,
+    allow_legacy: bool,
 ) !void {
-    if (appendSegmentDescriptorBlob(stack, payload) catch |err| switch (err) {
+    if (appendSegmentDescriptorBlob(stack, payload, allow_legacy) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => false,
     }) return;
-    if (appendCheckpointStateBlob(stack, payload) catch |err| switch (err) {
+    if (appendMarketSegmentDescriptorBlob(stack, payload) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => false,
     }) return;
-    _ = appendWalIndexBlob(stack, payload) catch |err| switch (err) {
+    if (appendCheckpointStateBlob(stack, payload, allow_legacy) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => false,
+    }) return;
+    _ = appendWalIndexBlob(stack, payload, allow_legacy) catch |err| switch (err) {
         error.OutOfMemory => return err,
         else => false,
     };
 }
 
-fn buildObjectRefsIndex(alloc: std.mem.Allocator, store: *object_store.ObjectStore) !ObjectRefsIndex {
+fn buildObjectRefsIndex(
+    alloc: std.mem.Allocator,
+    store: *object_store.ObjectStore,
+    allow_legacy: bool,
+) !ObjectRefsIndex {
     const ids = try store.listIds(alloc);
     defer alloc.free(ids);
 
@@ -3548,17 +3942,22 @@ fn buildObjectRefsIndex(alloc: std.mem.Allocator, store: *object_store.ObjectSto
                 for (tree.entries) |entry| try children.append(entry.object_id);
             },
             .blob => {
-                if (appendSegmentDescriptorBlob(&children, loaded.payload) catch |err| switch (err) {
+                if (appendSegmentDescriptorBlob(&children, loaded.payload, allow_legacy) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => false,
                 }) {
                     role = .segment_descriptor;
-                } else if (appendCheckpointStateBlob(&children, loaded.payload) catch |err| switch (err) {
+                } else if (appendMarketSegmentDescriptorBlob(&children, loaded.payload) catch |err| switch (err) {
+                    error.OutOfMemory => return err,
+                    else => false,
+                }) {
+                    role = .market_segment_descriptor;
+                } else if (appendCheckpointStateBlob(&children, loaded.payload, allow_legacy) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => false,
                 }) {
                     role = .checkpoint_state;
-                } else if (appendWalIndexBlob(&children, loaded.payload) catch |err| switch (err) {
+                } else if (appendWalIndexBlob(&children, loaded.payload, allow_legacy) catch |err| switch (err) {
                     error.OutOfMemory => return err,
                     else => false,
                 }) {
@@ -3672,13 +4071,20 @@ fn encodeObjectRefsIndex(alloc: std.mem.Allocator, index: ObjectRefsIndex) ![]u8
 fn appendSegmentDescriptorBlob(
     stack: *std.array_list.Managed(object_store.ObjectId),
     payload: []const u8,
+    allow_legacy: bool,
 ) !bool {
     const original_len = stack.items.len;
     errdefer stack.items.len = original_len;
 
-    if (payload.len == 0) return false;
+    const payload_offset = if (std.mem.startsWith(u8, payload, segment_descriptor_magic))
+        segment_descriptor_magic.len
+    else if (allow_legacy)
+        0
+    else
+        return false;
+    if (payload.len <= payload_offset) return false;
 
-    var idx: usize = 0;
+    var idx: usize = payload_offset;
     const version = payload[idx];
     idx += 1;
     if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5) return false;
@@ -3753,16 +4159,75 @@ fn appendSegmentDescriptorBlob(
     return true;
 }
 
-fn appendWalIndexBlob(
+fn appendMarketSegmentDescriptorBlob(
     stack: *std.array_list.Managed(object_store.ObjectId),
     payload: []const u8,
 ) !bool {
     const original_len = stack.items.len;
     errdefer stack.items.len = original_len;
 
-    if (payload.len == 0) return false;
+    if (payload.len <= market_segment_descriptor_magic.len or
+        !std.mem.startsWith(u8, payload, market_segment_descriptor_magic))
+    {
+        return false;
+    }
+    var idx: usize = market_segment_descriptor_magic.len;
+    const version = payload[idx];
+    idx += 1;
+    if (version != 1) return false;
 
-    var idx: usize = 0;
+    var market_segment_root: ?object_store.ObjectId = null;
+    if (idx >= payload.len) return false;
+    const root_flag = payload[idx];
+    idx += 1;
+    switch (root_flag) {
+        0 => {},
+        1 => market_segment_root = .{ .hash = try readHashAt(payload, &idx) },
+        else => return false,
+    }
+
+    _ = try readStringAt(payload, &idx); // path
+    _ = try readIntAt(payload, &idx, u64); // market_series_id
+    idx += 32; // schema_digest
+    _ = try readStringAt(payload, &idx); // metric
+    _ = try readStringAt(payload, &idx); // canonical_labels
+    _ = try readIntAt(payload, &idx, i64); // hour_bucket
+    _ = try readIntAt(payload, &idx, i64); // start_ts_ns
+    _ = try readIntAt(payload, &idx, i64); // end_ts_ns
+    _ = try readIntAt(payload, &idx, u64); // row_count
+    _ = try readIntAt(payload, &idx, u32); // block_count
+    const column_count = try readIntAt(payload, &idx, u32);
+    if (column_count == 0 or column_count > market_identity.max_market_columns) return false;
+    var column_idx: u32 = 0;
+    while (column_idx < column_count) : (column_idx += 1) {
+        _ = try readStringAt(payload, &idx);
+    }
+    idx += 32; // content_id
+    idx += 32; // file_hash
+    _ = try readIntAt(payload, &idx, u64); // file_size
+    if (idx != payload.len) return false;
+
+    if (market_segment_root) |id| try stack.append(id);
+    return true;
+}
+
+fn appendWalIndexBlob(
+    stack: *std.array_list.Managed(object_store.ObjectId),
+    payload: []const u8,
+    allow_legacy: bool,
+) !bool {
+    const original_len = stack.items.len;
+    errdefer stack.items.len = original_len;
+
+    const payload_offset = if (std.mem.startsWith(u8, payload, wal_index_magic))
+        wal_index_magic.len
+    else if (allow_legacy)
+        0
+    else
+        return false;
+    if (payload.len <= payload_offset) return false;
+
+    var idx: usize = payload_offset;
     const version = payload[idx];
     idx += 1;
     if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5) return false;
@@ -3825,13 +4290,20 @@ fn appendWalIndexBlob(
 fn appendCheckpointStateBlob(
     stack: *std.array_list.Managed(object_store.ObjectId),
     payload: []const u8,
+    allow_legacy: bool,
 ) !bool {
     const original_len = stack.items.len;
     errdefer stack.items.len = original_len;
 
-    if (payload.len == 0) return false;
+    const payload_offset = if (std.mem.startsWith(u8, payload, checkpoint_state_magic))
+        checkpoint_state_magic.len
+    else if (allow_legacy)
+        0
+    else
+        return false;
+    if (payload.len <= payload_offset) return false;
 
-    var idx: usize = 0;
+    var idx: usize = payload_offset;
     const version = payload[idx];
     idx += 1;
     if (version != 1) return false;
@@ -3960,6 +4432,7 @@ pub const BundleResult = struct {
 
 pub const CompatibilityDebtReport = struct {
     legacy_segment_descriptors: usize = 0,
+    legacy_market_segment_descriptors: usize = 0,
     legacy_wal_descriptors: usize = 0,
     loose_refs_present: usize = 0,
 };
@@ -4806,6 +5279,14 @@ pub fn cloneLocalRepositoryWithOptions(
         var dest = try CasManager.init(alloc, dst_path, fsync);
         defer dest.deinit();
 
+        dest.format = source.format;
+        try writeRepositoryFormat(alloc, dest.store.root, dest.format, dest.store.fsync);
+        dest.refs.setBackend(source.format.ref_backend);
+        if (!isZeroRepositoryId(source.repository_id)) {
+            dest.repository_id = source.repository_id;
+            try writeRepositoryId(dest.store.root, dest.repository_id, dest.store.fsync);
+        }
+
         const refs = try source.refs.listRefs(alloc);
         defer {
             for (refs) |*entry| entry.deinit(alloc);
@@ -4821,12 +5302,6 @@ pub fn cloneLocalRepositoryWithOptions(
         }
         if (updates.len != 0) try dest.refs.updateRefTxn(updates, "clone-local");
         try dest.store.configureAlternates(alloc, &[_][]const u8{src_path});
-        dest.format = source.format;
-        try writeRepositoryFormat(alloc, dest.store.root, dest.format, dest.store.fsync);
-        if (!isZeroRepositoryId(source.repository_id)) {
-            dest.repository_id = source.repository_id;
-            try writeRepositoryId(dest.store.root, dest.repository_id, dest.store.fsync);
-        }
         if (try source.readHeadSymRef()) |head_target| {
             defer alloc.free(head_target);
             try dest.writeHeadSymRef(head_target);
@@ -5034,6 +5509,11 @@ fn cleanupStaleMirrors(alloc: std.mem.Allocator, data_dir: std.fs.Dir, snapshot:
         if (mirror_path.len == 0) continue;
         try expected_segments.put(mirror_path, {});
     }
+    for (snapshot.market_segment_descriptors) |descriptor| {
+        const mirror_path = descriptor.mirrorPath();
+        if (mirror_path.len == 0) continue;
+        try expected_segments.put(mirror_path, {});
+    }
 
     var stale_segment_files: usize = 0;
     var stale_segment_bytes: u64 = 0;
@@ -5042,6 +5522,18 @@ fn cleanupStaleMirrors(alloc: std.mem.Allocator, data_dir: std.fs.Dir, snapshot:
     const segment_paths = try listFilesRecursive(alloc, data_dir, "segments");
     defer freeOwnedStrings(alloc, segment_paths);
     for (segment_paths) |path| {
+        if (expected_segments.contains(path)) continue;
+        const stat = try data_dir.statFile(path);
+        stale_segment_files += 1;
+        stale_segment_bytes += stat.size;
+        if (!dry_run) {
+            data_dir.deleteFile(path) catch {};
+            deleted += 1;
+        }
+    }
+    const market_segment_paths = try listFilesRecursive(alloc, data_dir, "market_segments");
+    defer freeOwnedStrings(alloc, market_segment_paths);
+    for (market_segment_paths) |path| {
         if (expected_segments.contains(path)) continue;
         const stat = try data_dir.statFile(path);
         stale_segment_files += 1;
@@ -5887,6 +6379,35 @@ fn loadReachabilityBitmap(alloc: std.mem.Allocator, root: std.fs.Dir) !Reachabil
     };
 }
 
+/// Reads the repository format marker or initializes it for a fresh/legacy
+/// repository without constructing a CasManager. The unsupported-version
+/// preflight runs before this function creates any path or marker.
+pub fn probeOrInitRepositoryFormat(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    fsync: cfg.FsyncPolicy,
+) !RepositoryFormat {
+    return (try probeOrInitRepositoryFormatWithState(alloc, path, fsync)).format;
+}
+
+pub fn probeOrInitRepositoryFormatWithState(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    fsync: cfg.FsyncPolicy,
+) !RepositoryFormatProbe {
+    try preflightRepositoryFormatVersion(path);
+    var cwd = std.fs.cwd();
+    try cwd.makePath(path);
+    var root = try cwd.openDir(path, .{ .iterate = true });
+    defer root.close();
+    const fresh_repository = !try hasRepositoryApplicationState(root);
+    try root.makePath("objects/info");
+    return .{
+        .format = try loadOrInitRepositoryFormat(alloc, root, fsync),
+        .fresh_repository = fresh_repository,
+    };
+}
+
 fn loadOrInitRepositoryFormat(alloc: std.mem.Allocator, root: std.fs.Dir, fsync: cfg.FsyncPolicy) !RepositoryFormat {
     return loadRepositoryFormat(root) catch |err| switch (err) {
         error.FileNotFound => blk: {
@@ -5897,6 +6418,19 @@ fn loadOrInitRepositoryFormat(alloc: std.mem.Allocator, root: std.fs.Dir, fsync:
             try writeRepositoryFormat(alloc, root, format, fsync);
             break :blk format;
         },
+        else => return err,
+    };
+}
+
+fn preflightRepositoryFormatVersion(path: []const u8) !void {
+    var cwd = std.fs.cwd();
+    var root = cwd.openDir(path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer root.close();
+    _ = loadRepositoryFormat(root) catch |err| switch (err) {
+        error.FileNotFound => return,
         else => return err,
     };
 }
@@ -5938,7 +6472,7 @@ pub fn recommendedStartupDefaults(root: std.fs.Dir, data_dir_path: []const u8) !
 }
 
 fn repositoryFormatDefaultsToPrimary(format: RepositoryFormat) bool {
-    return format.version >= current_repository_format_version and format.ref_backend == .reftable;
+    return format.version >= primary_repository_format_version and format.ref_backend == .reftable;
 }
 
 fn legacyCompatibleRepositoryFormat() RepositoryFormat {
@@ -5955,6 +6489,62 @@ fn hasLegacyCompatibilityState(root: std.fs.Dir) !bool {
     if (try pathExists(root, "series_catalog.jsonl")) return true;
     if (try directoryHasEntries(root, "wal")) return true;
     if (try directoryHasEntries(root, "segments")) return true;
+    return false;
+}
+
+fn hasRepositoryApplicationState(root: std.fs.Dir) !bool {
+    if (try hasLegacyCompatibilityState(root)) return true;
+    if (try pathExists(root, market_catalog_mod.path)) return true;
+    if (try pathExists(root, market_manifest_mod.manifest_path)) return true;
+    if (try pathExists(root, metric_catalog_mod.path)) return true;
+    if (try pathExists(root, "market_runtime.json")) return true;
+    if (try pathExists(root, "signal_events.jsonl")) return true;
+    if (try directoryHasEntries(root, "signal_events")) return true;
+    // Repository identity plus empty ref/object directories are initialization
+    // infrastructure. Ignoring them keeps a crash between CasManager creation
+    // and the first catalog/bootstrap commit eligible for fresh defaults.
+    if (try directoryTreeHasFiles(root, "refs")) return true;
+    if (try directoryTreeHasFiles(root, "reftable")) return true;
+    if (try directoryTreeHasFiles(root, "symrefs")) return true;
+    if (try directoryTreeHasFiles(root, "logs")) return true;
+    if (try objectStoreHasContent(root)) return true;
+    return false;
+}
+
+fn directoryTreeHasFiles(root: std.fs.Dir, path: []const u8) !bool {
+    var dir = root.openDir(path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer dir.close();
+
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind == .directory) {
+            if (try directoryTreeHasFiles(dir, entry.name)) return true;
+        } else {
+            return true;
+        }
+    }
+    return false;
+}
+
+fn objectStoreHasContent(root: std.fs.Dir) !bool {
+    var objects = root.openDir("objects", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return false,
+        else => return err,
+    };
+    defer objects.close();
+
+    var it = objects.iterate();
+    while (try it.next()) |entry| {
+        if (std.mem.eql(u8, entry.name, "info")) continue;
+        if (entry.kind == .directory) {
+            if (try directoryHasEntries(objects, entry.name)) return true;
+            continue;
+        }
+        return true;
+    }
     return false;
 }
 
@@ -5983,6 +6573,7 @@ fn loadRepositoryFormat(root: std.fs.Dir) !RepositoryFormat {
     if (!std.mem.eql(u8, bytes[0..store_format_magic.len], store_format_magic)) return error.CorruptStoreFormat;
     var cursor = Cursor{ .bytes = bytes, .index = store_format_magic.len };
     const version = try cursor.readInt(u16);
+    if (version > current_repository_format_version) return error.UnsupportedRepositoryFormatVersion;
     const ref_backend = std.meta.intToEnum(RefBackend, try cursor.readByte()) catch return error.UnsupportedRefBackend;
     const extent_chunk_bytes = try cursor.readInt(u32);
     try cursor.finish();
@@ -6072,7 +6663,7 @@ pub fn buildLegacySnapshot(
     store: ?*object_store.ObjectStore,
     extent_chunk_bytes: u32,
 ) !LegacySnapshot {
-    return try buildLegacySnapshotWithMarket(alloc, data_dir, manifest, tags, series_catalog, metric_catalog, null, store, extent_chunk_bytes);
+    return try buildLegacySnapshotWithNativeMarket(alloc, data_dir, manifest, tags, series_catalog, metric_catalog, null, null, store, extent_chunk_bytes);
 }
 
 pub fn buildLegacySnapshotWithMarket(
@@ -6083,6 +6674,21 @@ pub fn buildLegacySnapshotWithMarket(
     series_catalog: *const series_catalog_mod.SeriesCatalog,
     metric_catalog: *const metric_catalog_mod.MetricCatalog,
     market_catalog: ?*market_catalog_mod.Catalog,
+    store: ?*object_store.ObjectStore,
+    extent_chunk_bytes: u32,
+) !LegacySnapshot {
+    return try buildLegacySnapshotWithNativeMarket(alloc, data_dir, manifest, tags, series_catalog, metric_catalog, market_catalog, null, store, extent_chunk_bytes);
+}
+
+pub fn buildLegacySnapshotWithNativeMarket(
+    alloc: std.mem.Allocator,
+    data_dir: std.fs.Dir,
+    manifest: *const manifest_mod.Manifest,
+    tags: *const tags_mod.TagIndex,
+    series_catalog: *const series_catalog_mod.SeriesCatalog,
+    metric_catalog: *const metric_catalog_mod.MetricCatalog,
+    market_catalog: ?*market_catalog_mod.Catalog,
+    market_manifest: ?*const market_manifest_mod.Manifest,
     store: ?*object_store.ObjectStore,
     extent_chunk_bytes: u32,
 ) !LegacySnapshot {
@@ -6126,10 +6732,34 @@ pub fn buildLegacySnapshotWithMarket(
 
     sortDescriptors(descriptors.items);
 
+    var market_descriptors = std.array_list.Managed(MarketSegmentDescriptor).init(alloc);
+    errdefer {
+        for (market_descriptors.items) |*descriptor| descriptor.deinit(alloc);
+        market_descriptors.deinit();
+    }
+    if (market_manifest) |native_manifest| {
+        for (native_manifest.list()) |entry| {
+            var metadata = try market_segment_mod.inspect(alloc, data_dir, entry.path);
+            defer metadata.deinit(alloc);
+            try validateMarketManifestDescriptorMatchesSegment(entry, &metadata);
+            const market_root = if (store) |object_store_ref|
+                try market_segment_mod.writeSegmentRootForFile(alloc, data_dir, object_store_ref, entry.path, extent_chunk_bytes)
+            else
+                null;
+            try market_descriptors.append(try cloneMarketSegmentDescriptorFromManifest(alloc, entry, market_root));
+        }
+    }
+    sortMarketSegmentDescriptors(market_descriptors.items);
+
     const segment_descriptors = try descriptors.toOwnedSlice();
     errdefer {
         for (segment_descriptors) |*descriptor| descriptor.deinit(alloc);
         alloc.free(segment_descriptors);
+    }
+    const market_segment_descriptors = try market_descriptors.toOwnedSlice();
+    errdefer {
+        for (market_segment_descriptors) |*descriptor| descriptor.deinit(alloc);
+        alloc.free(market_segment_descriptors);
     }
 
     var tag_snapshot = try buildTagSnapshot(alloc, tags);
@@ -6146,6 +6776,9 @@ pub fn buildLegacySnapshotWithMarket(
     else
         null;
     errdefer if (market_catalog_snapshot) |*snapshot| snapshot.deinit(alloc);
+    if (market_catalog_snapshot) |*snapshot| {
+        if (snapshot.market_series) |entries| sortMarketSeriesEntries(entries);
+    }
 
     var wal_index = try buildWalIndex(alloc, data_dir, store, extent_chunk_bytes);
     errdefer wal_index.deinit(alloc);
@@ -6155,6 +6788,7 @@ pub fn buildLegacySnapshotWithMarket(
 
     return .{
         .segment_descriptors = segment_descriptors,
+        .market_segment_descriptors = market_segment_descriptors,
         .tag_snapshot = tag_snapshot,
         .series_catalog_snapshot = series_catalog_snapshot,
         .metric_catalog_snapshot = metric_catalog_snapshot,
@@ -6167,6 +6801,10 @@ pub fn buildLegacySnapshotWithMarket(
 pub fn verifyLegacySnapshot(live: LegacySnapshot, stored: Snapshot) !void {
     if (live.segment_descriptors.len != stored.segment_descriptors.len) return error.CasVerificationFailed;
     for (live.segment_descriptors, stored.segment_descriptors) |lhs, rhs| {
+        if (!lhs.eql(rhs)) return error.CasVerificationFailed;
+    }
+    if (live.market_segment_descriptors.len != stored.market_segment_descriptors.len) return error.CasVerificationFailed;
+    for (live.market_segment_descriptors, stored.market_segment_descriptors) |lhs, rhs| {
         if (!lhs.eql(rhs)) return error.CasVerificationFailed;
     }
 
@@ -6191,6 +6829,12 @@ pub fn verifyLegacySnapshot(live: LegacySnapshot, stored: Snapshot) !void {
         if (live_market.schemas.len != stored_market.schemas.len) return error.CasVerificationFailed;
         for (live_market.schemas, stored_market.schemas) |lhs, rhs| {
             if (!lhs.eql(rhs)) return error.CasVerificationFailed;
+        }
+        const live_series = live_market.market_series orelse &[_]market_catalog_mod.MarketSeriesIdentity{};
+        const stored_series = stored_market.market_series orelse &[_]market_catalog_mod.MarketSeriesIdentity{};
+        if (live_series.len != stored_series.len) return error.CasVerificationFailed;
+        for (live_series, stored_series) |lhs, rhs| {
+            if (!marketSeriesEntryEql(lhs, rhs)) return error.CasVerificationFailed;
         }
         if (live_market.bar_policies.len != stored_market.bar_policies.len) return error.CasVerificationFailed;
         for (live_market.bar_policies, stored_market.bar_policies) |lhs, rhs| {
@@ -6401,6 +7045,26 @@ fn verifyWalFiles(alloc: std.mem.Allocator, wal_index: WalIndex, data_dir: std.f
     }
 }
 
+fn verifyMarketSegmentFiles(
+    alloc: std.mem.Allocator,
+    descriptors: []const MarketSegmentDescriptor,
+    data_dir: std.fs.Dir,
+    store: *object_store.ObjectStore,
+) !void {
+    for (descriptors) |descriptor| {
+        try validateMarketSegmentRootMatchesDescriptor(alloc, store, descriptor);
+        const path = descriptor.mirrorPath();
+        if (path.len == 0) continue;
+        const live_hash = hashFile(data_dir, path) catch |err| switch (err) {
+            error.FileNotFound => return error.CasVerificationFailed,
+            else => return err,
+        };
+        if (!std.mem.eql(u8, live_hash[0..], descriptor.file_hash[0..])) {
+            return error.CasVerificationFailed;
+        }
+    }
+}
+
 fn buildParentSlice(alloc: std.mem.Allocator, parent: ?object_store.ObjectId) ![]object_store.ObjectId {
     if (parent) |id| {
         var parents = try alloc.alloc(object_store.ObjectId, 1);
@@ -6482,6 +7146,7 @@ fn encodeSegmentDescriptor(alloc: std.mem.Allocator, descriptor: SegmentDescript
 
     if (descriptor.segmentRoot() == null and descriptor.contentRef() == null) return error.MissingSegmentContentId;
 
+    try bytes.appendSlice(segment_descriptor_magic);
     try bytes.append(5);
     try appendOptionalObjectId(&bytes, descriptor.segmentRoot());
     if (descriptor.contentRef()) |content| {
@@ -6503,7 +7168,11 @@ fn encodeSegmentDescriptor(alloc: std.mem.Allocator, descriptor: SegmentDescript
 }
 
 fn decodeSegmentDescriptor(alloc: std.mem.Allocator, payload: []const u8) !SegmentDescriptor {
-    var cursor = Cursor{ .bytes = payload };
+    const descriptor_payload = if (std.mem.startsWith(u8, payload, segment_descriptor_magic))
+        payload[segment_descriptor_magic.len..]
+    else
+        payload;
+    var cursor = Cursor{ .bytes = descriptor_payload };
     const version = try cursor.readByte();
     if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5) return error.UnsupportedSegmentDescriptorVersion;
 
@@ -6549,6 +7218,93 @@ fn decodeSegmentDescriptor(alloc: std.mem.Allocator, payload: []const u8) !Segme
         .ts_codec = ts_codec,
         .val_codec = val_codec,
     };
+}
+
+fn encodeMarketSegmentDescriptor(alloc: std.mem.Allocator, descriptor: MarketSegmentDescriptor) ![]u8 {
+    if (descriptor.segmentRoot() == null) return error.MissingMarketSegmentRoot;
+
+    var bytes = std.array_list.Managed(u8).init(alloc);
+    errdefer bytes.deinit();
+
+    try bytes.appendSlice(market_segment_descriptor_magic);
+    try bytes.append(1);
+    try appendOptionalObjectId(&bytes, descriptor.segmentRoot());
+    try appendString(&bytes, descriptor.mirrorPath());
+    try appendInt(&bytes, u64, descriptor.market_series_id);
+    try bytes.appendSlice(descriptor.schema_digest[0..]);
+    try appendString(&bytes, descriptor.metric);
+    try appendString(&bytes, descriptor.canonical_labels);
+    try appendInt(&bytes, i64, descriptor.hour_bucket);
+    try appendInt(&bytes, i64, descriptor.start_ts_ns);
+    try appendInt(&bytes, i64, descriptor.end_ts_ns);
+    try appendInt(&bytes, u64, descriptor.row_count);
+    try appendInt(&bytes, u32, descriptor.block_count);
+    try appendInt(&bytes, u32, @intCast(descriptor.column_names.len));
+    for (descriptor.column_names) |name| try appendString(&bytes, name);
+    try bytes.appendSlice(descriptor.content_id[0..]);
+    try bytes.appendSlice(descriptor.file_hash[0..]);
+    try appendInt(&bytes, u64, descriptor.file_size);
+    return try bytes.toOwnedSlice();
+}
+
+fn decodeMarketSegmentDescriptor(alloc: std.mem.Allocator, payload: []const u8) !MarketSegmentDescriptor {
+    if (!std.mem.startsWith(u8, payload, market_segment_descriptor_magic)) {
+        return error.InvalidMarketSegmentDescriptorObject;
+    }
+    var cursor = Cursor{ .bytes = payload[market_segment_descriptor_magic.len..] };
+    const version = try cursor.readByte();
+    if (version != 1) return error.UnsupportedMarketSegmentDescriptorVersion;
+
+    const market_segment_root = try cursor.readOptionalObjectId();
+    const path = try cursor.readOwnedString(alloc);
+    errdefer alloc.free(path);
+    const market_series_id = try cursor.readInt(u64);
+    const schema_digest = try cursor.readHash();
+    const metric = try cursor.readOwnedString(alloc);
+    errdefer alloc.free(metric);
+    const canonical_labels = try cursor.readOwnedString(alloc);
+    errdefer alloc.free(canonical_labels);
+    const hour_bucket = try cursor.readInt(i64);
+    const start_ts_ns = try cursor.readInt(i64);
+    const end_ts_ns = try cursor.readInt(i64);
+    const row_count = try cursor.readInt(u64);
+    const block_count = try cursor.readInt(u32);
+    const column_count = try cursor.readInt(u32);
+    if (column_count == 0 or column_count > market_identity.max_market_columns) return error.InvalidMarketSegmentDescriptorObject;
+    var column_names = try alloc.alloc([]u8, column_count);
+    var decoded_columns: usize = 0;
+    errdefer {
+        for (column_names[0..decoded_columns]) |name| alloc.free(name);
+        alloc.free(column_names);
+    }
+    while (decoded_columns < column_count) : (decoded_columns += 1) {
+        column_names[decoded_columns] = try cursor.readOwnedString(alloc);
+    }
+    const content_id = try cursor.readHash();
+    const file_hash = try cursor.readHash();
+    const file_size = try cursor.readInt(u64);
+    try cursor.finish();
+
+    var descriptor = MarketSegmentDescriptor{
+        .path = path,
+        .market_segment_root = market_segment_root,
+        .market_series_id = market_series_id,
+        .schema_digest = schema_digest,
+        .metric = metric,
+        .canonical_labels = canonical_labels,
+        .hour_bucket = hour_bucket,
+        .start_ts_ns = start_ts_ns,
+        .end_ts_ns = end_ts_ns,
+        .row_count = row_count,
+        .block_count = block_count,
+        .column_names = column_names,
+        .content_id = content_id,
+        .file_hash = file_hash,
+        .file_size = file_size,
+    };
+    errdefer descriptor.deinit(alloc);
+    try validateMarketSegmentDescriptor(alloc, descriptor);
+    return descriptor;
 }
 
 fn encodeTagSnapshot(alloc: std.mem.Allocator, snapshot: TagSnapshot) ![]u8 {
@@ -6704,6 +7460,14 @@ fn encodeMarketCatalogSnapshot(alloc: std.mem.Allocator, snapshot: market_catalo
     try jw.beginArray();
     for (snapshot.schemas) |entry| try market_catalog_mod.writeSchema(&jw, entry);
     try jw.endArray();
+    try jw.objectField("market_series");
+    try jw.beginArray();
+    const market_series = snapshot.market_series orelse &[_]market_catalog_mod.MarketSeriesIdentity{};
+    const sorted_market_series = try alloc.dupe(market_catalog_mod.MarketSeriesIdentity, market_series);
+    defer alloc.free(sorted_market_series);
+    sortMarketSeriesEntries(sorted_market_series);
+    for (sorted_market_series) |entry| try market_catalog_mod.writeMarketSeriesIdentity(&jw, entry);
+    try jw.endArray();
     try jw.objectField("bar_policies");
     try jw.beginArray();
     for (snapshot.bar_policies) |entry| try market_catalog_mod.writeBarPolicy(&jw, entry);
@@ -6737,6 +7501,24 @@ fn decodeMarketCatalogSnapshot(alloc: std.mem.Allocator, payload: []const u8) !m
         snapshot.schemas = try alloc.alloc(market_catalog_mod.MarketSchema, value.array.items.len);
         for (value.array.items, 0..) |item, idx| snapshot.schemas[idx] = try decodeMarketSchemaEntry(alloc, item);
     }
+    if (obj.get("market_series")) |value| {
+        if (value != .array) return error.InvalidMetricCatalogSnapshotObject;
+        var market_series_entries = std.array_list.Managed(market_catalog_mod.MarketSeriesIdentity).init(alloc);
+        var market_series_entries_owned = false;
+        errdefer if (!market_series_entries_owned) {
+            for (market_series_entries.items) |*entry| entry.deinit(alloc);
+            market_series_entries.deinit();
+        };
+        for (value.array.items) |item| {
+            try market_series_entries.append(try decodeMarketSeriesEntry(alloc, item));
+        }
+        if (snapshot.market_series) |entries| alloc.free(entries);
+        snapshot.market_series = try market_series_entries.toOwnedSlice();
+        market_series_entries_owned = true;
+        try validateAndSortMarketSeriesSnapshot(alloc, snapshot.schemas, snapshot.market_series.?);
+    } else if (snapshot.market_series) |entries| {
+        try validateAndSortMarketSeriesSnapshot(alloc, snapshot.schemas, entries);
+    }
     if (obj.get("bar_policies")) |value| {
         if (value != .array) return error.InvalidMetricCatalogSnapshotObject;
         alloc.free(snapshot.bar_policies);
@@ -6762,6 +7544,7 @@ fn encodeCheckpointState(alloc: std.mem.Allocator, checkpoint: CheckpointState) 
     var bytes = std.array_list.Managed(u8).init(alloc);
     errdefer bytes.deinit();
 
+    try bytes.appendSlice(checkpoint_state_magic);
     try bytes.append(1);
     try appendInt(&bytes, u32, @intCast(checkpoint.highwaters.len));
     for (checkpoint.highwaters) |entry| {
@@ -6779,7 +7562,11 @@ fn encodeCheckpointState(alloc: std.mem.Allocator, checkpoint: CheckpointState) 
 }
 
 fn decodeCheckpointState(alloc: std.mem.Allocator, payload: []const u8) !CheckpointState {
-    var cursor = Cursor{ .bytes = payload };
+    const checkpoint_payload = if (std.mem.startsWith(u8, payload, checkpoint_state_magic))
+        payload[checkpoint_state_magic.len..]
+    else
+        payload;
+    var cursor = Cursor{ .bytes = checkpoint_payload };
     const version = try cursor.readByte();
     if (version != 1) return error.UnsupportedCheckpointStateVersion;
 
@@ -6821,6 +7608,7 @@ fn encodeWalIndex(alloc: std.mem.Allocator, wal_index: WalIndex) ![]u8 {
     var bytes = std.array_list.Managed(u8).init(alloc);
     errdefer bytes.deinit();
 
+    try bytes.appendSlice(wal_index_magic);
     try bytes.append(5);
     try appendInt(&bytes, u32, @intCast(wal_index.entries.len));
     for (wal_index.entries) |entry| {
@@ -6837,7 +7625,11 @@ fn encodeWalIndex(alloc: std.mem.Allocator, wal_index: WalIndex) ![]u8 {
 }
 
 fn decodeWalIndex(alloc: std.mem.Allocator, payload: []const u8) !WalIndex {
-    var cursor = Cursor{ .bytes = payload };
+    const wal_payload = if (std.mem.startsWith(u8, payload, wal_index_magic))
+        payload[wal_index_magic.len..]
+    else
+        payload;
+    var cursor = Cursor{ .bytes = wal_payload };
     const version = try cursor.readByte();
     if (version != 1 and version != 2 and version != 3 and version != 4 and version != 5) return error.UnsupportedWalIndexVersion;
 
@@ -7137,6 +7929,21 @@ fn countDescriptorsNotIn(lhs: []const SegmentDescriptor, rhs: []const SegmentDes
     return count;
 }
 
+fn countMarketSegmentDescriptorsNotIn(lhs: []const MarketSegmentDescriptor, rhs: []const MarketSegmentDescriptor) usize {
+    var count: usize = 0;
+    for (lhs) |entry| {
+        var found = false;
+        for (rhs) |other| {
+            if (entry.eql(other)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) count += 1;
+    }
+    return count;
+}
+
 fn countWalChunksNotIn(lhs: []const WalChunkDescriptor, rhs: []const WalChunkDescriptor) usize {
     var count: usize = 0;
     for (lhs) |entry| {
@@ -7192,6 +7999,80 @@ fn containsObjectId(entries: []const object_store.ObjectId, needle: object_store
     return false;
 }
 
+fn validateMarketManifestDescriptorMatchesSegment(
+    descriptor: market_manifest_mod.MarketSegmentDescriptor,
+    metadata: *const market_segment_mod.Metadata,
+) !void {
+    if (descriptor.market_series_id != metadata.market_series_id or
+        !std.mem.eql(u8, descriptor.schema_digest[0..], metadata.schema_digest[0..]) or
+        !std.mem.eql(u8, descriptor.metric, metadata.metric) or
+        !std.mem.eql(u8, descriptor.canonical_labels, metadata.canonical_labels) or
+        descriptor.hour_bucket != metadata.hour or
+        descriptor.start_ts_ns != metadata.start_ts_ns or
+        descriptor.end_ts_ns != metadata.end_ts_ns or
+        descriptor.row_count != metadata.count or
+        descriptor.block_count != metadata.block_count or
+        descriptor.column_names.len != metadata.column_names.len)
+    {
+        return error.MarketSegmentDescriptorMismatch;
+    }
+    for (descriptor.column_names, metadata.column_names) |expected, actual| {
+        if (!std.mem.eql(u8, expected, actual)) return error.MarketSegmentDescriptorMismatch;
+    }
+}
+
+fn validateMarketSegmentDescriptor(
+    alloc: std.mem.Allocator,
+    descriptor: MarketSegmentDescriptor,
+) !void {
+    try market_manifest_mod.validateDescriptorInput(alloc, .{
+        .path = descriptor.path,
+        .market_series_id = descriptor.market_series_id,
+        .schema_digest = descriptor.schema_digest,
+        .metric = descriptor.metric,
+        .canonical_labels = descriptor.canonical_labels,
+        .hour_bucket = descriptor.hour_bucket,
+        .start_ts_ns = descriptor.start_ts_ns,
+        .end_ts_ns = descriptor.end_ts_ns,
+        .row_count = descriptor.row_count,
+        .block_count = descriptor.block_count,
+        .column_names = descriptor.column_names,
+        .content_id = descriptor.content_id,
+        .file_hash = descriptor.file_hash,
+        .file_size = descriptor.file_size,
+    });
+    if (descriptor.segmentRoot() == null) return error.MissingMarketSegmentRoot;
+}
+
+fn validateMarketSegmentRootMatchesDescriptor(
+    alloc: std.mem.Allocator,
+    store: *object_store.ObjectStore,
+    descriptor: MarketSegmentDescriptor,
+) !void {
+    const root_id = descriptor.segmentRoot() orelse return error.MissingMarketSegmentRoot;
+    var metadata = try market_segment_mod.inspectSegmentRoot(alloc, store, root_id);
+    defer metadata.deinit(alloc);
+    if (metadata.market_series_id != descriptor.market_series_id or
+        !std.mem.eql(u8, metadata.schema_digest[0..], descriptor.schema_digest[0..]) or
+        !std.mem.eql(u8, metadata.metric, descriptor.metric) or
+        !std.mem.eql(u8, metadata.canonical_labels, descriptor.canonical_labels) or
+        metadata.hour != descriptor.hour_bucket or
+        metadata.count != descriptor.row_count or
+        metadata.start_ts_ns != descriptor.start_ts_ns or
+        metadata.end_ts_ns != descriptor.end_ts_ns or
+        metadata.block_count != descriptor.block_count or
+        metadata.file_size != descriptor.file_size or
+        !std.mem.eql(u8, metadata.content_hash[0..], descriptor.content_id[0..]) or
+        metadata.column_names.len != descriptor.column_names.len)
+    {
+        return error.MarketSegmentDescriptorMismatch;
+    }
+    for (metadata.column_names, descriptor.column_names) |actual, expected| {
+        if (!std.mem.eql(u8, actual, expected)) return error.MarketSegmentDescriptorMismatch;
+    }
+    try market_segment_mod.validateSegmentRoot(alloc, store, root_id);
+}
+
 fn checkpointStatesEql(lhs: CheckpointState, rhs: CheckpointState) bool {
     if (lhs.highwaters.len != rhs.highwaters.len) return false;
     for (lhs.highwaters, rhs.highwaters) |lhs_entry, rhs_entry| {
@@ -7220,6 +8101,84 @@ fn cloneSegmentDescriptor(alloc: std.mem.Allocator, descriptor: SegmentDescripto
         .count = descriptor.count,
         .ts_codec = descriptor.ts_codec,
         .val_codec = descriptor.val_codec,
+    };
+}
+
+fn cloneMarketSegmentDescriptor(alloc: std.mem.Allocator, descriptor: MarketSegmentDescriptor) !MarketSegmentDescriptor {
+    const path = try alloc.dupe(u8, descriptor.path);
+    errdefer alloc.free(path);
+    const metric = try alloc.dupe(u8, descriptor.metric);
+    errdefer alloc.free(metric);
+    const canonical_labels = try alloc.dupe(u8, descriptor.canonical_labels);
+    errdefer alloc.free(canonical_labels);
+
+    var column_names = try alloc.alloc([]u8, descriptor.column_names.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (column_names[0..initialized]) |name| alloc.free(name);
+        alloc.free(column_names);
+    }
+    for (descriptor.column_names, 0..) |name, idx| {
+        column_names[idx] = try alloc.dupe(u8, name);
+        initialized += 1;
+    }
+    return .{
+        .path = path,
+        .market_segment_root = descriptor.market_segment_root,
+        .market_series_id = descriptor.market_series_id,
+        .schema_digest = descriptor.schema_digest,
+        .metric = metric,
+        .canonical_labels = canonical_labels,
+        .hour_bucket = descriptor.hour_bucket,
+        .start_ts_ns = descriptor.start_ts_ns,
+        .end_ts_ns = descriptor.end_ts_ns,
+        .row_count = descriptor.row_count,
+        .block_count = descriptor.block_count,
+        .column_names = column_names,
+        .content_id = descriptor.content_id,
+        .file_hash = descriptor.file_hash,
+        .file_size = descriptor.file_size,
+    };
+}
+
+fn cloneMarketSegmentDescriptorFromManifest(
+    alloc: std.mem.Allocator,
+    descriptor: market_manifest_mod.MarketSegmentDescriptor,
+    market_segment_root: ?object_store.ObjectId,
+) !MarketSegmentDescriptor {
+    const path = try alloc.dupe(u8, descriptor.path);
+    errdefer alloc.free(path);
+    const metric = try alloc.dupe(u8, descriptor.metric);
+    errdefer alloc.free(metric);
+    const canonical_labels = try alloc.dupe(u8, descriptor.canonical_labels);
+    errdefer alloc.free(canonical_labels);
+
+    var column_names = try alloc.alloc([]u8, descriptor.column_names.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (column_names[0..initialized]) |name| alloc.free(name);
+        alloc.free(column_names);
+    }
+    for (descriptor.column_names, 0..) |name, idx| {
+        column_names[idx] = try alloc.dupe(u8, name);
+        initialized += 1;
+    }
+    return .{
+        .path = path,
+        .market_segment_root = market_segment_root,
+        .market_series_id = descriptor.market_series_id,
+        .schema_digest = descriptor.schema_digest,
+        .metric = metric,
+        .canonical_labels = canonical_labels,
+        .hour_bucket = descriptor.hour_bucket,
+        .start_ts_ns = descriptor.start_ts_ns,
+        .end_ts_ns = descriptor.end_ts_ns,
+        .row_count = descriptor.row_count,
+        .block_count = descriptor.block_count,
+        .column_names = column_names,
+        .content_id = descriptor.content_id,
+        .file_hash = descriptor.file_hash,
+        .file_size = descriptor.file_size,
     };
 }
 
@@ -7321,6 +8280,37 @@ fn decodeMarketSchemaEntry(alloc: std.mem.Allocator, value: std.json.Value) !mar
     };
 }
 
+fn decodeMarketSeriesEntry(alloc: std.mem.Allocator, value: std.json.Value) !market_catalog_mod.MarketSeriesIdentity {
+    if (value != .object) return error.InvalidMetricCatalogSnapshotObject;
+    const obj = value.object;
+    const id_value = obj.get("series_id") orelse return error.InvalidMetricCatalogSnapshotObject;
+    const digest_value = obj.get("schema_digest") orelse return error.InvalidMetricCatalogSnapshotObject;
+    const metric_value = obj.get("metric") orelse return error.InvalidMetricCatalogSnapshotObject;
+    const labels_value = obj.get("canonical_labels") orelse return error.InvalidMetricCatalogSnapshotObject;
+    if (digest_value != .string or metric_value != .string or labels_value != .string) {
+        return error.InvalidMetricCatalogSnapshotObject;
+    }
+
+    const canonical_labels = market_identity.canonicalizeLabels(
+        alloc,
+        labels_value.string,
+    ) catch return error.InvalidMetricCatalogSnapshotObject;
+    errdefer alloc.free(canonical_labels);
+    if (!std.mem.eql(u8, canonical_labels, labels_value.string)) {
+        return error.InvalidMetricCatalogSnapshotObject;
+    }
+
+    const metric = try alloc.dupe(u8, metric_value.string);
+    errdefer alloc.free(metric);
+
+    return .{
+        .series_id = try parseMarketSeriesIdSnapshot(id_value),
+        .schema_digest = market_identity.digestFromHex(digest_value.string) catch return error.InvalidMetricCatalogSnapshotObject,
+        .metric = metric,
+        .canonical_labels = canonical_labels,
+    };
+}
+
 fn decodeBarPolicyEntry(alloc: std.mem.Allocator, value: std.json.Value) !market_catalog_mod.BarPolicy {
     if (value != .object) return error.InvalidMetricCatalogSnapshotObject;
     const obj = value.object;
@@ -7409,12 +8399,85 @@ fn decodeStringArray(alloc: std.mem.Allocator, items: []const std.json.Value) ![
     return out;
 }
 
+fn parseMarketSeriesIdSnapshot(value: std.json.Value) !market_identity.MarketSeriesId {
+    return switch (value) {
+        .integer => |int| if (int < 0)
+            error.InvalidMetricCatalogSnapshotObject
+        else
+            @intCast(int),
+        .number_string => |digits| std.fmt.parseInt(
+            market_identity.MarketSeriesId,
+            digits,
+            10,
+        ) catch error.InvalidMetricCatalogSnapshotObject,
+        .string => |digits| std.fmt.parseInt(
+            market_identity.MarketSeriesId,
+            digits,
+            10,
+        ) catch error.InvalidMetricCatalogSnapshotObject,
+        else => error.InvalidMetricCatalogSnapshotObject,
+    };
+}
+
+fn validateAndSortMarketSeriesSnapshot(
+    alloc: std.mem.Allocator,
+    schemas: []const market_catalog_mod.MarketSchema,
+    entries: []market_catalog_mod.MarketSeriesIdentity,
+) !void {
+    for (entries, 0..) |entry, idx| {
+        if (entry.series_id != market_identity.seriesId(entry.metric, entry.canonical_labels)) {
+            return error.InvalidMetricCatalogSnapshotObject;
+        }
+        market_identity.validateCanonicalLabelsObject(
+            alloc,
+            entry.canonical_labels,
+        ) catch return error.InvalidMetricCatalogSnapshotObject;
+        const schema = findMarketSchemaSnapshot(schemas, entry.metric) orelse
+            return error.InvalidMetricCatalogSnapshotObject;
+        const expected_digest = schema.digest();
+        if (!std.mem.eql(u8, entry.schema_digest[0..], expected_digest[0..])) {
+            return error.InvalidMetricCatalogSnapshotObject;
+        }
+        market_identity.validateRequiredLabels(
+            alloc,
+            entry.canonical_labels,
+            schema.required_labels,
+        ) catch return error.InvalidMetricCatalogSnapshotObject;
+        for (entries[0..idx]) |previous| {
+            if (previous.series_id != entry.series_id) continue;
+            return error.InvalidMetricCatalogSnapshotObject;
+        }
+    }
+    sortMarketSeriesEntries(entries);
+}
+
+fn findMarketSchemaSnapshot(
+    schemas: []const market_catalog_mod.MarketSchema,
+    metric: []const u8,
+) ?market_catalog_mod.MarketSchema {
+    for (schemas) |schema| {
+        if (std.mem.eql(u8, schema.metric, metric)) return schema;
+    }
+    return null;
+}
+
 fn sortDescriptors(descriptors: []SegmentDescriptor) void {
     std.sort.block(SegmentDescriptor, descriptors, {}, struct {
         fn lessThan(_: void, lhs: SegmentDescriptor, rhs: SegmentDescriptor) bool {
             if (lhs.series_id != rhs.series_id) return lhs.series_id < rhs.series_id;
             if (lhs.hour_bucket != rhs.hour_bucket) return lhs.hour_bucket < rhs.hour_bucket;
             if (lhs.start_ts != rhs.start_ts) return lhs.start_ts < rhs.start_ts;
+            return std.mem.lessThan(u8, lhs.mirrorPath(), rhs.mirrorPath());
+        }
+    }.lessThan);
+}
+
+fn sortMarketSegmentDescriptors(descriptors: []MarketSegmentDescriptor) void {
+    std.sort.block(MarketSegmentDescriptor, descriptors, {}, struct {
+        fn lessThan(_: void, lhs: MarketSegmentDescriptor, rhs: MarketSegmentDescriptor) bool {
+            if (lhs.market_series_id != rhs.market_series_id) return lhs.market_series_id < rhs.market_series_id;
+            if (lhs.hour_bucket != rhs.hour_bucket) return lhs.hour_bucket < rhs.hour_bucket;
+            if (lhs.start_ts_ns != rhs.start_ts_ns) return lhs.start_ts_ns < rhs.start_ts_ns;
             return std.mem.lessThan(u8, lhs.mirrorPath(), rhs.mirrorPath());
         }
     }.lessThan);
@@ -7436,6 +8499,47 @@ fn sortMetricCatalogEntries(entries: []MetricCatalogSnapshotEntry) void {
             return std.mem.lessThan(u8, lhs.metric, rhs.metric);
         }
     }.lessThan);
+}
+
+fn sortMarketSeriesEntries(entries: []market_catalog_mod.MarketSeriesIdentity) void {
+    std.sort.block(market_catalog_mod.MarketSeriesIdentity, entries, {}, struct {
+        fn lessThan(_: void, lhs: market_catalog_mod.MarketSeriesIdentity, rhs: market_catalog_mod.MarketSeriesIdentity) bool {
+            if (lhs.series_id != rhs.series_id) return lhs.series_id < rhs.series_id;
+            if (!std.mem.eql(u8, lhs.metric, rhs.metric)) return std.mem.lessThan(u8, lhs.metric, rhs.metric);
+            return std.mem.lessThan(u8, lhs.canonical_labels, rhs.canonical_labels);
+        }
+    }.lessThan);
+}
+
+fn sortMarketSeriesEntriesCanonical(
+    alloc: std.mem.Allocator,
+    entries: []market_catalog_mod.MarketSeriesIdentity,
+) !bool {
+    const before = try alloc.dupe(market_catalog_mod.MarketSeriesIdentity, entries);
+    defer alloc.free(before);
+    sortMarketSeriesEntries(entries);
+    return !marketSeriesSlicesEql(before, entries);
+}
+
+fn marketSeriesSlicesEql(
+    lhs: []const market_catalog_mod.MarketSeriesIdentity,
+    rhs: []const market_catalog_mod.MarketSeriesIdentity,
+) bool {
+    if (lhs.len != rhs.len) return false;
+    for (lhs, rhs) |left, right| {
+        if (!marketSeriesEntryEql(left, right)) return false;
+    }
+    return true;
+}
+
+fn marketSeriesEntryEql(
+    lhs: market_catalog_mod.MarketSeriesIdentity,
+    rhs: market_catalog_mod.MarketSeriesIdentity,
+) bool {
+    return lhs.series_id == rhs.series_id and
+        std.mem.eql(u8, lhs.schema_digest[0..], rhs.schema_digest[0..]) and
+        std.mem.eql(u8, lhs.metric, rhs.metric) and
+        std.mem.eql(u8, lhs.canonical_labels, rhs.canonical_labels);
 }
 
 fn binarySearchTagEntry(entries: []const TagSnapshotEntry, key: []const u8) ?usize {
@@ -7467,6 +8571,11 @@ fn findBlobEntry(entries: []const TreeEntry, name: []const u8) ?object_store.Obj
         if (std.mem.eql(u8, entry.name, name)) return entry.object_id;
     }
     return null;
+}
+
+fn findMarketSeriesCatalogBlob(entries: []const TreeEntry) ?object_store.ObjectId {
+    return findBlobEntry(entries, "market_series_catalog") orelse
+        findBlobEntry(entries, "market_catalog");
 }
 
 fn listRefsRecursive(self: *RefStore, alloc: std.mem.Allocator, refs: *std.array_list.Managed(RefEntry), dir: std.fs.Dir, prefix: []const u8) !void {
@@ -8912,6 +10021,38 @@ fn writeManifestFile(alloc: std.mem.Allocator, data_dir: std.fs.Dir, descriptors
     try manifest.rewriteCheckpoint(data_dir);
 }
 
+fn writeMarketManifestFile(alloc: std.mem.Allocator, data_dir: std.fs.Dir, descriptors: []const MarketSegmentDescriptor) !void {
+    var manifest = market_manifest_mod.Manifest.init(alloc);
+    defer manifest.deinit();
+
+    var additions = std.array_list.Managed(market_manifest_mod.AddInput).init(alloc);
+    defer additions.deinit();
+    try additions.ensureTotalCapacity(descriptors.len);
+    for (descriptors) |descriptor| {
+        additions.appendAssumeCapacity(.{
+            .path = descriptor.mirrorPath(),
+            .market_series_id = descriptor.market_series_id,
+            .schema_digest = descriptor.schema_digest,
+            .metric = descriptor.metric,
+            .canonical_labels = descriptor.canonical_labels,
+            .hour_bucket = descriptor.hour_bucket,
+            .start_ts_ns = descriptor.start_ts_ns,
+            .end_ts_ns = descriptor.end_ts_ns,
+            .row_count = descriptor.row_count,
+            .block_count = descriptor.block_count,
+            .column_names = descriptor.column_names,
+            .content_id = descriptor.content_id,
+            .file_hash = descriptor.file_hash,
+            .file_size = descriptor.file_size,
+        });
+    }
+    if (additions.items.len == 0) {
+        try manifest.rewriteAtomically(data_dir);
+    } else {
+        try manifest.addBatch(data_dir, additions.items);
+    }
+}
+
 fn writeTagsFile(alloc: std.mem.Allocator, data_dir: std.fs.Dir, tag_snapshot: TagSnapshot) !void {
     _ = alloc;
     const temp_name = "tags.json.tmp";
@@ -9023,6 +10164,18 @@ fn writeMarketCatalogFile(alloc: std.mem.Allocator, data_dir: std.fs.Dir, snapsh
     try data_dir.rename(temp_name, market_catalog_mod.path);
 }
 
+fn expectSnapshotContainsMarketSeries(
+    snapshot: Snapshot,
+    expected: market_catalog_mod.MarketSeriesIdentity,
+) !void {
+    const market_snapshot = snapshot.market_catalog_snapshot orelse return error.MissingMarketCatalogSnapshot;
+    const entries = market_snapshot.market_series orelse return error.MissingMarketSeriesSnapshot;
+    for (entries) |entry| {
+        if (marketSeriesEntryEql(entry, expected)) return;
+    }
+    return error.MissingMarketSeriesSnapshot;
+}
+
 fn materializeSnapshotMirrors(
     alloc: std.mem.Allocator,
     data_dir: std.fs.Dir,
@@ -9034,6 +10187,14 @@ fn materializeSnapshotMirrors(
         if (mirror_path.len == 0) continue;
         const content = descriptor.contentRef() orelse continue;
         try writeContentRefToPath(alloc, data_dir, store, mirror_path, content);
+    }
+    for (snapshot.market_segment_descriptors) |descriptor| {
+        const root_id = descriptor.segmentRoot() orelse continue;
+        const restored_path = try market_segment_mod.restoreSegmentRootToLocalMirror(alloc, data_dir, store, root_id);
+        defer alloc.free(restored_path);
+        if (!std.mem.eql(u8, restored_path, descriptor.mirrorPath())) {
+            return error.MarketSegmentDescriptorMismatch;
+        }
     }
     for (snapshot.wal_index.entries) |entry| {
         const mirror_name = entry.mirrorName();
@@ -9195,6 +10356,446 @@ test "cas manager initializes a repository format marker for fresh repositories"
     try std.testing.expectEqual(cas_manager.format.extent_chunk_bytes, loaded.extent_chunk_bytes);
 }
 
+test "repository format probe initializes fresh and preserves legacy repositories without CasManager" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    const fresh_path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/format-probe-fresh",
+        .{tmp_dir.sub_path},
+    );
+    defer alloc.free(fresh_path);
+    const fresh = try probeOrInitRepositoryFormat(alloc, fresh_path, .none);
+    try std.testing.expectEqual(current_repository_format_version, fresh.version);
+
+    const legacy_path = try std.fmt.allocPrint(
+        alloc,
+        ".zig-cache/tmp/{s}/format-probe-legacy",
+        .{tmp_dir.sub_path},
+    );
+    defer alloc.free(legacy_path);
+    try std.fs.cwd().makePath(legacy_path);
+    var legacy_root = try std.fs.cwd().openDir(legacy_path, .{ .iterate = true });
+    defer legacy_root.close();
+    try legacy_root.writeFile(.{
+        .sub_path = "MANIFEST",
+        .data = "",
+        .flags = .{},
+    });
+    const legacy = try probeOrInitRepositoryFormat(alloc, legacy_path, .none);
+    try std.testing.expectEqual(legacy_repository_format_version, legacy.version);
+    try std.testing.expectEqual(RefBackend.loose, legacy.ref_backend);
+}
+
+test "cas manager opens format 3 repositories without rewriting the marker" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repo-format3", .{tmp_dir.sub_path});
+    defer alloc.free(data_path);
+    try std.fs.cwd().makePath(data_path);
+
+    var root = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer root.close();
+    try root.makePath("objects/info");
+    try writeRepositoryFormat(alloc, root, .{
+        .version = primary_repository_format_version,
+        .ref_backend = .reftable,
+        .extent_chunk_bytes = default_extent_chunk_bytes,
+    }, .none);
+
+    var cas_manager = try CasManager.init(alloc, data_path, .none);
+    defer cas_manager.deinit();
+
+    try std.testing.expectEqual(primary_repository_format_version, cas_manager.format.version);
+    try std.testing.expectEqual(RefBackend.reftable, cas_manager.format.ref_backend);
+    const loaded = try loadRepositoryFormat(cas_manager.store.root);
+    try std.testing.expectEqual(primary_repository_format_version, loaded.version);
+}
+
+test "cas manager rejects unsupported future repository formats before opening refs" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/repo-format-future", .{tmp_dir.sub_path});
+    defer alloc.free(data_path);
+    try std.fs.cwd().makePath(data_path);
+
+    var root = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer root.close();
+    try root.makePath("objects/info");
+    try writeRepositoryFormat(alloc, root, .{
+        .version = current_repository_format_version + 1,
+        .ref_backend = .reftable,
+        .extent_chunk_bytes = default_extent_chunk_bytes,
+    }, .none);
+
+    try std.testing.expectError(
+        error.UnsupportedRepositoryFormatVersion,
+        CasManager.init(alloc, data_path, .none),
+    );
+    try std.testing.expectError(error.FileNotFound, root.access("refs", .{}));
+}
+
+test "market catalog snapshots preserve market series identities through head and bundle" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/market-series-data", .{tmp_dir.sub_path});
+    defer alloc.free(data_path);
+    const bundle_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/market-series-bundle", .{tmp_dir.sub_path});
+    defer alloc.free(bundle_path);
+    const restore_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/market-series-restore", .{tmp_dir.sub_path});
+    defer alloc.free(restore_path);
+    try std.fs.cwd().makePath(data_path);
+
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var manifest = manifest_mod.Manifest{ .alloc = alloc, .entries = .{} };
+    defer manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = alloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(alloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(alloc, data_dir, .none);
+    defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(alloc, data_dir, .none);
+    defer metric_catalog.deinit();
+    var market_catalog = try market_catalog_mod.Catalog.loadOrInit(alloc, data_dir, .none);
+    defer market_catalog.deinit();
+
+    var schema = try market_catalog.registerSchema(.{
+        .metric = "market.synthetic",
+        .ordered_columns = &.{ "price", "size" },
+        .required_labels = &.{ "symbol", "venue" },
+        .storage_mapping = .native_v1,
+    });
+    defer schema.deinit(alloc);
+    var identity = try market_catalog.registerMarketSeries(
+        "market.synthetic",
+        "{\"venue\":\"XNAS\",\"symbol\":\"AAPL\"}",
+    );
+    defer identity.deinit(alloc);
+
+    var cas_manager = try CasManager.init(alloc, data_path, .none);
+    defer cas_manager.deinit();
+    _ = try cas_manager.bootstrapIfMissingWithMarket(
+        data_dir,
+        &manifest,
+        &tags,
+        &series_catalog,
+        &metric_catalog,
+        &market_catalog,
+    );
+
+    var reader = CommitReader{ .alloc = alloc, .store = &cas_manager.store, .refs = &cas_manager.refs };
+    var snapshot = try reader.loadHeadSnapshot();
+    defer snapshot.deinit(alloc);
+    try expectSnapshotContainsMarketSeries(snapshot, identity);
+
+    _ = try createBundle(alloc, data_path, bundle_path, .none, null);
+    _ = try applyBundle(alloc, bundle_path, restore_path, .none);
+
+    var restored = try CasManager.init(alloc, restore_path, .none);
+    defer restored.deinit();
+    var restored_reader = CommitReader{ .alloc = alloc, .store = &restored.store, .refs = &restored.refs };
+    var restored_snapshot = try restored_reader.loadHeadSnapshot();
+    defer restored_snapshot.deinit(alloc);
+    try expectSnapshotContainsMarketSeries(restored_snapshot, identity);
+}
+
+test "native market segment descriptors roundtrip through CAS snapshot and checkout" {
+    const alloc = std.testing.allocator;
+    var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp_dir.cleanup();
+
+    const data_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/market-segment-cas", .{tmp_dir.sub_path});
+    defer alloc.free(data_path);
+    try std.fs.cwd().makePath(data_path);
+
+    var data_dir = try std.fs.cwd().openDir(data_path, .{ .iterate = true });
+    defer data_dir.close();
+
+    var manifest = manifest_mod.Manifest{ .alloc = alloc, .entries = .{} };
+    defer manifest.deinit();
+    var market_manifest = market_manifest_mod.Manifest.init(alloc);
+    defer market_manifest.deinit();
+    var tags = tags_mod.TagIndex{ .alloc = alloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(alloc) };
+    defer tags.deinit();
+    var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(alloc, data_dir, .none);
+    defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(alloc, data_dir, .none);
+    defer metric_catalog.deinit();
+    var market_catalog = try market_catalog_mod.Catalog.loadOrInit(alloc, data_dir, .none);
+    defer market_catalog.deinit();
+
+    var schema = try market_catalog.registerSchema(.{
+        .metric = "market.synthetic",
+        .ordered_columns = &.{ "price", "size" },
+        .required_labels = &.{ "symbol", "venue" },
+        .storage_mapping = .native_v1,
+    });
+    defer schema.deinit(alloc);
+    var identity = try market_catalog.registerMarketSeries(
+        "market.synthetic",
+        "{\"venue\":\"XNAS\",\"symbol\":\"AAPL\"}",
+    );
+    defer identity.deinit(alloc);
+
+    const row0_values = [_]f64{ 10.5, 100.0 };
+    const row1_values = [_]f64{ 10.75, 125.0 };
+    const rows = [_]market_segment_mod.MarketRowView{
+        .{ .ts_ns = 1_000, .write_sequence = 1, .values = row0_values[0..] },
+        .{ .ts_ns = 2_000, .write_sequence = 2, .values = row1_values[0..] },
+    };
+    const segment_path = try market_segment_mod.write(alloc, data_dir, .{
+        .market_series_id = identity.series_id,
+        .schema_digest = schema.digest(),
+        .metric = schema.metric,
+        .canonical_labels = identity.canonical_labels,
+        .hour = 0,
+        .column_names = schema.ordered_columns,
+    }, rows[0..]);
+    defer alloc.free(segment_path);
+
+    const file_bytes = try data_dir.readFileAlloc(alloc, segment_path, 16 * 1024 * 1024);
+    defer alloc.free(file_bytes);
+    const digest = market_manifest_mod.contentDigest(file_bytes);
+    try market_manifest.addBatch(data_dir, &.{.{
+        .path = segment_path,
+        .market_series_id = identity.series_id,
+        .schema_digest = schema.digest(),
+        .metric = schema.metric,
+        .canonical_labels = identity.canonical_labels,
+        .hour_bucket = 0,
+        .start_ts_ns = rows[0].ts_ns,
+        .end_ts_ns = rows[rows.len - 1].ts_ns,
+        .row_count = rows.len,
+        .block_count = 1,
+        .column_names = schema.ordered_columns,
+        .content_id = digest,
+        .file_hash = digest,
+        .file_size = file_bytes.len,
+    }});
+
+    var cas_manager = try CasManager.init(alloc, data_path, .none);
+    defer cas_manager.deinit();
+    _ = try cas_manager.bootstrapIfMissingWithNativeMarket(
+        data_dir,
+        &manifest,
+        &tags,
+        &series_catalog,
+        &metric_catalog,
+        &market_catalog,
+        &market_manifest,
+    );
+
+    var reader = CommitReader{
+        .alloc = alloc,
+        .store = &cas_manager.store,
+        .refs = &cas_manager.refs,
+    };
+    var snapshot = try cas_manager.loadSnapshotForSpec(main_ref);
+    defer snapshot.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.market_segment_descriptors.len);
+    try std.testing.expect(snapshot.market_segment_descriptors[0].segmentRoot() != null);
+    try validateMarketSegmentRootMatchesDescriptor(alloc, &cas_manager.store, snapshot.market_segment_descriptors[0]);
+    var snapshot_root = try reader.loadTreeObject(snapshot.root_id);
+    defer snapshot_root.deinit(alloc);
+    const metadata_tree_id = findTreeEntry(snapshot_root.entries, "metadata") orelse
+        return error.MissingMetadataTree;
+    var metadata_tree = try reader.loadTreeObject(metadata_tree_id);
+    defer metadata_tree.deinit(alloc);
+    try std.testing.expect(findBlobEntry(
+        metadata_tree.entries,
+        "market_series_catalog",
+    ) != null);
+    try std.testing.expect(findBlobEntry(metadata_tree.entries, "market_catalog") == null);
+
+    const fsck_report = try cas_manager.fsck(data_dir, .{ .mode = .full });
+    try std.testing.expectEqual(@as(usize, 1), fsck_report.market_segment_contents_checked);
+    try std.testing.expectEqual(@as(usize, 0), fsck_report.missing_market_segment_mirrors);
+
+    try data_dir.deleteFile(segment_path);
+    try data_dir.deleteFile(market_manifest_mod.manifest_path);
+    try cas_manager.exportSpecToLegacy(main_ref, data_dir);
+
+    var restored_manifest = try market_manifest_mod.Manifest.loadOrEmpty(alloc, data_dir);
+    defer restored_manifest.deinit();
+    try std.testing.expectEqual(@as(usize, 1), restored_manifest.list().len);
+    try std.testing.expectEqualStrings(segment_path, restored_manifest.list()[0].path);
+
+    var restored = try market_segment_mod.readProjectedRange(
+        alloc,
+        data_dir,
+        segment_path,
+        0,
+        3_000,
+        &.{"price"},
+    );
+    defer restored.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), restored.timestamps.len);
+    try std.testing.expectEqual(@as(usize, 1), restored.columns.len);
+    try std.testing.expectEqualStrings("price", restored.columns[0].name);
+    try std.testing.expectApproxEqAbs(@as(f64, 10.5), restored.columns[0].values[0], 1e-9);
+    try std.testing.expectApproxEqAbs(@as(f64, 10.75), restored.columns[0].values[1], 1e-9);
+
+    const market_root_id = snapshot.market_segment_descriptors[0].segmentRoot().?;
+    var market_root_tree = try reader.loadTreeObject(market_root_id);
+    defer market_root_tree.deinit(alloc);
+    const blocks_tree_id = findTreeEntry(market_root_tree.entries, "blocks") orelse
+        return error.MissingMarketSegmentRootBlocks;
+    var blocks_tree = try reader.loadTreeObject(blocks_tree_id);
+    defer blocks_tree.deinit(alloc);
+    const block_tree_id = findTreeEntry(blocks_tree.entries, "0000000000000000") orelse
+        return error.MissingMarketSegmentBlock;
+    var block_tree = try reader.loadTreeObject(block_tree_id);
+    defer block_tree.deinit(alloc);
+    const values_tree_id = findTreeEntry(block_tree.entries, "values") orelse
+        return error.MissingMarketSegmentValues;
+    var values_tree = try reader.loadTreeObject(values_tree_id);
+    defer values_tree.deinit(alloc);
+    const unrequested_extent_id = findTreeEntry(values_tree.entries, "00000001") orelse
+        return error.MissingMarketSegmentColumn;
+    var unrequested_extent = try reader.loadTreeObject(unrequested_extent_id);
+    defer unrequested_extent.deinit(alloc);
+    try cas_manager.store.delete(unrequested_extent.entries[0].object_id);
+
+    var projected_from_cas = try market_segment_mod.readProjectedRangeSegmentRoot(
+        alloc,
+        &cas_manager.store,
+        market_root_id,
+        0,
+        3_000,
+        &.{"price"},
+    );
+    defer projected_from_cas.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), projected_from_cas.timestamps.len);
+    try std.testing.expectError(
+        error.FileNotFound,
+        cas_manager.fsck(data_dir, .{ .mode = .full }),
+    );
+}
+
+test "market catalog snapshot decode accepts old payloads without market series" {
+    const alloc = std.testing.allocator;
+    const payload =
+        \\{"schemas":[],"bar_policies":[],"rollups":[],"signals":[]}
+    ;
+    var snapshot = try decodeMarketCatalogSnapshot(alloc, payload);
+    defer snapshot.deinit(alloc);
+
+    try std.testing.expect(snapshot.market_series != null);
+    try std.testing.expectEqual(@as(usize, 0), snapshot.market_series.?.len);
+}
+
+test "market series catalog metadata lookup accepts old key and prefers canonical key" {
+    const old_id = object_store.ObjectId{ .hash = [_]u8{0x11} ** 32 };
+    const canonical_id = object_store.ObjectId{ .hash = [_]u8{0x22} ** 32 };
+    const old_only = [_]TreeEntry{.{
+        .name = @constCast("market_catalog"),
+        .object_type = .blob,
+        .object_id = old_id,
+    }};
+    try std.testing.expect(findMarketSeriesCatalogBlob(&old_only).?.eql(old_id));
+
+    const both = [_]TreeEntry{
+        .{
+            .name = @constCast("market_catalog"),
+            .object_type = .blob,
+            .object_id = old_id,
+        },
+        .{
+            .name = @constCast("market_series_catalog"),
+            .object_type = .blob,
+            .object_id = canonical_id,
+        },
+    };
+    try std.testing.expect(findMarketSeriesCatalogBlob(&both).?.eql(canonical_id));
+}
+
+test "market catalog snapshot decode rejects duplicate market series identities" {
+    const alloc = std.testing.allocator;
+    const digest = market_identity.schemaDigest(
+        "market.synthetic",
+        &.{ "price", "size" },
+        &.{ "symbol", "venue" },
+        "native_v1",
+    );
+    const digest_hex = market_identity.digestToHex(digest);
+    const canonical_labels = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}";
+    const series_id = market_identity.seriesId("market.synthetic", canonical_labels);
+    var series_id_buffer: [20]u8 = undefined;
+    const series_id_text = try std.fmt.bufPrint(&series_id_buffer, "{d}", .{series_id});
+
+    var buffer = std.array_list.Managed(u8).init(alloc);
+    errdefer buffer.deinit();
+    var writer = buffer.writer();
+    var tmp: [1024]u8 = undefined;
+    var adapter = writer.adaptToNewApi(&tmp);
+    const iface = &adapter.new_interface;
+    var jw = std.json.Stringify{ .writer = iface };
+    try jw.beginObject();
+    try jw.objectField("schemas");
+    try jw.beginArray();
+    try jw.beginObject();
+    try jw.objectField("metric");
+    try jw.write("market.synthetic");
+    try jw.objectField("ordered_columns");
+    try jw.beginArray();
+    try jw.write("price");
+    try jw.write("size");
+    try jw.endArray();
+    try jw.objectField("required_labels");
+    try jw.beginArray();
+    try jw.write("symbol");
+    try jw.write("venue");
+    try jw.endArray();
+    try jw.objectField("storage_mapping");
+    try jw.write("native_v1");
+    try jw.endObject();
+    try jw.endArray();
+    try jw.objectField("market_series");
+    try jw.beginArray();
+    for (0..2) |_| {
+        try jw.beginObject();
+        try jw.objectField("series_id");
+        try jw.write(series_id_text);
+        try jw.objectField("schema_digest");
+        try jw.write(&digest_hex);
+        try jw.objectField("metric");
+        try jw.write("market.synthetic");
+        try jw.objectField("canonical_labels");
+        try jw.write(canonical_labels);
+        try jw.endObject();
+    }
+    try jw.endArray();
+    try jw.objectField("bar_policies");
+    try jw.beginArray();
+    try jw.endArray();
+    try jw.objectField("rollups");
+    try jw.beginArray();
+    try jw.endArray();
+    try jw.objectField("signals");
+    try jw.beginArray();
+    try jw.endArray();
+    try jw.endObject();
+    try iface.flush();
+    if (adapter.err) |err| return err;
+
+    const payload = try buffer.toOwnedSlice();
+    defer alloc.free(payload);
+
+    try std.testing.expectError(
+        error.InvalidMetricCatalogSnapshotObject,
+        decodeMarketCatalogSnapshot(alloc, payload),
+    );
+}
+
 test "cas manager persists repository identities across reopen" {
     const alloc = std.testing.allocator;
     var tmp_dir = std.testing.tmpDir(.{ .iterate = true });
@@ -9280,6 +10881,8 @@ test "upgrade repository migrates legacy refs to reftable and refreshes format" 
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, data_dir, .none);
+    defer metric_catalog.deinit();
 
     const sid = types.hash64("upgrade.series");
     _ = try series_catalog.register("upgrade.series", "{}", sid);
@@ -9290,7 +10893,7 @@ test "upgrade repository migrates legacy refs to reftable and refreshes format" 
 
     var cas_manager = try CasManager.init(talloc, data_path, .none);
     defer cas_manager.deinit();
-    const head = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    const head = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
 
     cas_manager.refs.root.deleteTree("reftable") catch {};
     try cas_manager.refs.root.makePath("reftable");
@@ -9328,6 +10931,8 @@ test "upgrade normalizes active commits to canonical roots and clears compatibil
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, data_dir, .none);
+    defer metric_catalog.deinit();
 
     const sid = types.hash64("upgrade.normalize.series");
     _ = try series_catalog.register("upgrade.normalize.series", "{}", sid);
@@ -9338,7 +10943,7 @@ test "upgrade normalizes active commits to canonical roots and clears compatibil
 
     var cas_manager = try CasManager.init(talloc, data_path, .none);
     defer cas_manager.deinit();
-    const current_head = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    const current_head = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
 
     var reader = CommitReader{ .alloc = talloc, .store = &cas_manager.store, .refs = &cas_manager.refs };
     var snapshot = try reader.loadHeadSnapshot();
@@ -9374,8 +10979,10 @@ test "upgrade normalizes active commits to canonical roots and clears compatibil
         initialized_legacy_wal_entries = idx + 1;
     }
 
+    const legacy_market_descriptors = try talloc.alloc(MarketSegmentDescriptor, 0);
     var legacy_snapshot = LegacySnapshot{
         .segment_descriptors = legacy_descriptors,
+        .market_segment_descriptors = legacy_market_descriptors,
         .tag_snapshot = try cloneTagSnapshot(talloc, snapshot.tag_snapshot),
         .series_catalog_snapshot = try cloneSeriesCatalogSnapshot(talloc, snapshot.series_catalog_snapshot),
         .metric_catalog_snapshot = try cloneMetricCatalogSnapshot(talloc, snapshot.metric_catalog_snapshot),
@@ -9426,6 +11033,8 @@ test "repair rebuilds pack sidecars side indexes and reftable metadata" {
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, data_dir, .none);
+    defer metric_catalog.deinit();
 
     const sid = types.hash64("repair.series");
     _ = try series_catalog.register("repair.series", "{}", sid);
@@ -9436,7 +11045,7 @@ test "repair rebuilds pack sidecars side indexes and reftable metadata" {
 
     var cas_manager = try CasManager.init(talloc, data_path, .none);
     defer cas_manager.deinit();
-    _ = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    _ = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
     _ = try cas_manager.pack();
     try cas_manager.migrateToReftable(data_dir);
 
@@ -9492,6 +11101,8 @@ test "expire trims loose reflogs checkpoints and borrowed alternates" {
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, source_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, source_dir, .none);
+    defer metric_catalog.deinit();
 
     const sid = types.hash64("expire.series");
     _ = try series_catalog.register("expire.series", "{}", sid);
@@ -9502,7 +11113,7 @@ test "expire trims loose reflogs checkpoints and borrowed alternates" {
 
     var source_cas = try CasManager.init(talloc, source_path, .none);
     defer source_cas.deinit();
-    const head = try source_cas.bootstrapIfMissing(source_dir, &manifest, &tags, &series_catalog);
+    const head = try source_cas.bootstrapIfMissing(source_dir, &manifest, &tags, &series_catalog, &metric_catalog);
 
     var dest_dir = try std.fs.cwd().openDir(dest_path, .{ .iterate = true });
     defer dest_dir.close();
@@ -9617,6 +11228,8 @@ test "vacuum with policy preserves the active head and is idempotent" {
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, data_dir, .none);
+    defer metric_catalog.deinit();
 
     const sid = types.hash64("vacuum.series");
     _ = try series_catalog.register("vacuum.series", "{}", sid);
@@ -9627,25 +11240,25 @@ test "vacuum with policy preserves the active head and is idempotent" {
 
     var cas_manager = try CasManager.init(talloc, data_path, .none);
     defer cas_manager.deinit();
-    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
-    const orphan = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, "vacuum-orphan");
+    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
+    const orphan = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, &metric_catalog, "vacuum-orphan");
     try std.testing.expect(!initial.eql(orphan));
     try cas_manager.refs.updateHeadAtomic(main_ref, initial);
 
     cas_manager.store.root.deleteFile(commit_graph_path) catch {};
 
-    const first = try cas_manager.vacuumWithPolicy(data_dir, .{
+    const vacuum_policy = MaintenancePolicy{
         .repair_side_indexes = true,
-        .prune_grace_ms = 0,
-    });
+        .reflog_expiry_ms = 0,
+        .prune_grace_ms = 1_000,
+    };
+
+    const first = try cas_manager.vacuumWithPolicy(data_dir, vacuum_policy);
     try std.testing.expect(first.pack.reachable_objects > 0);
     try std.testing.expect(first.repair.side_indexes_rebuilt);
-    try std.testing.expect(first.gc.quarantined_count > 0 or first.gc.pruned_count > 0 or first.gc.deleted > 0);
+    try std.testing.expect(first.expiry.reflog_entries_expired > 0 or first.gc.reflog_protected > 0 or first.gc.quarantined_count > 0 or first.gc.pruned_count > 0 or first.gc.deleted > 0);
 
-    const second = try cas_manager.vacuumWithPolicy(data_dir, .{
-        .repair_side_indexes = true,
-        .prune_grace_ms = 0,
-    });
+    const second = try cas_manager.vacuumWithPolicy(data_dir, vacuum_policy);
     try std.testing.expectEqual(first.pack.reachable_objects, second.pack.reachable_objects);
 
     const head = try cas_manager.refs.readHead(main_ref) orelse return error.MissingCasHead;
@@ -9715,6 +11328,8 @@ test "cas bootstrap imports legacy metadata into a genesis commit" {
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, data_dir, .none);
+    defer metric_catalog.deinit();
 
     const sid = types.hash64("bootstrap.series");
     const points = [_]types.Point{
@@ -9732,10 +11347,10 @@ test "cas bootstrap imports legacy metadata into a genesis commit" {
     var cas_manager = try CasManager.init(talloc, data_path, .none);
     defer cas_manager.deinit();
 
-    const head = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    const head = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
     const ref_head = try cas_manager.refs.readHead(main_ref) orelse return error.MissingCasHead;
     try std.testing.expect(head.eql(ref_head));
-    try cas_manager.verifyHeadMatchesLegacy(data_dir, &manifest, &tags, &series_catalog);
+    try cas_manager.verifyHeadMatchesLegacy(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
 
     var reader = CommitReader{ .alloc = talloc, .store = &cas_manager.store, .refs = &cas_manager.refs };
     var snapshot = try reader.loadHeadSnapshot();
@@ -9767,6 +11382,8 @@ test "retention rewrites manifest and emits a CAS commit" {
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, data_dir, .none);
+    defer metric_catalog.deinit();
 
     const sid = types.hash64("retention.series");
     const now: i64 = @intCast(std.time.timestamp());
@@ -9790,7 +11407,7 @@ test "retention rewrites manifest and emits a CAS commit" {
 
     var cas_manager = try CasManager.init(talloc, data_path, .none);
     defer cas_manager.deinit();
-    const initial_head = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    const initial_head = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
 
     const changed = try retention_mod.applyWithResult(data_dir, &manifest, 1);
     try std.testing.expect(changed);
@@ -9799,9 +11416,9 @@ test "retention rewrites manifest and emits a CAS commit" {
     defer reloaded.deinit();
     try std.testing.expectEqual(@as(usize, 1), reloaded.entries.items.len);
 
-    const next_head = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, "retention");
+    const next_head = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, &metric_catalog, "retention");
     try std.testing.expect(!initial_head.eql(next_head));
-    try cas_manager.verifyHeadMatchesLegacy(data_dir, &manifest, &tags, &series_catalog);
+    try cas_manager.verifyHeadMatchesLegacy(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
 }
 
 test "compaction rewrites manifest and emits a CAS commit" {
@@ -9822,6 +11439,8 @@ test "compaction rewrites manifest and emits a CAS commit" {
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, data_dir, .none);
+    defer metric_catalog.deinit();
 
     const sid = types.hash64("compact.series");
     const first_points = [_]types.Point{
@@ -9844,7 +11463,7 @@ test "compaction rewrites manifest and emits a CAS commit" {
 
     var cas_manager = try CasManager.init(talloc, data_path, .none);
     defer cas_manager.deinit();
-    const initial_head = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    const initial_head = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
 
     const changed = try compact_mod.compactAllWithResult(talloc, data_dir, &manifest);
     try std.testing.expect(changed);
@@ -9853,9 +11472,9 @@ test "compaction rewrites manifest and emits a CAS commit" {
     defer reloaded.deinit();
     try std.testing.expectEqual(@as(usize, 1), reloaded.entries.items.len);
 
-    const next_head = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, "compaction");
+    const next_head = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, &metric_catalog, "compaction");
     try std.testing.expect(!initial_head.eql(next_head));
-    try cas_manager.verifyHeadMatchesLegacy(data_dir, &manifest, &tags, &series_catalog);
+    try cas_manager.verifyHeadMatchesLegacy(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
 }
 
 test "wal index captures CAS content ids for mutable current wal" {
@@ -10140,6 +11759,8 @@ test "checkpoints support diffing and rollback" {
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, data_dir, .none);
+    defer metric_catalog.deinit();
 
     const sid = types.hash64("checkpoint.series");
     _ = try series_catalog.register("checkpoint.series", "{}", sid);
@@ -10151,7 +11772,7 @@ test "checkpoints support diffing and rollback" {
 
     var cas_manager = try CasManager.init(talloc, data_path, .none);
     defer cas_manager.deinit();
-    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
     const checkpoint_ref = (try cas_manager.createCheckpoint("manual")) orelse return error.MissingCasHead;
     defer talloc.free(checkpoint_ref);
 
@@ -10160,7 +11781,7 @@ test "checkpoints support diffing and rollback" {
     defer talloc.free(second_path);
     try manifest.add(data_dir, sid, 0, 2_000, 2_000, 1, second_path);
 
-    const advanced = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, "advance");
+    const advanced = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, &metric_catalog, "advance");
     try std.testing.expect(!advanced.eql(initial));
 
     const diff = try cas_manager.diffSnapshots(checkpoint_ref, main_ref);
@@ -10189,6 +11810,8 @@ test "commit graph indexes reachable commit ancestry" {
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, data_dir, .none);
+    defer metric_catalog.deinit();
 
     const sid = types.hash64("commit.graph.series");
     _ = try series_catalog.register("commit.graph.series", "{}", sid);
@@ -10200,14 +11823,14 @@ test "commit graph indexes reachable commit ancestry" {
 
     var cas_manager = try CasManager.init(talloc, data_path, .none);
     defer cas_manager.deinit();
-    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
 
     const second_points = [_]types.Point{.{ .ts = 2_000, .value = 2.0 }};
     const second_path = try segment_mod.writeSegment(talloc, data_dir, sid, 0, second_points[0..]);
     defer talloc.free(second_path);
     try manifest.add(data_dir, sid, 0, 2_000, 2_000, 1, second_path);
 
-    const advanced = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, "advance");
+    const advanced = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, &metric_catalog, "advance");
     try std.testing.expect(!advanced.eql(initial));
 
     var graph = try loadCommitGraph(talloc, cas_manager.store.root);
@@ -10250,6 +11873,8 @@ test "reachability bitmap falls back to graph walks when corrupt" {
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, data_dir, .none);
+    defer metric_catalog.deinit();
 
     const sid = types.hash64("bitmap.series");
     _ = try series_catalog.register("bitmap.series", "{}", sid);
@@ -10261,7 +11886,7 @@ test "reachability bitmap falls back to graph walks when corrupt" {
     var cas_manager = try CasManager.init(talloc, data_path, .none);
     defer cas_manager.deinit();
 
-    _ = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    _ = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
     var bitmap = try loadReachabilityBitmap(talloc, cas_manager.store.root);
     bitmap.deinit(talloc);
 
@@ -10296,6 +11921,8 @@ test "gc prunes unreachable commits" {
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, data_dir, .none);
+    defer metric_catalog.deinit();
 
     const sid = types.hash64("gc.series");
     _ = try series_catalog.register("gc.series", "{}", sid);
@@ -10306,8 +11933,8 @@ test "gc prunes unreachable commits" {
 
     var cas_manager = try CasManager.init(talloc, data_path, .none);
     defer cas_manager.deinit();
-    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
-    const orphan = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, "orphan");
+    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
+    const orphan = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, &metric_catalog, "orphan");
     try std.testing.expect(!initial.eql(orphan));
     try cas_manager.refs.updateHeadAtomic(main_ref, initial);
 
@@ -10361,6 +11988,8 @@ test "gc writes loose unreachable objects into cruft packs" {
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, data_dir, .none);
+    defer metric_catalog.deinit();
 
     const sid = types.hash64("gc.cruft.pack");
     _ = try series_catalog.register("gc.cruft.pack", "{}", sid);
@@ -10371,8 +12000,8 @@ test "gc writes loose unreachable objects into cruft packs" {
 
     var cas_manager = try CasManager.init(talloc, data_path, .none);
     defer cas_manager.deinit();
-    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
-    const orphan = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, "cruft-pack-orphan");
+    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
+    const orphan = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, &metric_catalog, "cruft-pack-orphan");
     try std.testing.expect(!initial.eql(orphan));
     try cas_manager.refs.updateHeadAtomic(main_ref, initial);
 
@@ -10418,6 +12047,8 @@ test "fsck and pack preserve the reachable CAS head" {
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, data_dir, .none);
+    defer metric_catalog.deinit();
 
     const sid = types.hash64("pack.series");
     _ = try series_catalog.register("pack.series", "{}", sid);
@@ -10429,8 +12060,8 @@ test "fsck and pack preserve the reachable CAS head" {
     var cas_manager = try CasManager.init(talloc, data_path, .none);
     defer cas_manager.deinit();
 
-    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
-    const orphan = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, "orphan-pack");
+    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
+    const orphan = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, &metric_catalog, "orphan-pack");
     try std.testing.expect(!initial.eql(orphan));
     try cas_manager.refs.updateHeadAtomic(main_ref, initial);
 
@@ -10467,6 +12098,8 @@ test "fsck validates active pack manifests" {
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, data_dir, .none);
+    defer metric_catalog.deinit();
 
     const sid = types.hash64("fsck.pack.manifest");
     _ = try series_catalog.register("fsck.pack.manifest", "{}", sid);
@@ -10477,7 +12110,7 @@ test "fsck validates active pack manifests" {
 
     var cas_manager = try CasManager.init(talloc, data_path, .none);
     defer cas_manager.deinit();
-    _ = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    _ = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
     _ = try cas_manager.pack();
 
     var pack_dir = try cas_manager.store.root.openDir("objects/packs", .{ .iterate = true });
@@ -10521,6 +12154,8 @@ test "cas pack preserves older packs while sealing newly reachable loose objects
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, data_dir, .none);
+    defer metric_catalog.deinit();
 
     const sid = types.hash64("pack.set.series");
     _ = try series_catalog.register("pack.set.series", "{}", sid);
@@ -10533,7 +12168,7 @@ test "cas pack preserves older packs while sealing newly reachable loose objects
     var cas_manager = try CasManager.init(talloc, data_path, .none);
     defer cas_manager.deinit();
 
-    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
     const first_pack = try cas_manager.pack();
     try std.testing.expect(first_pack.rewritten_objects > 0);
 
@@ -10542,7 +12177,7 @@ test "cas pack preserves older packs while sealing newly reachable loose objects
     defer talloc.free(second_path);
     try manifest.add(data_dir, sid, 0, 2_000, 2_000, 1, second_path);
 
-    const advanced = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, "advance-pack-set");
+    const advanced = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, &metric_catalog, "advance-pack-set");
     try std.testing.expect(!advanced.eql(initial));
 
     const second_pack = try cas_manager.pack();
@@ -10583,6 +12218,8 @@ test "gc and fsck protect reflog-referenced commits by default" {
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, data_dir, .none);
+    defer metric_catalog.deinit();
 
     const sid = types.hash64("reflog.series");
     _ = try series_catalog.register("reflog.series", "{}", sid);
@@ -10593,8 +12230,8 @@ test "gc and fsck protect reflog-referenced commits by default" {
 
     var cas_manager = try CasManager.init(talloc, data_path, .none);
     defer cas_manager.deinit();
-    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
-    const orphan = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, "reflog-orphan");
+    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
+    const orphan = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, &metric_catalog, "reflog-orphan");
     try std.testing.expect(!initial.eql(orphan));
     try cas_manager.refs.updateHeadAtomic(main_ref, initial);
 
@@ -10642,6 +12279,8 @@ test "bundle create, verify, and apply round-trip the CAS head" {
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, data_dir, .none);
+    defer metric_catalog.deinit();
 
     const sid = types.hash64("bundle.series");
     _ = try series_catalog.register("bundle.series", "{}", sid);
@@ -10653,7 +12292,7 @@ test "bundle create, verify, and apply round-trip the CAS head" {
 
     var cas_manager = try CasManager.init(talloc, data_path, .none);
     defer cas_manager.deinit();
-    const head = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    const head = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
     const pack_result = try cas_manager.pack();
     try std.testing.expect(pack_result.rewritten_objects > 0);
 
@@ -10661,7 +12300,11 @@ test "bundle create, verify, and apply round-trip the CAS head" {
     try std.testing.expect(created.ref_count > 0);
     try std.testing.expect(created.object_count > 0);
     try std.testing.expect(created.pack_count > 0);
-    try std.testing.expect(created.reftable_file_count > 0);
+    if (cas_manager.format.ref_backend == .reftable) {
+        try std.testing.expect(created.reftable_file_count > 0);
+    } else {
+        try std.testing.expectEqual(@as(usize, 0), created.reftable_file_count);
+    }
 
     const verified = try verifyBundle(talloc, bundle_path);
     try std.testing.expectEqual(created.ref_count, verified.ref_count);
@@ -10716,6 +12359,8 @@ test "bundle apply preserves symbolic HEAD target and borrowed repositories" {
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, data_dir, .none);
+    defer metric_catalog.deinit();
 
     const sid = types.hash64("bundle.head.series");
     _ = try series_catalog.register("bundle.head.series", "{}", sid);
@@ -10726,7 +12371,7 @@ test "bundle apply preserves symbolic HEAD target and borrowed repositories" {
 
     var source = try CasManager.init(talloc, data_path, .none);
     defer source.deinit();
-    const source_head = try source.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    const source_head = try source.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
     const feature_ref = "heads/feature";
     try source.refs.updateHeadAtomic(feature_ref, source_head);
     try source.writeHeadSymRef(feature_ref);
@@ -10782,6 +12427,8 @@ test "bundle apply clears stale borrowed repositories when manifest has none" {
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, data_dir, .none);
+    defer metric_catalog.deinit();
 
     const sid = types.hash64("bundle.clean.series");
     _ = try series_catalog.register("bundle.clean.series", "{}", sid);
@@ -10792,7 +12439,7 @@ test "bundle apply clears stale borrowed repositories when manifest has none" {
 
     var source = try CasManager.init(talloc, data_path, .none);
     defer source.deinit();
-    const source_head = try source.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    const source_head = try source.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
 
     const created = try createBundle(talloc, data_path, bundle_path, .none, null);
     try std.testing.expect(created.object_count > 0);
@@ -10833,6 +12480,8 @@ test "local clone preserves pack files and reftable state" {
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, data_dir, .none);
+    defer metric_catalog.deinit();
 
     const sid = types.hash64("clone.series");
     _ = try series_catalog.register("clone.series", "{}", sid);
@@ -10843,12 +12492,16 @@ test "local clone preserves pack files and reftable state" {
 
     var source = try CasManager.init(talloc, data_path, .none);
     defer source.deinit();
-    const head = try source.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    const head = try source.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
     _ = try source.pack();
 
     const cloned = try cloneLocalRepository(talloc, data_path, clone_path, .none);
     try std.testing.expect(cloned.pack_count > 0);
-    try std.testing.expect(cloned.reftable_file_count > 0);
+    if (source.format.ref_backend == .reftable) {
+        try std.testing.expect(cloned.reftable_file_count > 0);
+    } else {
+        try std.testing.expectEqual(@as(usize, 0), cloned.reftable_file_count);
+    }
 
     var clone = try CasManager.init(talloc, clone_path, .none);
     defer clone.deinit();
@@ -10885,6 +12538,8 @@ test "local fetch borrows source repositories and tracks source refs" {
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, src_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, src_dir, .none);
+    defer metric_catalog.deinit();
     const sid = types.hash64("fetch.series");
     _ = try series_catalog.register("fetch.series", "{}", sid);
     const points = [_]types.Point{.{ .ts = 1_000, .value = 1.0 }};
@@ -10894,7 +12549,7 @@ test "local fetch borrows source repositories and tracks source refs" {
 
     var src = try CasManager.init(talloc, src_path, .none);
     defer src.deinit();
-    const src_head = try src.bootstrapIfMissing(src_dir, &manifest, &tags, &series_catalog);
+    const src_head = try src.bootstrapIfMissing(src_dir, &manifest, &tags, &series_catalog, &metric_catalog);
     try src.writeHeadSymRef(main_ref);
     _ = try src.pack();
 
@@ -10936,6 +12591,8 @@ test "local fetch tracks remote symbolic HEAD for non-main branches" {
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, src_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, src_dir, .none);
+    defer metric_catalog.deinit();
     const sid = types.hash64("fetch.head.series");
     _ = try series_catalog.register("fetch.head.series", "{}", sid);
     const points = [_]types.Point{.{ .ts = 1_000, .value = 1.0 }};
@@ -10945,7 +12602,7 @@ test "local fetch tracks remote symbolic HEAD for non-main branches" {
 
     var src = try CasManager.init(talloc, src_path, .none);
     defer src.deinit();
-    const src_head = try src.bootstrapIfMissing(src_dir, &manifest, &tags, &series_catalog);
+    const src_head = try src.bootstrapIfMissing(src_dir, &manifest, &tags, &series_catalog, &metric_catalog);
     const feature_ref = "heads/feature";
     try src.refs.updateHeadAtomic(feature_ref, src_head);
     try src.writeHeadSymRef(feature_ref);
@@ -10989,6 +12646,8 @@ test "clone local preserves symbolic HEAD target for bundle and borrow modes" {
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, src_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, src_dir, .none);
+    defer metric_catalog.deinit();
     const sid = types.hash64("clone.head.series");
     _ = try series_catalog.register("clone.head.series", "{}", sid);
     const points = [_]types.Point{.{ .ts = 1_000, .value = 1.0 }};
@@ -10998,7 +12657,7 @@ test "clone local preserves symbolic HEAD target for bundle and borrow modes" {
 
     var src = try CasManager.init(talloc, src_path, .none);
     defer src.deinit();
-    const src_head = try src.bootstrapIfMissing(src_dir, &manifest, &tags, &series_catalog);
+    const src_head = try src.bootstrapIfMissing(src_dir, &manifest, &tags, &series_catalog, &metric_catalog);
     const feature_ref = "heads/feature";
     try src.refs.updateHeadAtomic(feature_ref, src_head);
     try src.writeHeadSymRef(feature_ref);
@@ -11040,6 +12699,8 @@ test "local fetch can materialize borrowed content" {
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, src_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, src_dir, .none);
+    defer metric_catalog.deinit();
     const sid = types.hash64("fetch.materialize.series");
     _ = try series_catalog.register("fetch.materialize.series", "{}", sid);
     const points = [_]types.Point{.{ .ts = 1_000, .value = 1.5 }};
@@ -11049,7 +12710,7 @@ test "local fetch can materialize borrowed content" {
 
     var src = try CasManager.init(talloc, src_path, .none);
     defer src.deinit();
-    const src_head = try src.bootstrapIfMissing(src_dir, &manifest, &tags, &series_catalog);
+    const src_head = try src.bootstrapIfMissing(src_dir, &manifest, &tags, &series_catalog, &metric_catalog);
     _ = try src.pack();
 
     const fetched = try fetchLocalRepositoryWithOptions(talloc, src_path, dst_path, .none, .{ .materialize = true });
@@ -11076,6 +12737,7 @@ test "materialized local fetch stays usable after source repository is removed" 
 
     var src_head: object_store.ObjectId = undefined;
     var source_repo_id = RepositoryIdentity{ .bytes = [_]u8{0} ** 32 };
+    var destination_repo_id = RepositoryIdentity{ .bytes = [_]u8{0} ** 32 };
 
     {
         var src_dir = try std.fs.cwd().openDir(src_path, .{ .iterate = true });
@@ -11086,6 +12748,8 @@ test "materialized local fetch stays usable after source repository is removed" 
         defer tags.deinit();
         var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, src_dir, .none);
         defer series_catalog.deinit();
+        var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, src_dir, .none);
+        defer metric_catalog.deinit();
         const sid = types.hash64("fetch.detach.series");
         _ = try series_catalog.register("fetch.detach.series", "{}", sid);
         const points = [_]types.Point{.{ .ts = 1_000, .value = 4.5 }};
@@ -11095,13 +12759,18 @@ test "materialized local fetch stays usable after source repository is removed" 
 
         var src = try CasManager.init(talloc, src_path, .none);
         defer src.deinit();
-        src_head = try src.bootstrapIfMissing(src_dir, &manifest, &tags, &series_catalog);
+        src_head = try src.bootstrapIfMissing(src_dir, &manifest, &tags, &series_catalog, &metric_catalog);
         source_repo_id = src.repository_id;
         _ = try src.pack();
 
         const fetched = try fetchLocalRepositoryWithOptions(talloc, src_path, dst_path, .none, .{ .materialize = true });
         try std.testing.expect(fetched.repository_id.eql(src.repository_id));
         try std.testing.expectEqual(@as(usize, 0), fetched.borrowed_repositories);
+    }
+    {
+        var dst = try CasManager.init(talloc, dst_path, .none);
+        defer dst.deinit();
+        destination_repo_id = dst.repository_id;
     }
 
     try std.fs.cwd().deleteTree(src_path);
@@ -11110,9 +12779,11 @@ test "materialized local fetch stays usable after source repository is removed" 
     defer dst.deinit();
     try std.testing.expectEqual(@as(usize, 0), dst.store.alternates.repo_paths.len);
     try std.testing.expect(try dst.store.hasLocalObject(talloc, src_head));
-    const dst_head = try dst.refs.readHead(main_ref) orelse return error.MissingCasHead;
+    const tracking_name = try trackingRefName(talloc, source_repo_id, main_ref);
+    defer talloc.free(tracking_name);
+    const dst_head = try dst.refs.readHead(tracking_name) orelse return error.MissingCasHead;
     try std.testing.expect(dst_head.eql(src_head));
-    try std.testing.expect(dst.repository_id.eql(source_repo_id));
+    try std.testing.expect(dst.repository_id.eql(destination_repo_id));
 }
 
 test "borrowed clone can detach and stay independent after source removal" {
@@ -11138,6 +12809,8 @@ test "borrowed clone can detach and stay independent after source removal" {
         defer tags.deinit();
         var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, src_dir, .none);
         defer series_catalog.deinit();
+        var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, src_dir, .none);
+        defer metric_catalog.deinit();
         const sid = types.hash64("borrow.detach.series");
         _ = try series_catalog.register("borrow.detach.series", "{}", sid);
         const points = [_]types.Point{.{ .ts = 1_000, .value = 9.0 }};
@@ -11147,7 +12820,7 @@ test "borrowed clone can detach and stay independent after source removal" {
 
         var src = try CasManager.init(talloc, src_path, .none);
         defer src.deinit();
-        src_head = try src.bootstrapIfMissing(src_dir, &manifest, &tags, &series_catalog);
+        src_head = try src.bootstrapIfMissing(src_dir, &manifest, &tags, &series_catalog, &metric_catalog);
         _ = try src.pack();
 
         _ = try cloneLocalRepositoryWithOptions(talloc, src_path, dst_path, .none, .{ .borrow = true });
@@ -11187,51 +12860,45 @@ test "local push enforces fast-forward and materializes owned content by default
 
     var src_dir = try std.fs.cwd().openDir(src_path, .{ .iterate = true });
     defer src_dir.close();
-    var dst_dir = try std.fs.cwd().openDir(dst_path, .{ .iterate = true });
-    defer dst_dir.close();
 
     var src_manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
     defer src_manifest.deinit();
-    var dst_manifest = manifest_mod.Manifest{ .alloc = talloc, .entries = .{} };
-    defer dst_manifest.deinit();
     var tags = tags_mod.TagIndex{ .alloc = talloc, .map = std.StringHashMap(std.ArrayListUnmanaged(types.SeriesId)).init(talloc) };
     defer tags.deinit();
     var src_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, src_dir, .none);
     defer src_catalog.deinit();
-    var dst_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, dst_dir, .none);
-    defer dst_catalog.deinit();
+    var src_metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, src_dir, .none);
+    defer src_metric_catalog.deinit();
     const sid = types.hash64("push.series");
     _ = try src_catalog.register("push.series", "{}", sid);
-    _ = try dst_catalog.register("push.series", "{}", sid);
 
     const base_points = [_]types.Point{.{ .ts = 1_000, .value = 2.0 }};
     const base_src_path = try segment_mod.writeSegment(talloc, src_dir, sid, 0, base_points[0..]);
     defer talloc.free(base_src_path);
     try src_manifest.add(src_dir, sid, 0, 1_000, 1_000, 1, base_src_path);
-    const base_dst_path = try segment_mod.writeSegment(talloc, dst_dir, sid, 0, base_points[0..]);
-    defer talloc.free(base_dst_path);
-    try dst_manifest.add(dst_dir, sid, 0, 1_000, 1_000, 1, base_dst_path);
 
     var src = try CasManager.init(talloc, src_path, .none);
     defer src.deinit();
-    var dst = try CasManager.init(talloc, dst_path, .none);
-    defer dst.deinit();
-    _ = try src.bootstrapIfMissing(src_dir, &src_manifest, &tags, &src_catalog);
-    const dst_head = try dst.bootstrapIfMissing(dst_dir, &dst_manifest, &tags, &dst_catalog);
+    const base_head = try src.bootstrapIfMissing(src_dir, &src_manifest, &tags, &src_catalog, &src_metric_catalog);
+    const seeded = try pushLocalRepository(talloc, src_path, dst_path, .none);
+    try std.testing.expect(seeded.repository_id.eql(src.repository_id));
+    try std.testing.expectEqual(@as(usize, 0), seeded.borrowed_repositories);
 
     const next_points = [_]types.Point{.{ .ts = 2_000, .value = 3.0 }};
     const next_src_path = try segment_mod.writeSegment(talloc, src_dir, sid, 0, next_points[0..]);
     defer talloc.free(next_src_path);
     try src_manifest.add(src_dir, sid, 0, 2_000, 2_000, 1, next_src_path);
-    const src_head = try src.syncLegacySnapshot(src_dir, &src_manifest, &tags, &src_catalog, "advance-push");
+    const src_head = try src.syncLegacySnapshot(src_dir, &src_manifest, &tags, &src_catalog, &src_metric_catalog, "advance-push");
 
     const pushed = try pushLocalRepository(talloc, src_path, dst_path, .none);
     try std.testing.expect(pushed.repository_id.eql(src.repository_id));
     try std.testing.expectEqual(@as(usize, 0), pushed.borrowed_repositories);
 
+    var dst = try CasManager.init(talloc, dst_path, .none);
+    defer dst.deinit();
     const pushed_head = try dst.refs.readHead(main_ref) orelse return error.MissingCasHead;
     try std.testing.expect(pushed_head.eql(src_head));
-    try std.testing.expect(!pushed_head.eql(dst_head));
+    try std.testing.expect(!pushed_head.eql(base_head));
     try std.testing.expect(try dst.store.hasLocalObject(talloc, src_head));
 }
 
@@ -11259,6 +12926,8 @@ test "incremental bundle apply requires its prerequisite head" {
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(talloc, data_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(talloc, data_dir, .none);
+    defer metric_catalog.deinit();
 
     const sid = types.hash64("bundle.incremental");
     _ = try series_catalog.register("bundle.incremental", "{}", sid);
@@ -11270,7 +12939,7 @@ test "incremental bundle apply requires its prerequisite head" {
 
     var cas_manager = try CasManager.init(talloc, data_path, .none);
     defer cas_manager.deinit();
-    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    const initial = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
     const initial_hex = initial.toHex();
 
     _ = try createBundle(talloc, data_path, base_bundle_path, .none, null);
@@ -11279,7 +12948,7 @@ test "incremental bundle apply requires its prerequisite head" {
     const second_path = try segment_mod.writeSegment(talloc, data_dir, sid, 0, second_points[0..]);
     defer talloc.free(second_path);
     try manifest.add(data_dir, sid, 0, 2_000, 2_000, 1, second_path);
-    const advanced = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, "advance-bundle");
+    const advanced = try cas_manager.syncLegacySnapshot(data_dir, &manifest, &tags, &series_catalog, &metric_catalog, "advance-bundle");
     try std.testing.expect(!advanced.eql(initial));
 
     const created = try createBundle(talloc, data_path, incremental_bundle_path, .none, initial_hex[0..]);
@@ -11315,6 +12984,8 @@ test "exportSpecToLegacy materializes segment and wal mirrors from content refs"
     defer tags.deinit();
     var series_catalog = try series_catalog_mod.SeriesCatalog.loadOrInit(alloc, data_dir, .none);
     defer series_catalog.deinit();
+    var metric_catalog = try metric_catalog_mod.MetricCatalog.loadOrInit(alloc, data_dir, .none);
+    defer metric_catalog.deinit();
 
     const sid = types.hash64("checkout.series");
     const points = [_]types.Point{
@@ -11334,7 +13005,7 @@ test "exportSpecToLegacy materializes segment and wal mirrors from content refs"
 
     var cas_manager = try CasManager.init(alloc, data_path, .none);
     defer cas_manager.deinit();
-    _ = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog);
+    _ = try cas_manager.bootstrapIfMissing(data_dir, &manifest, &tags, &series_catalog, &metric_catalog);
 
     try data_dir.deleteFile(seg_path);
     try data_dir.deleteFile("wal/current.wal");

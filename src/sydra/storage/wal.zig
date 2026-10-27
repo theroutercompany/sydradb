@@ -2,10 +2,31 @@ const std = @import("std");
 const cfg = @import("../config.zig");
 const object_store = @import("object_store.zig");
 const extents = @import("extents.zig");
+const market_identity = @import("market_identity.zig");
 
 // WAL v0:
 // Type 1 = Put: [u32 len][u8 type][u64 series_id][i64 ts][f64 value][u32 crc32]
 // Type 2 = SeriesRegistration: [u32 len][u8 type][u64 series_id][u32 series_len][u32 tags_len][series bytes][canonical tags bytes][u32 crc32]
+// Type 3 = MarketRow: [u32 len][u8 type][u64 market_series_id][u64 write_sequence][i64 ts_ns][u16 column_count][f64 values...][u32 crc32]
+// Type 4 = MarketSeriesRegistration: [u32 len][u8 type][u64 market_series_id][32-byte schema_digest][u32 metric_len][u32 labels_len][metric bytes][canonical labels bytes][u32 crc32]
+
+const max_wal_payload_bytes: usize = 1 << 20;
+const market_row_fixed_payload_bytes: usize = 1 + 8 + 8 + 8 + 2;
+const market_registration_fixed_payload_bytes: usize = 1 + 8 + 32 + 4 + 4;
+
+pub const MarketRowAppend = struct {
+    market_series_id: market_identity.MarketSeriesId,
+    write_sequence: u64,
+    ts_ns: i64,
+    values: []const f64,
+};
+
+pub const MarketSeriesRegistrationAppend = struct {
+    market_series_id: market_identity.MarketSeriesId,
+    schema_digest: market_identity.SchemaDigest,
+    metric: []const u8,
+    canonical_labels: []const u8,
+};
 
 pub const JournalFrameIndexEntry = struct {
     offset: u64,
@@ -443,6 +464,154 @@ pub const WAL = struct {
         return total_bytes;
     }
 
+    pub fn appendMarketRow(
+        self: *WAL,
+        market_series_id: u64,
+        write_sequence: u64,
+        ts_ns: i64,
+        values: []const f64,
+    ) !u32 {
+        const payload_len = try marketRowPayloadLen(values.len);
+        const payload = try self.alloc.alloc(u8, payload_len);
+        defer self.alloc.free(payload);
+
+        var offset: usize = 0;
+        payload[offset] = 3;
+        offset += 1;
+        writeIntBytes(u64, payload, &offset, market_series_id);
+        writeIntBytes(u64, payload, &offset, write_sequence);
+        writeIntBytes(i64, payload, &offset, ts_ns);
+        writeIntBytes(u16, payload, &offset, @intCast(values.len));
+        for (values) |value| {
+            writeIntBytes(u64, payload, &offset, @as(u64, @bitCast(value)));
+        }
+        std.debug.assert(offset == payload.len);
+        return try appendPayload(self, payload);
+    }
+
+    pub fn appendMarketRowBatch(self: *WAL, rows: []const MarketRowAppend) !u64 {
+        if (rows.len == 0) return 0;
+
+        var total_bytes: usize = 0;
+        for (rows) |row| {
+            const payload_len = try marketRowPayloadLen(row.values.len);
+            total_bytes = try addFrameBytes(total_bytes, payload_len);
+        }
+
+        const encoded = try self.alloc.alloc(u8, total_bytes);
+        defer self.alloc.free(encoded);
+
+        var offset: usize = 0;
+        for (rows) |row| {
+            const payload_len = try marketRowPayloadLen(row.values.len);
+            writeIntBytes(u32, encoded, &offset, @intCast(payload_len));
+            const payload = encoded[offset .. offset + payload_len];
+
+            var payload_offset: usize = 0;
+            payload[payload_offset] = 3;
+            payload_offset += 1;
+            writeIntBytes(u64, payload, &payload_offset, row.market_series_id);
+            writeIntBytes(u64, payload, &payload_offset, row.write_sequence);
+            writeIntBytes(i64, payload, &payload_offset, row.ts_ns);
+            writeIntBytes(u16, payload, &payload_offset, @intCast(row.values.len));
+            for (row.values) |value| {
+                writeIntBytes(u64, payload, &payload_offset, @as(u64, @bitCast(value)));
+            }
+            std.debug.assert(payload_offset == payload.len);
+            offset += payload_len;
+
+            var crc = std.hash.Crc32.init();
+            crc.update(payload);
+            writeIntBytes(u32, encoded, &offset, crc.final());
+        }
+        std.debug.assert(offset == encoded.len);
+
+        try self.file.writeAll(encoded);
+        self.bytes_written += total_bytes;
+        switch (self.fsync) {
+            .always => try self.file.sync(),
+            .interval => {},
+            .none => {},
+        }
+        return total_bytes;
+    }
+
+    pub fn appendMarketSeriesRegistration(
+        self: *WAL,
+        market_series_id: u64,
+        schema_digest: [32]u8,
+        metric: []const u8,
+        canonical_labels: []const u8,
+    ) !u32 {
+        const payload_len = try marketRegistrationPayloadLen(metric.len, canonical_labels.len);
+        const payload = try self.alloc.alloc(u8, payload_len);
+        defer self.alloc.free(payload);
+
+        var offset: usize = 0;
+        payload[offset] = 4;
+        offset += 1;
+        writeIntBytes(u64, payload, &offset, market_series_id);
+        @memcpy(payload[offset .. offset + schema_digest.len], schema_digest[0..]);
+        offset += schema_digest.len;
+        writeIntBytes(u32, payload, &offset, @intCast(metric.len));
+        writeIntBytes(u32, payload, &offset, @intCast(canonical_labels.len));
+        @memcpy(payload[offset .. offset + metric.len], metric);
+        offset += metric.len;
+        @memcpy(payload[offset .. offset + canonical_labels.len], canonical_labels);
+        offset += canonical_labels.len;
+        std.debug.assert(offset == payload.len);
+        return try appendPayload(self, payload);
+    }
+
+    pub fn appendMarketSeriesRegistrationBatch(self: *WAL, registrations: []const MarketSeriesRegistrationAppend) !u64 {
+        if (registrations.len == 0) return 0;
+
+        var total_bytes: usize = 0;
+        for (registrations) |registration| {
+            const payload_len = try marketRegistrationPayloadLen(registration.metric.len, registration.canonical_labels.len);
+            total_bytes = try addFrameBytes(total_bytes, payload_len);
+        }
+
+        const encoded = try self.alloc.alloc(u8, total_bytes);
+        defer self.alloc.free(encoded);
+
+        var offset: usize = 0;
+        for (registrations) |registration| {
+            const payload_len = try marketRegistrationPayloadLen(registration.metric.len, registration.canonical_labels.len);
+            writeIntBytes(u32, encoded, &offset, @intCast(payload_len));
+            const payload = encoded[offset .. offset + payload_len];
+
+            var payload_offset: usize = 0;
+            payload[payload_offset] = 4;
+            payload_offset += 1;
+            writeIntBytes(u64, payload, &payload_offset, registration.market_series_id);
+            @memcpy(payload[payload_offset .. payload_offset + 32], registration.schema_digest[0..]);
+            payload_offset += 32;
+            writeIntBytes(u32, payload, &payload_offset, @intCast(registration.metric.len));
+            writeIntBytes(u32, payload, &payload_offset, @intCast(registration.canonical_labels.len));
+            @memcpy(payload[payload_offset .. payload_offset + registration.metric.len], registration.metric);
+            payload_offset += registration.metric.len;
+            @memcpy(payload[payload_offset .. payload_offset + registration.canonical_labels.len], registration.canonical_labels);
+            payload_offset += registration.canonical_labels.len;
+            std.debug.assert(payload_offset == payload.len);
+            offset += payload_len;
+
+            var crc = std.hash.Crc32.init();
+            crc.update(payload);
+            writeIntBytes(u32, encoded, &offset, crc.final());
+        }
+        std.debug.assert(offset == encoded.len);
+
+        try self.file.writeAll(encoded);
+        self.bytes_written += total_bytes;
+        switch (self.fsync) {
+            .always => try self.file.sync(),
+            .interval => {},
+            .none => {},
+        }
+        return total_bytes;
+    }
+
     pub fn rotateIfNeeded(self: *WAL) !void {
         if (self.bytes_written < 64 * 1024 * 1024) return; // 64 MiB
         self.file.close();
@@ -703,7 +872,7 @@ pub fn writeJournalRootFromBytes(
     while (offset < bytes.len) : (frame_idx += 1) {
         if (offset + 4 > bytes.len) return error.CorruptWal;
         const payload_len = std.mem.readInt(u32, @as(*const [4]u8, @ptrCast(bytes[offset .. offset + 4].ptr)), .little);
-        if (payload_len == 0 or payload_len > (1 << 20)) return error.CorruptWal;
+        if (payload_len == 0 or payload_len > max_wal_payload_bytes) return error.CorruptWal;
         const frame_len: usize = 4 + payload_len + 4;
         if (offset + frame_len > bytes.len) return error.CorruptWal;
 
@@ -855,7 +1024,7 @@ fn replayReader(alloc: std.mem.Allocator, reader: anytype, ctx: anytype) !void {
         if (len_read != 4) return error.CorruptWal;
 
         const payload_len = std.mem.readInt(u32, &len_buf, .little);
-        if (payload_len == 0 or payload_len > (1 << 20)) return error.CorruptWal;
+        if (payload_len == 0 or payload_len > max_wal_payload_bytes) return error.CorruptWal;
 
         const payload = try alloc.alloc(u8, payload_len);
         defer alloc.free(payload);
@@ -870,34 +1039,110 @@ fn replayReader(alloc: std.mem.Allocator, reader: anytype, ctx: anytype) !void {
 
         switch (payload[0]) {
             1 => {
-                if (payload.len < 1 + 8 + 8 + 8) continue;
-                const sid = std.mem.readInt(u64, payload[1 .. 1 + 8], .little);
-                const ts = std.mem.readInt(i64, payload[9 .. 9 + 8], .little);
-                const val_bits = std.mem.readInt(u64, payload[17 .. 17 + 8], .little);
+                if (payload.len != 1 + 8 + 8 + 8) return error.CorruptWal;
+                const sid = try readWalPayloadInt(payload, 1, u64);
+                const ts = try readWalPayloadInt(payload, 9, i64);
+                const val_bits = try readWalPayloadInt(payload, 17, u64);
                 const value: f64 = @bitCast(val_bits);
                 try ctx.onRecord(sid, ts, value);
             },
             2 => {
                 if (payload.len < 1 + 8 + 4 + 4) return error.CorruptWal;
-                const sid = std.mem.readInt(u64, payload[1 .. 1 + 8], .little);
-                const series_len = std.mem.readInt(u32, payload[9 .. 9 + 4], .little);
-                const tags_len = std.mem.readInt(u32, payload[13 .. 13 + 4], .little);
-                const expected_len = 1 + 8 + 4 + 4 + @as(usize, series_len) + @as(usize, tags_len);
-                if (payload.len != expected_len) return error.CorruptWal;
-                const series_start = 17;
-                const tags_start = series_start + series_len;
+                const sid = try readWalPayloadInt(payload, 1, u64);
+                const series_len = try readWalPayloadInt(payload, 9, u32);
+                const tags_len = try readWalPayloadInt(payload, 13, u32);
+                const series_start: usize = 17;
+                const tags_start = try checkedWalFieldEnd(payload.len, series_start, series_len);
+                const payload_end = try checkedWalFieldEnd(payload.len, tags_start, tags_len);
+                if (payload_end != payload.len) return error.CorruptWal;
                 const series = payload[series_start..tags_start];
-                const tags = payload[tags_start .. tags_start + tags_len];
+                const tags = payload[tags_start..payload_end];
                 if (@hasDecl(@TypeOf(ctx.*), "onSeriesRegistration")) {
                     try ctx.onSeriesRegistration(sid, series, tags);
                 }
             },
-            else => continue,
+            3 => {
+                if (payload.len < market_row_fixed_payload_bytes) return error.CorruptWal;
+                const market_series_id = try readWalPayloadInt(payload, 1, u64);
+                const write_sequence = try readWalPayloadInt(payload, 9, u64);
+                const ts_ns = try readWalPayloadInt(payload, 17, i64);
+                const column_count = try readWalPayloadInt(payload, 25, u16);
+                if (column_count == 0 or column_count > market_identity.max_market_columns) return error.CorruptWal;
+                const expected_len = market_row_fixed_payload_bytes + @as(usize, column_count) * @sizeOf(u64);
+                if (payload.len != expected_len) return error.CorruptWal;
+                if (@hasDecl(@TypeOf(ctx.*), "onMarketRow")) {
+                    const values = try alloc.alloc(f64, column_count);
+                    defer alloc.free(values);
+                    for (values, 0..) |*value, idx| {
+                        const value_start = market_row_fixed_payload_bytes + idx * @sizeOf(u64);
+                        const value_bits = try readWalPayloadInt(payload, value_start, u64);
+                        value.* = @bitCast(value_bits);
+                    }
+                    try ctx.onMarketRow(market_series_id, write_sequence, ts_ns, values);
+                }
+            },
+            4 => {
+                if (payload.len < market_registration_fixed_payload_bytes) return error.CorruptWal;
+                const market_series_id = try readWalPayloadInt(payload, 1, u64);
+                var schema_digest: [32]u8 = undefined;
+                @memcpy(schema_digest[0..], payload[9..41]);
+                const metric_len = try readWalPayloadInt(payload, 41, u32);
+                const labels_len = try readWalPayloadInt(payload, 45, u32);
+                const metric_start: usize = market_registration_fixed_payload_bytes;
+                const labels_start = try checkedWalFieldEnd(payload.len, metric_start, metric_len);
+                const payload_end = try checkedWalFieldEnd(payload.len, labels_start, labels_len);
+                if (payload_end != payload.len) return error.CorruptWal;
+                const metric = payload[metric_start..labels_start];
+                const canonical_labels = payload[labels_start..payload_end];
+                if (@hasDecl(@TypeOf(ctx.*), "onMarketSeriesRegistration")) {
+                    try ctx.onMarketSeriesRegistration(market_series_id, schema_digest, metric, canonical_labels);
+                }
+            },
+            else => return error.CorruptWal,
         }
     }
 }
 
+fn marketRowPayloadLen(column_count: usize) !usize {
+    if (column_count == 0 or column_count > market_identity.max_market_columns) return error.InvalidMarketColumnCount;
+    if (column_count > (max_wal_payload_bytes - market_row_fixed_payload_bytes) / @sizeOf(u64)) {
+        return error.WalPayloadTooLarge;
+    }
+    return market_row_fixed_payload_bytes + column_count * @sizeOf(u64);
+}
+
+fn marketRegistrationPayloadLen(metric_len: usize, labels_len: usize) !usize {
+    if (metric_len > std.math.maxInt(u32) or labels_len > std.math.maxInt(u32)) {
+        return error.WalPayloadTooLarge;
+    }
+    if (metric_len > max_wal_payload_bytes - market_registration_fixed_payload_bytes) {
+        return error.WalPayloadTooLarge;
+    }
+    const remaining = max_wal_payload_bytes - market_registration_fixed_payload_bytes - metric_len;
+    if (labels_len > remaining) return error.WalPayloadTooLarge;
+    return market_registration_fixed_payload_bytes + metric_len + labels_len;
+}
+
+fn addFrameBytes(total_bytes: usize, payload_len: usize) !usize {
+    const frame_bytes = 4 + payload_len + 4;
+    if (total_bytes > std.math.maxInt(usize) - frame_bytes) return error.WalBatchTooLarge;
+    return total_bytes + frame_bytes;
+}
+
+fn readWalPayloadInt(payload: []const u8, offset: usize, comptime T: type) !T {
+    const width = @sizeOf(T);
+    if (offset > payload.len or width > payload.len - offset) return error.CorruptWal;
+    return std.mem.readInt(T, @as(*const [width]u8, @ptrCast(payload[offset..].ptr)), .little);
+}
+
+fn checkedWalFieldEnd(payload_len: usize, start: usize, field_len: u32) !usize {
+    const field_len_usize: usize = field_len;
+    if (start > payload_len or field_len_usize > payload_len - start) return error.CorruptWal;
+    return start + field_len_usize;
+}
+
 fn appendPayload(self: *WAL, payload: []const u8) !u32 {
+    if (payload.len == 0 or payload.len > max_wal_payload_bytes) return error.WalPayloadTooLarge;
     var header: [4]u8 = undefined;
     const plen: u32 = @intCast(payload.len);
     std.mem.writeInt(u32, &header, plen, .little);
@@ -937,6 +1182,344 @@ fn readExact(reader: anytype, buf: []u8) !void {
         if (n == 0) return error.CorruptWal;
         offset += n;
     }
+}
+
+fn encodeWalFrameForTest(alloc: std.mem.Allocator, payload: []const u8) ![]u8 {
+    const frame = try alloc.alloc(u8, 4 + payload.len + 4);
+    var offset: usize = 0;
+    writeIntBytes(u32, frame, &offset, @intCast(payload.len));
+    @memcpy(frame[offset .. offset + payload.len], payload);
+    offset += payload.len;
+    var crc = std.hash.Crc32.init();
+    crc.update(payload);
+    writeIntBytes(u32, frame, &offset, crc.final());
+    std.debug.assert(offset == frame.len);
+    return frame;
+}
+
+test "wal replays mixed scalar and market records in durable order" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var wal = try WAL.open(alloc, tmp.dir, .none);
+    defer wal.close();
+
+    const schema_digest = [_]u8{0x5a} ** 32;
+    _ = try wal.appendSeriesRegistration(77, "weather.room4", "{\"host\":\"b\"}");
+    _ = try wal.appendMarketSeriesRegistration(9001, schema_digest, "trade", "{\"symbol\":\"ACME\"}");
+    _ = try wal.append(77, 1_000, 3.5);
+    _ = try wal.appendMarketRow(9001, 41, 2_000, &[_]f64{ 101.25, 7.0 });
+
+    var ctx = struct {
+        market_registered: bool = false,
+        order: [4]u8 = undefined,
+        order_len: usize = 0,
+
+        fn recordOrder(self: *@This(), record_type: u8) void {
+            self.order[self.order_len] = record_type;
+            self.order_len += 1;
+        }
+
+        pub fn onSeriesRegistration(self: *@This(), series_id: u64, series: []const u8, canonical_tags: []const u8) !void {
+            try std.testing.expectEqual(@as(u64, 77), series_id);
+            try std.testing.expectEqualStrings("weather.room4", series);
+            try std.testing.expectEqualStrings("{\"host\":\"b\"}", canonical_tags);
+            self.recordOrder(2);
+        }
+
+        pub fn onMarketSeriesRegistration(
+            self: *@This(),
+            market_series_id: u64,
+            digest: [32]u8,
+            metric: []const u8,
+            canonical_labels: []const u8,
+        ) !void {
+            try std.testing.expectEqual(@as(u64, 9001), market_series_id);
+            try std.testing.expectEqualSlices(u8, &([_]u8{0x5a} ** 32), digest[0..]);
+            try std.testing.expectEqualStrings("trade", metric);
+            try std.testing.expectEqualStrings("{\"symbol\":\"ACME\"}", canonical_labels);
+            self.market_registered = true;
+            self.recordOrder(4);
+        }
+
+        pub fn onRecord(self: *@This(), series_id: u64, ts: i64, value: f64) !void {
+            try std.testing.expectEqual(@as(u64, 77), series_id);
+            try std.testing.expectEqual(@as(i64, 1_000), ts);
+            try std.testing.expectEqual(@as(f64, 3.5), value);
+            self.recordOrder(1);
+        }
+
+        pub fn onMarketRow(
+            self: *@This(),
+            market_series_id: u64,
+            write_sequence: u64,
+            ts_ns: i64,
+            values: []const f64,
+        ) !void {
+            try std.testing.expect(self.market_registered);
+            try std.testing.expectEqual(@as(u64, 9001), market_series_id);
+            try std.testing.expectEqual(@as(u64, 41), write_sequence);
+            try std.testing.expectEqual(@as(i64, 2_000), ts_ns);
+            try std.testing.expectEqualSlices(f64, &[_]f64{ 101.25, 7.0 }, values);
+            self.recordOrder(3);
+        }
+    }{};
+
+    try wal.replay(alloc, &ctx);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 2, 4, 1, 3 }, ctx.order[0..ctx.order_len]);
+}
+
+test "wal market batches round trip registrations and rows" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var wal = try WAL.open(alloc, tmp.dir, .none);
+    defer wal.close();
+
+    const registrations = [_]MarketSeriesRegistrationAppend{
+        .{
+            .market_series_id = 10,
+            .schema_digest = [_]u8{0x10} ** 32,
+            .metric = "trade",
+            .canonical_labels = "{\"symbol\":\"AAA\"}",
+        },
+        .{
+            .market_series_id = 20,
+            .schema_digest = [_]u8{0x20} ** 32,
+            .metric = "quote",
+            .canonical_labels = "{\"symbol\":\"BBB\"}",
+        },
+    };
+    const registration_bytes = try wal.appendMarketSeriesRegistrationBatch(registrations[0..]);
+
+    const rows = [_]MarketRowAppend{
+        .{
+            .market_series_id = 10,
+            .write_sequence = 1,
+            .ts_ns = 100,
+            .values = &[_]f64{ 11.5, 2.0 },
+        },
+        .{
+            .market_series_id = 20,
+            .write_sequence = 2,
+            .ts_ns = 200,
+            .values = &[_]f64{ 11.0, 12.0, 3.0 },
+        },
+    };
+    const row_bytes = try wal.appendMarketRowBatch(rows[0..]);
+    try std.testing.expect(registration_bytes > 0);
+    try std.testing.expect(row_bytes > 0);
+
+    var ctx = struct {
+        registrations: usize = 0,
+        rows: usize = 0,
+
+        pub fn onRecord(_: *@This(), _: u64, _: i64, _: f64) !void {}
+
+        pub fn onMarketSeriesRegistration(
+            self: *@This(),
+            market_series_id: u64,
+            schema_digest: [32]u8,
+            metric: []const u8,
+            canonical_labels: []const u8,
+        ) !void {
+            const idx = self.registrations;
+            const expected_id = [_]u64{ 10, 20 };
+            const expected_digest_byte = [_]u8{ 0x10, 0x20 };
+            const expected_metric = [_][]const u8{ "trade", "quote" };
+            const expected_labels = [_][]const u8{ "{\"symbol\":\"AAA\"}", "{\"symbol\":\"BBB\"}" };
+            try std.testing.expectEqual(expected_id[idx], market_series_id);
+            for (schema_digest) |byte| {
+                try std.testing.expectEqual(expected_digest_byte[idx], byte);
+            }
+            try std.testing.expectEqualStrings(expected_metric[idx], metric);
+            try std.testing.expectEqualStrings(expected_labels[idx], canonical_labels);
+            self.registrations += 1;
+        }
+
+        pub fn onMarketRow(
+            self: *@This(),
+            market_series_id: u64,
+            write_sequence: u64,
+            ts_ns: i64,
+            values: []const f64,
+        ) !void {
+            if (self.rows == 0) {
+                try std.testing.expectEqual(@as(u64, 10), market_series_id);
+                try std.testing.expectEqual(@as(u64, 1), write_sequence);
+                try std.testing.expectEqual(@as(i64, 100), ts_ns);
+                try std.testing.expectEqualSlices(f64, &[_]f64{ 11.5, 2.0 }, values);
+            } else {
+                try std.testing.expectEqual(@as(u64, 20), market_series_id);
+                try std.testing.expectEqual(@as(u64, 2), write_sequence);
+                try std.testing.expectEqual(@as(i64, 200), ts_ns);
+                try std.testing.expectEqualSlices(f64, &[_]f64{ 11.0, 12.0, 3.0 }, values);
+            }
+            self.rows += 1;
+        }
+    }{};
+
+    try wal.replay(alloc, &ctx);
+    try std.testing.expectEqual(@as(usize, 2), ctx.registrations);
+    try std.testing.expectEqual(@as(usize, 2), ctx.rows);
+}
+
+test "wal market append validates counts and one mebibyte payload limit" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var wal = try WAL.open(alloc, tmp.dir, .none);
+    defer wal.close();
+
+    try std.testing.expectError(error.InvalidMarketColumnCount, wal.appendMarketRow(1, 1, 1, &.{}));
+
+    const too_many_values = try alloc.alloc(f64, market_identity.max_market_columns + 1);
+    defer alloc.free(too_many_values);
+    try std.testing.expectError(error.InvalidMarketColumnCount, wal.appendMarketRow(1, 1, 1, too_many_values));
+
+    const oversized_metric = try alloc.alloc(u8, max_wal_payload_bytes - market_registration_fixed_payload_bytes + 1);
+    defer alloc.free(oversized_metric);
+    @memset(oversized_metric, 'x');
+    try std.testing.expectError(
+        error.WalPayloadTooLarge,
+        wal.appendMarketSeriesRegistration(1, [_]u8{0} ** 32, oversized_metric, ""),
+    );
+}
+
+test "wal rejects malformed known record counts and lengths" {
+    const alloc = std.testing.allocator;
+    const Context = struct {
+        pub fn onRecord(_: *@This(), _: u64, _: i64, _: f64) !void {}
+    };
+
+    var short_scalar_payload: [24]u8 = @splat(0);
+    short_scalar_payload[0] = 1;
+    const short_scalar_frame = try encodeWalFrameForTest(alloc, &short_scalar_payload);
+    defer alloc.free(short_scalar_frame);
+    var short_scalar_ctx = Context{};
+    try std.testing.expectError(error.CorruptWal, replayBytes(alloc, short_scalar_frame, &short_scalar_ctx));
+
+    var long_scalar_payload: [26]u8 = @splat(0);
+    long_scalar_payload[0] = 1;
+    const long_scalar_frame = try encodeWalFrameForTest(alloc, &long_scalar_payload);
+    defer alloc.free(long_scalar_frame);
+    var long_scalar_ctx = Context{};
+    try std.testing.expectError(error.CorruptWal, replayBytes(alloc, long_scalar_frame, &long_scalar_ctx));
+
+    var short_registration_payload: [17]u8 = @splat(0);
+    short_registration_payload[0] = 2;
+    writeIntSlice(u32, short_registration_payload[9..13], 1);
+    const short_registration_frame = try encodeWalFrameForTest(alloc, &short_registration_payload);
+    defer alloc.free(short_registration_frame);
+    var short_registration_ctx = Context{};
+    try std.testing.expectError(error.CorruptWal, replayBytes(alloc, short_registration_frame, &short_registration_ctx));
+
+    var zero_count_payload: [market_row_fixed_payload_bytes]u8 = @splat(0);
+    zero_count_payload[0] = 3;
+    const zero_count_frame = try encodeWalFrameForTest(alloc, &zero_count_payload);
+    defer alloc.free(zero_count_frame);
+    var zero_count_ctx = Context{};
+    try std.testing.expectError(error.CorruptWal, replayBytes(alloc, zero_count_frame, &zero_count_ctx));
+
+    var short_row_payload: [market_row_fixed_payload_bytes + 8]u8 = @splat(0);
+    short_row_payload[0] = 3;
+    writeIntSlice(u16, short_row_payload[25..27], 2);
+    const short_row_frame = try encodeWalFrameForTest(alloc, &short_row_payload);
+    defer alloc.free(short_row_frame);
+    var short_row_ctx = Context{};
+    try std.testing.expectError(error.CorruptWal, replayBytes(alloc, short_row_frame, &short_row_ctx));
+
+    var bad_registration_payload: [market_registration_fixed_payload_bytes + 3]u8 = @splat(0);
+    bad_registration_payload[0] = 4;
+    writeIntSlice(u32, bad_registration_payload[41..45], 4);
+    const bad_registration_frame = try encodeWalFrameForTest(alloc, &bad_registration_payload);
+    defer alloc.free(bad_registration_frame);
+    var bad_registration_ctx = Context{};
+    try std.testing.expectError(error.CorruptWal, replayBytes(alloc, bad_registration_frame, &bad_registration_ctx));
+}
+
+test "wal rejects market rows above the production column cap during replay" {
+    const alloc = std.testing.allocator;
+    const over_limit_count = market_identity.max_market_columns + 1;
+    const payload_len = market_row_fixed_payload_bytes + over_limit_count * @sizeOf(u64);
+    const payload = try alloc.alloc(u8, payload_len);
+    defer alloc.free(payload);
+    @memset(payload, 0);
+    payload[0] = 3;
+    writeIntSlice(u16, payload[25..27], @intCast(over_limit_count));
+
+    const frame = try encodeWalFrameForTest(alloc, payload);
+    defer alloc.free(frame);
+    var ctx = struct {
+        pub fn onRecord(_: *@This(), _: u64, _: i64, _: f64) !void {}
+    }{};
+    try std.testing.expectError(error.CorruptWal, replayBytes(alloc, frame, &ctx));
+}
+
+test "wal rejects crc-valid unknown record types" {
+    const alloc = std.testing.allocator;
+    const frame = try encodeWalFrameForTest(alloc, &[_]u8{99});
+    defer alloc.free(frame);
+
+    var ctx = struct {
+        pub fn onRecord(_: *@This(), _: u64, _: i64, _: f64) !void {}
+    }{};
+    try std.testing.expectError(error.CorruptWal, replayBytes(alloc, frame, &ctx));
+}
+
+test "wal verifies crc before dispatching market records" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var wal = try WAL.open(alloc, tmp.dir, .none);
+    defer wal.close();
+    _ = try wal.appendMarketRow(42, 7, 123, &[_]f64{9.5});
+
+    const bytes = try tmp.dir.readFileAlloc(alloc, "wal/current.wal", max_wal_payload_bytes);
+    defer alloc.free(bytes);
+    bytes[4 + market_row_fixed_payload_bytes] ^= 0xff;
+
+    var ctx = struct {
+        called: bool = false,
+
+        pub fn onRecord(_: *@This(), _: u64, _: i64, _: f64) !void {}
+
+        pub fn onMarketRow(self: *@This(), _: u64, _: u64, _: i64, _: []const f64) !void {
+            self.called = true;
+        }
+    }{};
+    try std.testing.expectError(error.CorruptWal, replayBytes(alloc, bytes, &ctx));
+    try std.testing.expect(!ctx.called);
+}
+
+test "legacy replay contexts safely ignore valid market frames" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var wal = try WAL.open(alloc, tmp.dir, .none);
+    defer wal.close();
+    _ = try wal.appendMarketSeriesRegistration(55, [_]u8{0xab} ** 32, "quote", "{\"symbol\":\"XYZ\"}");
+    _ = try wal.appendMarketRow(55, 1, 1_000, &[_]f64{ 10.0, 11.0 });
+    _ = try wal.append(8, 2_000, 12.5);
+
+    var ctx = struct {
+        scalar_records: usize = 0,
+
+        pub fn onRecord(self: *@This(), series_id: u64, ts: i64, value: f64) !void {
+            try std.testing.expectEqual(@as(u64, 8), series_id);
+            try std.testing.expectEqual(@as(i64, 2_000), ts);
+            try std.testing.expectEqual(@as(f64, 12.5), value);
+            self.scalar_records += 1;
+        }
+    }{};
+
+    try wal.replay(alloc, &ctx);
+    try std.testing.expectEqual(@as(usize, 1), ctx.scalar_records);
 }
 
 test "wal replays series registrations before point records" {
@@ -1030,6 +1613,70 @@ test "journal roots replay captured wal frames in order" {
     try replayJournalRoot(alloc, &store, root_id, registration_bytes + first_bytes, &ctx);
     try std.testing.expect(ctx.registered);
     try std.testing.expectEqual(@as(usize, 1), ctx.point_count);
+}
+
+test "journal roots replay native market registration and row frames" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/market-wal-journal-store", .{tmp.sub_path});
+    defer alloc.free(store_path);
+    var store = try object_store.ObjectStore.init(alloc, store_path, .none);
+    defer store.deinit();
+
+    var wal = try WAL.open(alloc, tmp.dir, .none);
+    defer wal.close();
+    const registration_bytes = try wal.appendMarketSeriesRegistration(
+        800,
+        [_]u8{0x80} ** 32,
+        "trade",
+        "{\"symbol\":\"MKT\"}",
+    );
+    const row_bytes = try wal.appendMarketRow(800, 12, 8_000, &[_]f64{ 72.5, 6.0 });
+    _ = try wal.appendMarketRow(800, 13, 8_001, &[_]f64{ 72.75, 4.0 });
+
+    const root_id = try writeJournalRootForWalFile(alloc, tmp.dir, &store, "current.wal");
+
+    var ctx = struct {
+        registered: bool = false,
+        rows: usize = 0,
+
+        pub fn onRecord(_: *@This(), _: u64, _: i64, _: f64) !void {}
+
+        pub fn onMarketSeriesRegistration(
+            self: *@This(),
+            market_series_id: u64,
+            schema_digest: [32]u8,
+            metric: []const u8,
+            canonical_labels: []const u8,
+        ) !void {
+            try std.testing.expectEqual(@as(u64, 800), market_series_id);
+            try std.testing.expectEqualSlices(u8, &([_]u8{0x80} ** 32), schema_digest[0..]);
+            try std.testing.expectEqualStrings("trade", metric);
+            try std.testing.expectEqualStrings("{\"symbol\":\"MKT\"}", canonical_labels);
+            self.registered = true;
+        }
+
+        pub fn onMarketRow(
+            self: *@This(),
+            market_series_id: u64,
+            write_sequence: u64,
+            ts_ns: i64,
+            values: []const f64,
+        ) !void {
+            try std.testing.expect(self.registered);
+            try std.testing.expectEqual(@as(u64, 800), market_series_id);
+            try std.testing.expectEqual(@as(u64, 12), write_sequence);
+            try std.testing.expectEqual(@as(i64, 8_000), ts_ns);
+            try std.testing.expectEqualSlices(f64, &[_]f64{ 72.5, 6.0 }, values);
+            self.rows += 1;
+        }
+    }{};
+
+    try replayJournalRoot(alloc, &store, root_id, registration_bytes + row_bytes, &ctx);
+    try std.testing.expect(ctx.registered);
+    try std.testing.expectEqual(@as(usize, 1), ctx.rows);
 }
 
 test "journal roots replay after packed storage prunes loose copies" {
