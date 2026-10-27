@@ -80,8 +80,15 @@ const BenchmarkMetrics = struct {
     expected_physical_writes: u64,
     wal_bytes: u64,
     wal_payload_bytes: u64,
+    wal_append_elapsed_ns: u64,
+    memtable_append_elapsed_ns: u64,
     segment_bytes: u64,
     storage_bytes: u64,
+    flush_elapsed_ns: u64,
+    flush_segment_write_elapsed_ns: u64,
+    flush_manifest_elapsed_ns: u64,
+    cas_sync_elapsed_ns: u64,
+    drain_wait_elapsed_ns: u64,
     peak_resident_estimate_bytes: u64,
     query: QueryMetrics,
 };
@@ -503,10 +510,24 @@ fn emitResult(
     try jw.write(metrics.wal_bytes);
     try jw.objectField("wal_payload_bytes");
     try jw.write(metrics.wal_payload_bytes);
+    try jw.objectField("wal_append_elapsed_ns");
+    try jw.write(metrics.wal_append_elapsed_ns);
+    try jw.objectField("memtable_append_elapsed_ns");
+    try jw.write(metrics.memtable_append_elapsed_ns);
     try jw.objectField("segment_bytes");
     try jw.write(metrics.segment_bytes);
     try jw.objectField("storage_bytes");
     try jw.write(metrics.storage_bytes);
+    try jw.objectField("flush_elapsed_ns");
+    try jw.write(metrics.flush_elapsed_ns);
+    try jw.objectField("flush_segment_write_elapsed_ns");
+    try jw.write(metrics.flush_segment_write_elapsed_ns);
+    try jw.objectField("flush_manifest_elapsed_ns");
+    try jw.write(metrics.flush_manifest_elapsed_ns);
+    try jw.objectField("cas_sync_elapsed_ns");
+    try jw.write(metrics.cas_sync_elapsed_ns);
+    try jw.objectField("drain_wait_elapsed_ns");
+    try jw.write(metrics.drain_wait_elapsed_ns);
     try jw.objectField("query_latency_p50_ns");
     try jw.write(metrics.query.latency_p50_ns);
     try jw.objectField("query_latency_p95_ns");
@@ -621,8 +642,15 @@ fn runScenario(
             .expected_physical_writes = expected_writes,
             .wal_bytes = wal_bytes,
             .wal_payload_bytes = engine.metrics.wal_bytes_total.load(.monotonic),
+            .wal_append_elapsed_ns = engine.metrics.wal_append_ns_total.load(.monotonic),
+            .memtable_append_elapsed_ns = engine.metrics.memtable_append_ns_total.load(.monotonic),
             .segment_bytes = segment_bytes,
             .storage_bytes = wal_bytes + segment_bytes,
+            .flush_elapsed_ns = engine.metrics.flush_ns_total.load(.monotonic),
+            .flush_segment_write_elapsed_ns = engine.metrics.flush_segment_write_ns_total.load(.monotonic),
+            .flush_manifest_elapsed_ns = engine.metrics.flush_manifest_ns_total.load(.monotonic),
+            .cas_sync_elapsed_ns = engine.metrics.cas_sync_ns_total.load(.monotonic),
+            .drain_wait_elapsed_ns = engine.metrics.flush_queue_drain_wait_ns_total.load(.monotonic),
             .peak_resident_estimate_bytes = resident_estimate,
             .query = query,
         },
