@@ -2499,6 +2499,7 @@ pub const Engine = struct {
                         std.log.warn("rollup processing failed for {s}: {s}", .{ rollup.id, @errorName(err) });
                         break :blk market_runtime_mod.ProcessingReport{ .success = false, .error_message = @errorName(err) };
                     };
+                    defer if (report.last_event_id) |event_id| self.alloc.free(event_id);
                     try self.market_runtime.reportResult("rollup", rollup.id, rollup.version, @intCast(std.time.nanoTimestamp()), report);
                     try self.market_runtime.setPending("rollup", rollup.id, rollup.version, item.labels_json, false);
                 }
@@ -2517,6 +2518,7 @@ pub const Engine = struct {
                         std.log.warn("signal processing failed for {s}: {s}", .{ signal.id, @errorName(err) });
                         break :blk market_runtime_mod.ProcessingReport{ .success = false, .error_message = @errorName(err) };
                     };
+                    defer if (report.last_event_id) |event_id| self.alloc.free(event_id);
                     try self.market_runtime.reportResult("signal", signal.id, signal.version, @intCast(std.time.nanoTimestamp()), report);
                     try self.market_runtime.setPending("signal", signal.id, signal.version, item.labels_json, false);
                 }
@@ -2538,6 +2540,7 @@ pub const Engine = struct {
                 std.log.warn("rollup processing failed for {s}: {s}", .{ rollup.id, @errorName(err) });
                 break :blk market_runtime_mod.ProcessingReport{ .success = false, .error_message = @errorName(err) };
             };
+            defer if (report.last_event_id) |event_id| self.alloc.free(event_id);
             try self.market_runtime.reportResult("rollup", rollup.id, rollup.version, @intCast(std.time.nanoTimestamp()), report);
         }
 
@@ -2554,6 +2557,7 @@ pub const Engine = struct {
                 std.log.warn("signal processing failed for {s}: {s}", .{ signal.id, @errorName(err) });
                 break :blk market_runtime_mod.ProcessingReport{ .success = false, .error_message = @errorName(err) };
             };
+            defer if (report.last_event_id) |event_id| self.alloc.free(event_id);
             try self.market_runtime.reportResult("signal", signal.id, signal.version, @intCast(std.time.nanoTimestamp()), report);
         }
     }
@@ -2580,7 +2584,6 @@ pub const Engine = struct {
     ) !market_runtime_mod.ProcessingReport {
         if (ts) |value| {
             const event_id = try makeEventId(self.alloc, metric, labels_json, value);
-            defer self.alloc.free(event_id);
             return .{
                 .rows_processed = rows_processed,
                 .emissions_total = emissions_total,
@@ -2910,8 +2913,9 @@ pub const Engine = struct {
             const output_metric = try std.fmt.allocPrint(self.alloc, "_signal.{s}", .{signal.id});
             defer self.alloc.free(output_metric);
             const signal_report = try self.emitSignalPoints(output_metric, output_labels, group.labels_json, revision, signal, primary_points, secondary_points, checkpoint);
+            defer if (signal_report.last_event_id) |event_id| self.alloc.free(event_id);
             emissions_total += signal_report.emissions_total;
-            if (signal_report.last_event_id != null) {
+            if (signal_report.last_output_ts != null) {
                 last_emitted_ts = signal_report.last_output_ts orelse last_emitted_ts;
                 last_emitted_labels = group.labels_json;
             }
@@ -2951,7 +2955,7 @@ pub const Engine = struct {
         var emissions_total: u64 = 0;
         var last_event_id: ?[]u8 = null;
         var last_output_ts: ?i64 = null;
-        defer if (last_event_id) |value| self.alloc.free(value);
+        errdefer if (last_event_id) |value| self.alloc.free(value);
 
         switch (signal.expression_kind) {
             .ema => {
@@ -2963,8 +2967,9 @@ pub const Engine = struct {
                     if (point.ts <= checkpoint) continue;
                     try self.emitDerivedMetric(output_metric, output_labels, point.ts, ema_value, signal.input_metric, signal.expression_kind.text());
                     emissions_total += 1;
-                    if (last_event_id) |event_id| self.alloc.free(event_id);
-                    last_event_id = try self.recordSignalEmission(signal, raw_labels_json, data_revision, point.ts, ema_value);
+                    const event_id = try self.recordSignalEmission(signal, raw_labels_json, data_revision, point.ts, ema_value);
+                    if (last_event_id) |previous| self.alloc.free(previous);
+                    last_event_id = event_id;
                     last_output_ts = point.ts;
                 }
             },
@@ -2982,8 +2987,9 @@ pub const Engine = struct {
                     const avg_value = sum / @as(f64, @floatFromInt(period));
                     try self.emitDerivedMetric(output_metric, output_labels, point.ts, avg_value, signal.input_metric, signal.expression_kind.text());
                     emissions_total += 1;
-                    if (last_event_id) |event_id| self.alloc.free(event_id);
-                    last_event_id = try self.recordSignalEmission(signal, raw_labels_json, data_revision, point.ts, avg_value);
+                    const event_id = try self.recordSignalEmission(signal, raw_labels_json, data_revision, point.ts, avg_value);
+                    if (last_event_id) |previous| self.alloc.free(previous);
+                    last_event_id = event_id;
                     last_output_ts = point.ts;
                 }
             },
@@ -2997,8 +3003,9 @@ pub const Engine = struct {
                     if (!crossed or point.ts <= checkpoint) continue;
                     try self.emitDerivedMetric(output_metric, output_labels, point.ts, 1.0, signal.input_metric, signal.expression_kind.text());
                     emissions_total += 1;
-                    if (last_event_id) |event_id| self.alloc.free(event_id);
-                    last_event_id = try self.recordSignalEmission(signal, raw_labels_json, data_revision, point.ts, 1.0);
+                    const event_id = try self.recordSignalEmission(signal, raw_labels_json, data_revision, point.ts, 1.0);
+                    if (last_event_id) |previous| self.alloc.free(previous);
+                    last_event_id = event_id;
                     last_output_ts = point.ts;
                 }
             },
@@ -3008,8 +3015,9 @@ pub const Engine = struct {
                     if (value <= threshold or point.ts <= checkpoint) continue;
                     try self.emitDerivedMetric(output_metric, output_labels, point.ts, 1.0, signal.input_metric, signal.expression_kind.text());
                     emissions_total += 1;
-                    if (last_event_id) |event_id| self.alloc.free(event_id);
-                    last_event_id = try self.recordSignalEmission(signal, raw_labels_json, data_revision, point.ts, 1.0);
+                    const event_id = try self.recordSignalEmission(signal, raw_labels_json, data_revision, point.ts, 1.0);
+                    if (last_event_id) |previous| self.alloc.free(previous);
+                    last_event_id = event_id;
                     last_output_ts = point.ts;
                 }
             },
@@ -3025,8 +3033,9 @@ pub const Engine = struct {
                     if (@abs(price - vwap) / @abs(vwap) <= threshold) continue;
                     try self.emitDerivedMetric(output_metric, output_labels, point.ts, 1.0, signal.input_metric, signal.expression_kind.text());
                     emissions_total += 1;
-                    if (last_event_id) |event_id| self.alloc.free(event_id);
-                    last_event_id = try self.recordSignalEmission(signal, raw_labels_json, data_revision, point.ts, 1.0);
+                    const event_id = try self.recordSignalEmission(signal, raw_labels_json, data_revision, point.ts, 1.0);
+                    if (last_event_id) |previous| self.alloc.free(previous);
+                    last_event_id = event_id;
                     last_output_ts = point.ts;
                 }
             },
@@ -3048,8 +3057,9 @@ pub const Engine = struct {
                         if (crossed) {
                             try self.emitDerivedMetric(output_metric, output_labels, point.ts, 1.0, signal.input_metric, signal.expression_kind.text());
                             emissions_total += 1;
-                            if (last_event_id) |event_id| self.alloc.free(event_id);
-                            last_event_id = try self.recordSignalEmission(signal, raw_labels_json, data_revision, point.ts, 1.0);
+                            const event_id = try self.recordSignalEmission(signal, raw_labels_json, data_revision, point.ts, 1.0);
+                            if (last_event_id) |previous| self.alloc.free(previous);
+                            last_event_id = event_id;
                             last_output_ts = point.ts;
                         }
                     }
@@ -10551,6 +10561,7 @@ test "engine native market rows drive rollups and signals without scalar fanout"
         trade_rollup,
         trade_labels,
     );
+    defer if (trade_report.last_event_id) |event_id| talloc.free(event_id);
     try std.testing.expectEqual(@as(u64, 3), trade_report.rows_processed);
     try std.testing.expectEqual(@as(u64, 6), trade_report.emissions_total);
 
@@ -10584,6 +10595,7 @@ test "engine native market rows drive rollups and signals without scalar fanout"
         signal,
         bars.rows[0].canonical_labels,
     );
+    defer if (signal_report.last_event_id) |event_id| talloc.free(event_id);
     try std.testing.expectEqual(@as(u64, 1), signal_report.rows_processed);
     try std.testing.expectEqual(@as(u64, 1), signal_report.emissions_total);
 
@@ -10650,6 +10662,7 @@ test "engine native market rows drive rollups and signals without scalar fanout"
         bar_rollup,
         source_bar_labels,
     );
+    defer if (bar_report.last_event_id) |event_id| talloc.free(event_id);
     try std.testing.expectEqual(@as(u64, 3), bar_report.rows_processed);
     try std.testing.expectEqual(@as(u64, 6), bar_report.emissions_total);
 
@@ -10697,6 +10710,7 @@ test "engine native market rows drive rollups and signals without scalar fanout"
         quote_rollup,
         quote_labels,
     );
+    defer if (quote_report.last_event_id) |event_id| talloc.free(event_id);
     try std.testing.expectEqual(@as(u64, 2), quote_report.rows_processed);
     try std.testing.expectEqual(@as(u64, 4), quote_report.emissions_total);
 }
@@ -10789,10 +10803,12 @@ test "engine derived processors include native and legacy scalar bar groups" {
     _ = try engine.flushNow();
 
     const signal_report = try engine.processSignalDefinitionFiltered(signal, null);
+    defer if (signal_report.last_event_id) |event_id| talloc.free(event_id);
     try std.testing.expectEqual(@as(u64, 4), signal_report.rows_processed);
     try std.testing.expectEqual(@as(u64, 4), signal_report.emissions_total);
 
     const rollup_report = try engine.processRollupDefinitionFiltered(rollup, null);
+    defer if (rollup_report.last_event_id) |event_id| talloc.free(event_id);
     try std.testing.expectEqual(@as(u64, 4), rollup_report.rows_processed);
     try std.testing.expectEqual(@as(u64, 12), rollup_report.emissions_total);
 
@@ -10871,6 +10887,7 @@ test "engine derived native rows retain scalar history and override overlapping 
     _ = try engine.flushNow();
 
     const report = try engine.processRollupDefinitionFiltered(rollup, null);
+    defer if (report.last_event_id) |event_id| talloc.free(event_id);
     try std.testing.expectEqual(@as(u64, 3), report.rows_processed);
     try std.testing.expectEqual(@as(u64, 6), report.emissions_total);
 
