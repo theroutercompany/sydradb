@@ -153,6 +153,13 @@ Error cases:
 
 For same-host writers that want lower overhead than HTTP NDJSON, use the [local ingest socket](./local-ingest.md) instead of widening the HTTP contract.
 
+## Automatic market schema batches
+
+For `POST /api/v1/market/ingest`, when `market_storage_mode = "auto"`, one
+request may contain schemas mapped to both `fanout_v1` and `native_v1`. SydraDB
+preserves request order, returns `"storage_mode":"auto"`, and reports native-row
+and fanout-write totals across the whole request.
+
 ## `POST /api/v1/query/range`
 
 Requires `Content-Length` and a JSON body:
