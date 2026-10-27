@@ -6912,16 +6912,34 @@ pub fn buildLegacySnapshotWithNativeMarket(
     }
 
     for (manifest.entries.items) |entry| {
-        var metadata = try segment_mod.inspectMetadata(alloc, data_dir, entry.path);
+        var metadata = segment_mod.inspectMetadata(alloc, data_dir, entry.path) catch |err| {
+            std.log.err("CAS snapshot scalar inspect failed path={s} error={s}", .{
+                entry.path,
+                @errorName(err),
+            });
+            return err;
+        };
         defer metadata.deinit(alloc);
         if (metadata.series_id != entry.series_id or metadata.hour_bucket != entry.hour_bucket or metadata.start_ts != entry.start_ts or metadata.end_ts != entry.end_ts or metadata.count != entry.count) {
             return error.ManifestSegmentMismatch;
         }
         const segment_root = if (store) |object_store_ref|
-            try segment_mod.writeSegmentRootForFile(alloc, data_dir, object_store_ref, entry.path, extent_chunk_bytes)
+            segment_mod.writeSegmentRootForFile(alloc, data_dir, object_store_ref, entry.path, extent_chunk_bytes) catch |err| {
+                std.log.err("CAS snapshot scalar root capture failed path={s} error={s}", .{
+                    entry.path,
+                    @errorName(err),
+                });
+                return err;
+            }
         else
             null;
-        const content = try ensureContentRefForFile(alloc, store, data_dir, entry.path, extent_chunk_bytes);
+        const content = ensureContentRefForFile(alloc, store, data_dir, entry.path, extent_chunk_bytes) catch |err| {
+            std.log.err("CAS snapshot scalar content capture failed path={s} error={s}", .{
+                entry.path,
+                @errorName(err),
+            });
+            return err;
+        };
         try descriptors.append(.{
             .path = try alloc.dupe(u8, entry.path),
             .mirror_path = &[_]u8{},
@@ -6952,11 +6970,23 @@ pub fn buildLegacySnapshotWithNativeMarket(
     }
     if (market_manifest) |native_manifest| {
         for (native_manifest.list()) |entry| {
-            var metadata = try market_segment_mod.inspect(alloc, data_dir, entry.path);
+            var metadata = market_segment_mod.inspect(alloc, data_dir, entry.path) catch |err| {
+                std.log.err("CAS snapshot market inspect failed path={s} error={s}", .{
+                    entry.path,
+                    @errorName(err),
+                });
+                return err;
+            };
             defer metadata.deinit(alloc);
             try validateMarketManifestDescriptorMatchesSegment(entry, &metadata);
             const market_root = if (store) |object_store_ref|
-                try market_segment_mod.writeSegmentRootForFile(alloc, data_dir, object_store_ref, entry.path, extent_chunk_bytes)
+                market_segment_mod.writeSegmentRootForFile(alloc, data_dir, object_store_ref, entry.path, extent_chunk_bytes) catch |err| {
+                    std.log.err("CAS snapshot market root capture failed path={s} error={s}", .{
+                        entry.path,
+                        @errorName(err),
+                    });
+                    return err;
+                }
             else
                 null;
             try market_descriptors.append(try cloneMarketSegmentDescriptorFromManifest(alloc, entry, market_root));
@@ -7150,7 +7180,10 @@ fn buildMetricCatalogSnapshot(alloc: std.mem.Allocator, metric_catalog: *const m
 }
 
 fn buildWalIndex(alloc: std.mem.Allocator, data_dir: std.fs.Dir, store: ?*object_store.ObjectStore, extent_chunk_bytes: u32) !WalIndex {
-    const infos = try wal_mod.collectWalFileInfos(alloc, data_dir);
+    const infos = wal_mod.collectWalFileInfos(alloc, data_dir) catch |err| {
+        std.log.err("CAS snapshot WAL inventory failed error={s}", .{@errorName(err)});
+        return err;
+    };
     defer wal_mod.freeWalFileInfos(alloc, infos);
 
     var entries = std.array_list.Managed(WalChunkDescriptor).init(alloc);
@@ -7161,7 +7194,13 @@ fn buildWalIndex(alloc: std.mem.Allocator, data_dir: std.fs.Dir, store: ?*object
 
     for (infos) |info| {
         const journal_root = if (store) |object_store_ref|
-            try wal_mod.writeJournalRootForWalFile(alloc, data_dir, object_store_ref, info.name)
+            wal_mod.writeJournalRootForWalFile(alloc, data_dir, object_store_ref, info.name) catch |err| {
+                std.log.err("CAS snapshot WAL journal capture failed path=wal/{s} error={s}", .{
+                    info.name,
+                    @errorName(err),
+                });
+                return err;
+            }
         else
             null;
         const content = try ensureContentRefForWalFile(alloc, store, data_dir, info.name, extent_chunk_bytes);

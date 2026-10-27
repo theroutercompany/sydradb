@@ -304,6 +304,7 @@ pub const WAL = struct {
     fsync: cfg.FsyncPolicy,
     file: std.fs.File,
     bytes_written: usize,
+    snapshot_mu: std.Thread.Mutex = .{},
 
     pub fn open(alloc: std.mem.Allocator, data_dir: std.fs.Dir, policy: cfg.FsyncPolicy) !WAL {
         data_dir.makePath("wal") catch {};
@@ -314,11 +315,31 @@ pub const WAL = struct {
         };
         const end_pos = try f.getEndPos();
         try f.seekFromEnd(0);
-        return .{ .alloc = alloc, .dir = data_dir, .fsync = policy, .file = f, .bytes_written = @intCast(end_pos) };
+        return .{
+            .alloc = alloc,
+            .dir = data_dir,
+            .fsync = policy,
+            .file = f,
+            .bytes_written = @intCast(end_pos),
+        };
     }
 
     pub fn close(self: *WAL) void {
         self.file.close();
+    }
+
+    pub fn lockForSnapshot(self: *WAL) void {
+        self.snapshot_mu.lock();
+    }
+
+    pub fn unlockForSnapshot(self: *WAL) void {
+        self.snapshot_mu.unlock();
+    }
+
+    pub fn sync(self: *WAL) !void {
+        self.snapshot_mu.lock();
+        defer self.snapshot_mu.unlock();
+        try self.file.sync();
     }
 
     pub fn append(self: *WAL, series_id: u64, ts: i64, value: f64) !u32 {
@@ -334,6 +355,8 @@ pub const WAL = struct {
         var header: [4]u8 = undefined;
         const plen: u32 = @intCast(payload.len);
         std.mem.writeInt(u32, &header, plen, .little);
+        self.snapshot_mu.lock();
+        defer self.snapshot_mu.unlock();
         try self.file.writeAll(&header);
         try self.file.writeAll(payload);
         var crc = std.hash.Crc32.init();
@@ -387,6 +410,8 @@ pub const WAL = struct {
             writeIntBytes(u32, encoded, &offset, crc.final());
         }
 
+        self.snapshot_mu.lock();
+        defer self.snapshot_mu.unlock();
         try self.file.writeAll(encoded);
         self.bytes_written += total_bytes;
         switch (self.fsync) {
@@ -454,6 +479,8 @@ pub const WAL = struct {
             writeIntBytes(u32, encoded, &offset, crc.final());
         }
 
+        self.snapshot_mu.lock();
+        defer self.snapshot_mu.unlock();
         try self.file.writeAll(encoded);
         self.bytes_written += total_bytes;
         switch (self.fsync) {
@@ -526,6 +553,8 @@ pub const WAL = struct {
         }
         std.debug.assert(offset == encoded.len);
 
+        self.snapshot_mu.lock();
+        defer self.snapshot_mu.unlock();
         try self.file.writeAll(encoded);
         self.bytes_written += total_bytes;
         switch (self.fsync) {
@@ -602,6 +631,8 @@ pub const WAL = struct {
         }
         std.debug.assert(offset == encoded.len);
 
+        self.snapshot_mu.lock();
+        defer self.snapshot_mu.unlock();
         try self.file.writeAll(encoded);
         self.bytes_written += total_bytes;
         switch (self.fsync) {
@@ -613,6 +644,8 @@ pub const WAL = struct {
     }
 
     pub fn rotateIfNeeded(self: *WAL) !void {
+        self.snapshot_mu.lock();
+        defer self.snapshot_mu.unlock();
         if (self.bytes_written < 64 * 1024 * 1024) return; // 64 MiB
         self.file.close();
         // move current to wal/<epoch>.wal
@@ -625,6 +658,8 @@ pub const WAL = struct {
     }
 
     pub fn reset(self: *WAL) !void {
+        self.snapshot_mu.lock();
+        defer self.snapshot_mu.unlock();
         self.file.close();
         self.dir.makePath("wal") catch {};
 
@@ -1146,6 +1181,8 @@ fn appendPayload(self: *WAL, payload: []const u8) !u32 {
     var header: [4]u8 = undefined;
     const plen: u32 = @intCast(payload.len);
     std.mem.writeInt(u32, &header, plen, .little);
+    self.snapshot_mu.lock();
+    defer self.snapshot_mu.unlock();
     try self.file.writeAll(&header);
     try self.file.writeAll(payload);
     var crc = std.hash.Crc32.init();
@@ -1268,6 +1305,55 @@ test "wal replays mixed scalar and market records in durable order" {
 
     try wal.replay(alloc, &ctx);
     try std.testing.expectEqualSlices(u8, &[_]u8{ 2, 4, 1, 3 }, ctx.order[0..ctx.order_len]);
+}
+
+test "WAL snapshot lock serializes reset across current file capture" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    var wal = try WAL.open(alloc, tmp.dir, .none);
+    defer wal.close();
+    _ = try wal.append(7, 1_000, 3.5);
+
+    const ResetWorker = struct {
+        wal: *WAL,
+        started: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        completed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        failure: ?anyerror = null,
+
+        fn run(self: *@This()) void {
+            self.started.store(true, .release);
+            self.wal.reset() catch |err| {
+                self.failure = err;
+                self.completed.store(true, .release);
+                return;
+            };
+            self.completed.store(true, .release);
+        }
+    };
+
+    wal.lockForSnapshot();
+    var snapshot_locked = true;
+    defer if (snapshot_locked) wal.unlockForSnapshot();
+
+    var worker = ResetWorker{ .wal = &wal };
+    const thread = try std.Thread.spawn(.{}, ResetWorker.run, .{&worker});
+    var thread_joined = false;
+    defer if (!thread_joined) thread.join();
+
+    while (!worker.started.load(.acquire)) std.atomic.spinLoopHint();
+    std.Thread.sleep(5 * std.time.ns_per_ms);
+    try std.testing.expect(!worker.completed.load(.acquire));
+    try tmp.dir.access("wal/current.wal", .{});
+
+    wal.unlockForSnapshot();
+    snapshot_locked = false;
+    thread.join();
+    thread_joined = true;
+    if (worker.failure) |err| return err;
+    try std.testing.expect(worker.completed.load(.acquire));
+    try tmp.dir.access("wal/current.wal", .{});
 }
 
 test "wal market batches round trip registrations and rows" {

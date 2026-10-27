@@ -22,6 +22,11 @@ pub const CompactionResult = struct {
     }
 };
 
+pub const SeriesHour = struct {
+    market_series_id: market_manifest.MarketSeriesId,
+    hour_bucket: i64,
+};
+
 const OwnedRow = struct {
     ts_ns: i64,
     write_sequence: u64,
@@ -32,6 +37,54 @@ const OwnedRow = struct {
         self.* = undefined;
     }
 };
+
+/// Returns each series/hour partition that contains at least one overlapping
+/// descriptor pair. The keys are independent of the manifest and remain valid
+/// while compaction atomically replaces descriptor sets.
+pub fn selectOverlappingSeriesHours(
+    alloc: std.mem.Allocator,
+    manifest: *const market_manifest.Manifest,
+) ![]SeriesHour {
+    var keys = std.array_list.Managed(SeriesHour).init(alloc);
+    errdefer keys.deinit();
+
+    const descriptors = manifest.list();
+    for (descriptors, 0..) |descriptor, descriptor_idx| {
+        var overlaps = false;
+        for (descriptors, 0..) |other, other_idx| {
+            if (descriptor_idx == other_idx or
+                descriptor.market_series_id != other.market_series_id or
+                descriptor.hour_bucket != other.hour_bucket)
+            {
+                continue;
+            }
+            if (rangesOverlap(descriptor, other)) {
+                overlaps = true;
+                break;
+            }
+        }
+        if (!overlaps or containsSeriesHour(keys.items, .{
+            .market_series_id = descriptor.market_series_id,
+            .hour_bucket = descriptor.hour_bucket,
+        })) {
+            continue;
+        }
+        try keys.append(.{
+            .market_series_id = descriptor.market_series_id,
+            .hour_bucket = descriptor.hour_bucket,
+        });
+    }
+
+    std.sort.block(SeriesHour, keys.items, {}, struct {
+        fn lessThan(_: void, lhs: SeriesHour, rhs: SeriesHour) bool {
+            if (lhs.market_series_id != rhs.market_series_id) {
+                return lhs.market_series_id < rhs.market_series_id;
+            }
+            return lhs.hour_bucket < rhs.hour_bucket;
+        }
+    }.lessThan);
+    return try keys.toOwnedSlice();
+}
 
 /// Returns borrowed descriptors that overlap at least one other descriptor for
 /// the same series and hour. The returned pointer slice is owned by `alloc` and
@@ -255,6 +308,17 @@ fn rangesOverlap(
     return lhs.start_ts_ns <= rhs.end_ts_ns and rhs.start_ts_ns <= lhs.end_ts_ns;
 }
 
+fn containsSeriesHour(keys: []const SeriesHour, needle: SeriesHour) bool {
+    for (keys) |key| {
+        if (key.market_series_id == needle.market_series_id and
+            key.hour_bucket == needle.hour_bucket)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn validateDescriptorSet(
     descriptors: []const *const market_manifest.MarketSegmentDescriptor,
 ) !void {
@@ -409,6 +473,12 @@ test "market compaction selects only overlapping descriptors for one series hour
     defer alloc.free(c_path);
 
     const series_id = @import("market_identity.zig").seriesId(test_metric, test_labels);
+    const keys = try selectOverlappingSeriesHours(alloc, &manifest);
+    defer alloc.free(keys);
+    try std.testing.expectEqual(@as(usize, 1), keys.len);
+    try std.testing.expectEqual(series_id, keys[0].market_series_id);
+    try std.testing.expectEqual(@as(i64, 0), keys[0].hour_bucket);
+
     const selected = try selectOverlappingDescriptors(alloc, &manifest, series_id, 0);
     defer alloc.free(selected);
     try std.testing.expectEqual(@as(usize, 2), selected.len);

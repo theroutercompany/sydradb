@@ -4,6 +4,7 @@ const types = @import("types.zig");
 const AtomicU64 = @import("atomic_util.zig").AtomicU64;
 const manifest_mod = @import("storage/manifest.zig");
 const market_catalog_mod = @import("storage/market_catalog.zig");
+const market_compact_mod = @import("storage/market_compact.zig");
 const market_identity_mod = @import("storage/market_identity.zig");
 const market_manifest_mod = @import("storage/market_manifest.zig");
 const market_memtable_mod = @import("storage/market_memtable.zig");
@@ -1393,7 +1394,7 @@ pub const Engine = struct {
         };
         const flushed = try flushMemtable(self);
         if (flushed) try self.syncCasSnapshot("snapshot-flush");
-        try self.wal.file.sync();
+        try self.wal.sync();
         if (!flushed or self.cas == null) try self.ensureSnapshotBundleHead();
         try @import("snapshot.zig").snapshot(self.alloc, self.config.data_dir, dst_path, self.config.fsync);
         try resumeWriterAfterMaintenance(self);
@@ -2147,7 +2148,7 @@ pub const Engine = struct {
             }
             // fsync policy: interval
             if (self.config.fsync == .interval and (now - last_sync) >= self.flush_timer_ms) {
-                self.wal.file.sync() catch |err| {
+                self.wal.sync() catch |err| {
                     std.log.warn("wal sync failed: {s}", .{@errorName(err)});
                 };
                 last_sync = now;
@@ -5296,6 +5297,8 @@ pub const Engine = struct {
     }
 
     pub fn verifyCasState(self: *Engine) !void {
+        self.wal.lockForSnapshot();
+        defer self.wal.unlockForSnapshot();
         if (self.cas) |*cas| {
             return try cas.verifyHeadMatchesLegacyWithNativeMarket(
                 self.data_dir,
@@ -5318,7 +5321,7 @@ pub const Engine = struct {
 
         const flushed = try flushMemtable(self);
         if (flushed) try self.syncCasSnapshot("manual-flush");
-        try self.wal.file.sync();
+        try self.wal.sync();
         try resumeWriterAfterMaintenance(self);
         return flushed;
     }
@@ -5395,23 +5398,38 @@ pub const Engine = struct {
         errdefer resumeWriterAfterMaintenance(self) catch |err| {
             std.log.err("failed to resume writer after compaction: {s}", .{@errorName(err)});
         };
-        _ = try flushMemtable(self);
+        const flushed = try flushMemtable(self);
         if (self.cas) |*cas| {
             try self.metadata.refreshCasIndexIfStale(cas);
         }
-        const changed = if (self.cas != null and self.metadata.hasCasIndex())
+        const scalar_changed = if (self.cas != null and self.metadata.hasCasIndex())
             try compactCasBackedSegments(self)
         else
             try @import("storage/compact.zig").compactAllWithResult(self.alloc, self.data_dir, &self.metadata.manifest);
-        if (changed) {
+
+        var obsolete_market_mirrors = ObsoleteMarketMirrors.init(self.alloc);
+        defer obsolete_market_mirrors.deinit();
+        const market_changed = try compactNativeMarketSegments(
+            self,
+            &obsolete_market_mirrors,
+        );
+        const compacted = scalar_changed or market_changed;
+        if (compacted) {
             try self.createMaintenanceCheckpoint("compaction");
-            try self.syncCasSnapshot("compaction");
+        }
+        if (flushed or compacted) {
+            try self.syncCasSnapshot(if (compacted) "compaction" else "compaction-flush");
+        }
+        if (market_changed) {
+            deleteObsoleteMarketMirrors(self, obsolete_market_mirrors.paths.items);
         }
         try resumeWriterAfterMaintenance(self);
-        return changed;
+        return compacted;
     }
 
     fn syncCasSnapshot(self: *Engine, reason: []const u8) !void {
+        self.wal.lockForSnapshot();
+        defer self.wal.unlockForSnapshot();
         if (self.cas) |*cas| {
             const start_ns = std.time.nanoTimestamp();
             errdefer _ = self.metrics.cas_sync_failed_total.fetchAdd(1, .monotonic);
@@ -5434,6 +5452,8 @@ pub const Engine = struct {
     }
 
     fn ensureSnapshotBundleHead(self: *Engine) !void {
+        self.wal.lockForSnapshot();
+        defer self.wal.unlockForSnapshot();
         if (self.cas) |*cas| {
             if (try cas.refs.readHead(cas_mod.main_ref) == null) {
                 _ = try cas.bootstrapIfMissingWithNativeMarket(
@@ -6173,6 +6193,143 @@ fn findWalEntry(entries: []const cas_mod.WalChunkDescriptor, needle: []const u8)
         if (std.mem.eql(u8, entry.mirrorName(), needle)) return entry;
     }
     return null;
+}
+
+const ObsoleteMarketMirrors = struct {
+    alloc: std.mem.Allocator,
+    paths: std.array_list.Managed([]u8),
+
+    fn init(alloc: std.mem.Allocator) ObsoleteMarketMirrors {
+        return .{
+            .alloc = alloc,
+            .paths = std.array_list.Managed([]u8).init(alloc),
+        };
+    }
+
+    fn deinit(self: *ObsoleteMarketMirrors) void {
+        for (self.paths.items) |path| self.alloc.free(path);
+        self.paths.deinit();
+        self.* = undefined;
+    }
+};
+
+fn compactNativeMarketSegments(
+    engine: *Engine,
+    obsolete_mirrors: *ObsoleteMarketMirrors,
+) !bool {
+    const partitions = try market_compact_mod.selectOverlappingSeriesHours(
+        engine.alloc,
+        &engine.market_manifest,
+    );
+    defer engine.alloc.free(partitions);
+
+    var changed = false;
+    for (partitions) |partition| {
+        const selected = try market_compact_mod.selectOverlappingDescriptors(
+            engine.alloc,
+            &engine.market_manifest,
+            partition.market_series_id,
+            partition.hour_bucket,
+        );
+        defer engine.alloc.free(selected);
+        if (selected.len < 2) continue;
+
+        for (selected) |descriptor| {
+            try ensureMarketCompactionMirror(engine, descriptor);
+        }
+
+        var replaced_paths = std.array_list.Managed([]u8).init(engine.alloc);
+        defer {
+            for (replaced_paths.items) |path| engine.alloc.free(path);
+            replaced_paths.deinit();
+        }
+        try replaced_paths.ensureTotalCapacity(selected.len);
+        for (selected) |descriptor| {
+            try replaced_paths.append(try engine.alloc.dupe(u8, descriptor.path));
+        }
+
+        var result = try market_compact_mod.compactSeriesHour(
+            engine.alloc,
+            engine.data_dir,
+            &engine.market_manifest,
+            partition.market_series_id,
+            partition.hour_bucket,
+        );
+        defer result.deinit();
+        switch (result.outcome) {
+            .compacted => {
+                changed = true;
+                try obsolete_mirrors.paths.appendSlice(replaced_paths.items);
+                replaced_paths.clearRetainingCapacity();
+            },
+            .already_applied, .no_overlaps => {},
+        }
+    }
+    return changed;
+}
+
+fn ensureMarketCompactionMirror(
+    engine: *Engine,
+    descriptor: *const market_manifest_mod.MarketSegmentDescriptor,
+) !void {
+    if (engine.data_dir.access(descriptor.path, .{})) |_| {
+        return;
+    } else |err| switch (err) {
+        error.FileNotFound => {},
+        else => return err,
+    }
+
+    const cas = if (engine.cas) |*manager| manager else return error.NativeMarketDataUnavailable;
+    engine.metadata.cas_index_mu.lock();
+    defer engine.metadata.cas_index_mu.unlock();
+    const index = if (engine.metadata.cas_index) |*snapshot_index| snapshot_index else return error.NativeMarketDataUnavailable;
+
+    for (index.snapshot.market_segment_descriptors) |cas_descriptor| {
+        if (cas_descriptor.market_series_id != descriptor.market_series_id or
+            cas_descriptor.hour_bucket != descriptor.hour_bucket or
+            !std.mem.eql(u8, &cas_descriptor.content_id, &descriptor.content_id) or
+            !std.mem.eql(u8, cas_descriptor.mirrorPath(), descriptor.path))
+        {
+            continue;
+        }
+        const root_id = cas_descriptor.segmentRoot() orelse
+            return error.NativeMarketDataUnavailable;
+        const restored = try market_segment_mod.restoreSegmentRootToLocalMirror(
+            engine.alloc,
+            engine.data_dir,
+            &cas.store,
+            root_id,
+        );
+        defer engine.alloc.free(restored);
+        if (!std.mem.eql(u8, restored, descriptor.path)) {
+            return error.MarketSegmentDescriptorMismatch;
+        }
+        return;
+    }
+    return error.NativeMarketDataUnavailable;
+}
+
+fn deleteObsoleteMarketMirrors(engine: *Engine, paths: []const []const u8) void {
+    for (paths) |path| {
+        if (marketManifestReferencesPath(&engine.market_manifest, path)) continue;
+        engine.data_dir.deleteFile(path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => std.log.warn("obsolete market mirror cleanup failed path={s} error={s}", .{
+                path,
+                @errorName(err),
+            }),
+        };
+    }
+}
+
+fn marketManifestReferencesPath(
+    manifest: *const market_manifest_mod.Manifest,
+    path: []const u8,
+) bool {
+    for (manifest.list()) |descriptor| {
+        if (std.mem.eql(u8, descriptor.path, path)) return true;
+    }
+    return false;
 }
 
 const CompactibleDescriptorGroup = struct {
@@ -10145,6 +10302,145 @@ test "engine market query revision returns historical native values" {
         @as(u64, @bitCast(@as(f64, 12.0))),
         @as(u64, @bitCast(current.rows[0].values[0])),
     );
+}
+
+test "engine compacts native market corrections and preserves CAS revisions" {
+    const talloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const data_path = try std.fmt.allocPrint(
+        talloc,
+        ".zig-cache/tmp/{s}/native-market-compaction",
+        .{tmp.sub_path},
+    );
+    defer talloc.free(data_path);
+    var config = try testConfig(talloc, data_path);
+    config.cas_mode = .dual_write;
+    config.market_storage_mode = .native_v1;
+    config.market_storage_read_mode = .auto;
+    config.flush_interval_ms = std.math.maxInt(u32);
+    config.memtable_max_bytes = std.math.maxInt(usize);
+    var engine = try Engine.init(talloc, config);
+    defer engine.deinit();
+
+    const first_values = [_]f64{ 10.0, 100.0 };
+    const original_values = [_]f64{ 20.0, 200.0 };
+    _ = try engine.ingestMarketBatch(&.{
+        .{
+            .metric = "market.trade",
+            .labels_json = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}",
+            .ts_ns = 1_000,
+            .values = &first_values,
+        },
+        .{
+            .metric = "market.trade",
+            .labels_json = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}",
+            .ts_ns = 2_000,
+            .values = &original_values,
+        },
+    });
+    _ = try engine.flushNow();
+
+    const corrected_values = [_]f64{ 22.0, 220.0 };
+    const final_values = [_]f64{ 30.0, 300.0 };
+    _ = try engine.ingestMarketBatch(&.{
+        .{
+            .metric = "market.trade",
+            .labels_json = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}",
+            .ts_ns = 2_000,
+            .values = &corrected_values,
+        },
+        .{
+            .metric = "market.trade",
+            .labels_json = "{\"symbol\":\"AAPL\",\"venue\":\"XNAS\"}",
+            .ts_ns = 3_000,
+            .values = &final_values,
+        },
+    });
+    _ = try engine.flushNow();
+    try std.testing.expectEqual(@as(usize, 2), engine.market_manifest.list().len);
+
+    var source_paths = std.array_list.Managed([]u8).init(talloc);
+    defer {
+        for (source_paths.items) |path| talloc.free(path);
+        source_paths.deinit();
+    }
+    for (engine.market_manifest.list()) |descriptor| {
+        try source_paths.append(try talloc.dupe(u8, descriptor.path));
+    }
+
+    const pre_compaction_head = try engine.cas.?.refs.readHead(cas_mod.main_ref) orelse
+        return error.MissingCasHead;
+    const pre_compaction_revision = pre_compaction_head.toHex();
+    for (source_paths.items) |path| {
+        try engine.data_dir.deleteFile(path);
+    }
+    try std.testing.expect(try engine.compactNow());
+    try std.testing.expectEqual(@as(usize, 1), engine.market_manifest.list().len);
+    try engine.verifyCasState();
+
+    const output_path = engine.market_manifest.list()[0].path;
+    try engine.data_dir.access(output_path, .{});
+    for (source_paths.items) |path| {
+        try std.testing.expectError(error.FileNotFound, engine.data_dir.access(path, .{}));
+    }
+
+    var current = try engine.queryMarket(.{
+        .metric = "market.trade",
+        .start_ts_ns = 1_000,
+        .end_ts_ns = 3_000,
+    });
+    defer current.deinit();
+    try std.testing.expectEqual(@as(usize, 3), current.rows.len);
+    try std.testing.expectEqual(@as(i64, 2_000), current.rows[1].ts_ns);
+    try std.testing.expectEqual(
+        @as(u64, @bitCast(corrected_values[0])),
+        @as(u64, @bitCast(current.rows[1].values[0])),
+    );
+    try std.testing.expectEqual(
+        @as(u64, @bitCast(corrected_values[1])),
+        @as(u64, @bitCast(current.rows[1].values[1])),
+    );
+
+    var historical = try engine.queryMarket(.{
+        .metric = "market.trade",
+        .start_ts_ns = 1_000,
+        .end_ts_ns = 3_000,
+        .revision = pre_compaction_revision[0..],
+    });
+    defer historical.deinit();
+    try std.testing.expectEqual(@as(usize, 3), historical.rows.len);
+    try std.testing.expectEqual(
+        @as(u64, @bitCast(corrected_values[0])),
+        @as(u64, @bitCast(historical.rows[1].values[0])),
+    );
+
+    const post_compaction_head = try engine.cas.?.refs.readHead(cas_mod.main_ref) orelse
+        return error.MissingCasHead;
+    const post_compaction_revision = post_compaction_head.toHex();
+    const diff = try engine.cas.?.diffSnapshots(
+        pre_compaction_revision[0..],
+        post_compaction_revision[0..],
+    );
+    try std.testing.expectEqual(@as(usize, 1), diff.market_segments_added);
+    try std.testing.expectEqual(@as(usize, 2), diff.market_segments_removed);
+
+    const refs = try engine.cas.?.listRefs();
+    defer {
+        for (refs) |*entry| entry.deinit(talloc);
+        talloc.free(refs);
+    }
+    var saw_checkpoint = false;
+    for (refs) |entry| {
+        if (std.mem.startsWith(u8, entry.name, "checkpoints/compaction-") and
+            entry.id.eql(pre_compaction_head))
+        {
+            saw_checkpoint = true;
+            break;
+        }
+    }
+    try std.testing.expect(saw_checkpoint);
 }
 
 test "engine native market rows drive rollups and signals without scalar fanout" {
