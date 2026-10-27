@@ -110,6 +110,11 @@ Define bucket boundaries, timestamp units, empty buckets, late points,
 same-timestamp corrections, and restart behavior. Repeated processing must not
 duplicate results. Historical revision queries must remain deterministic.
 
+Each background refresh has a default memory limit of 64 MiB. The database
+configuration can change this limit. Account for temporary data used to
+recompute a group after late or corrected rows. The user approved this default
+and configuration scope on 2026-10-27.
+
 Use explicit rollup reads initially. Automatic selection remains a later task
 within the roadmap and requires proof of equivalence to raw-data aggregation.
 This project does not require automatic selection to complete its first generic
@@ -121,6 +126,9 @@ Use one contract across three fixture families: sensor measurements, service
 metrics, and trading records. Each fixture must exercise schema registration,
 ingest, projection, query, correction, restart, snapshot, and restore. Aggregate
 checks must use independently computed expected values.
+
+The final application-neutral query benchmark uses 10 million rows to measure
+memory and storage behavior, as requested on 2026-10-27.
 
 Use the existing Zig 0.15.1 toolchain, storage/runtime tests, wire tests, demos,
 and evidence runners. Run focused causal checks before broad suites. Preserve

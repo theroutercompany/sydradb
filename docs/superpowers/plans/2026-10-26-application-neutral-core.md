@@ -227,7 +227,9 @@ parser fixtures, language documentation.
 
 **Interfaces:** use `ast.Selector.tag_filter`. Start with the documented bracket
 selector form and label equality/inequality expressions. Keep regular
-`WHERE tag.<name>` predicates supported.
+`WHERE tag.<name>` and `WHERE label.<name>` predicates supported. The user
+approved `FROM sensor.temperature[label.site = 'west']` with the existing
+string-escape rules on 2026-10-27.
 
 - [x] Specify syntax, missing-label behavior, and unsupported expressions.
 - [x] Add parser and normalization fixtures for success and malformed input.
@@ -276,6 +278,7 @@ definition versioning and provenance. Trading enum strings remain unchanged.
 - [ ] Reuse sum/count/min/max/avg semantics with independently expected results.
 - [ ] Test boundary timestamps, empty buckets, and multi-label groups.
 - [ ] Test late points, corrections, retries, and restart idempotence.
+- [ ] Bound each background refresh to 64 MiB by default, configurable per database.
 - [ ] Verify publication ordering, provenance, and revision-query consistency.
 - [ ] Compare explicit rollup reads with raw aggregation for all fixture families.
 
@@ -290,7 +293,7 @@ relevant test graph, and existing release/performance evidence tools.
 
 - [ ] Run the full relevant local Zig, wire, demo, and evidence suites.
 - [ ] Run applicable crash, migration, shadow, and bounded soak checks after changes.
-- [ ] Measure relevant query and storage guardrails using existing benchmarks.
+- [ ] Measure query memory and storage with 10 million rows using existing benchmarks.
 - [ ] Obtain an independent review and resolve material findings with causal tests.
 - [ ] Audit every design requirement against terminal evidence and current files.
 

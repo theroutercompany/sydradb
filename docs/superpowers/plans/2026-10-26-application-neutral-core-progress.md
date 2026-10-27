@@ -6,45 +6,49 @@ Persistent goal: active in this conversation; no deadline or token budget.
 
 ## Current checkpoint
 
-The signed project checkpoint is `7ad797c0992ec57c7f52bde2849e628089a3805a`,
-tree `086df41aee27cf373255f8194d7829339ff48f20`. It passed 820/820 ReleaseSafe
-tests on macOS: 229 storage and 591 runtime. The root working source matches this
-checkpoint. The checkout remains on `codex/native-market-storage` at
-`42fbd552d9382e862fb02535392c539e5ef7cd90`; checkpoints remain on a separate
-branch. The earlier 794/794 result belongs to checkpoint `14290b9`.
+The signed project checkpoint is `5913786492f14ac524bac4571e44c7a22472ffd2`,
+tree `7080189949d1befae184ace2f106f601c455b656`. Its runtime suite passed
+595/595 ReleaseSafe tests on macOS. The root source includes the exact worker
+changes from this checkpoint. The preceding `7ad797c` checkpoint passed
+820/820 storage and runtime tests. No combined total is claimed for the newer
+checkpoint. The root branch remains `codex/native-market-storage` at
+`42fbd552d9382e862fb02535392c539e5ef7cd90`; its unpublished ancestry is preserved.
 
-PRs 94 and 95 passed hosted CI and are ready for review. PR 96 is ready for
-review. Its CI run passed, while its Docs run failed because local-ingest pages
-were absent from that branch. PR 78 supplies those pages and is an explicit
-dependency. PRs 97, 98, and 99 passed Ubuntu and macOS CI and are ready for review.
-PR 100 contains the CAS directory and publication-error correction. Its scoped
-branch passed 679/679 tests and its Ubuntu/macOS checks passed. It is ready for
-review. No PR has merged.
+The user explicitly authorized prompt merges of all open project PRs. Seventeen
+PRs have merged into their dependency branches so far. PR 76 reached `main` at
+`5e411b78f2bfc61806da709cefe7032744e69d7a` after Ubuntu, macOS, documentation,
+and CodeQL checks passed. It includes PRs 78 through 81. PR 75 then reached
+`main` at `99685afcd1ee9490fc7f4ad1fe7aa110f381e84d`; it includes the neutral
+schema/row API from PR 85. Native storage changes are being combined through
+their remaining PRs. No direct main push occurred.
 
-The application boundary, empty generic catalog, neutral API routes, query
-limits, and general label selection have current-root test evidence. Trading
-schema and transform behavior lives under `applications/trading`; legacy routes
-and serialized identifiers remain compatible. M2 through M4 remain incomplete
-upstream. Generic rollups remain design-only.
+The current P2 delivery candidate completed its suite with 702/704 tests
+passing, including 201 storage tests. Its two remaining runtime failures are
+under independent review. It is not accepted or published. The batch-lifetime
+and closed-queue ownership fixes are separate signed local checkpoints. Their
+new regressions reproduce the old failures, and the corrected project runtime
+suite passes all 595 tests. PR 101 passed 676/676 locally but hit a hosted
+compaction-fixture timeout; a scoped worker correction is under Debug validation.
 
-PRs 89 through 95 passed Ubuntu and macOS CI and are ready for review. Local
-checkpoints have verified GPG signatures. Published GitHub App commits are
-unsigned and have matching trees. No work is pushed directly to main.
+The application boundary, empty generic catalog, neutral routes, query limits,
+and general selection have current-root test evidence. Trading behavior remains
+under `applications/trading`, with legacy routes and serialized identifiers
+preserved. M2 through M4 still have upstream work. Generic rollups remain
+design-only: each refresh will default to a configurable 64 MiB limit, and the
+final application-neutral benchmark will use 10 million rows.
 
-The current source branch remains `codex/native-market-storage` at `42fbd55`.
-Atomic checkpoints are maintained separately so that its unpublished ancestry
-does not enter scoped feature PRs. New integration and P2 branches remain
-isolated and incomplete. The earlier 60-second restart soak recovered 15,604
-acknowledged rows after five restarts, and crash smoke passed seven points.
-Those results are smoke evidence. They do not establish long-soak acceptance.
+Local checkpoints have verified GPG signatures. Published GitHub App commits
+are unsigned and use matching trees. The earlier 60-second restart soak recovered
+15,604 acknowledged rows after five restarts; crash smoke passed seven points.
+These results do not establish long-soak acceptance.
 
 | Milestone | State | Acceptance evidence |
 | --- | --- | --- |
-| M1: native-storage stabilization | Open | PRs 94, 95, and 97 through 100 passed hosted checks. PR 96 has a PR 78 Docs dependency. Engine concurrency review corrections remain under validation. |
-| M2: application boundaries | Implemented locally; upstream delivery incomplete | Empty catalog, neutral routes, schema and transform extraction, and shared sensor, service, and trading lifecycle tests pass locally. |
-| M3: query limits | Implemented locally; upstream delivery incomplete | Accounting, exact-cap, overflow, cancellation, runtime, and wire checks pass locally. Original test-first chronology is not established. |
-| M4: general selection | Implemented locally; upstream delivery incomplete | Label filters, compiled families, ownership, and prepared-query lifecycle checks pass locally. |
-| M5: generic rollups and final audit | Design only | Definition, bounded-read, and bucket-semantics contracts remain under review. No implementation exists. |
+| M1: native-storage stabilization | Open | Completed PRs are being merged. P2 has two unresolved runtime failures; PR 101 has a hosted fixture correction under validation. |
+| M2: application boundaries | Implemented locally; upstream delivery incomplete | Neutral API routes are on main. Empty catalog and trading extraction still need upstream delivery. |
+| M3: query limits | Implemented locally; upstream delivery incomplete | Accounting, exact-cap, overflow, cancellation, runtime, and wire checks pass locally. |
+| M4: general selection | Implemented locally; upstream delivery incomplete | Bracket label filters, compiled families, ownership, and prepared-query lifecycle checks pass locally. |
+| M5: generic rollups and final audit | Design only | The user confirmed the 64 MiB configurable refresh limit and 10-million-row benchmark. |
 
 ## Starting work and preservation
 
@@ -1409,3 +1413,31 @@ before a new checkpoint. The lock audit found the port reserves `Queue.mu`
 before its prequeue gate, while both reference implementations reserve after
 the gate. That ordering blocks the unchanged test's `queue.wake()` call. The
 worker is restoring the reference ordering without changing assertions.
+
+### Confirmed query and rollup decisions, 2026-10-27
+
+The user approved bracket label-selector shorthand with existing string
+escapes and continued `WHERE label.site = 'west'` support. Current parser and
+shadow fixtures already cover this syntax. The user selected a 64 MiB default
+for each background rollup refresh, configurable per database, and a final
+benchmark scale of 10 million rows. These are now explicit plan and design
+requirements; the earlier 1-million-row working assumption is superseded.
+
+PR 101 contains the 112-line high unsigned-ID WAL-reopen regression. Its local
+branch passed 676/676 tests (200 storage, 476 runtime). Signed local checkpoint
+`da123496e138fe03e27e04f5d6fbe26bc7e4b6e5` and App commit
+`5c61bb05ccd5f5ea63be0925c080b006542bcee8` share tree
+`f11962d5186a65542084b06df48c9ecdd04e5591`. Its base combines reviewed
+prerequisites from PRs 94, 95, 96, and 99 with no new HTTP test. No direct main
+push or PR merge occurred. Hosted checks are pending.
+
+### Merge authority and current delivery, 2026-10-27
+
+The user requested that all open project PRs be merged as soon as possible.
+The manager merged completed dependency PRs through GitHub, with exact head-SHA
+checks, and retargeted children when their base PR merged. PR 76 and then PR 75
+reached main after their relevant combined checks passed. Remaining native
+branches are being checked after each combined source change. PR 89's refreshed
+run logged a CAS verification error; the writer/publication fixes in its PR 90
+dependency are being combined before that parent is promoted. No checks or
+repository protection settings were removed.
