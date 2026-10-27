@@ -11,6 +11,7 @@ const plan = @import("../../query/plan.zig");
 const value_mod = @import("../../query/value.zig");
 const engine_mod = @import("../../engine.zig");
 const query_functions = @import("../../query/functions.zig");
+const monotime = @import("../../time.zig");
 
 const ManagedArrayList = std.array_list.Managed;
 
@@ -1016,7 +1017,7 @@ fn handleSydraqlQuery(
     engine: *engine_mod.Engine,
     sydraql: []const u8,
 ) !void {
-    const start_time = std.time.microTimestamp();
+    var query_timer = monotime.startTimer();
     var cursor = query_exec.execute(alloc, engine, sydraql) catch |err| {
         const contract = pgwireExecutionErrorContract(err);
         try protocol.writeErrorResponse(writer, "ERROR", contract.sqlstate, contract.message);
@@ -1052,9 +1053,9 @@ fn handleSydraqlQuery(
     }
     cursor.stats.rows_emitted = @as(u64, @intCast(row_count));
     cursor.stats.rows_scanned = rows_scanned;
-    const elapsed_us = std.time.microTimestamp() - start_time;
+    const elapsed_us = query_timer.read() / std.time.ns_per_us;
     const plan_us = cursor.stats.parse_us + cursor.stats.validate_us + cursor.stats.bind_us + cursor.stats.compile_us + cursor.stats.logical_us + cursor.stats.optimize_us + cursor.stats.physical_us + cursor.stats.pipeline_us;
-    const stream_ms = @divTrunc(elapsed_us, 1000);
+    const stream_ms = @divTrunc(@as(i64, @intCast(elapsed_us)), 1000);
     const plan_ms = @divTrunc(@as(i64, @intCast(plan_us)), 1000);
     if (cursor.columns.len != 0) {
         const schema_notice = try formatSchemaNotice(alloc, cursor.columns);
